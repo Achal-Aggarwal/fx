@@ -13,19 +13,19 @@
 
 # fx
 
-fx is a coding agent for your terminal. It's written in Zig and ships as one native binary with no runtime to install, so it runs the same on your laptop, in CI, or inside an agent sandbox.
+fx is the smallest coding agent: one native binary, 6.7 MiB on Apple silicon, with no runtime to install. It's written in Zig and runs the same on your laptop, in CI, or inside an agent sandbox.
 
 It works with the model you choose, and its output is closer to a Unix shell than an IDE: the conversation prints into your scrollback instead of filling the screen. The same agent core runs in editors over the Agent Client Protocol (ACP) and in JavaScript apps through [libfx](sdk/README.md).
 
 ## Features
 
+- **Small and fast**: every stable release has to fit under 7.8 MiB on Apple silicon. Startup is benchmarked on every pull request, and CI fails a change if any measured command takes longer than 2 ms on Linux ([benchmarks](benchmarks/)).
 - **Any model**: use Vercel AI Gateway, your ChatGPT or Grok subscription, or any OpenAI-compatible endpoint such as Ollama or OpenRouter ([custom connections](https://fx.sh/docs/configure-fx/custom-model-connections)).
 - **Inline output**: the conversation stays in your terminal's scrollback, where you can scroll, search, and copy it like any other command's output. tmux bindings and copy mode keep working, and terminals that support the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) can show when fx is busy or waiting for you.
 - **Your own shell**: commands run in your login shell with your aliases, functions, and `PATH`. fx runs your startup files once and reuses the result, so a slow `.zshrc` doesn't slow down every command.
 - **Permissions**: the default `auto` mode runs routine work, such as editing project files and running tests, without asking. Anything else goes to a model that checks it for prompt injection or malicious behavior first. Switch to `ask` to approve each action yourself, or to `full-access` to turn the checks off ([permissions](https://fx.sh/docs/configure-fx/permissions)).
 - **Sessions**: fx saves your conversations, so `fx -c` picks up where you left off in a project. When a conversation fills the model's context, fx compacts older turns and keeps their full text on disk for the agent to look up ([sessions](https://fx.sh/docs/using-fx/sessions)).
 - **Skills, MCP, and subagents**: fx loads skills from `.fx/skills`, `~/.fx/skills`, and the folders other agents use, like `.claude/skills` and `.agents/skills`. It connects to MCP servers (`/mcp add slack` sets up Slack), hands independent work to subagents, and follows your project's `AGENTS.md`.
-- **Small and fast**: the macOS arm64 release binary is under 8 MiB. Startup is benchmarked on every pull request, and CI fails a change if any measured command takes longer than 2 ms on Linux ([benchmarks](benchmarks/)).
 
 ## Install
 
