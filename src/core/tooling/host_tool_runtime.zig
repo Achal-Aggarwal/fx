@@ -94,10 +94,6 @@ pub const Runtime = struct {
                 .bool => |declared| declared,
                 else => return error.InvalidHostTool,
             } else false;
-            const idempotent = if (entry.object.get("idempotent")) |value_| switch (value_) {
-                .bool => |declared| declared,
-                else => return error.InvalidHostTool,
-            } else false;
             if (description_value != .string or schema_value != .object) return error.InvalidHostTool;
             if (description_value.string.len > max_description_bytes) {
                 return error.HostToolDescriptionTooLarge;
@@ -133,7 +129,6 @@ pub const Runtime = struct {
                 .model_schema = .{ .name = name, .description = "" },
                 .model_visible = false,
                 .host_concurrent = !writes,
-                .host_idempotent = idempotent,
                 .executor_kind = .host,
                 .activity_kind = .command,
                 .action_label = "Running",
