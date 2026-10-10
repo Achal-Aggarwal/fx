@@ -554,7 +554,7 @@ pub const Engine = struct {
     fn take(e: *Engine) ?Event {
         if (e.event_count == 0) return null;
         const event = e.events[0];
-        std.mem.copyForwards(Event, e.events[0 .. e.event_count - 1], e.events[1..e.event_count]);
+        @memmove(e.events[0 .. e.event_count - 1], e.events[1..e.event_count]);
         e.event_count -= 1;
         return event;
     }

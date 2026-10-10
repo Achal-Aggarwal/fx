@@ -11,6 +11,7 @@ const mcp_contract = @import("../mcp/mcp_contract.zig");
 const io_mod = @import("../shared/io.zig");
 const host_target = @import("../hosts/target.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
+const text_utils = @import("../shared/text_utils.zig");
 const url_opener = @import("../hosts/url_opener.zig");
 const secret = @import("../auth/secret.zig");
 const config = @import("config.zig");
@@ -842,7 +843,7 @@ pub const Runtime = struct {
                     debug_trace.logf("mcp", "MCP elicitation declined server={s} reason=no call can ask", .{name});
                     return r.engine.answerElicitation(name, x.slot, decline);
                 };
-                const json = try std.fmt.allocPrint(r.gpa, "{{\"elicitation\":{{\"method\":\"elicitation/create\",\"params\":{s}}}}}", .{x.params});
+                const json = try r.gpa.print("{{\"elicitation\":{{\"method\":\"elicitation/create\",\"params\":{s}}}}}", .{x.params});
                 var pending: Pending = .{ .server = i, .json = json, .version = r.versionCopy(i), .reply = .{ .elicit = x.slot } };
                 if (!r.offer(req, pending)) {
                     pending.deinit(r.gpa);
@@ -1106,7 +1107,7 @@ pub const Runtime = struct {
                 "HTTP+SSE servers are not supported"
             else
                 "servers of \"type\": \"acp\" are not supported: ACP v1 defines stdio, HTTP, and SSE"),
-            .missing_env => std.fmt.allocPrint(alloc, "{s} is not set", .{s.missing orelse "a variable"}),
+            .missing_env => alloc.print("{s} is not set", .{s.missing orelse "a variable"}),
         };
     }
 
@@ -1173,7 +1174,7 @@ fn signInFailure(buffer: []u8, why: mcp.auth.client.Failure, message: ?[]const u
         while (end > 0 and said[end] & 0xC0 == 0x80) end -= 1;
         said = said[0..end];
     }
-    return std.fmt.bufPrint(buffer, "{s} ({s})", .{ what, said }) catch what;
+    return std.mem.print(buffer, "{s} ({s})", .{ what, said }) catch what;
 }
 
 test "a failed sign-in says why in words, with the server's own" {
@@ -1182,7 +1183,7 @@ test "a failed sign-in says why in words, with the server's own" {
     try std.testing.expectEqualStrings("the sign-in was cancelled", signInFailure(&buffer, .cancelled, null));
     try std.testing.expectEqualStrings("it didn't register fx as a client; set oauth.client_id for it in mcp.json", signInFailure(&buffer, .registration, null));
     try std.testing.expectEqualStrings("the sign-in page returned an error", signInFailure(&buffer, .response, " . "));
-    const long = "\xc3\xa9" ** 200;
+    const long = text_utils.repeat("\xc3\xa9", 200);
     const said = signInFailure(&buffer, .redemption, long);
     try std.testing.expect(std.unicode.utf8ValidateSlice(said));
     try std.testing.expect(said.len < 340);
@@ -1284,7 +1285,7 @@ test "tools and calls go through the owner thread, from several threads at once"
             var a: std.heap.ArenaAllocator = .init(testing.allocator);
             defer a.deinit();
             const result = runtime.call(a.allocator(), "fake", "echo", "{}", null, null) catch return;
-            if (result == .result and std.mem.indexOf(u8, result.result.content, "hi") != null) _ = ok.fetchAdd(1, .acq_rel);
+            if (result == .result and std.mem.find(u8, result.result.content, "hi") != null) _ = ok.fetchAdd(1, .acq_rel);
         }
     };
     var ok: std.atomic.Value(u32) = .init(0);

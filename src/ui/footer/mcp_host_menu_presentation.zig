@@ -101,14 +101,14 @@ fn listRow(alloc: Allocator, arena: Allocator, p: Projection, index: u16, width:
         const meta = if (p.rows.len == 0)
             "none yet"
         else if (p.filter.len > 0)
-            try std.fmt.allocPrint(arena, "{d} of {d}", .{ rows.len, p.rows.len })
+            try arena.print("{d} of {d}", .{ rows.len, p.rows.len })
         else
-            try std.fmt.allocPrint(arena, "{d}", .{p.rows.len});
+            try arena.print("{d}", .{p.rows.len});
         return title(alloc, "MCP servers", meta, width);
     }
     const has_note = p.notes > 0;
     if (has_note and index == row_count - 1) {
-        const note = try std.fmt.allocPrint(arena, "{d} config note{s}: /mcp list shows {s}", .{ p.notes, if (p.notes == 1) "" else "s", if (p.notes == 1) "it" else "them" });
+        const note = try arena.print("{d} config note{s}: /mcp list shows {s}", .{ p.notes, if (p.notes == 1) "" else "s", if (p.notes == 1) "it" else "them" });
         return row_text.composeTextRow(alloc, note, width, ui_render.dim_style, 2);
     }
     if (p.rows.len == 0) return if (index == 1)
@@ -117,7 +117,7 @@ fn listRow(alloc: Allocator, arena: Allocator, p: Projection, index: u16, width:
         row_text.composeTextRow(alloc, "or /mcp add NAME -- COMMAND", width, "", 11);
     const body = row_count - 1 - @as(u16, @intFromBool(has_note));
     if (rows.len == 0) {
-        const none = try std.fmt.allocPrint(arena, "No server matches \"{s}\"", .{p.filter});
+        const none = try arena.print("No server matches \"{s}\"", .{p.filter});
         return row_text.composeTextRow(alloc, none, width, ui_render.dim_style, 2);
     }
     const selected = p.state.selectedIndex(rows) orelse 0;
@@ -195,7 +195,7 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
         if (width >= 56) {
             try row_text.appendSpacesToColumn(alloc, &row, 16);
             try row.appendSlice(alloc, ui_render.dim_style);
-            const command = try std.fmt.allocPrint(arena, "/mcp {s} {s}", .{ cs[at].verb(), r.status.name });
+            const command = try arena.print("/mcp {s} {s}", .{ cs[at].verb(), r.status.name });
             try row_text.appendTerminalSafeSingleLine(alloc, &row, command, @as(usize, width) -| 16);
             try row.appendSlice(alloc, ui_render.reset_style);
         }
@@ -208,7 +208,7 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
             .loading => "Loading tools…",
             .needs_login => "Its tools show here once you log in.",
             .needs_approval => "Its tools show here once you approve it.",
-            .failed => |reason| try std.fmt.allocPrint(arena, "Its tools couldn't load: {s}", .{reason}),
+            .failed => |reason| try arena.print("Its tools couldn't load: {s}", .{reason}),
             .ready => |t| if (t.len == 0) "It has no tools." else "Tools",
         };
         return row_text.composeTextRow(alloc, heading, width, ui_render.dim_style, 2);
@@ -269,7 +269,7 @@ fn scrolled(state: menu.State, l: menu.Layout, window: usize) Scrolled {
 }
 
 fn countRow(alloc: Allocator, arena: Allocator, n: usize, where: []const u8, width: u16) !Row {
-    return row_text.composeTextRow(alloc, try std.fmt.allocPrint(arena, "{d} {s}", .{ n, where }), width, ui_render.dim_style, 2);
+    return row_text.composeTextRow(alloc, try arena.print("{d} {s}", .{ n, where }), width, ui_render.dim_style, 2);
 }
 
 const ConfirmLine = struct { text: []const u8, style: enum { question, detail, target } };
@@ -288,10 +288,10 @@ fn confirmLines(p: Projection, r: menu.Row, width: u16, out: *Confirm) []const C
     n += 1;
     const name = r.status.name;
     const q = switch (c) {
-        .remove => std.fmt.bufPrint(&out.question, "Remove {s} from {s}?", .{ name, p.fileOf(r) }),
-        .approve => std.fmt.bufPrint(&out.question, "Approve {s} for this project? It {s}:", .{ name, if (r.status.transport == .stdio) "runs" else "connects to" }),
-        .reject => std.fmt.bufPrint(&out.question, "Reject {s}? fx won't start it in this project.", .{name}),
-        .login, .logout => std.fmt.bufPrint(&out.question, "{s} {s}?", .{ c.label(), name }),
+        .remove => std.mem.print(&out.question, "Remove {s} from {s}?", .{ name, p.fileOf(r) }),
+        .approve => std.mem.print(&out.question, "Approve {s} for this project? It {s}:", .{ name, if (r.status.transport == .stdio) "runs" else "connects to" }),
+        .reject => std.mem.print(&out.question, "Reject {s}? fx won't start it in this project.", .{name}),
+        .login, .logout => std.mem.print(&out.question, "{s} {s}?", .{ c.label(), name }),
     } catch "Are you sure?";
     out.lines[n] = .{ .text = q, .style = .question };
     n += 1;
@@ -306,7 +306,7 @@ fn confirmLines(p: Projection, r: menu.Row, width: u16, out: *Confirm) []const C
             while (rest.len > 0 and n < out.lines.len) {
                 var end = @min(rest.len, limit);
                 if (end < rest.len) {
-                    if (std.mem.lastIndexOfScalar(u8, rest[0..end], ' ')) |space| {
+                    if (std.mem.findScalarLast(u8, rest[0..end], ' ')) |space| {
                         if (space > 0) end = space;
                     }
                     // Never inside a character.
@@ -470,7 +470,7 @@ test "a long tool list scrolls with the selection, framed by what's hidden" {
     const rows = [_]menu.Row{.{ .status = gh, .target = "https://h/mcp" }};
     var tools: [30]menu.Tool = undefined;
     var names: [30][8]u8 = undefined;
-    for (&tools, &names, 0..) |*t, *n, i| t.* = .{ .name = std.fmt.bufPrint(n, "tool{d:0>2}", .{i}) catch unreachable, .description = "" };
+    for (&tools, &names, 0..) |*t, *n, i| t.* = .{ .name = std.mem.print(n, "tool{d:0>2}", .{i}) catch unreachable, .description = "" };
     var p: Projection = .{ .rows = &rows, .tools = .{ .ready = &tools } };
     menu.open(&p.state);
     _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
@@ -478,9 +478,9 @@ test "a long tool list scrolls with the selection, framed by what's hidden" {
     for (0..12) |_| _ = menu.press(&p.state, view, .down);
     const text = try render(p, 60);
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.indexOf(u8, text, "above\n") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "more below\n") != null);
-    try testing.expect(std.mem.indexOf(u8, text, "› tool11") != null);
+    try testing.expect(std.mem.find(u8, text, "above\n") != null);
+    try testing.expect(std.mem.find(u8, text, "more below\n") != null);
+    try testing.expect(std.mem.find(u8, text, "› tool11") != null);
     try testing.expectEqual(@as(u16, max_inline_rows), menuRowCount(p, 60, max_inline_rows));
 }
 
@@ -515,12 +515,12 @@ test "names and errors from config and servers stay inert" {
     menu.open(&p.state);
     const list = try render(p, 80);
     defer testing.allocator.free(list);
-    try testing.expect(std.mem.indexOfScalar(u8, list, 0x1b) == null);
+    try testing.expect(std.mem.findScalar(u8, list, 0x1b) == null);
     _ = menu.press(&p.state, .{ .rows = &rows }, .enter);
     const server = try render(p, 80);
     defer testing.allocator.free(server);
-    try testing.expect(std.mem.indexOfScalar(u8, server, 0x1b) == null);
-    try testing.expect(std.mem.indexOf(u8, server, "error  boom") != null);
+    try testing.expect(std.mem.findScalar(u8, server, 0x1b) == null);
+    try testing.expect(std.mem.find(u8, server, "error  boom") != null);
 }
 
 test "no servers points to /mcp add" {

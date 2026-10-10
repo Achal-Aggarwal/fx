@@ -296,15 +296,15 @@ pub fn tokenFailure(a: Allocator, status: u16, raw: []const u8) Allocator.Error!
     const json = if (wire.objectFields(raw, &.{ "error", "error_description", "token_type" }, &f)) true else |_| false;
     if (!json) f = .{ null, null, null };
     if (status != 200) {
-        const code = wire.plainString(f[0] orelse return std.fmt.allocPrint(a, "its token endpoint answered HTTP {d}", .{status})) orelse
-            return std.fmt.allocPrint(a, "its token endpoint answered HTTP {d}", .{status});
+        const code = wire.plainString(f[0] orelse return a.print("its token endpoint answered HTTP {d}", .{status})) orelse
+            return a.print("its token endpoint answered HTTP {d}", .{status});
         const text = if (f[1]) |v| try wire.decodeString(a, v) else null;
-        return if (text) |t| std.fmt.allocPrint(a, "{s}: {s}", .{ code, t }) else a.dupe(u8, code);
+        return if (text) |t| a.print("{s}: {s}", .{ code, t }) else a.dupe(u8, code);
     }
     if (!json) return a.dupe(u8, "its token endpoint's answer isn't a JSON object");
     const kind = wire.plainString(f[2] orelse return a.dupe(u8, "its token response has no token_type")) orelse
         return a.dupe(u8, "its token response has no token_type");
-    if (!std.ascii.eqlIgnoreCase(kind, "bearer")) return std.fmt.allocPrint(a, "its token is of type {s}, not Bearer", .{kind});
+    if (!std.ascii.eqlIgnoreCase(kind, "bearer")) return a.print("its token is of type {s}, not Bearer", .{kind});
     return a.dupe(u8, "its token response has no access_token");
 }
 

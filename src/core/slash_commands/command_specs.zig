@@ -878,7 +878,7 @@ fn mcpVerbsOn() bool {
 
 fn runtimeArgCommand(registry: SlashRegistry) []const u8 {
     const first = registry.arguments[0].full;
-    return first[0 .. std.mem.indexOfScalar(u8, first, ' ') orelse first.len];
+    return first[0 .. std.mem.findScalar(u8, first, ' ') orelse first.len];
 }
 
 /// What follows the command the app's completions are for, untrimmed at
@@ -894,8 +894,8 @@ fn runtimeArgQuery(registry: SlashRegistry, prefix: []const u8) ?[]const u8 {
 /// A verb matches before its first space, and `VERB NAME` after it.
 fn runtimeArgMatches(registry: SlashRegistry, full: []const u8, query: []const u8) bool {
     const rest = full[runtimeArgCommand(registry).len + 1 ..];
-    const naming = std.mem.indexOfScalar(u8, query, ' ') != null;
-    if (naming != (std.mem.indexOfScalar(u8, rest, ' ') != null)) return false;
+    const naming = std.mem.findScalar(u8, query, ' ') != null;
+    if (naming != (std.mem.findScalar(u8, rest, ' ') != null)) return false;
     return std.ascii.startsWithIgnoreCase(rest, query);
 }
 

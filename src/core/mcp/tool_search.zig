@@ -449,7 +449,7 @@ pub fn renderAuthenticationRequired(
         const failed = server.state.load(.acquire) == .failed;
         server.status_lock.unlock(io_mod.getIo());
         if (authentication == .required) {
-            const guidance = try std.fmt.allocPrint(alloc, "Run /mcp auth {s} --open in an interactive fx session.", .{server.config.name});
+            const guidance = try alloc.print("Run /mcp auth {s} --open in an interactive fx session.", .{server.config.name});
             defer alloc.free(guidance);
             return try writeAuthenticationRequired(alloc, server.config.name, .{ .oauth = guidance });
         }
@@ -513,7 +513,7 @@ pub fn renderServerFailure(
 
 /// The page a search returns when the server it names is down.
 pub fn writeServerFailure(alloc: Allocator, server_name: []const u8, failure: []const u8) ![]u8 {
-    const message = try std.fmt.allocPrint(alloc, "MCP server '{s}' is unavailable: {s}", .{ server_name, failure });
+    const message = try alloc.print("MCP server '{s}' is unavailable: {s}", .{ server_name, failure });
     defer alloc.free(message);
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();

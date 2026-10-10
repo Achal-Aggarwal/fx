@@ -27,7 +27,7 @@ pub const Listener = struct {
 
     /// The redirect URI to sign in with, in `buffer`.
     pub fn redirectUri(l: *const Listener, buffer: *[64]u8) []const u8 {
-        return std.fmt.bufPrint(buffer, "http://127.0.0.1:{d}/callback", .{l.port}) catch unreachable;
+        return std.mem.print(buffer, "http://127.0.0.1:{d}/callback", .{l.port}) catch unreachable;
     }
 
     /// Waits for the browser's `GET /callback` and returns the full address it
@@ -74,7 +74,7 @@ fn answer(stream: std.Io.net.Stream, io: std.Io, alloc: Allocator, port: u16) !?
     }) catch {};
     writer.interface.flush() catch {};
     if (!ours) return null;
-    return try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}{s}", .{ port, target });
+    return try alloc.print("http://127.0.0.1:{d}{s}", .{ port, target });
 }
 
 const testing = std.testing;
@@ -111,7 +111,7 @@ test "the browser's return is the callback address; other requests get a 404 and
     defer thread.join();
     const url = try listener.accept(testing.io, testing.allocator);
     defer testing.allocator.free(url);
-    const want = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/callback?code=c1&state=s1", .{listener.port});
+    const want = try testing.allocator.print("http://127.0.0.1:{d}/callback?code=c1&state=s1", .{listener.port});
     defer testing.allocator.free(want);
     try testing.expectEqualStrings(want, url);
 }

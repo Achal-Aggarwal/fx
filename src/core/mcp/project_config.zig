@@ -168,8 +168,7 @@ pub fn renderWorkspaceDiagnostic(
             @tagName(value)
         else
             "value";
-        return std.fmt.allocPrint(
-            alloc,
+        return alloc.print(
             "{s} server '{s}' field {s} requires environment variable '{s}'; set it or use ${{{s}:-default}}.",
             .{
                 diagnosticFile(diagnostic),
@@ -180,8 +179,7 @@ pub fn renderWorkspaceDiagnostic(
             },
         );
     }
-    return std.fmt.allocPrint(
-        alloc,
+    return alloc.print(
         "{s} server '{s}' was skipped: {s}.",
         .{ diagnosticFile(diagnostic), encoded_server.bytes, @tagName(diagnostic.cause) },
     );

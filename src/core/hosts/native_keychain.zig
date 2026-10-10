@@ -432,7 +432,7 @@ pub fn loadMcpHostCredentials(alloc: std.mem.Allocator) Error!?[]u8 {
 pub fn storeMcpHostCredentials(value: []const u8) Error!void {
     if (!isAvailable()) return error.UnsupportedPlatform;
     if (value.len == 0 or value.len > max_mcp_credentials_bytes) return error.KeychainWriteFailed;
-    if (comptime builtin.os.tag == .macos) return storeMcpValueMac(mcp_host_credentials_service_name, value);
+    if (comptime builtin.target.os.tag == .macos) return storeMcpValueMac(mcp_host_credentials_service_name, value);
     return error.UnsupportedPlatform;
 }
 

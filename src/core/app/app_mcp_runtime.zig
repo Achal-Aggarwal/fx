@@ -1768,9 +1768,9 @@ pub const State = struct {
         };
         if (count > 0) {
             const text = if (count == 1)
-                std.fmt.allocPrint(std.heap.c_allocator, "This project has an MCP server waiting for approval: {s}. Use /mcp approve {s}.", .{ first, first })
+                std.heap.c_allocator.print("This project has an MCP server waiting for approval: {s}. Use /mcp approve {s}.", .{ first, first })
             else
-                std.fmt.allocPrint(std.heap.c_allocator, "This project has {d} MCP servers waiting for approval: {s}. Use /mcp approve NAME.", .{ count, news.items });
+                std.heap.c_allocator.print("This project has {d} MCP servers waiting for approval: {s}. Use /mcp approve NAME.", .{ count, news.items });
             if (text) |owned| sink.pushLocked(owned, false) else |_| {}
         }
         for (lease.host.notes) |note| if (sink.firstTime("note", note)) {
@@ -1882,16 +1882,16 @@ pub const State = struct {
             sink.mutex.lockUncancelable(io_mod.getIo());
             defer sink.mutex.unlock(io_mod.getIo());
             const text: ?[]u8, const warning = switch (notice) {
-                .authorize => |n| .{ std.fmt.allocPrint(a, "Sign in to {s} in your browser. If it didn't open, go to:\n  {s}", .{ safeText(aa, n.server, 160), safeText(aa, n.url, 16 * 1024) }) catch null, false },
+                .authorize => |n| .{ a.print("Sign in to {s} in your browser. If it didn't open, go to:\n  {s}", .{ safeText(aa, n.server, 160), safeText(aa, n.url, 16 * 1024) }) catch null, false },
                 .signed_in => |server| signed: {
                     sink.forget("login", server);
-                    break :signed .{ std.fmt.allocPrint(a, "Signed in to {s}.", .{safeText(aa, server, 160)}) catch null, false };
+                    break :signed .{ a.print("Signed in to {s}.", .{safeText(aa, server, 160)}) catch null, false };
                 },
-                .sign_in_failed => |n| .{ std.fmt.allocPrint(a, "Couldn't sign in to {s}: {s}.", .{ safeText(aa, n.server, 160), safeText(aa, n.reason, 240) }) catch null, true },
+                .sign_in_failed => |n| .{ a.print("Couldn't sign in to {s}: {s}.", .{ safeText(aa, n.server, 160), safeText(aa, n.reason, 240) }) catch null, true },
                 .needs_login => |server| told: {
                     if (!sink.firstTime("login", server)) break :told .{ null, false };
                     const name = safeText(aa, server, 160);
-                    break :told .{ std.fmt.allocPrint(a, "{s} needs login: /mcp login {s}", .{ name, name }) catch null, true };
+                    break :told .{ a.print("{s} needs login: /mcp login {s}", .{ name, name }) catch null, true };
                 },
             };
             sink.pushLocked(text orelse return, warning);
@@ -2009,7 +2009,7 @@ pub const State = struct {
                 .{ .verb = "reject", .ok = server.source == .workspace },
             };
             for (applies) |verb| if (verb.ok) try out.append(a, .{
-                .full = try std.fmt.allocPrint(a, "/mcp {s} {s}", .{ verb.verb, status.name }),
+                .full = try a.print("/mcp {s} {s}", .{ verb.verb, status.name }),
                 .description = description,
             });
         }

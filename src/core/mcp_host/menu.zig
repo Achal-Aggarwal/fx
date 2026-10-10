@@ -75,7 +75,7 @@ pub fn choices(row: Row, out: *[max_choices]Choice) []const Choice {
 
 /// Case-insensitive, like fx's other pickers; an empty filter keeps everything.
 pub fn matches(name: []const u8, filter: []const u8) bool {
-    return filter.len == 0 or std.ascii.indexOfIgnoreCase(name, filter) != null;
+    return filter.len == 0 or std.ascii.findIgnoreCase(name, filter) != null;
 }
 
 /// What the menu knows of the open server's tools.

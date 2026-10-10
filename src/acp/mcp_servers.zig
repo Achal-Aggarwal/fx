@@ -135,7 +135,7 @@ fn prepareHost(
     // Read only while the host starts.
     var inherited = io_mod.cloneEnvironMap(alloc) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .failed = try std.fmt.allocPrint(alloc, "MCP servers could not read the environment: {s}", .{@errorName(err)}) },
+        else => return .{ .failed = try alloc.print("MCP servers could not read the environment: {s}", .{@errorName(err)}) },
     };
     defer inherited.deinit();
     const h = mcp_host.Host.create(alloc, io_mod.getIo(), configs, &inherited, .{
@@ -145,7 +145,7 @@ fn prepareHost(
         .url_completions = url_completions,
     }, builtin_tools.registry) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => return .{ .failed = try std.fmt.allocPrint(alloc, "MCP servers could not start: {s}", .{@errorName(err)}) },
+        else => return .{ .failed = try alloc.print("MCP servers could not start: {s}", .{@errorName(err)}) },
     };
     return .{ .host = h };
 }
