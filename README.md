@@ -11,7 +11,9 @@
  ⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ```
 
-fx is the smallest coding agent. It ships as one native binary written in Zig, so there is no runtime to install, and the same binary runs on your laptop, in CI, and inside an agent sandbox.
+# fx
+
+fx is the smallest coding agent. It's one native binary written in Zig, so there is no runtime to install, and it runs the same on your laptop, in CI, or inside an agent sandbox.
 
 It works with the model you choose. Its output is closer to a Unix shell than an IDE, because the conversation prints into your terminal's scrollback instead of filling the screen. The agent core behind the terminal also runs in editors over the Agent Client Protocol (ACP) and in JavaScript apps through [libfx](sdk/README.md).
 
@@ -23,13 +25,13 @@ It works with the model you choose. Its output is closer to a Unix shell than an
 
 ## Features
 
-- Startup time and binary size have hard limits. CI fails a pull request if any benchmarked command, such as `fx help` or `fx status --json`, takes longer than 2 ms on Linux ([benchmarks](benchmarks/)). Stable releases for Apple silicon must also fit under a fixed size limit.
-- You can scroll, search, and copy the conversation like any other command's output, and tmux bindings and copy mode keep working. Terminals that support the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) can also show when fx is busy or waiting for you.
-- Shell commands run in your login shell, with your aliases, functions, and `PATH`. fx runs your startup files once and reuses the result until one of them changes, so a slow `.zshrc` doesn't slow down every command.
-- You can sign in to Vercel AI Gateway, use a ChatGPT or Grok subscription, or connect any OpenAI-compatible endpoint, such as Ollama or OpenRouter ([custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections)).
-- The default permission mode, `auto`, runs routine work such as editing project files and running tests without asking. Anything else goes first to a model that checks the exact action for prompt injection or malicious behavior, and fx holds the action if the check finds a problem. Switch to `ask` to approve each action yourself, or to `full-access` to turn the checks off ([permissions](https://fx.sh/docs/configure-fx/permissions)).
-- fx saves your conversations, and `fx -c` picks up where you left off in a project. When a conversation fills the model's context, fx compacts older turns but keeps their full text on disk, where the agent can look it up ([sessions](https://fx.sh/docs/using-fx/sessions)).
-- fx loads skills from `.fx/skills` and `~/.fx/skills`, and from the folders other agents use, such as `.claude/skills` and `.agents/skills`. It also connects to MCP servers (`/mcp add slack` sets up Slack), hands independent work to subagents, and follows your project's `AGENTS.md`.
+- **Small and fast**: CI fails a pull request if any benchmarked command, such as `fx help` or `fx status --json`, takes longer than 2 ms on Linux ([benchmarks](benchmarks/)). Stable releases for Apple silicon must also fit under a fixed size limit.
+- **Model choice**: sign in to Vercel AI Gateway, use a ChatGPT or Grok subscription, or connect an OpenAI-compatible Chat Completions endpoint such as Ollama or OpenRouter ([custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections)).
+- **Inline output**: you can scroll, search, and copy the conversation like any other command's output, and tmux bindings and copy mode keep working. Terminals that support the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) can also show when fx is busy or waiting for you.
+- **Your own shell**: commands run in your login shell, with your aliases, functions, and `PATH`. fx runs your startup files once and reuses the result until one of them changes, so a slow `.zshrc` doesn't slow down every command.
+- **Permissions**: the default `auto` mode runs routine work, such as editing project files and running tests, without asking. Anything else goes first to a model that checks the exact action for prompt injection or malicious behavior, and fx holds the action if the check finds a problem. Switch to `ask` to approve each action yourself, or to `full-access` to turn the checks off ([permissions](https://fx.sh/docs/configure-fx/permissions)).
+- **Sessions**: fx saves your conversations, and `fx -c` picks up where you left off in a project. When a conversation fills the model's context, fx compacts older turns but keeps their full text on disk, where the agent can look it up ([sessions](https://fx.sh/docs/using-fx/sessions)).
+- **Skills, MCP, and subagents**: fx loads skills from `.fx/skills` and `~/.fx/skills`, and from the folders other agents use, such as `.claude/skills` and `.agents/skills`. It also connects to MCP servers (`/mcp add slack` sets up Slack), hands independent work to subagents, and follows your project's `AGENTS.md`.
 
 ## Install
 
@@ -97,17 +99,17 @@ The [libfx README](sdk/README.md) and the [libfx docs](https://fx.sh/docs/lib) c
 
 The manual at [fx.sh/docs](https://fx.sh/docs) covers models, permissions, configuration, skills, MCP, sessions, and every CLI and slash command.
 
-## For agents
-
-This section is for coding agents reading this README on a user's behalf.
+## For coding agents
 
 To learn fx, read the manual as Markdown. [fx.sh/llms.txt](https://fx.sh/llms.txt) indexes every page, [fx.sh/llms-full.txt](https://fx.sh/llms-full.txt) puts the whole manual in one file, and adding `.md` to any docs URL returns that page as Markdown. For the flags of the installed version, run `fx <command> --help`.
 
-To run fx from your own tools, use `fx ask`. It reads the prompt from its arguments or from stdin, writes progress and diagnostics to stderr, and exits with a nonzero status when the request fails. With `--json`, read the final answer from `final_output`. `--resume last` continues the last session. `fx ask` uses the user's saved permission mode, so pass `--full-access` only when the user asks for it.
+To run fx from your own tools, use `fx ask`. It takes the prompt as arguments or on stdin, writes its result to stdout and progress and diagnostics to stderr, and exits with a nonzero status when the request fails. With `--json`, the final answer is in `final_output`.
 
-To inspect a user's setup, run `fx status --json` for configuration and runtime information, and `fx doctor --json` for local health checks.
+To inspect a user's setup, run `fx status --json` for configuration and runtime information, or `fx doctor --json` for local health checks. Neither changes the setup.
 
-To change fx itself, read [AGENTS.md](AGENTS.md) before you edit anything. It covers module ownership, Zig conventions, tests, and CI. It also requires you to verify each change with the freshly built `./zig-out/bin/fx`, because a bare `fx` on `PATH` may be an older install. fx loads `AGENTS.md` on its own when it starts in this repository.
+`fx ask` uses the user's saved permission mode, which is `auto` unless they changed it. Pass `--full-access` only when the user asks for it, because it turns off fx's permission checks.
+
+To change fx itself, read [AGENTS.md](AGENTS.md) first, then build and verify the change as described in [Contributing](#contributing).
 
 ## Feedback
 
@@ -145,7 +147,7 @@ tests/        end-to-end tests and model evals
 benchmarks/   startup, memory, and latency benchmarks
 ```
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before you open a pull request. It covers verification, CI, and PR labels. If a coding agent is helping you, point it at [For agents](#for-agents) and [AGENTS.md](AGENTS.md).
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before you open a pull request. It covers verification, CI, and PR labels. If a coding agent is helping you, point it at [For coding agents](#for-coding-agents).
 
 ## Security
 
