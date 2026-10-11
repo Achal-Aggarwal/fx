@@ -4,9 +4,11 @@
 // URL only, and never touch AI Gateway. No network: every request is answered
 // here.
 import { strict as assert } from "node:assert";
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { local } from "../durable/local.mjs";
 import { createFxAgent, createFxEngine, memory, supportsJspi } from "../node.js";
 
 const backend = process.argv[2] || "native";
@@ -201,7 +203,56 @@ const assertNoGateway = (log) => assert.equal(log.some((entry) => entry.url.incl
   assertNoGateway(world.log);
 }
 
-// 6. Options are checked before anything starts.
+// 6. A server that quotes the key back in an error never gets it into the
+// turn, its events, or the saved session, even escaped.
+{
+  const key = "sk-quoted-back";
+  const escaped = [...key].map((char) => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`).join("");
+  const world = server({
+    answer: (_index, request) => new Response(
+      `{"detail":"bad credential ${request.headers.get("authorization")}","escaped":"${escaped}"}`,
+      { status: 403, headers: { "content-type": "application/json" } },
+    ),
+  });
+  const dir = await mkdtemp(join(tmpdir(), "libfx-custom-quoted-key-"));
+  const events = [];
+  const streamed = [];
+  const agent = createFxAgent({
+    ...backendOptions,
+    durability: local({ dir }),
+    provider,
+    model: "local-model",
+    fetch: world.fetch,
+    credentials: () => ({ apiKey: key }),
+    onEvent: (event) => events.push(event),
+  });
+  try {
+    const turn = agent.session().prompt("say ok");
+    for await (const event of turn) streamed.push(event);
+    assert.notEqual((await turn.result).stopReason, "end_turn");
+  } finally {
+    await agent.close();
+  }
+  assert.equal(chatRequests(world.log)[0].headers.get("authorization"), `Bearer ${key}`, "the key reached the server");
+  assert.match(JSON.stringify(streamed), /bad credential Bearer \*{14}/, "the error reaches the turn with the key masked");
+  const saved = [];
+  for (const entry of await readdir(dir, { recursive: true, withFileTypes: true })) {
+    if (!entry.isFile()) continue;
+    const text = await readFile(join(entry.parentPath ?? entry.path, entry.name), "latin1");
+    // Records saved as base64 are searched decoded.
+    const blobs = [...text.matchAll(/"data":\s*"([A-Za-z0-9+/=]+)"/g)].map(([, data]) => Buffer.from(data, "base64").toString("latin1"));
+    saved.push(text, ...blobs);
+  }
+  assert.ok(saved.length > 0, "the session was saved");
+  // Undoes \u escapes at any depth of JSON nesting, so an escaped copy counts.
+  const decoded = (text) => text.replace(/\\+u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+  for (const [where, text] of [["the stream", JSON.stringify(streamed)], ["the events", JSON.stringify(events)], ["the saved session", saved.join("\n")]]) {
+    assert.equal(decoded(text).includes(key), false, `${where} must not repeat the key`);
+  }
+  await rm(dir, { recursive: true, force: true });
+}
+
+// 7. Options are checked before anything starts.
 const base = { ...backendOptions, model: "local-model" };
 await assert.rejects(createFxEngine({ ...base, provider: { ...provider, name: "codex" } }), /provider.name must be/);
 await assert.rejects(createFxEngine({ ...base, provider: { ...provider, name: "1local" } }), /provider.name must be/);
