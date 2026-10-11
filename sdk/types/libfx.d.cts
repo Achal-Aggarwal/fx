@@ -473,6 +473,7 @@ export interface FxGatewayProvider {
   provider?: "gateway" | undefined;
   credentials?: undefined;
   onCredentials?: undefined;
+  refreshLock?: undefined;
 }
 
 /** Runs on a user's plan instead of AI Gateway. */
@@ -482,6 +483,12 @@ interface FxSubscriptionProvider<Provider extends "codex" | "grok"> {
   credentials: (request: { provider: Provider; sessionId?: string }) => FxProviderCredentials | Promise<FxProviderCredentials>;
   /** Receives credentials libfx refreshed, so the host can save them. */
   onCredentials?: (credentials: FxProviderCredentials, info: { provider: Provider; sessionId?: string }) => void | Promise<void>;
+  /**
+   * Runs `refresh` while the host holds a lock on the account, so a host with
+   * several servers refreshes it on one at a time. libfx asks `credentials()`
+   * again inside it and uses credentials another server already saved.
+   */
+  refreshLock?: (info: { provider: Provider; sessionId?: string }, refresh: () => Promise<void>) => Promise<unknown>;
 }
 
 /** Runs on a ChatGPT plan through Codex instead of AI Gateway. */

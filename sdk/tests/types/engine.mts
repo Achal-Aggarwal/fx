@@ -231,12 +231,14 @@ declare const tokenStore: {
   load(provider: "codex", sessionId?: string): Promise<FxProviderCredentials>;
   save(provider: "codex", credentials: FxProviderCredentials): Promise<void>;
 };
+declare const accountLocks: { run<T>(key: string, fn: () => Promise<T>): Promise<T> };
 export async function codexEngine(): Promise<FxEngine> {
   const engine = await createFxEngine({
     provider: "codex",
     model: "gpt-6.1-sol",
     credentials: ({ provider, sessionId }) => tokenStore.load(provider, sessionId),
     onCredentials: (credentials, { provider }) => tokenStore.save(provider, credentials),
+    refreshLock: ({ provider, sessionId }, refresh) => accountLocks.run(`${provider}:${sessionId ?? "catalog"}`, refresh),
   });
   // @ts-expect-error a Codex engine needs credentials()
   await createFxEngine({ provider: "codex", model });
@@ -244,6 +246,8 @@ export async function codexEngine(): Promise<FxEngine> {
   await createFxEngine({ apiKey, model, credentials: () => tokenStore.load("codex") });
   // @ts-expect-error onCredentials needs provider "codex"
   await createFxEngine({ apiKey, model, onCredentials: () => {} });
+  // @ts-expect-error refreshLock needs provider "codex"
+  await createFxEngine({ apiKey, model, refreshLock: async (_info, refresh) => refresh() });
   // @ts-expect-error a Gateway engine needs apiKey
   await createFxEngine({ provider: "gateway", model });
   // @ts-expect-error a provider named by string is Gateway, Codex or Grok

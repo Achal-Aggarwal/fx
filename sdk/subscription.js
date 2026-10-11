@@ -134,14 +134,19 @@ export function createCredentialMemory() {
  * The fetch edge for subscription requests. `credentials({ provider, sessionId })`
  * supplies credentials; `onCredentials(next, { provider, sessionId })` receives
  * refreshed ones once for each session that uses them, so the host can save them.
+ * `refreshLock({ provider, sessionId }, refresh)` runs `refresh` while the host
+ * holds a lock on the account, for a host with several servers.
  *
  * Each spec: `{ provider, matches(endpoint), sessionId(headers), normalize(value),
  * refresh(credentials, { fetch, signal }), authorize(headers, endpoint, credentials) }`.
  */
-export function createSubscriptionAuthorizer(specs, { credentials, onCredentials, fetch, now = Date.now, memory = createCredentialMemory() }) {
+export function createSubscriptionAuthorizer(specs, { credentials, onCredentials, refreshLock, fetch, now = Date.now, memory = createCredentialMemory() }) {
   if (typeof credentials !== "function") throw new TypeError("a subscription provider needs a credentials() function");
   if (onCredentials !== undefined && typeof onCredentials !== "function") {
     throw new TypeError("onCredentials must be a function");
+  }
+  if (refreshLock !== undefined && typeof refreshLock !== "function") {
+    throw new TypeError("refreshLock must be a function");
   }
   // Each access token the host supplied maps to the newest credentials refreshed
   // from it, so a host that has not saved a rotation yet never spends the old
@@ -158,25 +163,51 @@ export function createSubscriptionAuthorizer(specs, { credentials, onCredentials
 
   // A host that keeps credentials per session must also save a rotation that
   // another session's request made.
-  const save = async (spec, next, sessionId) => {
-    if (!onCredentials) return;
+  const savedBy = (next) => {
     let sessions = saved.get(next);
     if (!sessions) saved.set(next, (sessions = new Set()));
+    return sessions;
+  };
+  const save = async (spec, next, sessionId) => {
+    if (!onCredentials) return;
+    const sessions = savedBy(next);
     if (sessions.has(sessionId)) return;
     sessions.add(sessionId);
     await onCredentials(next, { provider: spec.provider, sessionId });
+  };
+
+  const redeem = async (spec, supplied, current, sessionId, signal) => {
+    if (refreshLock) {
+      // Another server may have refreshed and saved them while this one waited.
+      const latest = spec.normalize(await credentials({ provider: spec.provider, sessionId }));
+      if (latest.accessToken !== current.accessToken && latest.accessToken !== supplied.accessToken && !needsRefresh(latest, now())) {
+        remember(spec, supplied, latest);
+        savedBy(latest).add(sessionId);
+        return latest;
+      }
+    }
+    const next = await spec.refresh(current, { fetch, signal });
+    remember(spec, supplied, next);
+    await save(spec, next, sessionId);
+    return next;
+  };
+
+  // With `refreshLock`, the host holds a lock on the account while the refresh
+  // runs, so its servers refresh one at a time.
+  const locked = async (spec, supplied, current, sessionId, signal) => {
+    let next;
+    await refreshLock({ provider: spec.provider, sessionId }, async () => {
+      next = await redeem(spec, supplied, current, sessionId, signal);
+    });
+    if (next === undefined) throw new Error("refreshLock must run and await the refresh it is given");
+    return next;
   };
 
   const refresh = async (spec, supplied, current, sessionId, signal) => {
     const key = keyOf(spec, current.refreshToken);
     let task = refreshing.get(key);
     if (!task) {
-      task = (async () => {
-        const next = await spec.refresh(current, { fetch, signal });
-        remember(spec, supplied, next);
-        await save(spec, next, sessionId);
-        return next;
-      })().finally(() => refreshing.delete(key));
+      task = (refreshLock ? locked : redeem)(spec, supplied, current, sessionId, signal).finally(() => refreshing.delete(key));
       refreshing.set(key, task);
     }
     const next = await task;

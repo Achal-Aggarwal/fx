@@ -224,6 +224,14 @@ const agent = createFxAgent({
 
 libfx calls `credentials()` before Codex requests, in whichever process runs the turn, and adds the credentials to those requests itself, so they never reach the engine or a saved session. It refreshes them shortly before they expire and once after a rejected request, then passes the new ones to `onCredentials` for you to save. Codex doesn't accept requests from web pages, so these turns run on your server.
 
+Sessions in one process share each refresh. If your app runs on several servers, two of them can notice the same expiring credentials at once, and the provider accepts only the first refresh. Pass `refreshLock` so they take turns:
+
+```js
+refreshLock: ({ provider, sessionId }, refresh) => locks.withLock(`${provider}:${accountOf(sessionId)}`, refresh),
+```
+
+libfx calls it with a function to run while you hold a lock on that user's account, for example in Redis. Inside it, libfx asks `credentials()` again and uses what another server already saved. This works for Grok too.
+
 To sign a user in, use `libfx/chatgpt`:
 
 ```js

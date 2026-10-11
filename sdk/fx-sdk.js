@@ -168,11 +168,11 @@ export function normalizeAgentOptions(value) {
   if (!subscription && !custom && options.credentials !== undefined) {
     throw new TypeError("credentials needs provider \"codex\", \"grok\" or a custom provider");
   }
-  // A custom provider's key is never refreshed, so it has no onCredentials.
-  if (!subscription && options.onCredentials !== undefined) {
-    throw new TypeError("onCredentials needs provider \"codex\" or \"grok\"");
+  // A custom provider's key is never refreshed, so it has no onCredentials or refreshLock.
+  for (const name of ["onCredentials", "refreshLock"]) {
+    if (!subscription && options[name] !== undefined) throw new TypeError(`${name} needs provider "codex" or "grok"`);
   }
-  for (const name of ["credentials", "onCredentials"]) {
+  for (const name of ["credentials", "onCredentials", "refreshLock"]) {
     if (options[name] !== undefined && typeof options[name] !== "function") throw new TypeError(`${name} must be a function`);
   }
   Object.assign(options, normalizeModelChoice(options));
@@ -2432,7 +2432,7 @@ export async function createFxEngine(options = {}) {
   const hostFetch = options.fetch ?? globalThis.fetch?.bind(globalThis);
   // Adds the host's credentials to the provider's own requests.
   const providerAuth = subscriptionProviders.has(options.provider)
-    ? createSubscriptionAuthorizer([codexSubscription, grokSubscription], { credentials: options.credentials, onCredentials: options.onCredentials, fetch: hostFetch, memory: options[credentialMemory] })
+    ? createSubscriptionAuthorizer([codexSubscription, grokSubscription], { credentials: options.credentials, onCredentials: options.onCredentials, refreshLock: options.refreshLock, fetch: hostFetch, memory: options[credentialMemory] })
     : options.customProvider && options.credentials
       ? createSubscriptionAuthorizer([customProviderSpec(options.customProvider, () => sessionId)], { credentials: options.credentials, fetch: hostFetch })
       : null;
