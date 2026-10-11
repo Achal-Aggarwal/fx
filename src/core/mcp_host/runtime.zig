@@ -16,6 +16,7 @@ const secret = @import("../auth/secret.zig");
 const config = @import("config.zig");
 const credentials = @import("credentials.zig");
 const loopback = @import("login.zig");
+const slack = @import("slack.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 
@@ -654,7 +655,8 @@ pub const Runtime = struct {
         const s = r.resolved.servers[i];
         if (s.transport != .http) return r.finish(req, .{ .failed = error.NotHttp });
         r.endLogin(i);
-        var listener = try loopback.Listener.open(r.io, s.callback_port);
+        // The bridge passes the port on, so any free one does.
+        var listener = try loopback.Listener.open(r.io, if (s.bridge) null else s.callback_port);
         const l = r.gpa.create(Login) catch |err| {
             listener.close(r.io);
             return err;
@@ -666,6 +668,7 @@ pub const Runtime = struct {
             .deadline_ms = r.nowMs() + login_timeout_ms,
             .open_browser = open_browser,
         };
+        if (s.bridge) l.listener.bridge = .{ .origin = slack.origin(), .redirect = slack.redirect_uri, .path = "/slack/oauth/callback" };
         r.logins.append(r.gpa, l) catch |err| {
             l.listener.close(r.io);
             r.gpa.destroy(l);
@@ -709,6 +712,16 @@ pub const Runtime = struct {
             r.gpa.free(url);
             r.gpa.destroy(req);
         };
+    }
+
+    /// fx.sh's start for a bridged sign-in to `server`, owned by `gpa`; null
+    /// for any other, or when the address lacks what the bridge needs.
+    fn bridgeStart(r: *const Runtime, server: usize, authorize: []const u8) ?[]u8 {
+        if (!r.resolved.servers[server].bridge) return null;
+        const l = r.loginFor(server) orelse return null;
+        const url = slack.startUrl(r.gpa, slack.origin(), authorize, l.listener.port) catch null;
+        if (url == null) debug_trace.logf("mcp", "MCP sign-in has no bridge start server={s}", .{r.resolved.servers[server].name});
+        return url;
     }
 
     fn loginFor(r: *const Runtime, server: usize) ?*Login {
@@ -817,7 +830,11 @@ pub const Runtime = struct {
                 // Nothing comes until someone logs in.
                 r.endToolWaiters(i, .needs_login);
             },
-            .authorize => |url| {
+            .authorize => |authorize| {
+                // A bridged sign-in starts at the bridge, which goes on to the server's page.
+                const bridged = r.bridgeStart(i, authorize);
+                defer if (bridged) |owned| r.gpa.free(owned);
+                const url = bridged orelse authorize;
                 r.notify(.{ .authorize = .{ .server = name, .url = url } });
                 for (r.logins.items) |l| if (l.server == i and l.open_browser) {
                     // The URL went out in the notice either way.
@@ -831,9 +848,12 @@ pub const Runtime = struct {
                 r.notify(.{ .signed_in = name });
             },
             .sign_in_failed => |f| {
-                r.endLogin(i);
+                // The message can point into the callback address the login
+                // holds, so it is put in words before the login goes.
                 var buffer: [512]u8 = undefined;
-                r.notify(.{ .sign_in_failed = .{ .server = name, .reason = signInFailure(&buffer, f.why, f.message) } });
+                const reason = signInFailure(&buffer, f.why, f.message);
+                r.endLogin(i);
+                r.notify(.{ .sign_in_failed = .{ .server = name, .reason = reason } });
             },
             .credential => try r.saveCredential(i),
             .elicit => |x| {
@@ -953,7 +973,12 @@ pub const Runtime = struct {
             };
             o.version = if (st.version) |v| try a.dupe(u8, v) else null;
             o.tools = st.tools;
-            o.last_error = if (st.last_error) |e| try a.dupe(u8, describeFailure(e)) else null;
+            // The engine keeps its last failure; it explains a server that is
+            // down, not one that is back or stopped to wait for a sign-in.
+            o.last_error = switch (o.state) {
+                .failed, .retrying => if (st.last_error) |e| try a.dupe(u8, describeFailure(e)) else null,
+                else => null,
+            };
             o.needs_login = r.flags[i].needs_login;
             o.signed_in = r.flags[i].signed_in;
             if (r.engine.instructions(s.name)) |t| o.instructions = try a.dupe(u8, t);
