@@ -403,6 +403,7 @@ fn serverEntryShape(value: std.json.Value) bool {
         return std.mem.eql(u8, kind.string, "local") or
             std.mem.eql(u8, kind.string, "stdio") or
             std.mem.eql(u8, kind.string, "http") or
+            std.mem.eql(u8, kind.string, "streamable-http") or
             std.mem.eql(u8, kind.string, "sse");
     }
     return false;
@@ -992,9 +993,10 @@ fn parseServerEntry(
         (if (kind_value == .string) kind_value.string else return failServerConfig(error.McpConfigInvalidType))
     else
         "local";
+    // Other clients' files spell Streamable HTTP out.
     const transport: McpTransport = if (std.mem.eql(u8, type_string, "sse"))
         .sse
-    else if (std.mem.eql(u8, type_string, "http"))
+    else if (std.mem.eql(u8, type_string, "http") or std.mem.eql(u8, type_string, "streamable-http"))
         .http
     else
         .stdio;
@@ -1790,6 +1792,17 @@ test "workspace parsing isolates invalid entries" {
     try std.testing.expectEqualStrings("good", result.configs.items[0].name);
     try std.testing.expectEqual(@as(usize, 1), result.diagnostics.items.len);
     try std.testing.expectEqualStrings("bad", result.diagnostics.items[0].server_name.?);
+}
+
+test "streamable-http reads as http in both files" {
+    const alloc = std.testing.allocator;
+    var profile = try parseProfileJson(alloc, "{\"mcpServers\":{\"web\":{\"type\":\"streamable-http\",\"url\":\"https://w.example/mcp\"}}}");
+    defer deinitConfigs(alloc, &profile);
+    try std.testing.expectEqual(McpTransport.http, profile.items[0].transport);
+    var project = try parseWorkspaceJson(alloc, "{\"mcpServers\":{\"web\":{\"type\":\"streamable-http\",\"url\":\"https://w.example/mcp\"}}}", .workspace, .{});
+    defer project.deinit(alloc);
+    try std.testing.expectEqual(McpTransport.http, project.configs.items[0].transport);
+    try std.testing.expectEqual(@as(usize, 0), project.diagnostics.items.len);
 }
 
 test "choice transitions are normalized and reject precedence is stable" {

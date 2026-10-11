@@ -1674,8 +1674,22 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// Ctrl+C closes the MCP menu from any screen instead of arming the
+        /// exit; its filter lives in the composer, so that goes too, as when
+        /// Esc closes the list.
+        fn exitMcpHostMenuIfActive(app: *App) bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            if (!mcpHostMenuActive(app)) return false;
+            app.mcp.closeHostMenu();
+            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
         fn handleSemanticCtrlC(app: *App) !void {
             if (exitModelPickerShortcutIfActive(app)) return;
+            if (exitMcpHostMenuIfActive(app)) return;
             if (app.stream.active and draftHasState(app)) {
                 clearDraftState(app, "ctrl_c");
                 app.shell.render_requests.request(.footer);
@@ -1892,13 +1906,14 @@ pub fn Runtime(comptime App: type) type {
             return app.mcp.hostMenuActive();
         }
 
-        /// Off the list there's nothing to type into: printable bytes are
-        /// dropped so the hidden filter doesn't change, and on a
-        /// confirmation any of them means no, like `[y/N]`. Control bytes
-        /// pass, so Ctrl+C and Ctrl+J/K still work.
+        /// On the list and on a server's screen, typing goes to the composer,
+        /// which filters the servers or the server's tools. On a
+        /// confirmation any printable byte means no, like `[y/N]`. Control
+        /// bytes pass, so Ctrl+C and Ctrl+J/K still work.
         fn routeMcpHostMenuByte(app: *App, byte: u8) !bool {
             if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
             if (!mcpHostMenuActive(app) or app.mcp.host_menu.screen == .list) return false;
+            if (app.mcp.host_menu.screen == .server and byte != '\r') return false;
             if (byte == '\r') {
                 try app.mcpHostMenuKey(.enter);
                 return true;
@@ -2958,6 +2973,12 @@ pub fn Runtime(comptime App: type) type {
             syncSkillsMenu(app);
             syncModelMenu(app);
             syncSessionMenu(app);
+            syncMcpHostMenu(app);
+        }
+
+        fn syncMcpHostMenu(app: *App) void {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return;
+            app.mcp.hostMenuFilterChanged(app.input_runtime.edit_state.input.items);
         }
 
         fn syncSettingsMenu(app: *App) void {

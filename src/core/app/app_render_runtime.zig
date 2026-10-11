@@ -769,6 +769,7 @@ pub fn Runtime(comptime App: type) type {
                     .filter = app.input_runtime.edit_state.input.items,
                     .tools = app.mcp.host_menu_tools,
                     .notes = app.mcp.host_menu_notes,
+                    .sign_in_url = app.mcp.hostMenuSignInUrl(),
                 } else .{},
                 .mcp_menu = if (comptime @hasField(App, "mcp")) blk: {
                     const view = app.mcp.menuView();
@@ -839,6 +840,7 @@ pub fn Runtime(comptime App: type) type {
                 else
                     .{},
                 .upgrade_status = upgrade_label,
+                .mcp_status = if (comptime @hasField(App, "mcp")) app.mcp.hostStatusText() else "",
                 .danger_status = if (yolo_warning_active)
                     app_permission_runtime.yolo_warning_text
                 else
@@ -1025,6 +1027,10 @@ pub fn Runtime(comptime App: type) type {
                 if (snapshot.reasons.contains(.first_frame)) {
                     App.startPromptCredentialPrewarm(app);
                 }
+            }
+            // MCP servers start once the first frame is on screen, never before.
+            if (comptime @hasDecl(App, "startMcpHostServers")) {
+                if (snapshot.reasons.contains(.first_frame)) App.startMcpHostServers(app);
             }
             if (comptime @hasDecl(App, "notePendingFrameCommitted")) {
                 if (result.pending_prompt_presented) {

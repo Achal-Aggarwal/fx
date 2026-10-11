@@ -442,6 +442,7 @@ pub fn Handlers(comptime App: type) type {
             for (notices) |n| try app.writeDomainNotice(.{ .topic = "mcp", .tone = if (n.warning) .warning else .neutral, .body = n.text }, true);
             app.refreshMcpCompletion();
             app.refreshMcpHostMenu();
+            app.refreshMcpHostStatus();
         }
 
         pub fn collectMcpStartupHealthFacts(app: *App) !void {
@@ -2687,6 +2688,8 @@ fn writeProblemsSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.All
         try writer.writeByte('\n');
     }
 
+    count += try writeMcpHostProblems(writer, app, alloc);
+
     var mcp_lease = if (comptime @hasDecl(@TypeOf(app.*), "acquireMcpRuntime"))
         app.acquireMcpRuntime()
     else
@@ -2845,6 +2848,62 @@ fn writeSessionTitleSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem
     try writer.writeByte('\n');
 }
 
+/// MCP-v2's servers, one line each; false when there is no host to ask.
+fn writeMcpHostServers(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !bool {
+    if (comptime !@hasDecl(@TypeOf(app.*), "mcpHostStatuses")) return false;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const statuses = (try app.mcpHostStatuses(arena.allocator())) orelse return false;
+    if (statuses.len == 0) {
+        try writer.writeAll("mcp_servers: none\n");
+        return true;
+    }
+    try writer.print("mcp_servers ({d}):\n", .{statuses.len});
+    for (statuses) |s| {
+        try writer.print("  - {s} state={s} transport={s} tools={d} signed_in={s} needs_login={s}\n", .{
+            s.name,
+            @tagName(s.state),
+            @tagName(s.transport),
+            s.tools,
+            boolLabel(s.signed_in),
+            boolLabel(s.needs_login),
+        });
+        if (s.last_error) |err| {
+            try writer.writeAll("    error: ");
+            try writeMaskedInline(writer, alloc, err);
+            try writer.writeByte('\n');
+        }
+    }
+    return true;
+}
+
+/// MCP-v2's servers that need someone to act: down, retrying, missing a
+/// variable, or waiting for a login.
+fn writeMcpHostProblems(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !usize {
+    if (comptime !@hasDecl(@TypeOf(app.*), "mcpHostStatuses")) return 0;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const statuses = (try app.mcpHostStatuses(arena.allocator())) orelse return 0;
+    var count: usize = 0;
+    for (statuses) |s| {
+        const what = switch (s.state) {
+            .failed => "failed",
+            .retrying => "retrying",
+            .missing_env => "missing a variable",
+            else => if (s.needs_login) "needs login" else continue,
+        };
+        count += 1;
+        try writer.print("- mcp server {s} name={s}", .{ what, s.name });
+        if (s.missing) |variable| try writer.print(" variable={s}", .{variable});
+        if (s.last_error) |err| {
+            try writer.writeAll(" error=");
+            try writeMaskedInline(writer, alloc, err);
+        }
+        try writer.writeByte('\n');
+    }
+    return count;
+}
+
 fn writeRuntimeContextSummary(writer: *std.Io.Writer, app: anytype, alloc: std.mem.Allocator) !void {
     try writer.writeAll("\n## Runtime Context\n");
     try writer.print("TERM: {s}\n", .{io_mod.getenv("TERM") orelse "(unset)"});
@@ -2854,6 +2913,11 @@ fn writeRuntimeContextSummary(writer: *std.Io.Writer, app: anytype, alloc: std.m
         boolLabel(io_mod.getenv("TMUX") != null),
         boolLabel(io_mod.getenv("CMUX_WORKSPACE_ID") != null),
     });
+
+    if (comptime @hasDecl(@TypeOf(app.*), "mcpHostSelected")) {
+        try writer.print("mcp_engine: {s}\n", .{if (app.mcpHostSelected()) "v2" else "v1"});
+    }
+    if (try writeMcpHostServers(writer, app, alloc)) return;
 
     var mcp_lease = if (comptime @hasDecl(@TypeOf(app.*), "acquireMcpRuntime"))
         app.acquireMcpRuntime()
