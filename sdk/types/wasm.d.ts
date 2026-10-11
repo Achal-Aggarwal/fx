@@ -15,7 +15,9 @@ export {
 
 export type {
   FxBytes,
+  FxChatgptCredentials,
   FxCheckpointMeta,
+  FxCodexProvider,
   FxEffort,
   FxEngine,
   FxEngineEvent,
@@ -27,6 +29,7 @@ export type {
   FxErrorSummary,
   FxFetch,
   FxFollowUp,
+  FxGatewayProvider,
   FxHostTool,
   FxImageBlock,
   FxJsonSchema,

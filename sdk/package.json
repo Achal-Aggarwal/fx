@@ -66,6 +66,10 @@
       "types": "./types/durable-world.d.ts",
       "default": "./durable/world.mjs"
     },
+    "./chatgpt": {
+      "types": "./types/chatgpt.d.ts",
+      "default": "./chatgpt-sign-in.js"
+    },
     "./mcp": {
       "types": "./types/mcp.d.ts",
       "default": "./mcp.js"
@@ -93,6 +97,8 @@
     "types/*.d.cts",
     "wasm-module.js",
     "core-output.js",
+    "chatgpt.js",
+    "chatgpt-sign-in.js",
     "fetch-cleanup.js",
     "mcp.js",
     "skills.js",

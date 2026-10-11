@@ -458,10 +458,43 @@ export type FxEngineStorage =
     checkpoint?: FxBytes;
   };
 
+/** ChatGPT credentials for a Codex agent. `accountId` and `expiresAt` default to the access token's own claims. */
+export interface FxChatgptCredentials {
+  accessToken: string;
+  /** Lets libfx refresh the access token near expiry and once after a rejection. */
+  refreshToken?: string;
+  accountId?: string;
+  /** Milliseconds since the epoch. */
+  expiresAt?: number;
+}
+
+/** Runs on AI Gateway, the default. */
+export interface FxGatewayProvider {
+  provider?: "gateway" | undefined;
+  chatgpt?: undefined;
+  onChatgptCredentials?: undefined;
+}
+
+/** Runs on a ChatGPT plan through Codex instead of AI Gateway. */
+export interface FxCodexProvider {
+  provider: "codex";
+  /** Credentials for Codex requests, asked for in whichever process runs the turn. `sessionId` is set for model requests and absent for the model list. */
+  chatgpt: (request: { sessionId?: string }) => FxChatgptCredentials | Promise<FxChatgptCredentials>;
+  /** Receives credentials libfx refreshed, so the host can save them. */
+  onChatgptCredentials?: (credentials: FxChatgptCredentials, info: { sessionId?: string }) => void | Promise<void>;
+}
+
 /** Options for `createFxEngine()`. */
-export type FxEngineOptions = FxSharedOptions<FxEngineEvent> & FxModelChoice & FxEngineStorage & {
-  /** The AI Gateway credential. Required. */
-  apiKey: string;
+export type FxEngineOptions = FxSharedOptions<FxEngineEvent> & FxModelChoice & FxEngineStorage & (
+  | (FxGatewayProvider & {
+    /** The AI Gateway credential. Required. */
+    apiKey: string;
+  })
+  | (FxCodexProvider & {
+    /** The AI Gateway credential, unused by Codex turns. */
+    apiKey?: string | undefined;
+  })
+) & {
   /** The id for AI Gateway session affinity: 1 to 255 letters, digits, `.`, `_`, or `-`. Give a restored session the id it had before. */
   sessionId?: string | null;
 };
@@ -491,7 +524,7 @@ export declare function memory(options?: MemoryOptions): Durability;
 // Durable agents
 
 /** Options for `createFxAgent()`. */
-export type FxAgentOptions = FxSharedOptions<FxAgentEvent> & FxModelChoice & {
+export type FxAgentOptions = FxSharedOptions<FxAgentEvent> & FxModelChoice & (FxGatewayProvider | FxCodexProvider) & {
   /** The AI Gateway credential. Without it, libfx uses `AI_GATEWAY_API_KEY`, then on Vercel the deployment's OIDC token. */
   apiKey?: string | undefined;
   /** Where sessions live. Without it, libfx picks one from the environment. */

@@ -495,10 +495,22 @@ pub fn selectCredentialForProvider(
     return true;
 }
 
+/// True when requests on the provider's route carry no credential from this
+/// server because the host authorizes them at its fetch edge.
+fn hostManagesRoute(cfg: Config, provider: model_provider.ProviderId) bool {
+    return provider == .codex and cfg.codex_auth_mode == .host_managed;
+}
+
+/// A tokenless credential that marks a route as authorized by the host.
+fn hostManagedCredential() credentials.Credential {
+    return .{ .token = &.{}, .source = .host_managed };
+}
+
 /// Stages authorization without changing any in-flight credential storage.
 /// The caller owns a non-null credential; null retains the current authorization.
 pub fn prepareCredentialForProvider(state: *ServerState, provider: model_provider.ProviderId) !?credentials.Credential {
     if (state.cfg.auth_mode == .host_managed) return null;
+    if (hostManagesRoute(state.cfg, provider)) return hostManagedCredential();
     const now_ms = io_mod.milliTimestamp();
     if (state.active_session) |active| {
         if (provider != .configured and credentialMatchesProvider(active.credential_source, provider) and
@@ -550,6 +562,39 @@ test "ACP credential preparation preserves the existing borrowed credential" {
     try std.testing.expectEqualStrings("active-token", borrowed);
     try std.testing.expect(state.api_key.ptr == borrowed.ptr);
     try std.testing.expectEqual(types.CredentialSource.configured, state.credential_source.?);
+}
+
+test "ACP Codex route is host-managed only when configured and never leaks into Gateway" {
+    const alloc = std.testing.allocator;
+    var state: ServerState = undefined;
+    state.alloc = alloc;
+    state.cfg.auth_mode = .local;
+    state.cfg.codex_auth_mode = .host_managed;
+    state.cfg.credential_override = "gateway-key";
+    state.active_session = null;
+    state.api_key = &.{};
+    state.credential_refresh_after_ms = null;
+    state.account_id = null;
+    state.gateway_team = null;
+
+    // A Codex turn leaves the process host-managed with no token.
+    var codex = (try prepareCredentialForProvider(&state, .codex)).?;
+    try std.testing.expectEqual(types.CredentialSource.host_managed, codex.source);
+    try std.testing.expectEqual(@as(usize, 0), codex.token.len);
+    adoptServerCredential(&state, &codex);
+    codex.deinit(alloc);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, state.credential_source.?);
+
+    // The next Gateway turn gets its own key, not the host-managed source.
+    var gateway = (try prepareCredentialForProvider(&state, .gateway)).?;
+    defer gateway.deinit(alloc);
+    try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, gateway.source);
+    try std.testing.expectEqualStrings("gateway-key", gateway.token);
+
+    // Without the policy Codex needs its own credential.
+    state.cfg.codex_auth_mode = .local;
+    try std.testing.expect(!hostManagesRoute(state.cfg, .codex));
+    try std.testing.expect(!hostManagesRoute(state.cfg, .gateway));
 }
 
 pub fn streamProviderFor(
@@ -2577,8 +2622,13 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         state.selected_model = startup.takeSelectedModel();
         state.process_model_override = startup.model_source == .process_override;
     }
-    state.provider = startup.provider;
-    state.process_provider_override = config_runtime.providerEnvOverride() != null;
+    if (state.cfg.provider_override) |override| {
+        state.provider = override;
+        state.process_provider_override = true;
+    } else {
+        state.provider = startup.provider;
+        state.process_provider_override = config_runtime.providerEnvOverride() != null;
+    }
     state.configured_providers.deinit(alloc);
     state.configured_providers = startup.configured_providers;
     startup.configured_providers = .{};
@@ -2586,7 +2636,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
     state.gateway_source_preference = startup.credential_source_preference;
     state.configured_model = try alloc.dupe(u8, startup.configured_model);
 
-    if (state.cfg.auth_mode == .host_managed) {
+    if (state.cfg.auth_mode == .host_managed or hostManagesRoute(state.cfg, state.provider)) {
         state.api_key = &.{};
         state.credential_source = .host_managed;
         state.credential_refresh_after_ms = null;
@@ -3209,7 +3259,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             .message = "No active session",
         });
         if (!target.eql(session.provider)) {
-            if (host_target.is_wasm) {
+            if (host_target.is_wasm and !hostManagesRoute(state.cfg, target)) {
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.invalid_request,
                     .message = "Subscription provider switching is unavailable in this WASM runtime",
@@ -3217,6 +3267,8 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
             }
             var staged_credential: ?credentials.Credential = if (state.cfg.auth_mode == .host_managed)
                 null
+            else if (hostManagesRoute(state.cfg, target))
+                hostManagedCredential()
             else if (target == .gateway and state.cfg.credential_override != null)
                 credentials.Credential{
                     .token = try alloc.dupe(u8, state.cfg.credential_override.?),
