@@ -273,6 +273,8 @@ export async function customEngine(): Promise<FxEngine> {
   await createFxEngine({ provider: router, model, credentials: () => tokenStore.load("codex") });
   // @ts-expect-error a custom provider's key is never refreshed
   await createFxEngine({ provider: router, model, onCredentials: () => {} });
+  // @ts-expect-error a custom provider's key is never refreshed, so it takes no lock
+  await createFxEngine({ provider: router, model, refreshLock: async (_info, refresh) => refresh() });
   // @ts-expect-error a custom provider needs a base URL
   await createFxEngine({ provider: { name: "router" }, model });
   // @ts-expect-error model details use libfx's option names

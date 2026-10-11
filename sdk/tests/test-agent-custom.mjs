@@ -7,7 +7,9 @@ import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { customProviderDefinition, customProviderSpec } from "../custom-provider.js";
 import { createFxAgent, createFxEngine, memory, supportsJspi } from "../node.js";
+import { createSubscriptionAuthorizer } from "../subscription.js";
 
 const backend = process.argv[2] || "native";
 if (!new Set(["native", "wasm"]).has(backend)) throw new Error("usage: test-agent-custom.mjs [native|wasm]");
@@ -251,7 +253,25 @@ const assertNoGateway = (log) => assert.equal(log.some((entry) => entry.url.incl
   }
 }
 
-// 7. Options are checked before anything starts.
+// 7. The key is added to the provider's chat URL and nowhere else, as the
+// engine names a request: origin and path.
+{
+  const definition = customProviderDefinition(provider);
+  const auth = createSubscriptionAuthorizer([customProviderSpec(definition, () => undefined)], { credentials: () => ({ apiKey: "sk-provider" }) });
+  assert.ok(auth.specFor(chatUrl), "the chat URL carries the key");
+  for (const endpoint of [
+    "https://models.example/v1/models",
+    "https://models.example/v1/chat/completions/extra",
+    "https://models.example/chat/completions",
+    "http://models.example/v1/chat/completions",
+    "https://models.example.evil/v1/chat/completions",
+    "https://ai-gateway.vercel.sh/v1/chat/completions",
+  ]) {
+    assert.equal(auth.specFor(endpoint), undefined, `${endpoint} must not carry the key`);
+  }
+}
+
+// 8. Options are checked before anything starts.
 const base = { ...backendOptions, model: "local-model" };
 await assert.rejects(createFxEngine({ ...base, provider: { ...provider, name: "codex" } }), /provider.name must be/);
 await assert.rejects(createFxEngine({ ...base, provider: { ...provider, name: "1local" } }), /provider.name must be/);
@@ -262,6 +282,7 @@ await assert.rejects(createFxEngine({ ...base, provider: { ...provider, models: 
 await assert.rejects(createFxEngine({ ...backendOptions, provider }), /a custom provider needs a model/);
 await assert.rejects(createFxEngine({ ...base, provider, credentials: "sk" }), /credentials must be a function/);
 await assert.rejects(createFxEngine({ ...base, provider, onCredentials: () => {} }), /onCredentials needs provider "codex" or "grok"/);
+await assert.rejects(createFxEngine({ ...base, provider, refreshLock: async (_info, refresh) => refresh() }), /refreshLock needs provider "codex" or "grok"/);
 await assert.rejects(createFxEngine({ ...base, provider: { ...provider, models: { "local-model": { contextWindow: 100, maxOutputTokens: 100 } } } }), /maxOutputTokens must be less than contextWindow/);
 await assert.rejects(createFxEngine({ ...base, provider: { ...provider, models: { "local-model": { supportsVision: "yes" } } } }), /supportsVision must be a boolean/);
 // The engine applies the CLI's complete rules to what passes the quick checks.

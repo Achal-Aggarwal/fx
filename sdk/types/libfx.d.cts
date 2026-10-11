@@ -527,6 +527,7 @@ export interface FxCustomProvider {
   /** The API key for the provider's requests, asked for in whichever process runs the turn. Omit it for a server that needs no key. */
   credentials?: ((request: { provider: string; sessionId?: string }) => FxApiKeyCredentials | Promise<FxApiKeyCredentials>) | undefined;
   onCredentials?: undefined;
+  refreshLock?: undefined;
 }
 
 /** Options for `createFxEngine()`. */
