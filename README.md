@@ -13,13 +13,13 @@
 
 # fx
 
-fx is the smallest coding agent: one native binary, 6.7 MiB on Apple silicon, with no runtime to install. It's written in Zig and runs the same on your laptop, in CI, or inside an agent sandbox.
+fx is the smallest coding agent: one native binary with no runtime to install. It's written in Zig and runs the same on your laptop, in CI, or inside an agent sandbox.
 
 It works with the model you choose, and its output is closer to a Unix shell than an IDE: the conversation prints into your scrollback instead of filling the screen. The same agent core runs in editors over the Agent Client Protocol (ACP) and in JavaScript apps through [libfx](sdk/README.md).
 
 ## Features
 
-- **Small and fast**: every stable release has to fit under 7.8 MiB on Apple silicon. Startup is benchmarked on every pull request, and CI fails a change if any measured command takes longer than 2 ms on Linux ([benchmarks](benchmarks/)).
+- **Small and fast**: the Apple silicon release has a hard size limit, and startup is benchmarked on every pull request. CI fails a change if any measured command takes longer than 2 ms on Linux ([benchmarks](benchmarks/)).
 - **Any model**: use Vercel AI Gateway, your ChatGPT or Grok subscription, or any OpenAI-compatible endpoint such as Ollama or OpenRouter ([custom connections](https://fx.sh/docs/configure-fx/custom-model-connections)).
 - **Inline output**: the conversation stays in your terminal's scrollback, where you can scroll, search, and copy it like any other command's output. tmux bindings and copy mode keep working, and terminals that support the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status) can show when fx is busy or waiting for you.
 - **Your own shell**: commands run in your login shell with your aliases, functions, and `PATH`. fx runs your startup files once and reuses the result, so a slow `.zshrc` doesn't slow down every command.
