@@ -4,6 +4,7 @@
 //! one, and the footer draws it.
 
 const std = @import("std");
+const text_utils = @import("../shared/text_utils.zig");
 const runtime = @import("runtime.zig");
 
 pub const Screen = enum { list, server, confirm };
@@ -635,7 +636,7 @@ test "typing on a server's screen narrows its tools; the list keeps its own filt
     list.keepListFilter("dat");
     try testing.expectEqualStrings("dat", list.listFilter());
     // Never cut inside a character.
-    const long = "a" ** (name_capacity - 1) ++ "é";
+    const long = text_utils.repeat("a", name_capacity - 1) ++ "é";
     list.keepListFilter(long);
     try testing.expectEqual(@as(usize, name_capacity - 1), list.listFilter().len);
     // Off a server's screen a filter changes nothing.

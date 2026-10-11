@@ -124,7 +124,7 @@ pub fn resolve(
         // token exchange asks for the same; MCP-v2 takes it only if it is
         // the server's own.
         if (s.bridge and auth.resource == null) if (s.url) |url| {
-            auth.resource = try std.fmt.allocPrint(arena, "{s}/", .{origin(url)});
+            auth.resource = try arena.print("{s}/", .{origin(url)});
         };
         if (saved) |lookup| if (s.url) |url| {
             auth.saved = try lookup.get(lookup.context, arena, s.name, url);

@@ -260,7 +260,7 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
             .loading => "Loading tools…",
             .needs_login => "Its tools show here once you log in.",
             .needs_approval => "Its tools show here once you approve it.",
-            .failed => |reason| try std.fmt.allocPrint(arena, "Its tools couldn't load: {s}", .{reason}),
+            .failed => |reason| try arena.print("Its tools couldn't load: {s}", .{reason}),
             .ready => |t| if (t.len == 0)
                 "It has no tools."
             else if (p.filter.len == 0)
@@ -268,7 +268,7 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
             else if (l.tools == 0)
                 "No tools match."
             else
-                try std.fmt.allocPrint(arena, "Tools {d} of {d}", .{ l.tools, t.len }),
+                try arena.print("Tools {d} of {d}", .{ l.tools, t.len }),
         };
         return row_text.composeTextRow(alloc, heading, width, ui_render.dim_style, 2);
     }
@@ -436,12 +436,12 @@ fn questionHints(p: Projection, buf: *HintBuf) []const []const u8 {
     const name = if (plainName(r.status.name)) r.status.name else "this server";
     const long = switch (c) {
         .remove => if (r.status.signed_in)
-            std.fmt.bufPrint(&buf.text[0], "Remove {s} and its login from {s}?     enter yes     esc no", .{ name, p.fileOf(r) })
+            std.mem.print(&buf.text[0], "Remove {s} and its login from {s}?     enter yes     esc no", .{ name, p.fileOf(r) })
         else
-            std.fmt.bufPrint(&buf.text[0], "Remove {s} from {s}?     enter yes     esc no", .{ name, p.fileOf(r) }),
-        else => std.fmt.bufPrint(&buf.text[0], "Reject {s}? fx won't start it in this project.     enter yes     esc no", .{name}),
+            std.mem.print(&buf.text[0], "Remove {s} from {s}?     enter yes     esc no", .{ name, p.fileOf(r) }),
+        else => std.mem.print(&buf.text[0], "Reject {s}? fx won't start it in this project.     enter yes     esc no", .{name}),
     } catch "enter yes     esc no";
-    const short = std.fmt.bufPrint(&buf.text[1], "{s} {s}?  enter yes  esc no", .{ c.label(), name }) catch "enter yes  esc no";
+    const short = std.mem.print(&buf.text[1], "{s} {s}?  enter yes  esc no", .{ c.label(), name }) catch "enter yes  esc no";
     buf.variants = .{ long, short, "enter yes  esc no" };
     return &buf.variants;
 }

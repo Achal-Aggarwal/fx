@@ -308,13 +308,13 @@ pub fn tokenFailure(a: Allocator, status: u16, raw: []const u8) Allocator.Error!
     if (!json) f = .{ null, null, null };
     if (f[0]) |raw_code| if (wire.plainString(raw_code)) |code| {
         const text = if (f[1]) |v| try wire.decodeString(a, v) else null;
-        return if (text) |t| std.fmt.allocPrint(a, "{s}: {s}", .{ code, t }) else a.dupe(u8, code);
+        return if (text) |t| a.print("{s}: {s}", .{ code, t }) else a.dupe(u8, code);
     };
-    if (status != 200) return std.fmt.allocPrint(a, "its token endpoint answered HTTP {d}", .{status});
+    if (status != 200) return a.print("its token endpoint answered HTTP {d}", .{status});
     if (!json) return a.dupe(u8, "its token endpoint's answer isn't a JSON object");
     const kind = wire.plainString(f[2] orelse return a.dupe(u8, "its token response has no token_type")) orelse
         return a.dupe(u8, "its token response has no token_type");
-    if (unsendable(kind)) return std.fmt.allocPrint(a, "its token is of type {s}, which can't be sent as a Bearer token", .{kind});
+    if (unsendable(kind)) return a.print("its token is of type {s}, which can't be sent as a Bearer token", .{kind});
     return a.dupe(u8, "its token response has no access_token");
 }
 

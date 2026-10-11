@@ -1918,16 +1918,16 @@ pub const State = struct {
                     sink.waitForSignIn(n.server, n.url);
                     // The menu shows the address; a typed login prints it.
                     if (!sink.isTyped(n.server)) return;
-                    const text = std.fmt.allocPrint(a, "Sign in to {s} in your browser. If it didn't open, go to:\n  {s}", .{ safeText(aa, n.server, 160), safeText(aa, n.url, 16 * 1024) }) catch return;
+                    const text = a.print("Sign in to {s} in your browser. If it didn't open, go to:\n  {s}", .{ safeText(aa, n.server, 160), safeText(aa, n.url, 16 * 1024) }) catch return;
                     sink.pushLocked(text, false);
                 },
                 .signed_in => |server| {
                     sink.endSignIn(server);
-                    sink.report(server, std.fmt.allocPrint(a, "Signed in to {s}.", .{safeText(aa, server, 160)}) catch return, false);
+                    sink.report(server, a.print("Signed in to {s}.", .{safeText(aa, server, 160)}) catch return, false);
                 },
                 .sign_in_failed => |n| {
                     sink.endSignIn(n.server);
-                    sink.report(n.server, std.fmt.allocPrint(a, "Couldn't sign in to {s}: {s}.", .{ safeText(aa, n.server, 160), safeText(aa, n.reason, 240) }) catch return, true);
+                    sink.report(n.server, a.print("Couldn't sign in to {s}: {s}.", .{ safeText(aa, n.server, 160), safeText(aa, n.reason, 240) }) catch return, true);
                 },
                 // The status line says so for as long as it's true.
                 .needs_login => {},
