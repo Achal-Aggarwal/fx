@@ -2,7 +2,7 @@ import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
 import { codexSubscription } from "./chatgpt.js";
 import { customProviderDefinition, customProviderSpec } from "./custom-provider.js";
 import { grokSubscription } from "./grok.js";
-import { createSubscriptionAuthorizer } from "./subscription.js";
+import { createSubscriptionAuthorizer, credentialMemory } from "./subscription.js";
 import { loadModule } from "./wasm-module.js";
 
 // Providers that run on a user's plan, authorized by the host's credentials.
@@ -2432,7 +2432,7 @@ export async function createFxEngine(options = {}) {
   const hostFetch = options.fetch ?? globalThis.fetch?.bind(globalThis);
   // Adds the host's credentials to the provider's own requests.
   const providerAuth = subscriptionProviders.has(options.provider)
-    ? createSubscriptionAuthorizer([codexSubscription, grokSubscription], { credentials: options.credentials, onCredentials: options.onCredentials, fetch: hostFetch })
+    ? createSubscriptionAuthorizer([codexSubscription, grokSubscription], { credentials: options.credentials, onCredentials: options.onCredentials, fetch: hostFetch, memory: options[credentialMemory] })
     : options.customProvider && options.credentials
       ? createSubscriptionAuthorizer([customProviderSpec(options.customProvider, () => sessionId)], { credentials: options.credentials, fetch: hostFetch })
       : null;
