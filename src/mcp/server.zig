@@ -474,7 +474,7 @@ pub const Server = struct {
         // An elicitation's answer is checked before anything goes out.
         for (l.round.slice(), values) |q, v| if (q.kind == .elicitation) {
             var form: elicitation.Form = .{};
-            const read = elicitation.parse(q.params.?, &form) catch return error.InvalidInputResponses;
+            const read = elicitation.parse(q.params.?, &form) catch return error.InvalidInputResponses; // read with the round
             _ = elicitation.readAnswer(read.mode, &form, v) catch return error.InvalidInputResponses;
         };
         const a = l.arena.allocator();
@@ -490,7 +490,7 @@ pub const Server = struct {
     pub fn answerElicitation(r: *Server, slot: u8, answer: elicitation.Answer) Error!void {
         const s = r.elicit.held(slot) orelse return error.UnknownElicitation;
         var form: elicitation.Form = .{};
-        _ = elicitation.parse(r.elicit_held[slot].params, &form) catch return error.InvalidAnswer;
+        _ = elicitation.parse(r.elicit_held[slot].params, &form) catch return error.InvalidAnswer; // read when asked
         const valid = if (elicitation.check(s.mode, &form, answer)) true else |err| switch (err) {
             error.InvalidAnswer => return error.InvalidAnswer,
             error.InvalidContent => false,

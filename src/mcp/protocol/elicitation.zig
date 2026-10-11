@@ -223,7 +223,7 @@ pub const Options = struct {
     elements: wire.Elements,
 
     pub fn init(o: *Options, field: *const Field) wire.DecodeError!void {
-        try o.elements.init(field.options.?);
+        try o.elements.init(field.options.?); // read by `parse`
     }
 
     pub fn next(o: *Options) ?Option {
