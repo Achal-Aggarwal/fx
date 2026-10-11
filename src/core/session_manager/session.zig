@@ -640,7 +640,7 @@ pub const Session = struct {
         var start: usize = 0;
         for (session.bounds.items, 0..) |end, i| {
             const line = session.batch.items[start..end];
-            const header = log_mod.checkLine(line) catch unreachable;
+            const header = log_mod.checkLine(line) catch return error.Io;
             // In a publish only line 1 is the header; the held and batch
             // lines after it come from the host.
             const line_cause: Cause = if (cause != .header) cause else if (i == 0) .header else .host;
@@ -1729,7 +1729,7 @@ fn copyFolded(session: *Session, copied: []const u8, fork_seq: u64) AppendError!
             try session.bounds.append(gpa, session.batch.items.len);
         }
         const line = session.batch.items[start..];
-        const header = log_mod.checkLine(line) catch unreachable;
+        const header = log_mod.checkLine(line) catch |io_err| return storage.ioFault(io_err);
         if (header.kind) |kind| {
             const body = schema.parseBody(arena.allocator(), kind, log_mod.lineBody(line, header)) catch |io_err| return storage.ioFault(io_err);
             try fold.apply(gpa, &session.state, fork_seq, .{ .seq = header.seq, .offset = start, .body = body });

@@ -1715,6 +1715,8 @@ const LoginPollTestState = struct {
     open_available: bool = true,
     open_error: bool = false,
     now_ms: i64 = 0,
+    /// A sleep or wait that could not be recorded; the next poll reports it.
+    record_error: ?Allocator.Error = null,
 
     fn init(alloc: Allocator, results: []const ScriptedPollResult) LoginPollTestState {
         return .{ .alloc = alloc, .results = results };
@@ -1755,6 +1757,7 @@ const LoginPollTestState = struct {
         _: std.Io.Clock.Timestamp,
     ) !oauth.PollResult {
         const self = testState(raw);
+        if (self.record_error) |err| return err;
         if (self.poll_index >= self.results.len) return error.TestUnexpectedDevicePoll;
         const result = self.results[self.poll_index];
         self.poll_index += 1;
@@ -1767,13 +1770,17 @@ const LoginPollTestState = struct {
 
     fn testSleepMs(raw: ?*anyopaque, ms: u64) void {
         const self = testState(raw);
-        self.sleep_calls.append(self.alloc, ms) catch unreachable;
+        self.sleep_calls.append(self.alloc, ms) catch |err| {
+            self.record_error = err;
+        };
         self.now_ms += @intCast(ms);
     }
 
     fn testWaitForEnter(raw: ?*anyopaque, timeout_ms: u64) bool {
         const self = testState(raw);
-        self.wait_calls.append(self.alloc, timeout_ms) catch unreachable;
+        self.wait_calls.append(self.alloc, timeout_ms) catch |err| {
+            self.record_error = err;
+        };
         self.now_ms += @intCast(timeout_ms);
         return if (self.enter_on_wait) |index| self.wait_calls.items.len == index else false;
     }

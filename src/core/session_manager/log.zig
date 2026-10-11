@@ -325,7 +325,7 @@ pub const Log = struct {
     pub fn append(log: *Log, batch: []const u8, line_count: u64) AppendError!void {
         if (log.status != .open or log.access != .read_write) return error.NotWritable;
         std.debug.assert(batch.len > 0 and batch[batch.len - 1] == '\n');
-        if (std.debug.runtime_safety) log.assertSeqs(batch, line_count);
+        if (std.debug.runtime_safety) std.debug.assert(log.seqsMatch(batch, line_count));
         const traced = if (hooks) log.hook.tracer != null else false;
         if (traced) {
             try log.appendTraced(batch);
@@ -395,15 +395,17 @@ pub const Log = struct {
         }
     }
 
-    fn assertSeqs(log: *const Log, batch: []const u8, line_count: u64) void {
+    /// Whether `batch` is `line_count` well-formed lines whose seqs run on
+    /// from `next_seq`.
+    fn seqsMatch(log: *const Log, batch: []const u8, line_count: u64) bool {
         var expected = log.next_seq;
         var at: usize = 0;
         while (std.mem.findScalarPos(u8, batch, at, '\n')) |nl| : (at = nl + 1) {
-            const header = checkLine(batch[at .. nl + 1]) catch unreachable;
-            std.debug.assert(header.seq == expected);
+            const header = checkLine(batch[at .. nl + 1]) catch return false;
+            if (header.seq != expected) return false;
             expected += 1;
         }
-        std.debug.assert(expected - log.next_seq == line_count);
+        return expected - log.next_seq == line_count;
     }
 };
 
