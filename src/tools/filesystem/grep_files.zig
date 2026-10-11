@@ -1,6 +1,7 @@
 const std = @import("std");
 const glob_pattern = @import("../../core/workspace/glob_pattern.zig");
 const grep_search = @import("../../core/workspace/grep_search.zig");
+const tool_files = @import("../../core/workspace/tool_files.zig");
 const io_mod = @import("../../core/shared/io.zig");
 const mem_utils = @import("../../core/shared/mem_utils.zig");
 const pathing = @import("../../core/workspace/pathing.zig");
@@ -498,26 +499,17 @@ fn writeGrepResultNotes(
             .collection_cap => writer.print("... match collection cap reached at {d} matches before all candidate files were scanned\n", .{grep_search.collection_cap}) catch return error.OutOfMemory,
         }
     }
-    try writeCandidateNotes(
-        writer,
-        result.candidate_incomplete,
-        result.candidate_cap,
-        result.skipped_overlong,
-    );
+    try candidateCompleteness(result).writeNotes(writer);
 }
 
-fn writeCandidateNotes(
-    writer: *std.Io.Writer,
-    candidate_incomplete: bool,
-    candidate_cap: usize,
-    skipped_overlong: usize,
-) error{OutOfMemory}!void {
-    if (candidate_incomplete) {
-        writer.print("... candidate list may be incomplete; candidate cap {d} reached before all files were discovered\n", .{candidate_cap}) catch return error.OutOfMemory;
-    }
-    if (skipped_overlong > 0) {
-        writer.print("... skipped {d} overlong candidate path{s}\n", .{ skipped_overlong, if (skipped_overlong == 1) "" else "s" }) catch return error.OutOfMemory;
-    }
+/// The candidate fields of a `grep_search.Result` or `CountResult`.
+fn candidateCompleteness(result: anytype) tool_files.Completeness {
+    return .{
+        .incomplete = result.candidate_incomplete,
+        .cap_reached = result.candidate_cap_reached,
+        .candidate_cap = result.candidate_cap,
+        .skipped_overlong = result.skipped_overlong,
+    };
 }
 
 fn formatCount(
@@ -529,12 +521,7 @@ fn formatCount(
     defer out.deinit();
 
     out.writer.print("[grep] count {d} matching lines in {d} files for {s}\n", .{ result.matching_lines, result.matching_files, pattern }) catch return error.OutOfMemory;
-    try writeCandidateNotes(
-        &out.writer,
-        result.candidate_incomplete,
-        result.candidate_cap,
-        result.skipped_overlong,
-    );
+    try candidateCompleteness(result).writeNotes(&out.writer);
     return try out.toOwnedSlice();
 }
 
@@ -1424,11 +1411,22 @@ test "grep_files formatter reports candidate cap without output truncation wordi
     const body = try formatMatches(alloc, alloc, "", "needle", .{
         .matches = &.{},
         .candidate_incomplete = true,
+        .candidate_cap_reached = true,
         .candidate_cap = 2,
     }, output_cap, 0, 0, tool_dispatch.default_max_list_entries, 2000);
     defer alloc.free(body);
 
     try std.testing.expectEqualStrings("[grep] no matches for needle\n... candidate list may be incomplete; candidate cap 2 reached before all files were discovered\n", body);
+
+    // A listing left incomplete by unreadable folders or git files says so,
+    // not that the cap was reached.
+    const unreadable = try formatMatches(alloc, alloc, "", "needle", .{
+        .matches = &.{},
+        .candidate_incomplete = true,
+        .candidate_cap = 100000,
+    }, output_cap, 0, 0, tool_dispatch.default_max_list_entries, 2000);
+    defer alloc.free(unreadable);
+    try std.testing.expectEqualStrings("[grep] no matches for needle\n... candidate list may be incomplete; some folders or git files could not be read\n", unreadable);
 }
 
 test "grep_files classifiers are read-only and reversible" {

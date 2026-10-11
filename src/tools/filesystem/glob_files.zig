@@ -124,9 +124,9 @@ fn callWithWorkspaceOptions(ctx: tool_dispatch.DispatchContext, erased: tool_dis
         requested_root;
     const root = maybe_root orelse {
         if (input.mode == .count) {
-            return .{ .success = try formatCount(ctx.allocator, input.pattern, 0, false, tool_files.default_candidate_cap, 0) };
+            return .{ .success = try formatCount(ctx.allocator, input.pattern, 0, .{}) };
         }
-        return .{ .success = try formatMatches(ctx.allocator, input.pattern, &.{}, false, false, tool_files.default_candidate_cap, 0, ctx.max_list_entries) };
+        return .{ .success = try formatMatches(ctx.allocator, input.pattern, &.{}, false, .{}, ctx.max_list_entries) };
     };
     const root_relative = try pathing.workspaceRelativePath(arena, ctx.workspace_root, root.absolute);
     var compiled_pattern = glob_pattern.Pattern.compile(arena, static_base.pattern) catch |err| switch (err) {
@@ -139,9 +139,7 @@ fn callWithWorkspaceOptions(ctx: tool_dispatch.DispatchContext, erased: tool_dis
     defer matches.deinit(arena);
     var match_count: usize = 0;
     var output_truncated = false;
-    var candidate_incomplete = false;
-    var candidate_cap: usize = tool_files.default_candidate_cap;
-    var skipped_overlong: usize = 0;
+    var completeness: tool_files.Completeness = .{};
     var options = list_options;
     options.skipped_names = ctx.ignored_list_entries;
     options.include_hidden = options.include_hidden or shouldIncludeHidden(root_relative, input.pattern);
@@ -152,9 +150,7 @@ fn callWithWorkspaceOptions(ctx: tool_dispatch.DispatchContext, erased: tool_dis
             error.FileNotFound => return .{ .failure = try std.fmt.allocPrint(ctx.allocator, "Unable to discover glob candidates: {s} ({s})", .{ root.absolute, @errorName(err) }) },
         };
         const candidate_files = listing.files;
-        candidate_incomplete = listing.incomplete;
-        candidate_cap = listing.candidate_cap;
-        skipped_overlong = listing.skipped_overlong;
+        completeness = .of(listing);
 
         for (candidate_files) |candidate| {
             if (!compiled_pattern.matchesPath(candidate)) continue;
@@ -180,24 +176,22 @@ fn callWithWorkspaceOptions(ctx: tool_dispatch.DispatchContext, erased: tool_dis
     }
 
     if (input.mode == .count) {
-        return .{ .success = try formatCount(ctx.allocator, input.pattern, match_count, candidate_incomplete, candidate_cap, skipped_overlong) };
+        return .{ .success = try formatCount(ctx.allocator, input.pattern, match_count, completeness) };
     }
-    return .{ .success = try formatMatches(ctx.allocator, input.pattern, matches.items, output_truncated, candidate_incomplete, candidate_cap, skipped_overlong, ctx.max_list_entries) };
+    return .{ .success = try formatMatches(ctx.allocator, input.pattern, matches.items, output_truncated, completeness, ctx.max_list_entries) };
 }
 
 fn formatCount(
     alloc: Allocator,
     pattern: []const u8,
     match_count: usize,
-    candidate_incomplete: bool,
-    candidate_cap: usize,
-    skipped_overlong: usize,
+    completeness: tool_files.Completeness,
 ) tool_dispatch.DispatchError![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
 
     out.writer.print("[glob] count {d} matches for {s}\n", .{ match_count, pattern }) catch return error.OutOfMemory;
-    try writeCandidateNotes(&out.writer, candidate_incomplete, candidate_cap, skipped_overlong);
+    try completeness.writeNotes(&out.writer);
     return try out.toOwnedSlice();
 }
 
@@ -206,9 +200,7 @@ fn formatMatches(
     pattern: []const u8,
     matches: []const []const u8,
     output_truncated: bool,
-    candidate_incomplete: bool,
-    candidate_cap: usize,
-    skipped_overlong: usize,
+    completeness: tool_files.Completeness,
     max_list_entries: usize,
 ) tool_dispatch.DispatchError![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
@@ -216,7 +208,7 @@ fn formatMatches(
 
     if (matches.len == 0) {
         out.writer.print("[glob] no matches for {s}\n", .{pattern}) catch return error.OutOfMemory;
-        try writeCandidateNotes(&out.writer, candidate_incomplete, candidate_cap, skipped_overlong);
+        try completeness.writeNotes(&out.writer);
         return try out.toOwnedSlice();
     }
 
@@ -227,18 +219,9 @@ fn formatMatches(
     if (output_truncated) {
         out.writer.print("... truncated to first {d} matches\n", .{max_list_entries}) catch return error.OutOfMemory;
     }
-    try writeCandidateNotes(&out.writer, candidate_incomplete, candidate_cap, skipped_overlong);
+    try completeness.writeNotes(&out.writer);
 
     return try out.toOwnedSlice();
-}
-
-fn writeCandidateNotes(writer: anytype, candidate_incomplete: bool, candidate_cap: usize, skipped_overlong: usize) tool_dispatch.DispatchError!void {
-    if (candidate_incomplete) {
-        writer.print("... candidate list may be incomplete; candidate cap {d} reached before all files were discovered\n", .{candidate_cap}) catch return error.OutOfMemory;
-    }
-    if (skipped_overlong > 0) {
-        writer.print("... skipped {d} overlong candidate path{s}\n", .{ skipped_overlong, if (skipped_overlong == 1) "" else "s" }) catch return error.OutOfMemory;
-    }
 }
 
 const SearchRoot = struct {
@@ -725,7 +708,7 @@ test "glob_files count mode reports exact matches without rendering entries" {
 test "glob_files formatter uses active truncation wording" {
     const alloc = std.testing.allocator;
     const matches = [_][]const u8{ "a.txt", "b.txt" };
-    const body = try formatMatches(alloc, "*.txt", &matches, true, false, tool_files.default_candidate_cap, 0, 2);
+    const body = try formatMatches(alloc, "*.txt", &matches, true, .{}, 2);
     defer alloc.free(body);
 
     try std.testing.expectEqualStrings("[glob] 2 matches for *.txt\n - a.txt\n - b.txt\n... truncated to first 2 matches\n", body);
@@ -860,7 +843,7 @@ test "glob_files finds match beyond former traversal cap" {
 test "glob_files distinguishes candidate cap from output cap" {
     const alloc = std.testing.allocator;
     const matches = [_][]const u8{ "a.txt", "b.txt" };
-    const body = try formatMatches(alloc, "*.txt", &matches, true, true, 2, 0, 2);
+    const body = try formatMatches(alloc, "*.txt", &matches, true, .{ .incomplete = true, .cap_reached = true, .candidate_cap = 2 }, 2);
     defer alloc.free(body);
 
     try std.testing.expect(std.mem.find(u8, body, "... truncated to first 2 matches\n") != null);

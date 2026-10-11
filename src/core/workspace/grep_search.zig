@@ -36,6 +36,7 @@ pub const Result = struct {
     candidate_count: usize = 0,
     candidate_cap: usize = tool_files.default_candidate_cap,
     candidate_incomplete: bool = false,
+    candidate_cap_reached: bool = false,
     skipped_overlong: usize = 0,
 };
 
@@ -46,6 +47,7 @@ pub const CountResult = struct {
     candidate_count: usize = 0,
     candidate_cap: usize = tool_files.default_candidate_cap,
     candidate_incomplete: bool = false,
+    candidate_cap_reached: bool = false,
     skipped_overlong: usize = 0,
 };
 
@@ -199,6 +201,7 @@ const CandidateStats = struct {
     count: usize = 0,
     cap: usize = tool_files.default_candidate_cap,
     incomplete: bool = false,
+    cap_reached: bool = false,
     skipped_overlong: usize = 0,
 
     fn fromListing(listing: tool_files.Listing) CandidateStats {
@@ -206,6 +209,7 @@ const CandidateStats = struct {
             .count = listing.files.len,
             .cap = listing.candidate_cap,
             .incomplete = listing.incomplete,
+            .cap_reached = listing.cap_reached,
             .skipped_overlong = listing.skipped_overlong,
         };
     }
@@ -218,6 +222,7 @@ fn finishMatches(arena: Allocator, matches: *std.ArrayList(Match), truncated_rea
         .candidate_count = stats.count,
         .candidate_cap = stats.cap,
         .candidate_incomplete = stats.incomplete,
+        .candidate_cap_reached = stats.cap_reached,
         .skipped_overlong = stats.skipped_overlong,
     };
 }
@@ -227,6 +232,7 @@ fn finishCount(result: CountResult, stats: CandidateStats) CountResult {
     out.candidate_count = stats.count;
     out.candidate_cap = stats.cap;
     out.candidate_incomplete = stats.incomplete;
+    out.candidate_cap_reached = stats.cap_reached;
     out.skipped_overlong += stats.skipped_overlong;
     return out;
 }
@@ -287,7 +293,9 @@ const FileOutcome = struct {
 
 /// Shared state of one parallel content scan. Merging in candidate order makes
 /// the output identical to a single-threaded scan, including where the
-/// collection cap truncates it.
+/// collection cap truncates it. Batches are handed out in candidate order, so
+/// once finished batches hold the cap, no batch that has not started can
+/// reach the merged result.
 const ParallelScan = struct {
     /// Thread-safe and temporary: candidate resolution and per-file matches.
     work: Allocator,
@@ -301,12 +309,10 @@ const ParallelScan = struct {
     next_batch: std.atomic.Value(usize) = .init(0),
     stop: std.atomic.Value(bool) = .init(false),
     mutex: std.Io.Mutex = .init,
-    /// Guarded by `mutex`: which batches are done, how many leading batches
-    /// are done, and how many matches those leading batches hold.
-    batch_done: []bool,
-    done_prefix: usize = 0,
-    prefix_matches: usize = 0,
-    out_of_memory: bool = false,
+    /// Guarded by `mutex`: the matches every finished batch holds, and the
+    /// first file of the earliest batch that ran out of memory.
+    done_matches: usize = 0,
+    out_of_memory_from: ?usize = null,
 
     fn run(self: *ParallelScan) void {
         while (!self.stop.load(.acquire)) {
@@ -317,13 +323,13 @@ const ParallelScan = struct {
             for (first..last) |index| {
                 _ = self.scanOne(index) catch {
                     self.mutex.lockUncancelable(io_mod.getIo());
-                    self.out_of_memory = true;
+                    self.out_of_memory_from = @min(self.out_of_memory_from orelse first, first);
                     self.mutex.unlock(io_mod.getIo());
                     self.stop.store(true, .release);
                     return;
                 };
             }
-            self.finishBatch(batch);
+            self.finishBatch(first, last);
         }
     }
 
@@ -350,17 +356,16 @@ const ParallelScan = struct {
         }
     }
 
-    /// Once the leading done batches hold the collection cap, no later file
-    /// can change the merged result, so the remaining work stops.
-    fn finishBatch(self: *ParallelScan, batch: usize) void {
+    /// Every finished batch came before any batch not yet started, so once
+    /// they hold the collection cap the remaining work stops. Matches past the
+    /// cut are never buffered beyond the batches already running.
+    fn finishBatch(self: *ParallelScan, first: usize, last: usize) void {
+        var batch_matches: usize = 0;
+        for (self.outcomes[first..last]) |outcome| batch_matches += outcome.matches.len;
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
-        self.batch_done[batch] = true;
-        while (self.done_prefix < self.batch_done.len and self.batch_done[self.done_prefix]) : (self.done_prefix += 1) {
-            const first = self.done_prefix * batch_files;
-            for (self.outcomes[first..@min(first + batch_files, self.outcomes.len)]) |outcome| self.prefix_matches += outcome.matches.len;
-        }
-        if (self.mode == .matches and self.prefix_matches >= collection_cap) self.stop.store(true, .release);
+        self.done_matches += batch_matches;
+        if (self.mode == .matches and self.done_matches >= collection_cap) self.stop.store(true, .release);
     }
 };
 
@@ -371,8 +376,9 @@ fn workerCount(files: usize) usize {
 }
 
 /// Scans `files` with up to `max_scan_workers` threads, the calling thread
-/// included. A helper that cannot start leaves its share to the others.
-fn runParallelScan(scan: *ParallelScan) Allocator.Error!void {
+/// included. A helper that cannot start leaves its share to the others. Running
+/// out of memory is recorded in `out_of_memory_from` for the caller to judge.
+fn runParallelScan(scan: *ParallelScan) void {
     const helpers = workerCount(scan.files.len) - 1;
     var threads: [max_scan_workers]std.Thread = undefined;
     var started: usize = 0;
@@ -383,7 +389,6 @@ fn runParallelScan(scan: *ParallelScan) Allocator.Error!void {
     }
     scan.run();
     for (threads[0..started]) |thread| thread.join();
-    if (scan.out_of_memory) return error.OutOfMemory;
 }
 
 fn selectCandidates(work: Allocator, candidates: []const []const u8, include: ?glob_pattern.Pattern) ![]const []const u8 {
@@ -406,8 +411,6 @@ fn initParallelScan(
 ) !ParallelScan {
     const outcomes = try work.alloc(FileOutcome, files.len);
     @memset(outcomes, .{});
-    const batch_done = try work.alloc(bool, std.math.divCeil(usize, files.len, batch_files) catch 0);
-    @memset(batch_done, false);
     return .{
         .work = work,
         .workspace_root = workspace_root,
@@ -417,7 +420,6 @@ fn initParallelScan(
         .case_insensitive = case_insensitive,
         .mode = mode,
         .outcomes = outcomes,
-        .batch_done = batch_done,
     };
 }
 
@@ -437,8 +439,16 @@ fn scanCandidateList(
     const work = work_state.allocator();
     const files = try selectCandidates(work, candidates, include);
     var scan = try initParallelScan(work, workspace_root, provider_root, files, pattern, case_insensitive, .matches);
-    try runParallelScan(&scan);
-    for (scan.outcomes) |outcome| {
+    runParallelScan(&scan);
+    return mergeMatches(arena, &scan, matches);
+}
+
+/// Appends the scanned matches in candidate order up to the collection cap.
+/// Running out of memory fails the search only when the cut is not reached
+/// before the file where it happened.
+fn mergeMatches(arena: Allocator, scan: *const ParallelScan, matches: *std.ArrayList(Match)) Allocator.Error!?TruncatedReason {
+    for (scan.outcomes, 0..) |outcome, index| {
+        if (scan.out_of_memory_from) |from| if (index >= from) return error.OutOfMemory;
         var retained_path: ?[]const u8 = null;
         for (outcome.matches) |match| {
             if (matches.items.len >= collection_cap) return .collection_cap;
@@ -464,7 +474,9 @@ fn countCandidateList(
     const work = work_state.allocator();
     const files = try selectCandidates(work, candidates, include);
     var scan = try initParallelScan(work, workspace_root, provider_root, files, pattern, case_insensitive, .count);
-    try runParallelScan(&scan);
+    runParallelScan(&scan);
+    // A count needs every file.
+    if (scan.out_of_memory_from != null) return error.OutOfMemory;
     for (scan.outcomes) |outcome| {
         if (outcome.matching_lines == 0) continue;
         count_result.matching_files += 1;
@@ -1212,4 +1224,52 @@ test "grep search parallel scan matches single-threaded order and cap truncation
         try std.testing.expectEqual(@as(usize, 3000), counted.matching_lines);
         try std.testing.expectEqual(@as(usize, 1500), counted.matching_files);
     }
+}
+
+test "parallel grep stops once finished batches hold the cap, even with an earlier batch still running" {
+    var work_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer work_state.deinit();
+    const work = work_state.allocator();
+    const files = try work.alloc([]const u8, batch_files * 4);
+    for (files) |*file| file.* = "f";
+    var scan = try initParallelScan(work, "/w", "/w", files, "x", false, .matches);
+    const many = try work.alloc(Match, collection_cap);
+    for (many) |*match| match.* = .{ .absolute_path = "/w/f", .line_number = 1, .line = "x" };
+
+    // Batch 0 is still running; batch 1 finishes holding the cap.
+    scan.outcomes[batch_files] = .{ .matches = many };
+    scan.finishBatch(batch_files, batch_files * 2);
+    try std.testing.expect(scan.stop.load(.acquire));
+
+    // Below the cap the scan keeps going.
+    var short = try initParallelScan(work, "/w", "/w", files, "x", false, .matches);
+    short.outcomes[batch_files] = .{ .matches = many[0 .. collection_cap - 1] };
+    short.finishBatch(batch_files, batch_files * 2);
+    try std.testing.expect(!short.stop.load(.acquire));
+}
+
+test "grep fails for running out of memory only before the cut" {
+    var work_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer work_state.deinit();
+    const work = work_state.allocator();
+    const files = try work.alloc([]const u8, batch_files * 3);
+    for (files) |*file| file.* = "f";
+    const many = try work.alloc(Match, collection_cap);
+    for (many) |*match| match.* = .{ .absolute_path = "/w/f", .line_number = 1, .line = "x" };
+
+    // The cut lands in the first file, so a later batch running out of
+    // memory changes nothing.
+    var past = try initParallelScan(work, "/w", "/w", files, "x", false, .matches);
+    past.outcomes[0] = .{ .matches = many };
+    past.out_of_memory_from = batch_files * 2;
+    var kept: std.ArrayList(Match) = .empty;
+    try std.testing.expectEqual(@as(?TruncatedReason, .collection_cap), try mergeMatches(work, &past, &kept));
+    try std.testing.expectEqual(collection_cap, kept.items.len);
+
+    // Before the cut, the missing matches would change the result.
+    var before = try initParallelScan(work, "/w", "/w", files, "x", false, .matches);
+    before.outcomes[0] = .{ .matches = many[0..10] };
+    before.out_of_memory_from = batch_files;
+    var partial: std.ArrayList(Match) = .empty;
+    try std.testing.expectError(error.OutOfMemory, mergeMatches(work, &before, &partial));
 }

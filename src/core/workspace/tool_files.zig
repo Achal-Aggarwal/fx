@@ -34,6 +34,8 @@ pub const Listing = struct {
     candidate_cap: usize,
     /// The cap or an unreadable folder or rule file left files out.
     incomplete: bool,
+    /// The candidate cap stopped the listing.
+    cap_reached: bool,
     skipped_overlong: usize,
 };
 
@@ -107,9 +109,42 @@ fn collect(arena: Allocator, tree: *const indexer.Tree, subtree: []const u8, opt
         .files = try files.toOwnedSlice(arena),
         .candidate_cap = options.candidate_cap,
         .incomplete = tree.incomplete or tree.cap_reached,
+        .cap_reached = tree.cap_reached,
         .skipped_overlong = tree.skipped_overlong,
     };
 }
+
+/// What a candidate list may have left out, for the notes a file tool appends.
+pub const Completeness = struct {
+    /// The cap or an unreadable folder or git file left files out.
+    incomplete: bool = false,
+    /// The candidate cap stopped the listing.
+    cap_reached: bool = false,
+    candidate_cap: usize = default_candidate_cap,
+    skipped_overlong: usize = 0,
+
+    pub fn of(listing: Listing) Completeness {
+        return .{
+            .incomplete = listing.incomplete,
+            .cap_reached = listing.cap_reached,
+            .candidate_cap = listing.candidate_cap,
+            .skipped_overlong = listing.skipped_overlong,
+        };
+    }
+
+    /// Names the reason files may be missing: the cap, or folders and git
+    /// files fx could not read.
+    pub fn writeNotes(self: Completeness, writer: *std.Io.Writer) error{OutOfMemory}!void {
+        if (self.cap_reached) {
+            writer.print("... candidate list may be incomplete; candidate cap {d} reached before all files were discovered\n", .{self.candidate_cap}) catch return error.OutOfMemory;
+        } else if (self.incomplete) {
+            writer.writeAll("... candidate list may be incomplete; some folders or git files could not be read\n") catch return error.OutOfMemory;
+        }
+        if (self.skipped_overlong > 0) {
+            writer.print("... skipped {d} overlong candidate path{s}\n", .{ self.skipped_overlong, if (self.skipped_overlong == 1) "" else "s" }) catch return error.OutOfMemory;
+        }
+    }
+};
 
 /// Whether a folder in `path` (not its last component) is hidden.
 pub fn pathContainsHiddenDirectoryComponent(path: []const u8) bool {
