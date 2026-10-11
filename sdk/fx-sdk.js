@@ -1,4 +1,5 @@
 import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
+import { createChatgptAuthorizer, isCodexRequest } from "./chatgpt.js";
 import { loadModule } from "./wasm-module.js";
 
 const encoder = new TextEncoder();
@@ -107,15 +108,9 @@ function normalizeUltrafast(value) {
   return value;
 }
 
-export function normalizeAgentOptions(value) {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new TypeError("createFxEngine() options must be an object");
-  }
-  const options = { ...value };
-  if (Object.hasOwn(options, "env")) {
-    throw new TypeError("createFxEngine() does not accept env; pass apiKey and model directly");
-  }
-  options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
+// The model choice in `options`, a model object or a model ID with the
+// deprecated top-level options, as `{ model, effort, fast, ultrafast }`.
+export function normalizeModelChoice(options) {
   if (options.model !== null && typeof options.model === "object" && !Array.isArray(options.model)) {
     if (Object.hasOwn(options, "effort") || Object.hasOwn(options, "fast") || Object.hasOwn(options, "ultrafast")) {
       throw new TypeError("model options cannot be mixed with top-level effort, fast, or ultrafast");
@@ -126,16 +121,43 @@ export function normalizeAgentOptions(value) {
         throw new TypeError(`unsupported model option: ${name}`);
       }
     }
-    options.model = boundedString(model.id, "model.id", maxModelBytes, true);
-    options.effort = normalizeEffort(model.effort);
-    options.fast = normalizeFast(model.fast);
-    options.ultrafast = normalizeUltrafast(model.ultrafast);
-  } else {
-    options.model = boundedString(options.model, "model", maxModelBytes, false);
-    options.effort = normalizeEffort(options.effort);
-    options.fast = normalizeFast(options.fast);
-    options.ultrafast = normalizeUltrafast(options.ultrafast);
+    return {
+      model: boundedString(model.id, "model.id", maxModelBytes, true),
+      effort: normalizeEffort(model.effort),
+      fast: normalizeFast(model.fast),
+      ultrafast: normalizeUltrafast(model.ultrafast),
+    };
   }
+  return {
+    model: boundedString(options.model, "model", maxModelBytes, false),
+    effort: normalizeEffort(options.effort),
+    fast: normalizeFast(options.fast),
+    ultrafast: normalizeUltrafast(options.ultrafast),
+  };
+}
+
+export function normalizeAgentOptions(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("createFxEngine() options must be an object");
+  }
+  const options = { ...value };
+  if (Object.hasOwn(options, "env")) {
+    throw new TypeError("createFxEngine() does not accept env; pass apiKey and model directly");
+  }
+  if (options.provider !== undefined && options.provider !== "gateway" && options.provider !== "codex") {
+    throw new TypeError("provider must be \"gateway\" or \"codex\"");
+  }
+  const codex = options.provider === "codex";
+  // A Codex agent runs on the host's ChatGPT credentials; Gateway needs its key.
+  options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, !codex);
+  if (codex && typeof options.chatgpt !== "function") {
+    throw new TypeError("provider \"codex\" needs a chatgpt() credentials function");
+  }
+  if (!codex && options.chatgpt !== undefined) throw new TypeError("chatgpt needs provider \"codex\"");
+  if (options.onChatgptCredentials !== undefined && typeof options.onChatgptCredentials !== "function") {
+    throw new TypeError("onChatgptCredentials must be a function");
+  }
+  Object.assign(options, normalizeModelChoice(options));
   validateGatewayChatUrl(options.gatewayChatUrl);
   if (options.resizeImage !== undefined && typeof options.resizeImage !== "function") {
     throw new TypeError("resizeImage must be a function");
@@ -413,7 +435,8 @@ function journalMarks(events) {
 
 function agentEnvironment(options) {
   return {
-    AI_GATEWAY_API_KEY: options.apiKey,
+    ...(options.apiKey === undefined ? {} : { AI_GATEWAY_API_KEY: options.apiKey }),
+    ...(options.provider === undefined ? {} : { FX_PROVIDER: options.provider }),
     ...(options.model === undefined ? {} : { FX_MODEL: options.model }),
     ...(options.effort === undefined ? {} : { FX_EFFORT: options.effort }),
     ...(options.fast === undefined ? {} : { FX_FAST: options.fast ? "true" : "false" }),
@@ -2044,6 +2067,8 @@ function normalizeHostTools(value) {
       description,
       inputSchema: schema,
       ...(writes === undefined ? {} : { writes }),
+      // The engine does not read `idempotent`, but it stays in the shape a
+      // checkpoint records, so a change to it counts as a changed tool set.
       ...(idempotent === true ? { idempotent: true } : {}),
     });
     executors.set(name, execute);
@@ -2074,7 +2099,7 @@ function modelCatalogBody(value) {
   return body;
 }
 
-function normalizeInstructions(value) {
+export function normalizeInstructions(value) {
   let instructions;
   if (value === undefined) instructions = "";
   else if (typeof value === "string") instructions = value;
@@ -2384,6 +2409,9 @@ export async function createFxEngine(options = {}) {
     return checkpointing;
   };
   const hostFetch = options.fetch ?? globalThis.fetch?.bind(globalThis);
+  const codexAuth = options.provider === "codex"
+    ? createChatgptAuthorizer({ chatgpt: options.chatgpt, onCredentials: options.onChatgptCredentials, fetch: hostFetch })
+    : null;
   const transportFetch = async (input, init = {}) => {
     const method = String(init.method ?? input?.method ?? "GET").toUpperCase();
     let endpoint = String(input?.url ?? input);
@@ -2411,7 +2439,9 @@ export async function createFxEngine(options = {}) {
           throw new DOMException("Aborted", "AbortError");
         }
         if (!hostFetch) throw new TypeError("fetch is unavailable");
-        const response = await hostFetch(input, init);
+        const response = codexAuth && isCodexRequest(endpoint)
+          ? await codexAuth.fetch(hostFetch, input, init)
+          : await hostFetch(input, init);
         const headers = response.headers;
         emit("transport.response", {
           attempt,

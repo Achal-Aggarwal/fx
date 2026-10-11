@@ -31,7 +31,7 @@ pub const Transport = struct {
         return self.next_fn(self.context, handle, out);
     }
 
-    fn close(self: Transport, handle: i32) void {
+    pub fn close(self: Transport, handle: i32) void {
         self.close_fn(self.context, handle);
     }
 
@@ -136,8 +136,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         null;
     defer if (auth) |value| alloc.free(value);
 
-    const Header = struct { name: []const u8, value: []const u8 };
-    var headers: std.ArrayList(Header) = .empty;
+    var headers: std.ArrayList(std.http.Header) = .empty;
     defer headers.deinit(alloc);
     try headers.appendSlice(alloc, &.{
         .{ .name = "content-type", .value = "application/json" },
@@ -155,41 +154,13 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         .{ .name = "x-session-affinity", .value = session_id },
     });
 
-    var headers_json: std.Io.Writer.Allocating = .init(alloc);
-    defer headers_json.deinit();
-    try std.json.Stringify.value(headers.items, .{}, &headers_json.writer);
-
-    const endpoint = context.endpoint.url();
-    try request.admission.admit();
-    request.delivery.markPossiblySent();
-    const handle = try transport.open("POST", endpoint, headers_json.writer.buffered(), payload);
-    if (handle < 0) return error.HostStreamFailed;
-    defer transport.close(handle);
-
-    var status_code: u16 = 0;
-    while (true) {
-        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
-        if (deadlineExpired(request.deadline)) return error.Timeout;
-        const status_result = transport.status(handle, &status_code);
-        if (status_result == 1) break;
-        if (status_result == -2) return error.Cancelled;
-        if (status_result < 0) return error.HostStreamFailed;
-        try pulse(request.cooperative_pulse);
-    }
-
-    const status: std.http.Status = @enumFromInt(status_code);
-    if (status != .ok) {
-        const body = try readBody(
-            alloc,
-            transport,
-            handle,
-            request.cancel_flag,
-            request.deadline,
-            request.cooperative_pulse,
-        );
+    const opened = try openPost(alloc, transport, request, context.endpoint.url(), headers.items, payload);
+    defer transport.close(opened.handle);
+    if (opened.status != .ok) {
+        const body = try readErrorBody(alloc, transport, opened.handle, request);
         // Gateway reports the last provider it tried, so a provider's size
         // rejection can arrive as a 400 from a later fallback.
-        const kind = failureKind(status);
+        const kind = failureKind(opened.status);
         return .{ .failed = .{
             .kind = if (kind == .invalid_request and vercel_failure_diagnostics.providerRejectedRequestSize(alloc, body)) .request_too_large else kind,
             .detail = body,
@@ -200,7 +171,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     var reader: HostStreamReader = undefined;
     reader.init(
         transport,
-        handle,
+        opened.handle,
         request.cancel_flag,
         request.deadline,
         request.cooperative_pulse,
@@ -216,14 +187,84 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         request.cancel_flag,
         request.content_capture_limit,
     ) catch |err| switch (err) {
-        error.ReadFailed => return if (reader.timed_out)
-            error.Timeout
-        else if (request.cancel_flag.load(.seq_cst) or reader.aborted)
-            error.Cancelled
-        else
-            error.HostStreamFailed,
+        error.ReadFailed => return readFailure(&reader, request.cancel_flag),
         else => return err,
     };
+    signalConsumed(transport, opened.handle, request, completion);
+    return .{ .completed = .{
+        .completion = completion,
+        .usage = gatewayUsageOutcome(request, completion),
+        .ownership = .owned,
+    } };
+}
+
+pub const OpenedPost = struct {
+    handle: i32,
+    status: std.http.Status,
+};
+
+/// Admits the request, sends one POST through the host and waits for its HTTP
+/// status. On success the caller owns `handle` and must close it with
+/// `transport.close`; on error the handle is already closed. Headers reach the
+/// host as a JSON list of `{name, value}` objects.
+pub fn openPost(
+    alloc: Allocator,
+    transport: Transport,
+    request: stream_provider.ModelRequest,
+    endpoint: []const u8,
+    headers: []const std.http.Header,
+    payload: []const u8,
+) !OpenedPost {
+    var headers_json: std.Io.Writer.Allocating = .init(alloc);
+    defer headers_json.deinit();
+    try std.json.Stringify.value(headers, .{}, &headers_json.writer);
+
+    try request.admission.admit();
+    request.delivery.markPossiblySent();
+    const handle = try transport.open("POST", endpoint, headers_json.writer.buffered(), payload);
+    if (handle < 0) return error.HostStreamFailed;
+    errdefer transport.close(handle);
+
+    var status_code: u16 = 0;
+    while (true) {
+        if (request.cancel_flag.load(.seq_cst)) return error.Cancelled;
+        if (deadlineExpired(request.deadline)) return error.Timeout;
+        const status_result = transport.status(handle, &status_code);
+        if (status_result == 1) break;
+        if (status_result == -2) return error.Cancelled;
+        if (status_result < 0) return error.HostStreamFailed;
+        try pulse(request.cooperative_pulse);
+    }
+    return .{ .handle = handle, .status = @enumFromInt(status_code) };
+}
+
+/// Reads a non-success response body, bounded. The caller owns the bytes.
+pub fn readErrorBody(
+    alloc: Allocator,
+    transport: Transport,
+    handle: i32,
+    request: stream_provider.ModelRequest,
+) ![]u8 {
+    return readBody(alloc, transport, handle, request.cancel_flag, request.deadline, request.cooperative_pulse);
+}
+
+pub const ReadFailure = error{ Timeout, Cancelled, HostStreamFailed };
+
+/// Names why a `HostStreamReader` stopped with `error.ReadFailed`.
+pub fn readFailure(reader: *const HostStreamReader, cancel_flag: *std.atomic.Value(bool)) ReadFailure {
+    if (reader.timed_out) return error.Timeout;
+    if (cancel_flag.load(.seq_cst) or reader.aborted) return error.Cancelled;
+    return error.HostStreamFailed;
+}
+
+/// Tells the host a response was consumed in full, once the completion is valid
+/// and uncancelled, so it may release the response before the stream closes.
+pub fn signalConsumed(
+    transport: Transport,
+    handle: i32,
+    request: stream_provider.ModelRequest,
+    completion: @import("../core/shared/types.zig").ModelCompletion,
+) void {
     const types = @import("../core/shared/types.zig");
     if (transport.consumed_fn != null and
         !request.cancel_flag.load(.seq_cst) and
@@ -233,11 +274,6 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
     {
         transport.consumed(handle);
     }
-    return .{ .completed = .{
-        .completion = completion,
-        .usage = gatewayUsageOutcome(request, completion),
-        .ownership = .owned,
-    } };
 }
 
 test "host provider signals logical consumption only after valid uncancelled completion" {
@@ -458,7 +494,7 @@ fn pulse(value: ?stream_provider.CooperativePulse) !void {
     if (value) |callback| try callback.pulse();
 }
 
-fn deadlineExpired(deadline: ?std.Io.Clock.Timestamp) bool {
+pub fn deadlineExpired(deadline: ?std.Io.Clock.Timestamp) bool {
     const value = deadline orelse return false;
     const now = std.Io.Clock.Timestamp.now(io_mod.getIo(), .awake);
     return !std.Io.Clock.Timestamp.compare(now, .lt, value);
@@ -493,7 +529,9 @@ fn readBody(
     return out.toOwnedSlice(alloc);
 }
 
-const HostStreamReader = struct {
+/// Adapts one open host response into a `std.Io.Reader` that honors the
+/// request's cancellation, deadline and cooperative pulses.
+pub const HostStreamReader = struct {
     transport: Transport = undefined,
     handle: i32 = -1,
     cancel_flag: *std.atomic.Value(bool) = undefined,
@@ -505,7 +543,7 @@ const HostStreamReader = struct {
     buffer: [16 * 1024]u8 = undefined,
     interface: std.Io.Reader = undefined,
 
-    fn init(
+    pub fn init(
         self: *@This(),
         transport: Transport,
         handle: i32,
