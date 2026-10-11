@@ -252,6 +252,7 @@ jobs:
         run: |
           node --experimental-wasm-jspi sdk/tests/test-durable.mjs memory wasm
           node --experimental-wasm-jspi sdk/tests/test-durable.mjs local wasm
+          node --experimental-wasm-jspi sdk/tests/test-durable-codex-crash.mjs wasm
 
       - name: Type-check the TypeScript declarations
         run: node sdk/tests/test-types.mjs
@@ -298,6 +299,7 @@ jobs:
           node sdk/tests/test-durable.mjs memory native
           node sdk/tests/test-durable.mjs local native
           node sdk/tests/test-durable.mjs world native
+          node sdk/tests/test-durable-codex-crash.mjs native
           node sdk/tests/test-durable-core.mjs memory
           node sdk/tests/test-durable-core.mjs local
           node sdk/tests/test-durable-core.mjs world

@@ -1,4 +1,5 @@
 import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
+import { createChatgptAuthorizer, isCodexRequest } from "./chatgpt.js";
 import { loadModule } from "./wasm-module.js";
 
 const encoder = new TextEncoder();
@@ -143,7 +144,19 @@ export function normalizeAgentOptions(value) {
   if (Object.hasOwn(options, "env")) {
     throw new TypeError("createFxEngine() does not accept env; pass apiKey and model directly");
   }
-  options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, true);
+  if (options.provider !== undefined && options.provider !== "gateway" && options.provider !== "codex") {
+    throw new TypeError("provider must be \"gateway\" or \"codex\"");
+  }
+  const codex = options.provider === "codex";
+  // A Codex agent runs on the host's ChatGPT credentials; Gateway needs its key.
+  options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, !codex);
+  if (codex && typeof options.chatgpt !== "function") {
+    throw new TypeError("provider \"codex\" needs a chatgpt() credentials function");
+  }
+  if (!codex && options.chatgpt !== undefined) throw new TypeError("chatgpt needs provider \"codex\"");
+  if (options.onChatgptCredentials !== undefined && typeof options.onChatgptCredentials !== "function") {
+    throw new TypeError("onChatgptCredentials must be a function");
+  }
   Object.assign(options, normalizeModelChoice(options));
   validateGatewayChatUrl(options.gatewayChatUrl);
   if (options.resizeImage !== undefined && typeof options.resizeImage !== "function") {
@@ -422,7 +435,8 @@ function journalMarks(events) {
 
 function agentEnvironment(options) {
   return {
-    AI_GATEWAY_API_KEY: options.apiKey,
+    ...(options.apiKey === undefined ? {} : { AI_GATEWAY_API_KEY: options.apiKey }),
+    ...(options.provider === undefined ? {} : { FX_PROVIDER: options.provider }),
     ...(options.model === undefined ? {} : { FX_MODEL: options.model }),
     ...(options.effort === undefined ? {} : { FX_EFFORT: options.effort }),
     ...(options.fast === undefined ? {} : { FX_FAST: options.fast ? "true" : "false" }),
@@ -2395,6 +2409,9 @@ export async function createFxEngine(options = {}) {
     return checkpointing;
   };
   const hostFetch = options.fetch ?? globalThis.fetch?.bind(globalThis);
+  const codexAuth = options.provider === "codex"
+    ? createChatgptAuthorizer({ chatgpt: options.chatgpt, onCredentials: options.onChatgptCredentials, fetch: hostFetch })
+    : null;
   const transportFetch = async (input, init = {}) => {
     const method = String(init.method ?? input?.method ?? "GET").toUpperCase();
     let endpoint = String(input?.url ?? input);
@@ -2422,7 +2439,9 @@ export async function createFxEngine(options = {}) {
           throw new DOMException("Aborted", "AbortError");
         }
         if (!hostFetch) throw new TypeError("fetch is unavailable");
-        const response = await hostFetch(input, init);
+        const response = codexAuth && isCodexRequest(endpoint)
+          ? await codexAuth.fetch(hostFetch, input, init)
+          : await hostFetch(input, init);
         const headers = response.headers;
         emit("transport.response", {
           attempt,

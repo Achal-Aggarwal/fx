@@ -2,6 +2,8 @@ const std = @import("std");
 const build_options = @import("build_options");
 const acp_server = @import("acp/server.zig");
 const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
+const host_openai_codex = @import("gateway/host_openai_codex.zig");
+const model_provider = @import("core/config/model_provider.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const provider_set = @import("core/gateway/provider_set.zig");
@@ -52,6 +54,9 @@ pub fn main(init: std.process.Init) !void {
         .context_registry = .{ .default_provider = context_contract.empty_provider },
         .mode_registry = builtin_modes.registry,
         .credential_override = io_mod.getenv("AI_GATEWAY_API_KEY"),
+        .provider_override = try providerOverrideFromEnv(io_mod.getenv("FX_PROVIDER")),
+        // The JS host adds ChatGPT credentials at its fetch edge.
+        .codex_auth_mode = .host_managed,
         .model_override = io_mod.getenv("FX_MODEL"),
         .effort_override = io_mod.getenv("FX_EFFORT"),
         .fast_override = fastOverrideFromEnv(io_mod.getenv("FX_FAST")),
@@ -69,15 +74,34 @@ const js_host_gateway_provider = gateway_provider.Provider{
     .chat_url = .{ .resolve_fn = resolveChatUrl },
 };
 
-const js_host_provider_set = provider_set.gateway_only(.{
-    .presentation = provider_catalog.find(.gateway),
-    .auth_strategy = .vercel,
-    .fallback_model_capabilities_fn = vercel_model_policy.capabilitiesForModel,
-    .agent_stream = js_host_stream_provider.provider(),
-    .cli_model_catalog = .{ .fetch_fn = fetchCliModelCatalog },
-    .model_catalog = js_host_model_catalog.provider,
-    .credits = .{ .fetch_fn = fetchCredits },
-});
+const codex_context = host_openai_codex.Context{ .transport = js_host_stream_provider.transport };
+
+const js_host_provider_set = set: {
+    var providers = provider_set.gateway_only(.{
+        .presentation = provider_catalog.find(.gateway),
+        .auth_strategy = .vercel,
+        .fallback_model_capabilities_fn = vercel_model_policy.capabilitiesForModel,
+        .agent_stream = js_host_stream_provider.provider(),
+        .cli_model_catalog = .{ .fetch_fn = fetchCliModelCatalog },
+        .model_catalog = js_host_model_catalog.provider,
+        .credits = .{ .fetch_fn = fetchCredits },
+    });
+    providers.codex = .{
+        .presentation = provider_catalog.find(.codex),
+        .auth_strategy = .chatgpt,
+        .agent_stream = host_openai_codex.provider(@constCast(&codex_context)),
+        .model_catalog = host_openai_codex.modelCatalogProvider(@constCast(&codex_context)),
+    };
+    break :set providers;
+};
+
+/// libfx engines run Gateway or Codex. Null keeps the startup provider.
+fn providerOverrideFromEnv(value: ?[]const u8) error{InvalidProvider}!?model_provider.ProviderId {
+    const raw = value orelse return null;
+    if (std.mem.eql(u8, raw, "gateway")) return .gateway;
+    if (std.mem.eql(u8, raw, "codex")) return .codex;
+    return error.InvalidProvider;
+}
 
 fn resolveChatUrl(_: ?*anyopaque, fallback: []const u8) []const u8 {
     return fallback;
