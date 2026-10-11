@@ -307,7 +307,74 @@ const assertNoSecrets = (value, secrets) => {
   }
 }
 
-// 8. Options are checked before anything starts.
+// 8. Two servers that share a lock refresh an account once: the second waits,
+// then uses the credentials the first saved.
+{
+  const world = grokWorld({ refreshedToken: "at-renewed" });
+  let stored = credentialsFor("at-expiring", { expiresAt: Date.now() + 60_000 });
+  // The refresh finishes only once both servers have asked for credentials, so
+  // without the lock each would spend the refresh token.
+  const asked = new Set();
+  let bothAsked;
+  const ready = new Promise((resolve) => { bothAsked = resolve; });
+  const fetch = async (input, init = {}) => {
+    if (String(input?.url ?? input) === tokenUrl) await ready;
+    return world.fetch(input, init);
+  };
+  let held = Promise.resolve();
+  const refreshLock = (_info, refresh) => {
+    const run = held.then(refresh);
+    held = run.catch(() => {});
+    return run;
+  };
+  const server = (name) => createFxAgent({
+    ...backendOptions,
+    durability: memory(),
+    provider: "grok",
+    model: "grok-4.5",
+    fetch,
+    credentials: () => {
+      asked.add(name);
+      if (asked.size === 2) bothAsked();
+      return stored;
+    },
+    onCredentials: (credentials) => { stored = credentials; },
+    refreshLock,
+  });
+  const servers = [server("a"), server("b")];
+  try {
+    const turns = servers.map((agent) => agent.session().prompt("say ok"));
+    for (const turn of turns) {
+      for await (const event of turn) void event;
+      assert.equal((await turn.result).stopReason, "end_turn");
+    }
+    assert.equal(world.log.filter((entry) => entry.url === tokenUrl).length, 1, "servers that share a lock refresh an account once");
+    assert.equal(replyRequests(world.log).filter((entry) => entry.headers.get("authorization") === "Bearer at-renewed").length, 2);
+  } finally {
+    await Promise.all(servers.map((agent) => agent.close()));
+  }
+}
+
+// A lock that never runs the refresh fails the request instead of sending the
+// expiring credentials.
+{
+  const world = grokWorld({ refreshedToken: "at-unused" });
+  const outcome = await runTurn({
+    fetch: world.fetch,
+    credentials: () => credentialsFor("at-expiring", { expiresAt: Date.now() + 60_000 }),
+    refreshLock: async () => {},
+  }).catch((error) => ({ error }));
+  assert.ok(outcome.error || outcome.result.stopReason !== "end_turn", "the turn does not finish without a refresh");
+  assert.equal(world.log.filter((entry) => entry.url === tokenUrl).length, 0);
+  assert.equal(replyRequests(world.log).length, 0, "nothing is sent on credentials the lock never refreshed");
+}
+
+// 9. Options are checked before anything starts.
 await assert.rejects(createFxEngine({ ...backendOptions, provider: "grok", model: "grok-4.5" }), /provider "grok" needs a credentials\(\) function/);
+await assert.rejects(
+  createFxEngine({ ...backendOptions, provider: "grok", model: "grok-4.5", credentials: () => credentialsFor("at-first"), refreshLock: "lock" }),
+  /refreshLock must be a function/,
+);
+await assert.rejects(createFxEngine({ ...backendOptions, apiKey: "key", refreshLock: async (_info, refresh) => refresh() }), /refreshLock needs provider "codex" or "grok"/);
 
 console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Grok agent passed`);

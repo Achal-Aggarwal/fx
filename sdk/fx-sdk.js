@@ -158,11 +158,11 @@ export function normalizeAgentOptions(value) {
   if (subscription && typeof options.credentials !== "function") {
     throw new TypeError(`provider "${options.provider}" needs a credentials() function`);
   }
-  for (const name of ["credentials", "onCredentials"]) {
+  for (const name of ["credentials", "onCredentials", "refreshLock"]) {
     if (!subscription && options[name] !== undefined) throw new TypeError(`${name} needs provider "codex" or "grok"`);
   }
-  if (options.onCredentials !== undefined && typeof options.onCredentials !== "function") {
-    throw new TypeError("onCredentials must be a function");
+  for (const name of ["onCredentials", "refreshLock"]) {
+    if (options[name] !== undefined && typeof options[name] !== "function") throw new TypeError(`${name} must be a function`);
   }
   Object.assign(options, normalizeModelChoice(options));
   validateGatewayChatUrl(options.gatewayChatUrl);
@@ -2417,7 +2417,7 @@ export async function createFxEngine(options = {}) {
   };
   const hostFetch = options.fetch ?? globalThis.fetch?.bind(globalThis);
   const subscriptionAuth = subscriptionProviders.has(options.provider)
-    ? createSubscriptionAuthorizer([codexSubscription, grokSubscription], { credentials: options.credentials, onCredentials: options.onCredentials, fetch: hostFetch, memory: options[credentialMemory] })
+    ? createSubscriptionAuthorizer([codexSubscription, grokSubscription], { credentials: options.credentials, onCredentials: options.onCredentials, refreshLock: options.refreshLock, fetch: hostFetch, memory: options[credentialMemory] })
     : null;
   const transportFetch = async (input, init = {}) => {
     const method = String(init.method ?? input?.method ?? "GET").toUpperCase();
