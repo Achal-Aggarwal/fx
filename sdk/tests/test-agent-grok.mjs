@@ -227,7 +227,87 @@ const assertNoSecrets = (value, secrets) => {
   }
 }
 
-// 6. Options are checked before anything starts.
+// 6. One agent's sessions refresh an account once, and each session hears the
+// refreshed credentials, for a host that keeps them per session.
+{
+  const world = grokWorld({ refreshedToken: "at-shared" });
+  const saved = [];
+  const agent = createFxAgent({
+    ...backendOptions,
+    durability: memory(),
+    provider: "grok",
+    model: "grok-4.5",
+    fetch: world.fetch,
+    credentials: () => credentialsFor("at-expiring", { expiresAt: Date.now() + 60_000 }),
+    onCredentials: (credentials, { sessionId }) => { saved.push({ accessToken: credentials.accessToken, sessionId }); },
+  });
+  try {
+    const turns = [agent.session().prompt("say ok"), agent.session().prompt("say ok")];
+    const sessionIds = await Promise.all(turns.map(async (turn) => (await turn.accepted).sessionId));
+    for (const turn of turns) {
+      for await (const event of turn) void event;
+      assert.equal((await turn.result).stopReason, "end_turn");
+    }
+    assert.equal(world.log.filter((entry) => entry.url === tokenUrl).length, 1, "the sessions share one refresh");
+    for (const sessionId of sessionIds) {
+      assert.ok(saved.some((entry) => entry.sessionId === sessionId && entry.accessToken === "at-shared"), "each session hears the refreshed credentials");
+    }
+  } finally {
+    await agent.close();
+  }
+}
+
+// 7. A rejection that arrives after another session refreshed retries on the
+// new token instead of spending the old refresh token again.
+{
+  const world = grokWorld({ refreshedToken: "at-new" });
+  let rejected = 0;
+  let secondSent;
+  const bothSent = new Promise((resolve) => { secondSent = resolve; });
+  let releaseLate;
+  const late = new Promise((resolve) => { releaseLate = resolve; });
+  const fetch = async (input, init = {}) => {
+    const url = String(input?.url ?? input);
+    // The refresh finishes only once both sessions have sent the old token.
+    if (url === tokenUrl) await bothSent;
+    if (url === responsesUrl) {
+      const authorization = new Headers(init.headers).get("authorization");
+      if (authorization === "Bearer at-old") {
+        rejected += 1;
+        if (rejected === 2) {
+          secondSent();
+          // Rejected only after the first session's refresh has finished.
+          await late;
+        }
+        return Response.json({ error: "token expired" }, { status: 401 });
+      }
+      if (authorization === "Bearer at-new") releaseLate();
+    }
+    return world.fetch(input, init);
+  };
+  const agent = createFxAgent({
+    ...backendOptions,
+    durability: memory(),
+    provider: "grok",
+    model: "grok-4.5",
+    fetch,
+    credentials: () => credentialsFor("at-old"),
+  });
+  try {
+    const turns = [agent.session().prompt("say ok"), agent.session().prompt("say ok")];
+    for (const turn of turns) {
+      for await (const event of turn) void event;
+      assert.equal((await turn.result).stopReason, "end_turn");
+    }
+    assert.equal(rejected, 2);
+    assert.equal(world.log.filter((entry) => entry.url === tokenUrl).length, 1, "a late rejection does not refresh again");
+    assert.equal(replyRequests(world.log).filter((entry) => entry.headers.get("authorization") === "Bearer at-new").length, 2);
+  } finally {
+    await agent.close();
+  }
+}
+
+// 8. Options are checked before anything starts.
 await assert.rejects(createFxEngine({ ...backendOptions, provider: "grok", model: "grok-4.5" }), /provider "grok" needs a credentials\(\) function/);
 
 console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} Grok agent passed`);

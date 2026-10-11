@@ -70,25 +70,34 @@ export function needsRefresh(credentials, nowMs) {
     credentials.expiresAt - refreshSkewMs <= nowMs;
 }
 
+/** The engine option that carries an agent's `createCredentialMemory()`. */
+export const credentialMemory = Symbol.for("libfx.credentialMemory");
+
+/**
+ * Refresh state for `createSubscriptionAuthorizer()`. An agent gives the same
+ * memory to every session's engine, so its sessions refresh an account once.
+ */
+export function createCredentialMemory() {
+  return { descendants: new Map(), refreshing: new Map(), saved: new WeakMap() };
+}
+
 /**
  * The fetch edge for subscription requests. `credentials({ provider, sessionId })`
  * supplies credentials; `onCredentials(next, { provider, sessionId })` receives
- * refreshed ones, with the session whose request needed them, so the host can
- * save them.
+ * refreshed ones once for each session that uses them, so the host can save them.
  *
  * Each spec: `{ provider, matches(endpoint), sessionId(headers), normalize(value),
  * refresh(credentials, { fetch, signal }), authorize(headers, endpoint, credentials) }`.
  */
-export function createSubscriptionAuthorizer(specs, { credentials, onCredentials, fetch, now = Date.now }) {
+export function createSubscriptionAuthorizer(specs, { credentials, onCredentials, fetch, now = Date.now, memory = createCredentialMemory() }) {
   if (typeof credentials !== "function") throw new TypeError("a subscription provider needs a credentials() function");
   if (onCredentials !== undefined && typeof onCredentials !== "function") {
     throw new TypeError("onCredentials must be a function");
   }
   // Each access token the host supplied maps to the newest credentials refreshed
-  // from it, so sessions on one account share a refresh and a host that has not
-  // saved a rotation yet never spends the old refresh token twice.
-  const descendants = new Map();
-  const refreshing = new Map();
+  // from it, so a host that has not saved a rotation yet never spends the old
+  // refresh token twice. Engines that share `memory` share this.
+  const { descendants, refreshing, saved } = memory;
   const keyOf = (spec, token) => `${spec.provider}\u0000${token}`;
 
   const remember = (spec, supplied, next) => {
@@ -98,24 +107,39 @@ export function createSubscriptionAuthorizer(specs, { credentials, onCredentials
     if (descendants.size > maxRememberedCredentials) descendants.delete(descendants.keys().next().value);
   };
 
-  const refresh = (spec, supplied, current, sessionId, signal) => {
+  // A host that keeps credentials per session must also save a rotation that
+  // another session's request made.
+  const save = async (spec, next, sessionId) => {
+    if (!onCredentials) return;
+    let sessions = saved.get(next);
+    if (!sessions) saved.set(next, (sessions = new Set()));
+    if (sessions.has(sessionId)) return;
+    sessions.add(sessionId);
+    await onCredentials(next, { provider: spec.provider, sessionId });
+  };
+
+  const refresh = async (spec, supplied, current, sessionId, signal) => {
     const key = keyOf(spec, current.refreshToken);
-    const pending = refreshing.get(key);
-    if (pending) return pending;
-    const task = (async () => {
-      const next = await spec.refresh(current, { fetch, signal });
-      remember(spec, supplied, next);
-      await onCredentials?.(next, { provider: spec.provider, sessionId });
-      return next;
-    })().finally(() => refreshing.delete(key));
-    refreshing.set(key, task);
-    return task;
+    let task = refreshing.get(key);
+    if (!task) {
+      task = (async () => {
+        const next = await spec.refresh(current, { fetch, signal });
+        remember(spec, supplied, next);
+        await save(spec, next, sessionId);
+        return next;
+      })().finally(() => refreshing.delete(key));
+      refreshing.set(key, task);
+    }
+    const next = await task;
+    if (sessionId !== undefined) await save(spec, next, sessionId);
+    return next;
   };
 
   const current = async (spec, sessionId, signal) => {
     const supplied = spec.normalize(await credentials({ provider: spec.provider, sessionId }));
     const best = descendants.get(keyOf(spec, supplied.accessToken)) ?? supplied;
     const used = needsRefresh(best, now()) ? await refresh(spec, supplied, best, sessionId, signal) : best;
+    if (used !== supplied && sessionId !== undefined) await save(spec, used, sessionId);
     return { supplied, used };
   };
 
@@ -131,11 +155,16 @@ export function createSubscriptionAuthorizer(specs, { credentials, onCredentials
     /** Sends one request with credentials, refreshing once after a 401. */
     async fetch(spec, endpoint, hostFetch, input, init = {}) {
       const sessionId = spec.sessionId(new Headers(init.headers)) || undefined;
-      const { supplied, used } = await current(spec, sessionId, init.signal);
+      const { used } = await current(spec, sessionId, init.signal);
       const response = await hostFetch(input, withCredentials(spec, endpoint, init, used));
       if (response.status !== 401 || used.refreshToken === undefined) return response;
       await response.body?.cancel().catch(() => {});
-      const next = await refresh(spec, supplied, used, sessionId, init.signal);
+      // Another request may have replaced these credentials while this one was
+      // out. Only a rejection of the newest ones spends a refresh token.
+      const latest = await current(spec, sessionId, init.signal);
+      const next = latest.used.accessToken !== used.accessToken
+        ? latest.used
+        : await refresh(spec, latest.supplied, used, sessionId, init.signal);
       return hostFetch(input, withCredentials(spec, endpoint, init, next));
     },
   };

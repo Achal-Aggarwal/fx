@@ -1,7 +1,7 @@
 import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
 import { codexSubscription } from "./chatgpt.js";
 import { grokSubscription } from "./grok.js";
-import { createSubscriptionAuthorizer } from "./subscription.js";
+import { createSubscriptionAuthorizer, credentialMemory } from "./subscription.js";
 import { loadModule } from "./wasm-module.js";
 
 // Providers that run on a user's plan, authorized by the host's credentials.
@@ -2417,7 +2417,7 @@ export async function createFxEngine(options = {}) {
   };
   const hostFetch = options.fetch ?? globalThis.fetch?.bind(globalThis);
   const subscriptionAuth = subscriptionProviders.has(options.provider)
-    ? createSubscriptionAuthorizer([codexSubscription, grokSubscription], { credentials: options.credentials, onCredentials: options.onCredentials, fetch: hostFetch })
+    ? createSubscriptionAuthorizer([codexSubscription, grokSubscription], { credentials: options.credentials, onCredentials: options.onCredentials, fetch: hostFetch, memory: options[credentialMemory] })
     : null;
   const transportFetch = async (input, init = {}) => {
     const method = String(init.method ?? input?.method ?? "GET").toUpperCase();
