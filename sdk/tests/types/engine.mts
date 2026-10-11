@@ -246,7 +246,20 @@ export async function codexEngine(): Promise<FxEngine> {
   await createFxEngine({ apiKey, model, onCredentials: () => {} });
   // @ts-expect-error a Gateway engine needs apiKey
   await createFxEngine({ provider: "gateway", model });
-  // @ts-expect-error libfx runs Gateway or Codex
-  await createFxEngine({ provider: "grok", apiKey, model });
+  // @ts-expect-error libfx runs Gateway, Codex or Grok
+  await createFxEngine({ provider: "custom", apiKey, model });
+  return engine;
+}
+
+// A Grok engine on the host's Grok credentials; one store serves both plans.
+declare const planTokens: { load(provider: "codex" | "grok", sessionId?: string): Promise<FxProviderCredentials> };
+export async function grokEngine(): Promise<FxEngine> {
+  const engine = await createFxEngine({
+    provider: "grok",
+    model: "grok-4.5",
+    credentials: ({ provider, sessionId }) => planTokens.load(provider, sessionId),
+  });
+  // @ts-expect-error a Grok request names provider "grok"
+  await createFxEngine({ provider: "grok", model, credentials: ({ provider }) => tokenStore.load(provider) });
   return engine;
 }

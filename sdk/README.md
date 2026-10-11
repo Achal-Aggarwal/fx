@@ -40,7 +40,7 @@ The full documentation is at [fx.sh/docs/lib](https://fx.sh/docs/lib).
 - [Steers](https://fx.sh/docs/lib/steering) a turn while it runs
 - Takes [images](https://fx.sh/docs/lib/images) in prompts and tool results
 - Gives each conversation its own model, instructions and context
-- Runs on AI Gateway, or on a user's [ChatGPT plan](#chatgpt-plans) through Codex
+- Runs on AI Gateway, or on a user's own [ChatGPT](#chatgpt-plans) or [Grok](#grok-plans) plan
 - Uses a native addon on macOS and Linux, and WebAssembly everywhere else, including browsers
 - Puts the [fx terminal](https://fx.sh/docs/lib/webassembly#embed-the-terminal) in a web page
 - Ships TypeScript types for every entry point, with no runtime dependencies
@@ -240,6 +240,35 @@ After the user signs in, OpenAI opens a page at `localhost:1455` that doesn't lo
 
 The sign-in uses the same OpenAI client as the Codex CLI, and the user's ChatGPT plan and OpenAI's terms apply to the turns.
 
+### Grok plans
+
+An agent can also run on a user's Grok plan. Set `provider: "grok"` and pass the same `credentials` callback, which libfx calls with `provider: "grok"`:
+
+```js
+const agent = createFxAgent({
+  provider: "grok",
+  model: "grok-4.5",
+  credentials: ({ provider, sessionId }) => tokens.load(provider, sessionId),
+  onCredentials: (credentials, { provider, sessionId }) => tokens.save(provider, sessionId, credentials),
+});
+```
+
+libfx handles Grok credentials the same way as Codex's: it adds them to Grok requests itself, refreshes them, and checks that a refreshed token still belongs to the same xAI account. Grok doesn't accept requests from web pages either, so these turns run on your server.
+
+To sign a user in, use `libfx/grok`. Device code is the simplest:
+
+```js
+import { startDeviceSignIn, completeDeviceSignIn } from "libfx/grok";
+
+// Show device.userCode and a link to device.verificationUrl.
+const device = await startDeviceSignIn();
+
+// Wait until the user enters the code. pollDeviceSignIn() checks once, for a later request.
+const credentials = await completeDeviceSignIn(device);
+```
+
+`startSignIn()` and `finishSignIn()` work like ChatGPT's: after the user signs in, xAI opens a page at `127.0.0.1` that doesn't load, and the user pastes its address back. The sign-in uses the same xAI client as the fx CLI, and the user's Grok plan and xAI's terms apply to the turns.
+
 ## One conversation, no sessions
 
 `createFxEngine()` is the engine under the agent: one conversation in the memory of the process that runs it, with no queue and no session store. Use it for a single request, or to keep the conversation in storage of your own.
@@ -320,6 +349,7 @@ This is the fx CLI's interface compiled to WebAssembly. Your page supplies stora
 | `libfx/wasm` | The WebAssembly SDK without packaged asset paths, so you pass `wasm` yourself |
 | `libfx/durable-local`, `libfx/durable-vercel`, `libfx/durable-world` | `local()`, `vercel()` and `world()` |
 | `libfx/chatgpt` | `startSignIn`, `finishSignIn`, `startDeviceSignIn`, `pollDeviceSignIn`, `completeDeviceSignIn`, `refreshCredentials` |
+| `libfx/grok` | `startSignIn`, `finishSignIn`, `startDeviceSignIn`, `pollDeviceSignIn`, `completeDeviceSignIn`, `refreshCredentials` |
 | `libfx/mcp` | `createMcpAdapter` |
 | `libfx/skills`, `libfx/skills/node` | `createSkillsAdapter`, and `loadSkillFile` for Node.js and Bun |
 

@@ -3,6 +3,7 @@ const build_options = @import("build_options");
 const acp_server = @import("acp/server.zig");
 const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
 const host_openai_codex = @import("gateway/host_openai_codex.zig");
+const host_xai_grok = @import("gateway/host_xai_grok.zig");
 const model_provider = @import("core/config/model_provider.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
@@ -55,8 +56,8 @@ pub fn main(init: std.process.Init) !void {
         .mode_registry = builtin_modes.registry,
         .credential_override = io_mod.getenv("AI_GATEWAY_API_KEY"),
         .provider_override = try providerOverrideFromEnv(io_mod.getenv("FX_PROVIDER")),
-        // The JS host adds ChatGPT credentials at its fetch edge.
-        .codex_auth_mode = .host_managed,
+        // The JS host adds subscription credentials at its fetch edge.
+        .subscription_auth_mode = .host_managed,
         .model_override = io_mod.getenv("FX_MODEL"),
         .effort_override = io_mod.getenv("FX_EFFORT"),
         .fast_override = fastOverrideFromEnv(io_mod.getenv("FX_FAST")),
@@ -75,6 +76,8 @@ const js_host_gateway_provider = gateway_provider.Provider{
 };
 
 const codex_context = host_openai_codex.Context{ .transport = js_host_stream_provider.transport };
+// Mutable: it remembers the Grok client version between requests.
+var grok_context = host_xai_grok.Context{ .transport = js_host_stream_provider.transport };
 
 const js_host_provider_set = set: {
     var providers = provider_set.gateway_only(.{
@@ -92,14 +95,21 @@ const js_host_provider_set = set: {
         .agent_stream = host_openai_codex.provider(@constCast(&codex_context)),
         .model_catalog = host_openai_codex.modelCatalogProvider(@constCast(&codex_context)),
     };
+    providers.grok = .{
+        .presentation = provider_catalog.find(.grok),
+        .auth_strategy = .grok,
+        .agent_stream = host_xai_grok.provider(&grok_context),
+        .model_catalog = host_xai_grok.modelCatalogProvider(&grok_context),
+    };
     break :set providers;
 };
 
-/// libfx engines run Gateway or Codex. Null keeps the startup provider.
+/// libfx engines run Gateway, Codex or Grok. Null keeps the startup provider.
 fn providerOverrideFromEnv(value: ?[]const u8) error{InvalidProvider}!?model_provider.ProviderId {
     const raw = value orelse return null;
     if (std.mem.eql(u8, raw, "gateway")) return .gateway;
     if (std.mem.eql(u8, raw, "codex")) return .codex;
+    if (std.mem.eql(u8, raw, "grok")) return .grok;
     return error.InvalidProvider;
 }
 

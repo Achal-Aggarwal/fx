@@ -11,6 +11,8 @@ import {
   type ChatgptSignIn,
   type ChatgptSignInErrorCode,
 } from "libfx/chatgpt";
+import * as grok from "libfx/grok";
+import type { GrokDeviceSignIn, GrokSignIn, GrokSignInErrorCode } from "libfx/grok";
 import { createMcpAdapter, type McpAdapter, type McpClient } from "libfx/mcp";
 import { createSkillsAdapter, type SkillRecord } from "libfx/skills";
 import { createSkillsAdapter as createSkillsAdapterFromNode, loadSkillFile, type LoadedSkill } from "libfx/skills/node";
@@ -94,4 +96,21 @@ export async function chatgptSignIn(pastedAddress: string): Promise<FxProviderCr
   const code: ChatgptSignInErrorCode = "LIBFX_CHATGPT_SIGN_IN_EXPIRED";
   void polled; void waited; void code;
   return refreshCredentials(credentials);
+}
+
+// Sign in with a Grok plan: device code first, the pasted address as a fallback.
+declare const grokStore: { put(value: GrokSignIn | GrokDeviceSignIn): void };
+export async function grokSignIn(pastedAddress: string): Promise<FxProviderCredentials> {
+  const device: GrokDeviceSignIn = await grok.startDeviceSignIn();
+  grokStore.put(device);
+  const polled: FxProviderCredentials | null = await grok.pollDeviceSignIn(device);
+  const viaDevice: FxProviderCredentials = await grok.completeDeviceSignIn(device, { signal: AbortSignal.timeout(1_800_000) });
+  const signIn: GrokSignIn = await grok.startSignIn();
+  const redirect: string = signIn.redirectUri;
+  const viaAddress = await grok.finishSignIn(signIn, pastedAddress);
+  // @ts-expect-error finishSignIn() needs the sign-in startSignIn() returned
+  await grok.finishSignIn({ url: signIn.url, state: signIn.state, verifier: signIn.verifier }, pastedAddress);
+  const code: GrokSignInErrorCode = "LIBFX_GROK_ACCOUNT_CHANGED";
+  void polled; void viaDevice; void redirect; void code;
+  return grok.refreshCredentials(viaAddress);
 }

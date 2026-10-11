@@ -1,0 +1,142 @@
+// Subscription credentials for libfx agents: Codex on a ChatGPT plan, Grok on
+// a Grok plan. The engine sends these providers' requests without credentials;
+// this module adds them at the fetch edge, from the host's `credentials`
+// callback, refreshing near expiry and once after a rejection. Credentials
+// never enter the engine or a session's saved records.
+//
+// A provider spec supplies what differs: which requests it authorizes, how its
+// credentials are checked and refreshed, and which headers carry them.
+
+const refreshSkewMs = 5 * 60 * 1000;
+const maxRememberedCredentials = 256;
+const maxTokenBytes = 64 * 1024;
+const encoder = new TextEncoder();
+
+/** A non-empty, bounded credential field, or undefined when optional and absent. */
+export function tokenString(value, name, required, label) {
+  if (value === undefined && !required) return undefined;
+  if (typeof value !== "string" || value.length === 0) {
+    throw new TypeError(`${label} credentials ${name} must be a non-empty string`);
+  }
+  if (encoder.encode(value).length > maxTokenBytes) {
+    throw new RangeError(`${label} credentials ${name} exceeds ${maxTokenBytes} bytes`);
+  }
+  return value;
+}
+
+/** The claims of a JWT, or null when it is not one. Does not verify it. */
+export function jwtClaims(token) {
+  const part = typeof token === "string" ? token.split(".")[1] : undefined;
+  if (!part) return null;
+  try {
+    const base64 = part.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(part.length / 4) * 4, "=");
+    const binary = atob(base64);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    const claims = JSON.parse(new TextDecoder().decode(bytes));
+    return claims && typeof claims === "object" ? claims : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Validates credentials from the host. `accountId` and `expiresAt` default to
+ * the access token's claims, `accountClaim(claims)` picking the account.
+ * Returns a new object.
+ */
+export function normalizeCredentials(value, { label, accountClaim }) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("credentials() must return { accessToken, refreshToken?, accountId?, expiresAt? }");
+  }
+  const accessToken = tokenString(value.accessToken, "accessToken", true, label);
+  const refreshToken = tokenString(value.refreshToken, "refreshToken", false, label);
+  const claims = jwtClaims(accessToken);
+  const accountId = value.accountId === undefined ? accountClaim(claims) : tokenString(value.accountId, "accountId", true, label);
+  if (typeof accountId !== "string" || accountId.length === 0) {
+    throw new TypeError(`${label} credentials need an accountId; it was not in the access token`);
+  }
+  let expiresAt = value.expiresAt;
+  if (expiresAt === undefined && Number.isFinite(claims?.exp)) expiresAt = claims.exp * 1000;
+  if (expiresAt !== undefined && !Number.isFinite(expiresAt)) {
+    throw new TypeError(`${label} credentials expiresAt must be milliseconds since the epoch`);
+  }
+  return { accessToken, ...(refreshToken === undefined ? {} : { refreshToken }), accountId, ...(expiresAt === undefined ? {} : { expiresAt }) };
+}
+
+/** True when the credentials can and should be refreshed before use. */
+export function needsRefresh(credentials, nowMs) {
+  return credentials.refreshToken !== undefined &&
+    credentials.expiresAt !== undefined &&
+    credentials.expiresAt - refreshSkewMs <= nowMs;
+}
+
+/**
+ * The fetch edge for subscription requests. `credentials({ provider, sessionId })`
+ * supplies credentials; `onCredentials(next, { provider, sessionId })` receives
+ * refreshed ones, with the session whose request needed them, so the host can
+ * save them.
+ *
+ * Each spec: `{ provider, matches(endpoint), sessionId(headers), normalize(value),
+ * refresh(credentials, { fetch, signal }), authorize(headers, endpoint, credentials) }`.
+ */
+export function createSubscriptionAuthorizer(specs, { credentials, onCredentials, fetch, now = Date.now }) {
+  if (typeof credentials !== "function") throw new TypeError("a subscription provider needs a credentials() function");
+  if (onCredentials !== undefined && typeof onCredentials !== "function") {
+    throw new TypeError("onCredentials must be a function");
+  }
+  // Each access token the host supplied maps to the newest credentials refreshed
+  // from it, so sessions on one account share a refresh and a host that has not
+  // saved a rotation yet never spends the old refresh token twice.
+  const descendants = new Map();
+  const refreshing = new Map();
+  const keyOf = (spec, token) => `${spec.provider}\u0000${token}`;
+
+  const remember = (spec, supplied, next) => {
+    const key = keyOf(spec, supplied.accessToken);
+    descendants.delete(key);
+    descendants.set(key, next);
+    if (descendants.size > maxRememberedCredentials) descendants.delete(descendants.keys().next().value);
+  };
+
+  const refresh = (spec, supplied, current, sessionId, signal) => {
+    const key = keyOf(spec, current.refreshToken);
+    const pending = refreshing.get(key);
+    if (pending) return pending;
+    const task = (async () => {
+      const next = await spec.refresh(current, { fetch, signal });
+      remember(spec, supplied, next);
+      await onCredentials?.(next, { provider: spec.provider, sessionId });
+      return next;
+    })().finally(() => refreshing.delete(key));
+    refreshing.set(key, task);
+    return task;
+  };
+
+  const current = async (spec, sessionId, signal) => {
+    const supplied = spec.normalize(await credentials({ provider: spec.provider, sessionId }));
+    const best = descendants.get(keyOf(spec, supplied.accessToken)) ?? supplied;
+    const used = needsRefresh(best, now()) ? await refresh(spec, supplied, best, sessionId, signal) : best;
+    return { supplied, used };
+  };
+
+  const withCredentials = (spec, endpoint, init, used) => {
+    const headers = new Headers(init.headers);
+    spec.authorize(headers, endpoint, used);
+    return { ...init, headers };
+  };
+
+  return {
+    /** The spec that authorizes requests to `endpoint` (origin and path), if any. */
+    specFor: (endpoint) => specs.find((spec) => spec.matches(endpoint)),
+    /** Sends one request with credentials, refreshing once after a 401. */
+    async fetch(spec, endpoint, hostFetch, input, init = {}) {
+      const sessionId = spec.sessionId(new Headers(init.headers)) || undefined;
+      const { supplied, used } = await current(spec, sessionId, init.signal);
+      const response = await hostFetch(input, withCredentials(spec, endpoint, init, used));
+      if (response.status !== 401 || used.refreshToken === undefined) return response;
+      await response.body?.cancel().catch(() => {});
+      const next = await refresh(spec, supplied, used, sessionId, init.signal);
+      return hostFetch(input, withCredentials(spec, endpoint, init, next));
+    },
+  };
+}

@@ -498,7 +498,8 @@ pub fn selectCredentialForProvider(
 /// True when requests on the provider's route carry no credential from this
 /// server because the host authorizes them at its fetch edge.
 fn hostManagesRoute(cfg: Config, provider: model_provider.ProviderId) bool {
-    return provider == .codex and cfg.codex_auth_mode == .host_managed;
+    const subscription = provider == .codex or provider == .grok;
+    return subscription and cfg.subscription_auth_mode == .host_managed;
 }
 
 /// A tokenless credential that marks a route as authorized by the host.
@@ -564,12 +565,12 @@ test "ACP credential preparation preserves the existing borrowed credential" {
     try std.testing.expectEqual(types.CredentialSource.configured, state.credential_source.?);
 }
 
-test "ACP Codex route is host-managed only when configured and never leaks into Gateway" {
+test "ACP subscription routes are host-managed only when configured and never leak into Gateway" {
     const alloc = std.testing.allocator;
     var state: ServerState = undefined;
     state.alloc = alloc;
     state.cfg.auth_mode = .local;
-    state.cfg.codex_auth_mode = .host_managed;
+    state.cfg.subscription_auth_mode = .host_managed;
     state.cfg.credential_override = "gateway-key";
     state.active_session = null;
     state.api_key = &.{};
@@ -591,9 +592,16 @@ test "ACP Codex route is host-managed only when configured and never leaks into 
     try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, gateway.source);
     try std.testing.expectEqualStrings("gateway-key", gateway.token);
 
-    // Without the policy Codex needs its own credential.
-    state.cfg.codex_auth_mode = .local;
+    // A Grok turn is host-managed the same way.
+    var grok = (try prepareCredentialForProvider(&state, .grok)).?;
+    defer grok.deinit(alloc);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, grok.source);
+    try std.testing.expectEqual(@as(usize, 0), grok.token.len);
+
+    // Without the policy each subscription needs its own credential.
+    state.cfg.subscription_auth_mode = .local;
     try std.testing.expect(!hostManagesRoute(state.cfg, .codex));
+    try std.testing.expect(!hostManagesRoute(state.cfg, .grok));
     try std.testing.expect(!hostManagesRoute(state.cfg, .gateway));
 }
 
