@@ -265,6 +265,22 @@ fn loadControlled(
     return if (matched) |entry| try entry.credentials.clone(alloc) else null;
 }
 
+/// Every login this store kept, for MCP-v2 to take over once: from the
+/// Keychain when `keychain`, else from the file. The caller holds the
+/// credential directory's lock, which both stores share, and `dir` is that
+/// directory; nothing here takes the lock again.
+pub fn eachLocked(
+    alloc: Allocator,
+    dir: *io_mod.VerifiedDir,
+    keychain: bool,
+    context: anytype,
+    comptime each: fn (@TypeOf(context), server: []const u8, credentials: *const mcp_auth.Credentials) Allocator.Error!void,
+) !void {
+    var store = try loadStoreControlled(alloc, dir, if (keychain) .macos_keychain else .profile_file, native_keychain_backend, null);
+    defer store.deinit(alloc);
+    for (store.credentials.items) |*entry| try each(context, entry.server_identity, &entry.credentials);
+}
+
 pub fn status(
     alloc: Allocator,
     server_identity: []const u8,

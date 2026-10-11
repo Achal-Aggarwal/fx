@@ -49,6 +49,8 @@ pub fn signalAllForExit(io: std.Io) void {
 pub const Options = struct {
     argv: []const []const u8,
     environ_map: ?*const std.process.Environ.Map = null,
+    /// The directory the server starts in, borrowed; the host's own when null.
+    cwd: ?[]const u8 = null,
     config: core.Config = .{},
     /// The longest stdout line; a longer one is a connection error.
     max_line: usize = 16 * 1024 * 1024,
@@ -310,6 +312,7 @@ pub const Process = struct {
         const child = try std.process.spawn(p.io, .{
             .argv = p.options.argv,
             .environ_map = p.options.environ_map,
+            .cwd = if (p.options.cwd) |dir| .{ .path = dir } else .inherit,
             .stdin = .pipe,
             .stdout = .pipe,
             .stderr = .pipe,
@@ -482,6 +485,20 @@ test "messages arrive, and a stop that closes stdin ends the server" {
     try p.stop();
     try expectState(&p, .stopped);
     try testing.expect(!p.conn.term_sent and !p.conn.kill_sent);
+}
+
+test "a server starts in the directory it's given" {
+    // The server names its directory as a notification's method.
+    const argv = shell("printf '{\"jsonrpc\":\"2.0\",\"method\":\"%s\"}\\n' \"$(pwd -P)\"; exec cat >/dev/null");
+    var p: Process = undefined;
+    initTest(&p, &argv);
+    defer p.deinit();
+    p.options.cwd = "/";
+    try p.start();
+    const first = try p.next(5_000);
+    try testing.expectEqualStrings("/", first.message.message.notification.method);
+    try p.stop();
+    try expectState(&p, .stopped);
 }
 
 test "a server that ignores closed stdin gets SIGTERM, then SIGKILL if it ignores that too" {
