@@ -11,8 +11,6 @@
  ⣿⣿⣿⠟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
 ```
 
-# fx
-
 fx is the smallest coding agent. It ships as one native binary written in Zig, so there is no runtime to install, and the same binary runs on your laptop, in CI, and inside an agent sandbox.
 
 It works with the model you choose. Its output is closer to a Unix shell than an IDE, because the conversation prints into your terminal's scrollback instead of filling the screen. The agent core behind the terminal also runs in editors over the Agent Client Protocol (ACP) and in JavaScript apps through [libfx](sdk/README.md).
