@@ -7,6 +7,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -216,6 +217,37 @@ describe("poisoned repository", () => {
       const status = toolResult(bodies[3]!, "status");
       expect(status).toContain("M alpha-tracked.txt");
       expect(status).toContain("?? notes/");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "auto mode holds a git command whose repository config fx cannot read",
+    async () => {
+      const fixture = poisonedRepository();
+      // fx reads repository config only through regular files, so an include
+      // that is a symlink leaves the config unread and safe git refuses.
+      writeFileSync(join(fixture.base, "real.inc"), `[core]\n\tfsmonitor = ${join(fixture.base, "sentinel.sh")}\n`);
+      symlinkSync(join(fixture.base, "real.inc"), join(fixture.workspace, ".git", "linked.inc"));
+      git(fixture, ["config", "include.path", "linked.inc"]);
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("status", "shell", {
+          request: { action: "run", command: "git status --short", profile: "clean", yield_time_ms: 30_000 },
+        }),
+        fakeGatewayFinalText("inspection complete"),
+      ], { classifierResponses: [] });
+      gateways.push(gateway);
+
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Inspect the repository."],
+        { cwd: fixture.workspace, env: fxEnv(fixture, gateway), timeoutMs: TIMEOUT },
+      );
+      expect(result.code, result.stderr).toBe(0);
+      expect(result.stderr).not.toMatch(/panic/i);
+      expect(sentinelRuns(fixture)).toEqual([]);
+      expect(gateway.classifierRequests).toHaveLength(0);
+      const bodies = gateway.requests.map((request: { body: string }) => request.body);
+      expect(toolResult(bodies[1]!, "status")).toContain("fx did not run this git command");
     },
     TIMEOUT,
   );

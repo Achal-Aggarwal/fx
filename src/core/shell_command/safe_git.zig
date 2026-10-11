@@ -13,10 +13,12 @@ const indexer = @import("../indexer/indexer.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// `core.fsmonitor` became a boolean in git 2.36. Older git reads the value
-/// as a hook program.
+/// The oldest git these settings were checked against with planted programs
+/// for every route: 2.25.1, 2.34.1 and 2.54.0. `core.fsmonitor` became a
+/// boolean in git 2.36; older git runs the value as a hook command, and the
+/// fixed PATH resolves `false` to the system `false`, which does nothing.
 const minimum_major: u32 = 2;
-const minimum_minor: u32 = 36;
+const minimum_minor: u32 = 25;
 
 const max_probe_output: usize = 4096;
 
@@ -236,13 +238,15 @@ fn runCaptured(arena: Allocator, argv: []const []const u8, cwd: []const u8) Allo
     };
 }
 
-test "git version check requires 2.36 and reads vendor suffixes" {
+test "git version check requires 2.25 and reads vendor suffixes" {
     const cases = [_]struct { output: []const u8, expected: VersionCheck }{
         .{ .output = "git version 2.50.1 (Apple Git-155)\n", .expected = .supported },
         .{ .output = "git version 2.36.0\n", .expected = .supported },
+        .{ .output = "git version 2.34.1\n", .expected = .supported },
+        .{ .output = "git version 2.25.0\n", .expected = .supported },
         .{ .output = "git version 2.39.3.windows.1\n", .expected = .supported },
         .{ .output = "git version 3.0.0\n", .expected = .supported },
-        .{ .output = "git version 2.35.8\n", .expected = .too_old },
+        .{ .output = "git version 2.24.4\n", .expected = .too_old },
         .{ .output = "git version 1.9.5\n", .expected = .too_old },
         .{ .output = "hub version 2.14\n", .expected = .unknown },
         .{ .output = "git version x.y\n", .expected = .unknown },
@@ -610,6 +614,16 @@ test "safe git follows git's repository choice and refuses what it cannot blank"
     try repo.plain(gitdir, &.{ "config", "core.bare", "false" });
     try repo.plain(gitdir, &.{ "config", "core.worktree", repo.repo });
     try std.testing.expectEqual(Refusal.repository_mismatch, (try prepare(repo.arena, gitdir)).refused);
+
+    // An inner repository whose `HEAD` is a symlink into `refs/`. git uses
+    // it; fx's discovery rejects it and reads the outer repository, so the two
+    // disagree and safe git refuses instead of running with the wrong config.
+    const linked = try repo.path("repo/linked");
+    try repo.plain(repo.repo, &.{ "init", "-q", "--template=", linked });
+    const linked_head = try repo.path("repo/linked/.git/HEAD");
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, linked_head);
+    try std.Io.Dir.cwd().symLink(std.testing.io, "refs/heads/main", linked_head, .{ .is_directory = false });
+    try std.testing.expectEqual(Refusal.repository_mismatch, (try prepare(repo.arena, linked)).refused);
 
     try repo.plain(repo.repo, &.{ "config", "filter.a=b.clean", repo.sentinel });
     try std.testing.expectEqual(Refusal.unsupported_filter_name, (try prepare(repo.arena, repo.repo)).refused);
