@@ -357,3 +357,10 @@ export async function GET(request: Request): Promise<Response> {
 }
 
 export const wake: (request: Request) => Promise<Response> = agent.wakeHandler();
+
+// A durable Codex agent: each process asks the host for the session's credentials.
+export const codexAgent: FxAgent = createFxAgent({
+  provider: "codex",
+  model: "gpt-6.1-sol",
+  chatgpt: async ({ sessionId }) => ({ accessToken: sessionId ?? "token", refreshToken: "refresh" }),
+});

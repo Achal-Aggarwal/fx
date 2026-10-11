@@ -40,6 +40,7 @@ The full documentation is at [fx.sh/docs/lib](https://fx.sh/docs/lib).
 - [Steers](https://fx.sh/docs/lib/steering) a turn while it runs
 - Takes [images](https://fx.sh/docs/lib/images) in prompts and tool results
 - Gives each conversation its own model, instructions and context
+- Runs on AI Gateway, or on a user's [ChatGPT plan](#chatgpt-plans) through Codex
 - Uses a native addon on macOS and Linux, and WebAssembly everywhere else, including browsers
 - Puts the [fx terminal](https://fx.sh/docs/lib/webassembly#embed-the-terminal) in a web page
 - Ships TypeScript types for every entry point, with no runtime dependencies
@@ -208,6 +209,37 @@ createFxAgent({ model: { id: "anthropic/claude-opus-5.5", effort: "low", fast: t
 
 `onEvent` receives diagnostics apart from the model's output: request timing, and session events such as `session.deadline` and `checkpoint.mismatch`. Credentials never appear in them.
 
+### ChatGPT plans
+
+An agent can run on a user's ChatGPT plan through Codex instead of AI Gateway. Set `provider: "codex"` and hand libfx the user's ChatGPT credentials:
+
+```js
+const agent = createFxAgent({
+  provider: "codex",
+  model: "gpt-6.1-sol",
+  chatgpt: ({ sessionId }) => tokens.load(sessionId),
+  onChatgptCredentials: (credentials, { sessionId }) => tokens.save(sessionId, credentials),
+});
+```
+
+libfx calls `chatgpt()` before Codex requests, in whichever process runs the turn, and adds the credentials to those requests itself, so they never reach the engine or a saved session. It refreshes them shortly before they expire and once after a rejected request, then passes the new ones to `onChatgptCredentials` for you to save. Codex doesn't accept requests from web pages, so these turns run on your server.
+
+To sign a user in, use `libfx/chatgpt`:
+
+```js
+import { startSignIn, finishSignIn } from "libfx/chatgpt";
+
+// One request: send the user to signIn.url and keep signIn on the server.
+const signIn = await startSignIn();
+
+// A later request: the user pastes the address OpenAI opened.
+const credentials = await finishSignIn(signIn, pastedAddress);
+```
+
+After the user signs in, OpenAI opens a page at `localhost:1455` that doesn't load. That's expected. Ask the user to copy the page's whole address and paste it back. If their account or ChatGPT workspace allows device code sign-in, `startDeviceSignIn()` and `pollDeviceSignIn()` show a short code to enter on OpenAI's site instead. Each step returns plain data, so it can finish in another request or function.
+
+The sign-in uses the same OpenAI client as the Codex CLI, and the user's ChatGPT plan and OpenAI's terms apply to the turns.
+
 ## One conversation, no sessions
 
 `createFxEngine()` is the engine under the agent: one conversation in the memory of the process that runs it, with no queue and no session store. Use it for a single request, or to keep the conversation in storage of your own.
@@ -287,12 +319,13 @@ This is the fx CLI's interface compiled to WebAssembly. Your page supplies stora
 | `libfx/browser` | The browser build, plus `createFxTerminal` and `xtermAdapter` |
 | `libfx/wasm` | The WebAssembly SDK without packaged asset paths, so you pass `wasm` yourself |
 | `libfx/durable-local`, `libfx/durable-vercel`, `libfx/durable-world` | `local()`, `vercel()` and `world()` |
+| `libfx/chatgpt` | `startSignIn`, `finishSignIn`, `startDeviceSignIn`, `pollDeviceSignIn`, `completeDeviceSignIn`, `refreshCredentials` |
 | `libfx/mcp` | `createMcpAdapter` |
 | `libfx/skills`, `libfx/skills/node` | `createSkillsAdapter`, and `loadSkillFile` for Node.js and Bun |
 
 ## Security
 
-Your tools, MCP clients and skill loaders have whatever access your code gives them. libfx validates and orders their calls but grants nothing itself, and the native backend doesn't turn on fx's built-in shell or file tools. Don't put long-lived keys in browser code, and treat the `nativeAddon` and `gatewayChatUrl` options as trusted configuration.
+Your tools, MCP clients and skill loaders have whatever access your code gives them. libfx validates and orders their calls but grants nothing itself, and the native backend doesn't turn on fx's built-in shell or file tools. Don't put long-lived keys in browser code, and treat the `nativeAddon` and `gatewayChatUrl` options as trusted configuration. Keep ChatGPT credentials, and the `signIn` object `startSignIn()` returns, on the server.
 
 ## Contributing
 

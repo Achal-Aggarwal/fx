@@ -6,6 +6,7 @@ const provider_set = @import("../gateway/provider_set.zig");
 const host = @import("../hosts/host.zig");
 const host_attachments = @import("../hosts/host_attachments.zig");
 const credentials = @import("../auth/credentials.zig");
+const model_provider = @import("../config/model_provider.zig");
 const mode_registry = @import("../modes/mode_registry.zig");
 const prompt_policy = @import("../config/prompt_policy.zig");
 const context_contract = @import("../workspace/context_contract.zig");
@@ -44,6 +45,12 @@ pub const Config = struct {
     /// Ultrafast-lane override. Null leaves the startup and session defaults
     /// untouched.
     ultrafast_override: ?bool = null,
+    /// Provider for every session this server runs, like model_override. Null
+    /// keeps the startup provider and each saved session's own provider.
+    provider_override: ?model_provider.ProviderId = null,
+    /// `.host_managed` sends Codex requests without a credential; the host adds
+    /// one at its fetch edge. Other routes keep `auth_mode`.
+    codex_auth_mode: credentials.AuthMode = .local,
     credential_override: ?[]const u8 = null,
     home_override: ?[]const u8 = null,
     workspace_root_override: ?[]const u8 = null,
