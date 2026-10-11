@@ -241,21 +241,34 @@ pub const Unavailable = struct {
     reason: []const u8,
 };
 
+/// A config file read or looked for. System and user config follow a final
+/// symlink, as git does; repository config never does.
+pub const ReadPath = struct {
+    path: []const u8,
+    follow_symlinks: bool,
+};
+
 pub const Loaded = struct {
     /// In file order, with included files spliced in at their directive.
     entries: []const LoadedEntry,
     unavailable: []const Unavailable,
     /// Every config file read or looked for, missing ones included, so a
     /// later change to any of them can be detected.
-    paths: []const []const u8 = &.{},
+    paths: []const ReadPath = &.{},
 
     /// The last entry for the key, or null when unset.
     pub fn last(self: Loaded, section: []const u8, subsection: ?[]const u8, name: []const u8) ?*const Entry {
+        const loaded = self.lastLoaded(section, subsection, name) orelse return null;
+        return &loaded.entry;
+    }
+
+    /// Like `last`, with the scope the entry came from.
+    pub fn lastLoaded(self: Loaded, section: []const u8, subsection: ?[]const u8, name: []const u8) ?*const LoadedEntry {
         var i = self.entries.len;
         while (i > 0) {
             i -= 1;
-            const entry = &self.entries[i].entry;
-            if (keyMatches(entry, section, subsection, name)) return entry;
+            const loaded = &self.entries[i];
+            if (keyMatches(&loaded.entry, section, subsection, name)) return loaded;
         }
         return null;
     }
@@ -269,6 +282,10 @@ fn keyMatches(entry: *const Entry, section: []const u8, subsection: ?[]const u8,
     }
     return entry.subsection == null;
 }
+
+/// Every environment variable `Context.fromEnvironment` reads to locate
+/// config, so a saved listing is reused only under the same values.
+pub const environment_names = [_][]const u8{ "HOME", "XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM" };
 
 /// Where config comes from and what conditions are evaluated against.
 pub const Context = struct {
@@ -314,15 +331,22 @@ const Loader = struct {
     mode: Mode,
     entries: std.ArrayList(LoadedEntry) = .empty,
     unavailable: std.ArrayList(Unavailable) = .empty,
-    paths: std.ArrayList([]const u8) = .empty,
+    paths: std.ArrayList(ReadPath) = .empty,
 
     fn readFile(self: *Loader, path: []const u8, scope: Scope, depth: usize) Allocator.Error!void {
         if (depth > max_include_depth) return self.markUnavailable(path, "include_depth");
         // git reads /dev/null as an empty file; it is commonly used to
         // disable a config level.
         if (std.mem.eql(u8, path, "/dev/null")) return;
-        try self.paths.append(self.arena, path);
-        const content = switch (try bounded_read.readAbsolute(self.arena, path, max_config_file_bytes)) {
+        // System and user config, and what they include, are the user's own
+        // files, often links from a dotfile manager.
+        const follow = scope == .system or scope == .global;
+        try self.paths.append(self.arena, .{ .path = path, .follow_symlinks = follow });
+        const outcome = if (follow)
+            try bounded_read.readUserAbsolute(self.arena, path, max_config_file_bytes)
+        else
+            try bounded_read.readAbsolute(self.arena, path, max_config_file_bytes);
+        const content = switch (outcome) {
             .content => |bytes| bytes,
             .missing => return,
             .unavailable => |reason| return self.markUnavailable(path, reason),
@@ -492,6 +516,9 @@ pub const ObjectFormat = enum { sha1, sha256 };
 pub const IgnoreSettings = struct {
     /// Absolute path of the excludes file to read, or null for none.
     excludes_file: ?[]const u8,
+    /// Whether system or user config named the excludes file, or it is git's
+    /// default location, so it is the user's own and a symlink is followed.
+    excludes_file_follows_symlinks: bool,
     ignore_case: bool,
     object_format: ObjectFormat,
     /// Settings git would refuse, by key. Static strings.
@@ -526,8 +553,10 @@ pub fn ignoreSettings(arena: Allocator, loaded: Loaded, context: *const Context)
         break;
     }
 
-    const excludes_file: ?[]const u8 = if (loaded.last("core", null, "excludesfile")) |entry| blk: {
-        const raw = entry.value orelse break :blk null;
+    var excludes_file_follows_symlinks = true;
+    const excludes_file: ?[]const u8 = if (loaded.lastLoaded("core", null, "excludesfile")) |entry| blk: {
+        excludes_file_follows_symlinks = entry.scope == .system or entry.scope == .global;
+        const raw = entry.entry.value orelse break :blk null;
         if (raw.len == 0) break :blk null;
         if (std.mem.startsWith(u8, raw, "~/")) {
             const home = context.home orelse break :blk null;
@@ -546,6 +575,7 @@ pub fn ignoreSettings(arena: Allocator, loaded: Loaded, context: *const Context)
 
     return .{
         .excludes_file = excludes_file,
+        .excludes_file_follows_symlinks = excludes_file_follows_symlinks,
         .ignore_case = ignore_case,
         .object_format = object_format,
         .invalid = try invalid.toOwnedSlice(arena),
@@ -720,6 +750,43 @@ test "config gitdir patterns relative to the including file" {
     const settings = try ignoreSettings(arena, try loadAll(arena, &repo.context), &repo.context);
     const expected = try std.fs.path.join(arena, &.{ repo.context.layout.?.worktree_root, "relative/ignore" });
     try std.testing.expectEqualStrings(expected, settings.excludes_file.?);
+}
+
+test "user config links are followed and repository config links are not" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const repo = try testRepo(arena, &tmp, "repo", "main");
+    // A dotfile manager links the user's files into the home folder.
+    try writeTestFile(tmp.dir, "dotfiles/gitconfig", "[include]\npath = ~/.gitconfig.local\n[core]\nexcludesfile = ~/.gitignore_global\n");
+    try writeTestFile(tmp.dir, "dotfiles/local", "[core]\nignorecase = true\n");
+    try writeTestFile(tmp.dir, "dotfiles/ignore", "*.env\n");
+    tmp.dir.symLink(std.testing.io, "../dotfiles/gitconfig", "home/.gitconfig", .{}) catch return error.SkipZigTest;
+    try tmp.dir.symLink(std.testing.io, "../dotfiles/local", "home/.gitconfig.local", .{});
+    try tmp.dir.symLink(std.testing.io, "../dotfiles/ignore", "home/.gitignore_global", .{});
+
+    const loaded = try loadAll(arena, &repo.context);
+    try std.testing.expectEqual(@as(usize, 0), loaded.unavailable.len);
+    const settings = try ignoreSettings(arena, loaded, &repo.context);
+    try std.testing.expect(settings.ignore_case);
+    try std.testing.expectEqualStrings(try std.fs.path.join(arena, &.{ repo.root, "home/.gitignore_global" }), settings.excludes_file.?);
+    try std.testing.expect(settings.excludes_file_follows_symlinks);
+    const home_prefix = try std.fs.path.join(arena, &.{ repo.root, "home/" });
+    for (loaded.paths) |read| {
+        try std.testing.expectEqual(std.mem.startsWith(u8, read.path, home_prefix), read.follow_symlinks);
+    }
+
+    // The repository's own config never follows a link, and an excludes file
+    // it names is not the user's.
+    try writeTestFile(tmp.dir, "repo/.git/config", "[include]\npath = linked.inc\n[core]\nexcludesfile = /repo-excludes\n");
+    try tmp.dir.symLink(std.testing.io, "../../dotfiles/local", "repo/.git/linked.inc", .{});
+    const repo_loaded = try loadAll(arena, &repo.context);
+    try std.testing.expectEqual(@as(usize, 1), repo_loaded.unavailable.len);
+    const repo_settings = try ignoreSettings(arena, repo_loaded, &repo.context);
+    try std.testing.expectEqualStrings("/repo-excludes", repo_settings.excludes_file.?);
+    try std.testing.expect(!repo_settings.excludes_file_follows_symlinks);
 }
 
 test "repository filter names come only from repository config and count every includeIf" {

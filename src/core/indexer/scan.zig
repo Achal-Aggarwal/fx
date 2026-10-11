@@ -7,7 +7,9 @@
 //! listed and never followed; submodules and nested repositories are listed
 //! and never entered. Folders are read by a bounded pool of worker threads,
 //! all joined before `scan` returns, and the output is sorted, so it does not
-//! depend on scheduling.
+//! depend on scheduling unless the walk stops at the collection limit (see
+//! `collect_factor`). A listing cut there is marked incomplete, and which
+//! folders it holds can vary between runs.
 
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
@@ -49,7 +51,9 @@ pub const Result = struct {
 pub const Error = error{ OutOfMemory, Canceled, RootUnavailable };
 
 /// Workers stop reading folders past this many collected entries, so a huge
-/// tree cannot exhaust memory. Below it, the cap keeps a sorted prefix.
+/// tree cannot exhaust memory. Below it, the cap keeps a sorted prefix. Past
+/// it, which folders were read depends on thread timing, so the result is
+/// marked incomplete with the cap reached.
 const collect_factor: usize = 4;
 /// Helper threads start only once this many folders are waiting.
 const parallel_threshold: usize = 16;
@@ -75,7 +79,13 @@ const Rules = struct {
     }
 };
 
-const SourceRequest = struct { path: []const u8, identity_only: bool };
+const SourceRequest = struct {
+    path: []const u8,
+    identity_only: bool,
+    /// Stamp the file a final symlink points at: the user's own config may be
+    /// a link, and an edit to its target must invalidate the listing.
+    follow_symlinks: bool = false,
+};
 
 const Job = struct {
     /// Relative to the scan root.
@@ -262,7 +272,7 @@ pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*std.at
         if (listing.ignore_file) |path| try rules.sources.append(arena, .{ .path = try arena.dupe(u8, path), .identity_only = false });
     }
     const stamps = try arena.alloc(tree_mod.SourceStamp, rules.sources.items.len);
-    for (rules.sources.items, stamps) |request, *stamp| stamp.* = tree_mod.sourceStamp(request.path, request.identity_only, scan_started_ns);
+    for (rules.sources.items, stamps) |request, *stamp| stamp.* = tree_mod.sourceStamp(request.path, request.identity_only, request.follow_symlinks, scan_started_ns);
     const skipped_names = try arena.alloc([]const u8, options.skipped_names.len);
     for (options.skipped_names, skipped_names) |name, *copy| copy.* = try arena.dupe(u8, name);
 
@@ -310,8 +320,8 @@ fn repositoryRules(arena: Allocator, root: []const u8, rules: *Rules, incomplete
     if (loaded.unavailable.len > 0 or settings.invalid.len > 0) incomplete.* = true;
     const wide = try sources.loadRepositoryWide(arena, found, settings);
     if (wide.unavailable.len > 0) incomplete.* = true;
-    for (loaded.paths) |path| try rules.sources.append(arena, .{ .path = path, .identity_only = false });
-    if (settings.excludes_file) |path| try rules.sources.append(arena, .{ .path = path, .identity_only = false });
+    for (loaded.paths) |read| try rules.sources.append(arena, .{ .path = read.path, .identity_only = false, .follow_symlinks = read.follow_symlinks });
+    if (settings.excludes_file) |path| try rules.sources.append(arena, .{ .path = path, .identity_only = false, .follow_symlinks = settings.excludes_file_follows_symlinks });
     for ([_][]const u8{"info/exclude"}) |name| try rules.sources.append(arena, .{ .path = try std.fs.path.join(arena, &.{ found.common_dir, name }), .identity_only = false });
     for ([_][]const u8{ "index", "HEAD", "commondir" }) |name| try rules.sources.append(arena, .{ .path = try std.fs.path.join(arena, &.{ found.git_dir, name }), .identity_only = false });
 
@@ -521,7 +531,9 @@ fn listDirectory(shared: *Shared, worker: *Worker, job: Job, children: *std.Arra
     listing.children = child_entries.items;
     const total = shared.collected.fetchAdd(files.items.len + child_entries.items.len, .acq_rel) + files.items.len + child_entries.items.len;
     if (total > shared.collect_limit) {
-        shared.limit_reached.store(true, .release);
+        if (!shared.limit_reached.swap(true, .acq_rel)) {
+            debug_trace.logf("indexer", "scan collection limit reached limit={d} dropped_folders={d}", .{ shared.collect_limit, children.items.len });
+        }
         children.clearRetainingCapacity();
     }
 }

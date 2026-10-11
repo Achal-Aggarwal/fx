@@ -277,3 +277,47 @@ describe("poisoned repository", () => {
     TIMEOUT,
   );
 });
+
+// Dotfile managers often make `~/.gitconfig` a symlink. Files the user's own
+// excludes file ignores must stay out of glob and grep through it, as in git.
+describe("user git config through a symlink", () => {
+  test(
+    "glob and grep honor an excludes file named by a symlinked ~/.gitconfig",
+    async () => {
+      const base = realpathSync(mkdtempSync(join(tmpdir(), "fx-linked-gitconfig-")));
+      const fixture: Fixture = { base, home: join(base, "home"), workspace: join(base, "workspace"), log: join(base, "unused.log") };
+      fixtures.push(fixture);
+      mkdirSync(join(fixture.home, ".fx"), { recursive: true });
+      mkdirSync(join(fixture.home, "dotfiles"));
+      mkdirSync(fixture.workspace);
+      writeFileSync(join(fixture.home, ".fx", "settings.json"), JSON.stringify({ auto_upgrade: false }));
+      writeFileSync(join(fixture.home, "dotfiles", "ignore"), "*.secret\n");
+      writeFileSync(join(fixture.home, "dotfiles", "gitconfig"), "[core]\n\texcludesFile = ~/dotfiles/ignore\n");
+      symlinkSync(join(fixture.home, "dotfiles", "gitconfig"), join(fixture.home, ".gitconfig"));
+      git(fixture, ["init", "-q", "--template=", "-b", "main"]);
+      writeFileSync(join(fixture.workspace, "public.txt"), "needle public\n");
+      writeFileSync(join(fixture.workspace, "api.secret"), "needle hidden\n");
+      expect(git(fixture, ["ls-files", "-co", "--exclude-standard"]).trim()).toBe("public.txt");
+
+      const gateway = startFakeGateway([
+        fakeGatewayToolCall("glob", "glob_files", { pattern: "**/*" }),
+        fakeGatewayToolCall("grep", "grep_files", { pattern: "needle" }),
+        fakeGatewayFinalText("inspection complete"),
+      ], { classifierResponses: [] });
+      gateways.push(gateway);
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Inspect the repository."],
+        { cwd: fixture.workspace, env: { ...fxEnv(fixture, gateway), GIT_CONFIG_NOSYSTEM: "1" }, timeoutMs: TIMEOUT },
+      );
+      expect(result.code, result.stderr).toBe(0);
+      const bodies = gateway.requests.map((request: { body: string }) => request.body);
+      const glob = toolResult(bodies[1]!, "glob");
+      expect(glob).toContain("public.txt");
+      expect(glob).not.toContain("api.secret");
+      const grep = toolResult(bodies[2]!, "grep");
+      expect(grep).toContain("needle public");
+      expect(grep).not.toContain("needle hidden");
+    },
+    TIMEOUT,
+  );
+});

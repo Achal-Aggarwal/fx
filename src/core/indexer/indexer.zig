@@ -20,6 +20,9 @@ pub const Entry = scan_mod.Entry;
 pub const ScanResult = scan_mod.Result;
 pub const ScanError = scan_mod.Error;
 pub const default_skipped_names = scan_mod.default_skipped_names;
+/// The environment variables that locate git config. A saved listing is valid
+/// only under the values it was built with.
+pub const config_environment_names = git_config.environment_names;
 
 /// Lists the files and folders under the absolute `root`: inside a git
 /// repository exactly what git shows, elsewhere everything except `.gitignore`

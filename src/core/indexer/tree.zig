@@ -48,6 +48,8 @@ pub const SourceStamp = struct {
     mtime_ns: i64 = 0,
     ctime_ns: i64 = 0,
     reusable: bool,
+    /// Stamped through a final symlink, as the file was read.
+    follow_symlinks: bool = false,
 };
 
 pub const Tree = struct {
@@ -95,9 +97,9 @@ pub fn folderStamp(rel: []const u8, stat: std.Io.File.Stat, scan_started_ns: i64
 }
 
 /// Stamps the absolute `path` without following a final symlink.
-pub fn sourceStamp(path: []const u8, identity_only: bool, scan_started_ns: i64) SourceStamp {
-    const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = false }) catch {
-        return .{ .path = path, .exists = false, .identity_only = identity_only, .reusable = true };
+pub fn sourceStamp(path: []const u8, identity_only: bool, follow_symlinks: bool, scan_started_ns: i64) SourceStamp {
+    const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = follow_symlinks }) catch {
+        return .{ .path = path, .exists = false, .identity_only = identity_only, .reusable = true, .follow_symlinks = follow_symlinks };
     };
     const mtime = clampNs(stat.mtime.nanoseconds);
     const ctime = clampNs(stat.ctime.nanoseconds);
@@ -113,6 +115,7 @@ pub fn sourceStamp(path: []const u8, identity_only: bool, scan_started_ns: i64) 
         .mtime_ns = if (identity) 0 else mtime,
         .ctime_ns = if (identity) 0 else ctime,
         .reusable = identity or reusableTimes(mtime, ctime, scan_started_ns),
+        .follow_symlinks = follow_symlinks,
     };
 }
 
@@ -139,7 +142,7 @@ pub fn isCurrent(tree: *const Tree, root: []const u8, skipped_names: []const []c
 
     for (tree.sources) |source| {
         if (!source.reusable) return false;
-        const current = sourceStamp(source.path, source.identity_only, tree.scan_started_ns);
+        const current = sourceStamp(source.path, source.identity_only, source.follow_symlinks, tree.scan_started_ns);
         if (!sameSource(source, current)) return false;
         if (current.mtime_ns > now or current.ctime_ns > now) return false;
     }
@@ -165,6 +168,27 @@ test "stamps reuse only times older than the scan start by the margin" {
     try std.testing.expect(!reusableTimes(start - 3 * std.time.ns_per_s, start, start));
     try std.testing.expect(!reusableTimes(start + 1, start - 3 * std.time.ns_per_s, start));
     // A missing source stays missing until it appears.
-    const missing = sourceStamp("/nonexistent/fx-indexer-test", false, start);
+    const missing = sourceStamp("/nonexistent/fx-indexer-test", false, false, start);
     try std.testing.expect(!missing.exists and missing.reusable);
+}
+
+test "a followed source stamps the file its link points at" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "target", .data = "[core]\n" });
+    tmp.dir.symLink(std.testing.io, "target", "link", .{}) catch return error.SkipZigTest;
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    const link = try std.fs.path.join(alloc, &.{ root, "link" });
+    defer alloc.free(link);
+
+    const start = nowNs();
+    const followed = sourceStamp(link, false, true, start);
+    const unfollowed = sourceStamp(link, false, false, start);
+    try std.testing.expect(followed.follow_symlinks and !unfollowed.follow_symlinks);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "target", .data = "[core]\n\tignorecase = true\n" });
+    // An edit to the target is seen through the link, never by the link alone.
+    try std.testing.expect(!sameSource(followed, sourceStamp(link, false, true, start)));
+    try std.testing.expect(sameSource(unfollowed, sourceStamp(link, false, false, start)));
 }

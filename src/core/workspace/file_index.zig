@@ -858,16 +858,35 @@ fn loadGeneration(
     return .ready;
 }
 
-/// `<home>/.fx/file-index/<sha256 of the roots>.idx`, one file per scope, or
-/// null without an absolute home directory.
+/// `<home>/.fx/file-index/<sha256>.idx`, or null without an absolute home
+/// directory. The digest covers the roots and every variable that locates git
+/// config, so a listing built under one config is never reused under another.
 pub fn snapshotPath(alloc: Allocator, roots: []const []const u8) Allocator.Error!?[]const u8 {
     const home = io_mod.getenv("HOME") orelse return null;
     if (!std.fs.path.isAbsolute(home)) return null;
-    return try snapshotPathIn(alloc, home, roots);
+    var config_environment: [indexer.config_environment_names.len]?[]const u8 = undefined;
+    for (indexer.config_environment_names, &config_environment) |name, *value| value.* = io_mod.getenv(name);
+    return try snapshotPathIn(alloc, home, roots, &config_environment);
 }
 
-fn snapshotPathIn(alloc: Allocator, home: []const u8, roots: []const []const u8) Allocator.Error![]const u8 {
-    const hex = std.fmt.bytesToHex(rootsDigest(roots), .lower);
+fn snapshotPathIn(
+    alloc: Allocator,
+    home: []const u8,
+    roots: []const []const u8,
+    config_environment: []const ?[]const u8,
+) Allocator.Error![]const u8 {
+    var digest = std.crypto.hash.sha2.Sha256.init(.{});
+    digest.update(&rootsDigest(roots));
+    for (config_environment) |value| {
+        if (value) |bytes| {
+            digest.update(&.{1});
+            digest.update(bytes);
+            digest.update(&.{0});
+        } else digest.update(&.{0});
+    }
+    var sum: [sha256_digest_len]u8 = undefined;
+    digest.final(&sum);
+    const hex = std.fmt.bytesToHex(sum, .lower);
     return std.fmt.allocPrint(alloc, "{s}/.fx/file-index/{s}.idx", .{ home, &hex });
 }
 
@@ -2688,7 +2707,7 @@ test "persisted file index paints a stale preview and the real scan replaces it"
     const scanned_count = first.count();
     try std.testing.expectEqual(@as(usize, 1), adoptions);
     try std.testing.expect(scanned_count >= 2);
-    const snapshot_file = try snapshotPathIn(alloc, home, &roots);
+    const snapshot_file = (try snapshotPath(alloc, &roots)).?;
     defer alloc.free(snapshot_file);
     var cached = (try indexer.loadSnapshot(alloc, snapshot_file, &roots)).?;
     defer cached.deinit();
@@ -3674,4 +3693,24 @@ test "file picker pending scope coalesces epochs through A B A and failed refres
 fn sleepBlocking(milliseconds: u64) void {
     var sleep_io_backend: std.Io.Threaded = .init_single_threaded;
     sleep_io_backend.io().sleep(.fromMilliseconds(@intCast(milliseconds)), .real) catch {};
+}
+
+test "snapshot path changes with where git config is located" {
+    const alloc = std.testing.allocator;
+    const roots = [_][]const u8{"/work"};
+    const cases = [_][indexer.config_environment_names.len]?[]const u8{
+        .{ "/home/u", null, null, null, null },
+        .{ "/home/u", "/home/u/.xdg", null, null, null },
+        .{ "/home/u", "/home/u/.other", null, null, null },
+        .{ "/home/u", null, "/home/u/gitconfig", null, null },
+    };
+    var paths: [cases.len][]const u8 = undefined;
+    for (cases, &paths) |case, *path| path.* = try snapshotPathIn(alloc, "/home/u", &roots, &case);
+    defer for (paths) |path| alloc.free(path);
+    for (paths, 0..) |a, i| for (paths[i + 1 ..]) |b| try std.testing.expect(!std.mem.eql(u8, a, b));
+
+    const again = try snapshotPathIn(alloc, "/home/u", &roots, &cases[1]);
+    defer alloc.free(again);
+    try std.testing.expectEqualStrings(paths[1], again);
+    try std.testing.expect(std.mem.startsWith(u8, again, "/home/u/.fx/file-index/"));
 }

@@ -26,15 +26,23 @@ pub const RepositoryWide = struct {
 };
 
 /// Loads the excludes file named by `settings` and `info/exclude` from the
-/// common git directory. Memory belongs to `arena`.
+/// common git directory. Only an excludes file the user's own config names
+/// follows a symlink. Memory belongs to `arena`.
 pub fn loadRepositoryWide(arena: Allocator, layout: layout_mod.Layout, settings: git_config.IgnoreSettings) Allocator.Error!RepositoryWide {
     var lists: std.ArrayList(*const ignore.PatternList) = .empty;
     var unavailable: std.ArrayList(Unavailable) = .empty;
     const info_exclude = try std.fs.path.join(arena, &.{ layout.common_dir, "info", "exclude" });
-    const paths = [_]?[]const u8{ settings.excludes_file, info_exclude };
-    for (paths) |maybe_path| {
-        const path = maybe_path orelse continue;
-        switch (try bounded_read.readAbsolute(arena, path, ignore.max_pattern_file_bytes)) {
+    const files = [_]struct { path: ?[]const u8, follow_symlinks: bool }{
+        .{ .path = settings.excludes_file, .follow_symlinks = settings.excludes_file_follows_symlinks },
+        .{ .path = info_exclude, .follow_symlinks = false },
+    };
+    for (files) |file| {
+        const path = file.path orelse continue;
+        const outcome = if (file.follow_symlinks)
+            try bounded_read.readUserAbsolute(arena, path, ignore.max_pattern_file_bytes)
+        else
+            try bounded_read.readAbsolute(arena, path, ignore.max_pattern_file_bytes);
+        switch (outcome) {
             .content => |content| {
                 const list = try arena.create(ignore.PatternList);
                 list.* = try ignore.PatternList.parse(arena, "", content);
@@ -93,6 +101,7 @@ test "repository-wide ignore sources load in git's precedence and report unreada
 
     const settings: git_config.IgnoreSettings = .{
         .excludes_file = try std.fs.path.join(arena, &.{ root, "global-ignore" }),
+        .excludes_file_follows_symlinks = true,
         .ignore_case = false,
         .object_format = .sha1,
         .invalid = &.{},
@@ -108,6 +117,18 @@ test "repository-wide ignore sources load in git's precedence and report unreada
     const partial = try loadRepositoryWide(arena, layout, unreadable);
     try std.testing.expectEqual(@as(usize, 1), partial.lists.len);
     try std.testing.expectEqual(@as(usize, 1), partial.unavailable.len);
+
+    // A linked excludes file is followed only when the user's config named it.
+    tmp.dir.symLink(std.testing.io, "global-ignore", "linked-ignore", .{}) catch return error.SkipZigTest;
+    var linked = settings;
+    linked.excludes_file = try std.fs.path.join(arena, &.{ root, "linked-ignore" });
+    const followed = try loadRepositoryWide(arena, layout, linked);
+    try std.testing.expectEqual(@as(usize, 2), followed.lists.len);
+    try std.testing.expectEqual(ignore.Decision.excluded, ignore.decide(followed.lists, "a.tmp", false, false));
+    linked.excludes_file_follows_symlinks = false;
+    const refused = try loadRepositoryWide(arena, layout, linked);
+    try std.testing.expectEqual(@as(usize, 1), refused.lists.len);
+    try std.testing.expectEqual(@as(usize, 1), refused.unavailable.len);
 }
 
 test "directory .gitignore loads with its base and refuses symlinks" {

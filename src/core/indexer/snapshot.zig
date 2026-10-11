@@ -1,4 +1,4 @@
-//! Saved trees for one scope (format v2), so `@` can paint at launch and a
+//! Saved trees for one scope (format v3), so `@` can paint at launch and a
 //! refresh can confirm nothing changed without reading folders again. The
 //! caller chooses the file path. A file is used only when it is a private
 //! regular file with one link, at most `max_bytes`, matching digest, exactly
@@ -15,7 +15,7 @@ const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Tree = tree_mod.Tree;
 
-const magic = "fx-file-index-v2\n";
+const magic = "fx-file-index-v3\n";
 const max_bytes: usize = 64 * 1024 * 1024;
 const max_path_bytes: usize = 4096;
 
@@ -157,7 +157,8 @@ fn encode(writer: *std.Io.Writer, trees: []const Tree) !void {
         try writeInt(writer, u32, @intCast(tree.sources.len));
         for (tree.sources) |source| {
             try writeString(writer, source.path);
-            const source_flags: u8 = @as(u8, @intFromBool(source.exists)) | @as(u8, @intFromBool(source.identity_only)) << 1 | @as(u8, @intFromBool(source.reusable)) << 2;
+            const source_flags: u8 = @as(u8, @intFromBool(source.exists)) | @as(u8, @intFromBool(source.identity_only)) << 1 |
+                @as(u8, @intFromBool(source.reusable)) << 2 | @as(u8, @intFromBool(source.follow_symlinks)) << 3;
             try writer.writeByte(source_flags);
             try writeInt(writer, u64, source.inode);
             try writeInt(writer, u64, source.size);
@@ -240,12 +241,13 @@ fn decode(arena: Allocator, bytes: []const u8, roots: []const []const u8) (Alloc
         for (stamps) |*source| {
             const path = try decoder.string(arena, max_path_bytes, false);
             const source_flags = (try decoder.take(1))[0];
-            if (source_flags & ~@as(u8, 0b111) != 0) return error.InvalidSnapshot;
+            if (source_flags & ~@as(u8, 0b1111) != 0) return error.InvalidSnapshot;
             source.* = .{
                 .path = path,
                 .exists = source_flags & 1 != 0,
                 .identity_only = source_flags & 2 != 0,
                 .reusable = source_flags & 4 != 0,
+                .follow_symlinks = source_flags & 8 != 0,
                 .inode = try decoder.int(u64),
                 .size = try decoder.int(u64),
                 .mtime_ns = try decoder.int(i64),
@@ -288,7 +290,7 @@ fn testTree(root: []const u8, entries: []const tree_mod.Entry) Tree {
         .sources = &.{
             .{ .path = "/w/.gitignore", .exists = true, .identity_only = false, .inode = 3, .size = 10, .mtime_ns = 4, .ctime_ns = 4, .reusable = true },
             .{ .path = "/w/.git", .exists = true, .identity_only = true, .inode = 11, .reusable = true },
-            .{ .path = "/home/.gitconfig", .exists = false, .identity_only = false, .reusable = true },
+            .{ .path = "/home/.gitconfig", .exists = false, .identity_only = false, .reusable = true, .follow_symlinks = true },
         },
     };
 }
@@ -325,6 +327,7 @@ test "snapshot round trips, rejects tampering, other scopes and v1 files, and an
         try std.testing.expect(!first.folders[1].reusable and first.folders[1].boundary and first.folders[1].excluded);
         try std.testing.expect(!first.folders[0].boundary and !first.folders[0].excluded);
         try std.testing.expect(first.sources[1].identity_only and !first.sources[2].exists);
+        try std.testing.expect(first.sources[2].follow_symlinks and !first.sources[0].follow_symlinks);
         try std.testing.expectEqualStrings("b.txt", loaded.trees[1].entries[0].path);
     }
 
@@ -338,9 +341,12 @@ test "snapshot round trips, rejects tampering, other scopes and v1 files, and an
     file.close(std.testing.io);
     try std.testing.expect((try load(alloc, path, &roots)) == null);
 
-    // A v1 file fails the magic check.
-    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "fx-file-index-v1\n{}", .flags = .{ .permissions = .fromMode(0o600) } });
-    try std.testing.expect((try load(alloc, path, &roots)) == null);
+    // Older formats fail the magic check. A v2 file stamped every source
+    // without following symlinks.
+    for ([_][]const u8{ "fx-file-index-v1\n{}", "fx-file-index-v2\n" }) |old| {
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = old, .flags = .{ .permissions = .fromMode(0o600) } });
+        try std.testing.expect((try load(alloc, path, &roots)) == null);
+    }
 
     // A file others can read is not trusted.
     try save(alloc, path, &trees);
