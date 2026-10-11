@@ -63,7 +63,8 @@ pub fn get(
         if (state == 1) break;
         if (state < 0) return .{ .failure = .{ .category = if (state == -2) .cancellation else .transport } };
     }
-    if (status != 200) return .{ .failure = model_catalog.failureForHttpStatus(@enumFromInt(status)) };
+    const http_status = host_stream.httpStatus(status) orelse return .{ .failure = .{ .category = .transport } };
+    if (http_status != .ok) return .{ .failure = model_catalog.failureForHttpStatus(http_status) };
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(alloc);
     var chunk: [16 * 1024]u8 = undefined;
@@ -82,4 +83,47 @@ pub fn get(
 
 fn cancelled(cancel_flag: ?*std.atomic.Value(bool)) bool {
     return if (cancel_flag) |flag| flag.load(.seq_cst) else false;
+}
+
+test "catalog GET fails cleanly on a status outside the HTTP range" {
+    const FakeTransport = struct {
+        status_code: u16,
+        close_calls: usize = 0,
+
+        fn open(_: ?*anyopaque, _: []const u8, _: []const u8, _: []const u8, _: []const u8) anyerror!i32 {
+            return 3;
+        }
+        fn status(raw: ?*anyopaque, _: i32, status_out: *u16) i32 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            status_out.* = self.status_code;
+            return 1;
+        }
+        fn next(_: ?*anyopaque, _: i32, _: []u8) i32 {
+            return 0;
+        }
+        fn close(raw: ?*anyopaque, _: i32) void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.close_calls += 1;
+        }
+    };
+
+    for ([_]u16{ 0, 99, 404, 600, 1024, 65535 }) |code| {
+        var fake: FakeTransport = .{ .status_code = code };
+        const transport: host_stream.Transport = .{
+            .context = &fake,
+            .open_fn = FakeTransport.open,
+            .status_fn = FakeTransport.status,
+            .next_fn = FakeTransport.next,
+            .close_fn = FakeTransport.close,
+        };
+        const result = try get(std.testing.allocator, transport, "https://example.invalid/v1/models", &.{}, null, 1024);
+        try std.testing.expect(result == .failure);
+        if (code == 404) {
+            try std.testing.expectEqual(@as(?std.http.Status, .not_found), result.failure.http_status);
+        } else {
+            try std.testing.expectEqual(model_catalog.FailureCategory.transport, result.failure.category);
+            try std.testing.expectEqual(@as(?std.http.Status, null), result.failure.http_status);
+        }
+        try std.testing.expectEqual(@as(usize, 1), fake.close_calls);
+    }
 }

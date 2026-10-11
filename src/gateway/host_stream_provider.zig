@@ -39,6 +39,13 @@ pub const Transport = struct {
     }
 };
 
+/// The HTTP status a host reported, or null when `code` is outside 100 to 599.
+/// A host can report any `u16`, and `std.http.Status` cannot hold most of them.
+pub fn httpStatus(code: u16) ?std.http.Status {
+    if (code < 100 or code > 599) return null;
+    return @enumFromInt(code);
+}
+
 pub const ProviderContext = struct {
     build_fn: *const fn (Allocator, stream_provider.RequestData) anyerror![]u8,
     endpoint: Endpoint,
@@ -228,7 +235,8 @@ pub fn openPost(
         if (status_result < 0) return error.HostStreamFailed;
         try pulse(request.cooperative_pulse);
     }
-    return .{ .handle = handle, .status = @enumFromInt(status_code) };
+    const http_status = httpStatus(status_code) orelse return error.HostStreamFailed;
+    return .{ .handle = handle, .status = http_status };
 }
 
 /// Reads a non-success response body, bounded. The caller owns the bytes.
@@ -267,6 +275,15 @@ pub fn signalConsumed(
     {
         transport.consumed(handle);
     }
+}
+
+test "host statuses outside 100 to 599 are not HTTP statuses" {
+    for ([_]u16{ 0, 99, 600, 1023, 1024, 65535 }) |code| {
+        try std.testing.expectEqual(@as(?std.http.Status, null), httpStatus(code));
+    }
+    try std.testing.expectEqual(@as(?std.http.Status, .@"continue"), httpStatus(100));
+    try std.testing.expectEqual(@as(?std.http.Status, .ok), httpStatus(200));
+    try std.testing.expectEqual(@as(u16, 599), @intFromEnum(httpStatus(599).?));
 }
 
 test "host provider signals logical consumption only after valid uncancelled completion" {
@@ -355,6 +372,9 @@ test "host provider signals logical consumption only after valid uncancelled com
             "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"tool-calls\"}}\n\n" },
         .{ .body = text ++ stop, .cancel_on_content = true },
         .{ .body = "upstream failure", .status = 500 },
+        .{ .body = text ++ stop, .status = 0, .expected_error = error.HostStreamFailed },
+        .{ .body = text ++ stop, .status = 1024, .expected_error = error.HostStreamFailed },
+        .{ .body = text ++ stop, .status = 65535, .expected_error = error.HostStreamFailed },
         .{ .body = text, .read_error = -1, .expected_error = error.HostStreamFailed },
         .{ .body = "data: {not-json}\n\n", .expected_error = error.InvalidGatewaySseEvent },
     };
