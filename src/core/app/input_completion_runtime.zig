@@ -798,11 +798,13 @@ pub fn CompletionRuntime(comptime App: type) type {
             return hold;
         }
 
-        /// While a frame waits for a folder listing, the event loop checks back
-        /// every millisecond instead of every tick.
+        /// For the first tick of every folder listing, the event loop checks
+        /// back every millisecond instead of every tick. A listing that
+        /// finishes in that time is seen at once, which also turns waiting
+        /// back on after a slow folder.
         pub fn fileListingHoldPending(app: *const App, now_ms: i64) bool {
             if (comptime !runtime_profile.allows(App, .file_index)) return false;
-            return app.input_runtime.picker.file_listing_wait.active(now_ms);
+            return app.input_runtime.picker.file_listing_wait.measuring(now_ms);
         }
 
         /// The sole acquisition boundary. Called after input batching, never by
@@ -2174,6 +2176,18 @@ test "filesystem file picker releases a held folder frame only with its rows" {
     try std.testing.expectEqualStrings("./tree", view.items[0].path);
     try std.testing.expectEqualStrings("./tree/leaf.txt", view.items[1].path);
     try std.testing.expect(!rt.fileListingHoldPending(&app, now_ms));
+}
+
+test "file picker keeps watching a listing after a slow folder so waiting can turn back on" {
+    const rt = CompletionRuntime(FilePickerTestApp);
+    var app: FilePickerTestApp = .{ .alloc = std.testing.allocator };
+    defer app.deinit();
+
+    // The previous folder outlasted the wait, so this listing's frame paints
+    // at once, but the loop still checks back every millisecond.
+    app.input_runtime.picker.file_listing_wait = .{ .started_ms = 1_000, .last_outlasted_hold = true };
+    try std.testing.expect(!app.input_runtime.picker.file_listing_wait.active(1_001));
+    try std.testing.expect(rt.fileListingHoldPending(&app, 1_001));
 }
 
 test "file picker loading Tab preserves pending request and Enter never queues acceptance" {

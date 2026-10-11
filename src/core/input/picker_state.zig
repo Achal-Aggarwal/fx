@@ -112,8 +112,14 @@ const FileListingWait = struct {
     }
 
     pub fn active(self: FileListingWait, now_ms: i64) bool {
+        return !self.last_outlasted_hold and self.measuring(now_ms);
+    }
+
+    /// True during the first tick of every listing, waited for or not, so a
+    /// listing that finishes in time is seen at once and waiting turns back on.
+    pub fn measuring(self: FileListingWait, now_ms: i64) bool {
         const started = self.started_ms orelse return false;
-        return !self.last_outlasted_hold and withinHold(started, now_ms);
+        return withinHold(started, now_ms);
     }
 
     fn withinHold(started_ms: i64, now_ms: i64) bool {
@@ -1060,9 +1066,12 @@ test "folder listing wait spans one tick and is skipped after a slow listing" {
     try std.testing.expect(!wait.hold(true, 140));
     try std.testing.expect(!wait.active(140));
     try std.testing.expect(!wait.hold(false, 141));
-    // The folder was slow, so the next keystroke does not wait for it.
+    // The folder was slow, so the next keystroke does not wait for it, but
+    // the listing is still watched for its first tick.
     try std.testing.expect(!wait.hold(true, 200));
     try std.testing.expect(!wait.active(200));
+    try std.testing.expect(wait.measuring(200 + FileListingWait.hold_ms - 1));
+    try std.testing.expect(!wait.measuring(200 + FileListingWait.hold_ms));
     // A listing that finishes within the wait turns waiting back on.
     try std.testing.expect(!wait.hold(false, 202));
     try std.testing.expect(wait.hold(true, 300));
