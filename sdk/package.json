@@ -107,6 +107,7 @@
     "chatgpt-sign-in.js",
     "grok.js",
     "grok-sign-in.js",
+    "custom-provider.js",
     "fetch-cleanup.js",
     "mcp.js",
     "skills.js",

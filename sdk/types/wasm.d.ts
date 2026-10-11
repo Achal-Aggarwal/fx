@@ -14,9 +14,13 @@ export {
 } from "./libfx.cjs";
 
 export type {
+  FxApiKeyCredentials,
   FxBytes,
   FxCheckpointMeta,
   FxCodexProvider,
+  FxCustomProvider,
+  FxCustomProviderDefinition,
+  FxCustomProviderModel,
   FxEffort,
   FxEngine,
   FxEngineEvent,

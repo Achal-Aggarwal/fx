@@ -498,8 +498,7 @@ pub fn selectCredentialForProvider(
 /// True when requests on the provider's route carry no credential from this
 /// server because the host authorizes them at its fetch edge.
 fn hostManagesRoute(cfg: Config, provider: model_provider.ProviderId) bool {
-    const subscription = provider == .codex or provider == .grok;
-    return subscription and cfg.subscription_auth_mode == .host_managed;
+    return provider != .gateway and cfg.provider_auth_mode == .host_managed;
 }
 
 /// A tokenless credential that marks a route as authorized by the host.
@@ -565,12 +564,12 @@ test "ACP credential preparation preserves the existing borrowed credential" {
     try std.testing.expectEqual(types.CredentialSource.configured, state.credential_source.?);
 }
 
-test "ACP subscription routes are host-managed only when configured and never leak into Gateway" {
+test "ACP provider routes are host-managed only when configured and never leak into Gateway" {
     const alloc = std.testing.allocator;
     var state: ServerState = undefined;
     state.alloc = alloc;
     state.cfg.auth_mode = .local;
-    state.cfg.subscription_auth_mode = .host_managed;
+    state.cfg.provider_auth_mode = .host_managed;
     state.cfg.credential_override = "gateway-key";
     state.active_session = null;
     state.api_key = &.{};
@@ -598,10 +597,18 @@ test "ACP subscription routes are host-managed only when configured and never le
     try std.testing.expectEqual(types.CredentialSource.host_managed, grok.source);
     try std.testing.expectEqual(@as(usize, 0), grok.token.len);
 
-    // Without the policy each subscription needs its own credential.
-    state.cfg.subscription_auth_mode = .local;
+    // So is a configured provider: the host adds its API key, if any.
+    const configured = model_provider.parse("local").?;
+    var custom = (try prepareCredentialForProvider(&state, configured)).?;
+    defer custom.deinit(alloc);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, custom.source);
+    try std.testing.expectEqual(@as(usize, 0), custom.token.len);
+
+    // Without the policy each provider needs its own credential.
+    state.cfg.provider_auth_mode = .local;
     try std.testing.expect(!hostManagesRoute(state.cfg, .codex));
     try std.testing.expect(!hostManagesRoute(state.cfg, .grok));
+    try std.testing.expect(!hostManagesRoute(state.cfg, configured));
     try std.testing.expect(!hostManagesRoute(state.cfg, .gateway));
 }
 
@@ -2524,12 +2531,17 @@ test "ordinary ACP ignores private libfx capabilities" {
 
 fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
     if (state.cfg.minimal_kernel) {
-        return app_lifecycle.loadLibfxStartupState(
+        var startup = try app_lifecycle.loadLibfxStartupState(
             alloc,
             state.cfg.workspace_root_override orelse "/",
             state.cfg.model_override orelse state.cfg.default_model,
             state.cfg.default_agent_step_limit,
         );
+        errdefer startup.deinit(alloc);
+        if (state.cfg.configured_providers_json) |json| {
+            startup.configured_providers = try @import("../core/config/configured_provider.zig").Registry.parse_json(alloc, json);
+        }
+        return startup;
     }
     if (state.cfg.home_override) |home_dir| {
         if (state.cfg.workspace_root_override) |workspace_root| {

@@ -4,6 +4,7 @@ const acp_server = @import("acp/server.zig");
 const js_host_stream_provider = @import("gateway/js_host_stream_provider.zig");
 const host_openai_codex = @import("gateway/host_openai_codex.zig");
 const host_xai_grok = @import("gateway/host_xai_grok.zig");
+const host_chat_completions = @import("gateway/host_chat_completions.zig");
 const model_provider = @import("core/config/model_provider.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
@@ -34,14 +35,25 @@ pub const panic = @import("core/hosts/wasm_panic.zig").panic;
 pub fn main(init: std.process.Init) !void {
     io_mod.setIo(init.io);
     io_mod.setEnvironMap(init.environ_map);
-    try acp_server.run(std.heap.c_allocator, .{
+    const alloc = std.heap.c_allocator;
+    // FX_CONFIGURED_PROVIDERS defines the app's own provider, if it has one.
+    const configured_providers = io_mod.getenv("FX_CONFIGURED_PROVIDERS");
+    var custom_context: ?host_chat_completions.Context = null;
+    defer if (custom_context) |*context| context.deinit(alloc);
+    var providers = js_host_provider_set;
+    if (configured_providers) |json| {
+        custom_context = try host_chat_completions.Context.init(alloc, js_host_stream_provider.transport, json);
+        providers.configured_fn = host_chat_completions.bundle;
+        providers.configured_context = &custom_context.?;
+    }
+    try acp_server.run(alloc, .{
         .default_model = builtin_gateway.default_model,
         .default_agent_step_limit = agent_steps.default_max_agent_steps,
         .gateway_retry_count = 0,
         .gateway_chat_url = builtin_gateway.default_chat_url,
         .gateway_models_path = builtin_gateway.models_path,
         .gateway_provider = js_host_gateway_provider,
-        .provider_set = js_host_provider_set,
+        .provider_set = providers,
         .secret_store = host.unavailable_secret_store,
         .prompt_policy = .{ .system_prompt = "" },
         .ignored_list_entries = &.{},
@@ -55,9 +67,10 @@ pub fn main(init: std.process.Init) !void {
         .context_registry = .{ .default_provider = context_contract.empty_provider },
         .mode_registry = builtin_modes.registry,
         .credential_override = io_mod.getenv("AI_GATEWAY_API_KEY"),
-        .provider_override = try providerOverrideFromEnv(io_mod.getenv("FX_PROVIDER")),
-        // The JS host adds subscription credentials at its fetch edge.
-        .subscription_auth_mode = .host_managed,
+        .provider_override = try providerOverrideFromEnv(io_mod.getenv("FX_PROVIDER"), if (custom_context) |*context| context else null),
+        // The JS host adds provider credentials at its fetch edge.
+        .provider_auth_mode = .host_managed,
+        .configured_providers_json = configured_providers,
         .model_override = io_mod.getenv("FX_MODEL"),
         .effort_override = io_mod.getenv("FX_EFFORT"),
         .fast_override = fastOverrideFromEnv(io_mod.getenv("FX_FAST")),
@@ -104,9 +117,15 @@ const js_host_provider_set = set: {
     break :set providers;
 };
 
-/// libfx engines run Gateway, Codex or Grok. Null keeps the startup provider.
-fn providerOverrideFromEnv(value: ?[]const u8) error{InvalidProvider}!?model_provider.ProviderId {
+/// libfx engines run Gateway, Codex, Grok, or the configured provider, bound to
+/// its definition so saved sessions record it. Null keeps the startup provider.
+fn providerOverrideFromEnv(value: ?[]const u8, configured: ?*const host_chat_completions.Context) error{InvalidProvider}!?model_provider.ProviderId {
     const raw = value orelse return null;
+    if (configured) |context| {
+        const provider = model_provider.parse(raw) orelse return error.InvalidProvider;
+        if (provider != .configured) return error.InvalidProvider;
+        return provider.bind(context.registry) catch error.InvalidProvider;
+    }
     if (std.mem.eql(u8, raw, "gateway")) return .gateway;
     if (std.mem.eql(u8, raw, "codex")) return .codex;
     if (std.mem.eql(u8, raw, "grok")) return .grok;
