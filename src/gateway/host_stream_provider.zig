@@ -228,7 +228,7 @@ pub fn openPost(
         if (status_result < 0) return error.HostStreamFailed;
         try pulse(request.cooperative_pulse);
     }
-    return .{ .handle = handle, .status = @enumFromInt(status_code) };
+    return .{ .handle = handle, .status = @fromBackingInt(@intCast(status_code)) };
 }
 
 /// Reads a non-success response body, bounded. The caller owns the bytes.
