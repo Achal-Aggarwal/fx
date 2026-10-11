@@ -16,6 +16,8 @@ const scripts = [
   "test-native-core-config-isolation.mjs",
   "test-agent-request-context.mjs",
   "test-agent-transport-retry.mjs",
+  "test-agent-codex.mjs",
+  "test-chatgpt-sign-in.mjs",
   "test-native-core-stream.mjs",
   "test-native-core-http-cleanup.mjs",
   "test-native-core-fetch-failure.mjs",

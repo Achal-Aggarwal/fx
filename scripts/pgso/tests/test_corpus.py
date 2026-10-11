@@ -59,6 +59,7 @@ VERIFICATION_E2E_TESTS = (
     "review-model-override.test.ts",
     "configured-providers.test.ts",
     "oauth-keychain-migration.test.ts",
+    "mcp-verbs.test.ts",
     "tui-auth-source-selection.test.ts",
     "tui-compaction-activity.test.ts",
     "compaction-policy.test.ts",

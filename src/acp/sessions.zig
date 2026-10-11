@@ -26,6 +26,7 @@ const agent_execution_memory = @import("../core/agent/execution_memory.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const tool_call_presentation = @import("tool_call_presentation.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
+const mcp_host = @import("../core/mcp_host/host.zig");
 const mcp_contract = @import("../core/mcp/mcp_contract.zig");
 const project_config = @import("../core/mcp/project_config.zig");
 const builtin_mcp = @import("../builtins/mcp.zig");
@@ -53,13 +54,47 @@ const Allocator = std.mem.Allocator;
 const ErrorCode = jsonrpc.ErrorCode;
 const writeJsonStr = jsonrpc.writeJsonStr;
 
+/// The session id a `libfx/new` request names, or null when it names none.
+/// The id reaches gateway headers, so it must pass the session layout rules.
+/// Caller owns the returned slice.
+fn requestedLibfxSessionId(alloc: Allocator, params_raw: ?[]const u8) error{ InvalidSessionId, OutOfMemory }!?[]u8 {
+    const raw = params_raw orelse return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSessionId,
+    };
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSessionId;
+    const value = parsed.value.object.get("sessionId") orelse return null;
+    switch (value) {
+        .null => return null,
+        .string => |id| {
+            session_store_paths.validateSessionId(id) catch return error.InvalidSessionId;
+            return try alloc.dupe(u8, id);
+        },
+        else => return error.InvalidSessionId,
+    }
+}
+
 pub fn handleNewLibfxSession(
     state: *server.ServerState,
     alloc: Allocator,
     msg: *jsonrpc.Message,
 ) !void {
+    // Checked before the active session is released, so a bad request
+    // leaves it in place.
+    const requested = requestedLibfxSessionId(alloc, msg.params_raw) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidSessionId => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Invalid sessionId",
+        }),
+    };
+    var requested_owned = requested != null;
+    defer if (requested_owned) alloc.free(requested.?);
     try server.releaseActiveSession(state);
-    const session_id = try session_store.generateSessionId(alloc);
+    requested_owned = false;
+    const session_id = requested orelse try session_store.generateSessionId(alloc);
     var session_id_owned = true;
     defer if (session_id_owned) alloc.free(session_id);
     const model = try alloc.dupe(u8, state.selected_model);
@@ -357,7 +392,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     );
     defer mcp_preparation.deinit(alloc);
     switch (mcp_preparation) {
-        .ready => {},
+        .ready, .host => {},
         .failed => |message| return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = message,
@@ -371,12 +406,17 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
             alloc.destroy(runtime);
         }
     };
+    const session_host = mcp_preparation.takeHost();
+    var session_host_owned = true;
+    defer if (session_host_owned) if (session_host) |h| h.destroy();
     switch (server.sessionsBackend(state)) {
         .v1 => {},
         .v2 => |v2_store| {
             session_mcp_owned = false;
+            session_host_owned = false;
             return startV2Session(state, alloc, msg, v2_store, .{
                 .mcp = session_mcp,
+                .mcp_host = session_host,
                 .workspace = if (workspace) |*binding| binding else null,
                 .client_system_prompt = &client_system_prompt,
             });
@@ -459,6 +499,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
         .effort = state.effort,
         .session_rt = session_rt,
         .mcp = session_mcp,
+        .mcp_host = session_host,
         .client_system_prompt = client_system_prompt,
         .workspace = if (workspace) |*binding| binding else null,
     }) catch {
@@ -476,6 +517,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     model_owned = false;
     session_rt_owned = false;
     session_mcp_owned = false;
+    session_host_owned = false;
 
     try writeNewSessionResponse(state, alloc, msg, session_id);
 }
@@ -484,6 +526,8 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
 const V2Start = struct {
     /// Owned; the session takes it over.
     mcp: ?*mcp_runtime.McpRuntime,
+    /// Owned like `mcp`.
+    mcp_host: ?*mcp_host.Host = null,
     /// The request's `cwd`, borrowed as in v1.
     workspace: ?*workspace_binding.Binding,
     /// Owned by the caller. The session takes the text over on success, and
@@ -509,6 +553,9 @@ fn startV2Session(
             alloc.destroy(runtime);
         }
     };
+    const session_host = start.mcp_host;
+    var session_host_owned = true;
+    defer if (session_host_owned) if (session_host) |h| h.destroy();
     const workspace_root = if (start.workspace) |binding| binding.root else state.workspace_root;
     const v2 = session_adapter.Session.create(alloc, v2_store, workspace_root, .acp, .{
         .preferences = .{
@@ -559,6 +606,7 @@ fn startV2Session(
         .effort = state.effort,
         .session_rt = session_rt,
         .mcp = session_mcp,
+        .mcp_host = session_host,
         .client_system_prompt = start.client_system_prompt.*,
         .workspace = start.workspace,
     }) catch
@@ -572,6 +620,7 @@ fn startV2Session(
     model_owned = false;
     session_rt_owned = false;
     session_mcp_owned = false;
+    session_host_owned = false;
     try writeNewSessionResponse(state, alloc, msg, session_id);
 }
 
@@ -836,7 +885,7 @@ fn handleRestoreSession(
     );
     defer mcp_preparation.deinit(alloc);
     switch (mcp_preparation) {
-        .ready => {},
+        .ready, .host => {},
         .failed => |message| return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_params,
             .message = message,
@@ -850,6 +899,9 @@ fn handleRestoreSession(
             alloc.destroy(runtime);
         }
     };
+    const session_host = mcp_preparation.takeHost();
+    var session_host_owned = true;
+    defer if (session_host_owned) if (session_host) |h| h.destroy();
 
     if (state.active_session) |*active| {
         // Loading the active session into another workspace releases it and
@@ -867,6 +919,9 @@ fn handleRestoreSession(
             const previous_mcp = active.mcp;
             active.mcp = session_mcp;
             session_mcp_owned = false;
+            const previous_host = active.mcp_host;
+            active.mcp_host = session_host;
+            session_host_owned = false;
             const start = server.loadStartingMode(state, alloc);
             active.mode = start.id;
             active.permission_mode = start.permission_mode;
@@ -876,6 +931,7 @@ fn handleRestoreSession(
                 runtime.deinit();
                 alloc.destroy(runtime);
             }
+            if (previous_host) |h| h.destroy();
             server.enableSubagentHost(state);
             if (kind.replaysHistory()) {
                 try sendActiveHistoryUpdates(state, alloc, session_id);
@@ -1036,6 +1092,7 @@ fn handleRestoreSession(
         .effort = durable.preferences.effort,
         .session_rt = session_rt,
         .mcp = session_mcp,
+        .mcp_host = session_host,
         .client_system_prompt = client_system_prompt,
         .workspace = if (workspace) |*binding| binding else null,
     }) catch
@@ -1051,6 +1108,7 @@ fn handleRestoreSession(
     model_owned = false;
     session_rt_owned = false;
     session_mcp_owned = false;
+    session_host_owned = false;
     if (kind.replaysHistory()) {
         try sendActiveHistoryUpdates(state, alloc, session_id);
     }
@@ -1340,6 +1398,7 @@ const SessionActivation = struct {
     effort: types.ReasoningEffort,
     session_rt: session_runtime.SessionRuntime,
     mcp: ?*mcp_runtime.McpRuntime,
+    mcp_host: ?*mcp_host.Host = null,
     /// Owned client prompt. The session takes it over on success; the caller
     /// frees it when activation fails.
     client_system_prompt: ?[]u8 = null,
@@ -1487,6 +1546,7 @@ fn activateSession(
         .permission_rules = state.permission_rules,
         .session_rt = activation.session_rt,
         .mcp = activation.mcp,
+        .mcp_host = activation.mcp_host,
         .cancel_flag = std.atomic.Value(bool).init(false),
         .pending_prompt_id = null,
     };
@@ -3512,4 +3572,33 @@ test "ACP same-session restore retires the replaced MCP runtime after active use
     if (restore.err) |err| return err;
     try std.testing.expect(retired_before_destroy);
     try std.testing.expect(!completed_while_leased);
+}
+
+test "libfx/new uses a valid host session id and generates one when none is named" {
+    const alloc = std.testing.allocator;
+    const id = (try requestedLibfxSessionId(alloc, "{\"sessionId\":\"wrun_01M3X0485FF9GX5ZA6FWMGR503\"}")).?;
+    defer alloc.free(id);
+    try std.testing.expectEqualStrings("wrun_01M3X0485FF9GX5ZA6FWMGR503", id);
+    try std.testing.expect((try requestedLibfxSessionId(alloc, null)) == null);
+    try std.testing.expect((try requestedLibfxSessionId(alloc, "{}")) == null);
+    try std.testing.expect((try requestedLibfxSessionId(alloc, "{\"sessionId\":null}")) == null);
+}
+
+test "libfx/new rejects a session id that is not header and path safe" {
+    const alloc = std.testing.allocator;
+    const bad = [_][]const u8{
+        "{\"sessionId\":\"\"}",
+        "{\"sessionId\":\"..\"}",
+        "{\"sessionId\":\"a/b\"}",
+        "{\"sessionId\":\"a b\"}",
+        "{\"sessionId\":\"a\\r\\nx-injected: 1\"}",
+        "{\"sessionId\":42}",
+        "[]",
+        "{",
+    };
+    for (bad) |params| {
+        try std.testing.expectError(error.InvalidSessionId, requestedLibfxSessionId(alloc, params));
+    }
+    const long = "{\"sessionId\":\"" ++ "a" ** 256 ++ "\"}";
+    try std.testing.expectError(error.InvalidSessionId, requestedLibfxSessionId(alloc, long));
 }
