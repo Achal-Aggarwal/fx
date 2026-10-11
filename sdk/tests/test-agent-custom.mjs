@@ -4,11 +4,9 @@
 // URL only, and never touch AI Gateway. No network: every request is answered
 // here.
 import { strict as assert } from "node:assert";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { local } from "../durable/local.mjs";
 import { createFxAgent, createFxEngine, memory, supportsJspi } from "../node.js";
 
 const backend = process.argv[2] || "native";
@@ -214,20 +212,22 @@ const assertNoGateway = (log) => assert.equal(log.some((entry) => entry.url.incl
       { status: 403, headers: { "content-type": "application/json" } },
     ),
   });
-  const dir = await mkdtemp(join(tmpdir(), "libfx-custom-quoted-key-"));
+  const durability = memory();
   const events = [];
   const streamed = [];
   const agent = createFxAgent({
     ...backendOptions,
-    durability: local({ dir }),
+    durability,
     provider,
     model: "local-model",
     fetch: world.fetch,
     credentials: () => ({ apiKey: key }),
     onEvent: (event) => events.push(event),
   });
+  let sessionId;
   try {
     const turn = agent.session().prompt("say ok");
+    ({ sessionId } = await turn.accepted);
     for await (const event of turn) streamed.push(event);
     assert.notEqual((await turn.result).stopReason, "end_turn");
   } finally {
@@ -235,21 +235,20 @@ const assertNoGateway = (log) => assert.equal(log.some((entry) => entry.url.incl
   }
   assert.equal(chatRequests(world.log)[0].headers.get("authorization"), `Bearer ${key}`, "the key reached the server");
   assert.match(JSON.stringify(streamed), /bad credential Bearer \*{14}/, "the error reaches the turn with the key masked");
-  const saved = [];
-  for (const entry of await readdir(dir, { recursive: true, withFileTypes: true })) {
-    if (!entry.isFile()) continue;
-    const text = await readFile(join(entry.parentPath ?? entry.path, entry.name), "latin1");
-    // Records saved as base64 are searched decoded.
-    const blobs = [...text.matchAll(/"data":\s*"([A-Za-z0-9+/=]+)"/g)].map(([, data]) => Buffer.from(data, "base64").toString("latin1"));
-    saved.push(text, ...blobs);
-  }
-  assert.ok(saved.length > 0, "the session was saved");
+  // Everything the session saved: its log, with byte payloads as text, and its UI stream.
+  const stored = await durability.create().session(sessionId);
+  const log = JSON.stringify(await stored.readSince(0), (_, value) => value instanceof Uint8Array ? Buffer.from(value).toString("latin1") : value);
+  const lines = await stored.ui.length();
+  assert.ok(lines > 0, "the session saved its UI stream");
+  const reader = stored.ui.read(0).getReader();
+  let ui = "";
+  for (let line = 0; line < lines; line += 1) ui += new TextDecoder().decode((await reader.read()).value);
+  await reader.cancel();
   // Undoes \u escapes at any depth of JSON nesting, so an escaped copy counts.
   const decoded = (text) => text.replace(/\\+u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
-  for (const [where, text] of [["the stream", JSON.stringify(streamed)], ["the events", JSON.stringify(events)], ["the saved session", saved.join("\n")]]) {
+  for (const [where, text] of [["the stream", JSON.stringify(streamed)], ["the events", JSON.stringify(events)], ["the saved log", log], ["the saved UI stream", ui]]) {
     assert.equal(decoded(text).includes(key), false, `${where} must not repeat the key`);
   }
-  await rm(dir, { recursive: true, force: true });
 }
 
 // 7. Options are checked before anything starts.
