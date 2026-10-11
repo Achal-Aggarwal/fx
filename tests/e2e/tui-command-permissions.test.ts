@@ -3141,19 +3141,24 @@ describe("effect-aware command permissions", () => {
   );
 
   test(
-    "fx ask forwards agent identity to captured and TTY commands",
+    "fx ask forwards agent identity to clean, user, and TTY commands",
     async () => {
-      for (const tty of [false, true]) {
+      for (const options of [{ profile: "clean" }, { profile: "user" }, { tty: true }]) {
         const root = createIsolatedRoot();
+        const tracePath = join(root.root, "trace.log");
         const gateway = startFakeGateway([
-          toolCall(`printf 'agent=%s' "$AI_AGENT"`, { tty }),
+          toolCall(`printf 'agent=%s' "$AI_AGENT"`, options),
           finalText("agent environment complete"),
         ]);
         const result = await runFx(
           ["ask", "--yolo", "--quiet", "--json", "Report the agent environment."],
           {
             cwd: root.workspace,
-            env: gatewayEnv(root, gateway),
+            env: gatewayEnv(root, gateway, {
+              AI_AGENT: "other-agent",
+              FX_TRACE_LOG: tracePath,
+              FX_TRACE_SCOPES: "core",
+            }),
             timeoutMs: TIMEOUT,
           },
         );
@@ -3164,6 +3169,9 @@ describe("effect-aware command permissions", () => {
         const toolResult = JSON.parse(toolResultText(gateway.requests[1].body, "command_1"));
         expect(toolResult).toMatchObject({ state: "completed", exit_code: 0 });
         expect(toolResult.output_delta).toContain("agent=fx");
+        if (options.profile === "user") {
+          expect(readFileSync(tracePath, "utf8")).toContain("command runner snapshot generation=");
+        }
       }
     },
     TIMEOUT,

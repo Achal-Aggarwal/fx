@@ -3588,6 +3588,30 @@ test "commands receive fx agent environment" {
     ) != null);
 }
 
+test "agent environment preserves the supplied environment without mutating it" {
+    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+
+    var environment = std.process.Environ.Map.init(std.testing.allocator);
+    defer environment.deinit();
+    try environment.put("AI_AGENT", "other-agent");
+    try environment.put("FX_AGENT_FIXTURE", "retained");
+
+    var scratch_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer scratch_state.deinit();
+    const result = try executeProcessWithScript(
+        scratch_state.allocator(),
+        .{ .max_command_output_bytes = 4096 },
+        &.{ "/bin/sh", "-c", "printf '%s:%s' \"$AI_AGENT\" \"$FX_AGENT_FIXTURE\"" },
+        "/tmp",
+        "",
+        &environment,
+    );
+
+    try std.testing.expectEqualStrings("fx:retained", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+    try std.testing.expectEqualStrings("other-agent", environment.get("AI_AGENT").?);
+}
+
 test "authorized command executes exactly once" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
