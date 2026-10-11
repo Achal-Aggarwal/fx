@@ -729,7 +729,10 @@ pub fn failureDiagnosticValue(code: []const u8, detail: []const u8) types.ModelF
         "";
     if (safe_detail.len == 0) return types.ModelFailureDiagnostic.init(prefix);
     var buffer: [max_bytes]u8 = undefined;
-    const text = std.mem.print(&buffer, "{s}: {s}", .{ prefix, safe_detail }) catch unreachable;
+    const text = buffer[0 .. prefix.len + 2 + safe_detail.len];
+    @memcpy(text[0..prefix.len], prefix);
+    @memcpy(text[prefix.len..][0..2], ": ");
+    @memcpy(text[prefix.len + 2 ..], safe_detail);
     return types.ModelFailureDiagnostic.init(text);
 }
 

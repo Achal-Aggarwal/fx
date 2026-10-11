@@ -568,10 +568,10 @@ pub const Session = struct {
             .file => null,
         };
         if (known) |hash| if (s.stat(dir, &hash)) |_| return hash else |_| {};
-        var tmp_name: [1 + 7 + 1 + 16 + 4]u8 = undefined;
         var suffix: [8]u8 = undefined;
         io.random(&suffix);
-        const name = std.mem.print(&tmp_name, ".pending.{x}.tmp", .{&suffix}) catch unreachable;
+        const tmp_name = ".pending.".* ++ std.fmt.bytesToHex(suffix, .lower) ++ ".tmp".*;
+        const name: []const u8 = &tmp_name;
         const file = s.createReadOnlyFile(dir, name) catch |io_err| return storage.ioFault(io_err);
         var file_open = true;
         defer if (file_open) s.closeFile(file);

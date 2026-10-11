@@ -470,7 +470,7 @@ test "a long tool list scrolls with the selection, framed by what's hidden" {
     const rows = [_]menu.Row{.{ .status = gh, .target = "https://h/mcp" }};
     var tools: [30]menu.Tool = undefined;
     var names: [30][8]u8 = undefined;
-    for (&tools, &names, 0..) |*t, *n, i| t.* = .{ .name = std.mem.print(n, "tool{d:0>2}", .{i}) catch unreachable, .description = "" };
+    for (&tools, &names, 0..) |*t, *n, i| t.* = .{ .name = try std.mem.print(n, "tool{d:0>2}", .{i}), .description = "" };
     var p: Projection = .{ .rows = &rows, .tools = .{ .ready = &tools } };
     menu.open(&p.state);
     _ = menu.press(&p.state, .{ .rows = &rows }, .enter);

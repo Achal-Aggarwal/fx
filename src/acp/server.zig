@@ -1742,7 +1742,7 @@ fn handleKernelCheckpoint(
         error.AttachmentStoreFull => return state.writer.writeError(alloc, msg.id, unavailable),
     };
     var response: [64]u8 = undefined;
-    const written = std.mem.print(&response, "{{\"checkpointAttachment\":{d}}}", .{attachment}) catch unreachable;
+    const written = try std.mem.print(&response, "{{\"checkpointAttachment\":{d}}}", .{attachment});
     try state.writer.writeResponse(alloc, msg.id, written);
 }
 

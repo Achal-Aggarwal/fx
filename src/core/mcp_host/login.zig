@@ -27,7 +27,13 @@ pub const Listener = struct {
 
     /// The redirect URI to sign in with, in `buffer`.
     pub fn redirectUri(l: *const Listener, buffer: *[64]u8) []const u8 {
-        return std.mem.print(buffer, "http://127.0.0.1:{d}/callback", .{l.port}) catch unreachable;
+        const origin = "http://127.0.0.1:";
+        const path = "/callback";
+        comptime std.debug.assert(origin.len + std.fmt.count("{d}", .{std.math.maxInt(@TypeOf(l.port))}) + path.len <= buffer.len);
+        buffer[0..origin.len].* = origin.*;
+        const port_end = origin.len + std.fmt.printInt(buffer[origin.len..], l.port, 10, .lower, .{});
+        buffer[port_end..][0..path.len].* = path.*;
+        return buffer[0 .. port_end + path.len];
     }
 
     /// Waits for the browser's `GET /callback` and returns the full address it
@@ -114,4 +120,16 @@ test "the browser's return is the callback address; other requests get a 404 and
     const want = try testing.allocator.print("http://127.0.0.1:{d}/callback?code=c1&state=s1", .{listener.port});
     defer testing.allocator.free(want);
     try testing.expectEqualStrings(want, url);
+}
+
+test "the redirect URI spells out every port in full" {
+    var buffer: [64]u8 = undefined;
+    for ([_]struct { u16, []const u8 }{
+        .{ 1, "http://127.0.0.1:1/callback" },
+        .{ 8080, "http://127.0.0.1:8080/callback" },
+        .{ 65535, "http://127.0.0.1:65535/callback" },
+    }) |case| {
+        const listener: Listener = .{ .server = undefined, .port = case[0] };
+        try testing.expectEqualStrings(case[1], listener.redirectUri(&buffer));
+    }
 }
