@@ -1658,6 +1658,118 @@ test "clear retains installed full transcript page until window worker terminate
     try std.testing.expect(runtime.full_transcript_installed_page == null);
 }
 
+test "user prompt card commit caches the same source a frame would rebuild" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 20,
+            .divider_top_row = 21,
+            .input_row = 22,
+            .divider_bottom_row = 23,
+            .hint_row = 24,
+        },
+        .owned_top_row = 1,
+        .has_committed_frame = true,
+    };
+    defer runtime.deinit(alloc);
+    var metrics: Metrics = .{};
+    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "WELCOME_ROW\n", .welcome);
+    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "previous answer\n" ** 40, .unknown_raw);
+    _ = try runtime.appendRawTranscriptEntryClassified(alloc, "  6m 25s (↑14 ↓30k)", .turn_summary);
+    const revision_before = runtime.full_transcript_content_revision;
+
+    var seeded_text = "SEEDED_PROMPT".*;
+    _ = try runtime.writeUserPromptCard(alloc, &metrics, .{ .text = &seeded_text }, true, &.{});
+    try std.testing.expect(runtime.full_transcript_content_revision != revision_before);
+    const seeded = runtime.compact_transcript_source_cache.find(
+        runtime.full_transcript_content_revision,
+        runtime.layout.cols,
+        runtime.has_committed_frame,
+    ) orelse return error.CommittedSourceNotCached;
+
+    var rebuilt = try source_preparation.prepareTranscriptSource(&runtime, alloc, null);
+    defer rebuilt.deinit(alloc);
+    try rebuilt.ensureLineIndex(alloc);
+    try std.testing.expect(std.mem.find(u8, rebuilt.bytes, "SEEDED_PROMPT") != null);
+    try std.testing.expectEqualDeep(rebuilt, seeded.*);
+
+    // Before the first committed frame the frame-time source keeps the
+    // welcome cut, so the commit's source is not reused.
+    runtime.has_committed_frame = false;
+    const unframed_revision = runtime.full_transcript_content_revision;
+    var unframed_text = "UNFRAMED_PROMPT".*;
+    _ = try runtime.writeUserPromptCard(alloc, &metrics, .{ .text = &unframed_text }, true, &.{});
+    try std.testing.expect(runtime.compact_transcript_source_cache.find(
+        runtime.full_transcript_content_revision,
+        runtime.layout.cols,
+        false,
+    ) == null);
+    try std.testing.expect(runtime.full_transcript_content_revision != unframed_revision);
+
+    // With the full transcript open the commit prepares at full depth, which
+    // the next inline frame must not reuse.
+    runtime.has_committed_frame = true;
+    runtime.full_transcript = .{ .depth = .full };
+    const full_depth_revision = runtime.full_transcript_content_revision;
+    var full_depth_text = "FULL_DEPTH_PROMPT".*;
+    _ = try runtime.writeUserPromptCard(alloc, &metrics, .{ .text = &full_depth_text }, true, &.{});
+    try std.testing.expect(runtime.full_transcript_content_revision != full_depth_revision);
+    try std.testing.expect(runtime.compact_transcript_source_cache.find(
+        runtime.full_transcript_content_revision,
+        runtime.layout.cols,
+        true,
+    ) == null);
+}
+
+test "committed transcript source is not cached while released rows are still published" {
+    const alloc = std.testing.allocator;
+    var runtime = TranscriptRuntime{
+        .layout = .{ .cols = 40, .rows = 12, .content_bottom = 8, .divider_top_row = 9, .input_row = 10, .divider_bottom_row = 11, .hint_row = 12 },
+        .has_committed_frame = true,
+        .detached_commit_alloc = alloc,
+        .committed_frame_layout = .{ .terminal_cols = 40, .terminal_rows = 12 },
+    };
+    defer runtime.deinit(alloc);
+    const id = try runtime.appendRawTranscriptEntryClassified(alloc, "RELEASED_ROW", .unknown_raw);
+    var flow = try source_preparation.prepareRetentionSource(&runtime, alloc);
+    defer flow.deinit(alloc);
+    var identity = try source_preparation.RetentionIdentity.capture(&runtime, alloc, &flow);
+    errdefer identity.deinit(alloc);
+    identity.publication_entries = try alloc.dupe(u32, &.{id});
+    identity.publication_release_floor = 1;
+    runtime.transcript_commit_state = .{ .recovering = .{
+        .flow = try alloc.dupe(u8, flow.bytes),
+        .retention_identity = identity,
+        .attempt_cols = 40,
+        .attempt_total_visual_rows = 1,
+        .materialized_visual_rows = 1,
+        .materialized_flow_len = flow.bytes.len,
+        .tracks_semantic_progress = true,
+        .presentation_valid = true,
+    } };
+    identity = .{};
+
+    for ([_]bool{ true, false }) |published| {
+        if (!published) {
+            const retention = &runtime.transcript_commit_state.recovering.retention_identity;
+            alloc.free(retention.publication_entries);
+            retention.publication_entries = &.{};
+        }
+        const previous_revision = runtime.full_transcript_content_revision;
+        runtime.full_transcript_content_revision += 1;
+        const committed = try source_preparation.prepareTranscriptSource(&runtime, alloc, null);
+        runtime.adoptCommittedTranscriptSource(alloc, committed, previous_revision);
+        const cached = runtime.compact_transcript_source_cache.find(
+            runtime.full_transcript_content_revision,
+            runtime.layout.cols,
+            true,
+        );
+        try std.testing.expectEqual(!published, cached != null);
+    }
+}
+
 test "compact transcript cache survives navigation and invalidates on content change" {
     const alloc = std.testing.allocator;
     var runtime = TranscriptRuntime{
@@ -4311,6 +4423,14 @@ pub const TranscriptRuntime = struct {
     has_committed_frame: bool = false,
     committed_frame_layout: render_engine.frame_layout.CommittedLayoutSnapshot = .{},
     transcript_commit_state: TranscriptCommitState = .invalid,
+    /// A partial scroll may have moved rows into terminal history already.
+    /// No ordinary repaint may run until the remaining rows are committed.
+    pending_session_scrollback_handoff: ?struct {
+        remaining_rows: u16,
+        total_rows: u16,
+        terminal_cols: u16,
+        terminal_rows: u16,
+    } = null,
     publication_projection_invalid: bool = false,
     /// True while the terminal reports zero, unreadable, or too-small
     /// dimensions after the first committed frame. Normal painters stay
@@ -4818,7 +4938,133 @@ pub const TranscriptRuntime = struct {
         return self.lifecycle_state.finalized_turn_watermark;
     }
 
+    /// Publishes the committed visible transcript before its session state is discarded.
+    /// A failed or partial frame leaves the old transcript owned by the caller.
+    pub fn sessionScrollbackHandoffPending(self: *const TranscriptRuntime) bool {
+        return self.pending_session_scrollback_handoff != null;
+    }
+
+    pub fn cancelSessionScrollbackHandoff(self: *TranscriptRuntime) void {
+        const pending = self.pending_session_scrollback_handoff orelse return;
+        self.pending_session_scrollback_handoff = null;
+        self.resetTranscriptAnchor("session_scrollback_handoff_geometry_changed");
+        self.markTranscriptDirty();
+        self.render_requests.request(.footer);
+        debug_trace.logf("scroll", "session_scrollback_handoff_cancel remaining_rows={d} reason=geometry_changed", .{pending.remaining_rows});
+    }
+
+    pub fn commitVisibleTranscriptBeforeFreshSession(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        metrics: *Metrics,
+    ) !void {
+        if (self.pending_session_scrollback_handoff == null) {
+            if (!self.has_committed_frame) return;
+            const anchor = switch (self.transcript_commit_state) {
+                .stable => |value| value,
+                .invalid, .recovering => return error.SessionScrollbackHandoffUnavailable,
+            };
+            if (anchor.occupied_last_row == 0) return;
+            const shadow = self.shadow_vt orelse return error.SessionScrollbackHandoffUnavailable;
+            const previous = self.committed_frame_layout;
+            if (self.terminal_dimensions_invalid or self.terminal_reset_pending or
+                self.pending_resize_observation != null or self.render_requests.resizeLifecyclePending() or
+                self.render_requests.blocksFrameCommit() or self.fullTranscriptActive() or
+                previous.layout_id == 0 or previous.layout_id != anchor.layout_id or
+                previous.terminal_cols != self.layout.cols or previous.terminal_rows != self.layout.rows or
+                shadow.cols != self.layout.cols or shadow.rows != self.layout.rows or
+                self.owned_top_row == 0 or self.owned_top_row != previous.owned_top or
+                previous.transcript_area.isEmpty() or
+                anchor.occupied_last_row < self.owned_top_row or
+                anchor.occupied_last_row > previous.transcript_area.bottom or
+                anchor.occupied_last_row > self.layout.rows)
+            {
+                return error.SessionScrollbackHandoffUnavailable;
+            }
+            self.pending_session_scrollback_handoff = .{
+                .remaining_rows = anchor.occupied_last_row,
+                .total_rows = anchor.occupied_last_row,
+                .terminal_cols = self.layout.cols,
+                .terminal_rows = self.layout.rows,
+            };
+        }
+        const pending = self.pending_session_scrollback_handoff.?;
+        const shadow = self.shadow_vt orelse return error.SessionScrollbackHandoffUnavailable;
+        if (pending.terminal_cols != self.layout.cols or pending.terminal_rows != self.layout.rows or
+            shadow.cols != self.layout.cols or shadow.rows != self.layout.rows)
+        {
+            return error.SessionScrollbackHandoffGeometryChanged;
+        }
+        if (self.terminal_dimensions_invalid or self.terminal_reset_pending or
+            self.render_requests.resizeLifecyclePending() or self.render_requests.blocksFrameCommit() or
+            self.fullTranscriptActive() or self.owned_top_row == 0 or
+            (pending.remaining_rows > 0 and pending.remaining_rows < self.owned_top_row))
+        {
+            return error.SessionScrollbackHandoffUnavailable;
+        }
+        const terminal_rows = self.layout.rows;
+        const scroll_plan = if (pending.remaining_rows > 0)
+            render_engine.frame_scroll_plan.merge(
+                terminal_rows,
+                self.owned_top_row,
+                self.owned_top_row - 1,
+                @as(u32, pending.remaining_rows - self.owned_top_row + 1),
+            )
+        else
+            render_engine.frame_scroll_plan.FrameScrollPlan.none(terminal_rows, self.owned_top_row);
+        const empty = render_engine.paint_plan.FrameBand.empty;
+        const plan: render_engine.paint_plan.PaintPlan = .{
+            .layout = self.layout,
+            .viewport = .{ .top_row = 1, .bottom_row = terminal_rows, .start_line = 0, .partial_skip_rows = 0, .line_count = 0 },
+            .footer = .{
+                .top = terminal_rows,
+                .top_divider = terminal_rows,
+                .banner = terminal_rows,
+                .input_base = terminal_rows,
+                .picker_divider = terminal_rows,
+                .picker_start = terminal_rows,
+                .bottom_divider = terminal_rows,
+                .hint = terminal_rows,
+                .total_rows = 0,
+            },
+            .activity = .none,
+            .preserved_band = empty(.preserved_shell),
+            .transcript_band = empty(.transcript),
+            .blank_band = .{ .top = 1, .bottom = terminal_rows, .owner = .gap },
+            .activity_band = empty(.activity),
+            .footer_band = empty(.footer),
+            .invalidation = .empty(),
+            .footer_clean_allowed = true,
+            .synchronized_update = self.sync_updates_enabled,
+            .cursor_target = .{ .row = 1, .col = 1, .visible = false },
+            .bottom_reserved_rows = 0,
+            .preserve_scrollback = true,
+        };
+        const result = try render_engine.frame_builder.buildAndFlushFrame(
+            alloc,
+            self,
+            metrics,
+            .{ .plan = plan, .body = .none, .scroll_plan = scroll_plan },
+        );
+        const receipt = result.scrollCommit(scroll_plan);
+        if (receipt.unplanned_terminal_scroll_rows != 0) return error.InvalidFrameScrollPlan;
+        self.ackPreservedRowReleaseAssumeValid(scroll_plan, receipt.accepted_terminal_scroll_rows);
+        self.pending_session_scrollback_handoff.?.remaining_rows -= receipt.accepted_terminal_scroll_rows;
+        if (!result.is_committed() or !receipt.complete()) {
+            return error.SessionScrollbackHandoffIncomplete;
+        }
+        self.pending_session_scrollback_handoff = null;
+        self.committed_frame_layout = render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan);
+        self.cursor_row = 1;
+        self.cursor_col = 1;
+        debug_trace.logf("scroll", "session_scrollback_handoff rows={d} owned_top={d}", .{ pending.total_rows, scroll_plan.prior_owned_top });
+    }
+
     pub fn clearTranscript(self: *TranscriptRuntime, alloc: Allocator) void {
+        if (self.pending_session_scrollback_handoff) |pending| {
+            debug_trace.logf("scroll", "session_scrollback_handoff_discard remaining_rows={d} reason=transcript_clear", .{pending.remaining_rows});
+            self.pending_session_scrollback_handoff = null;
+        }
         const pending_resume_bytes = self.releasePendingResumeSource(alloc);
         if (pending_resume_bytes > 0) {
             debug_trace.logf(
@@ -10029,6 +10275,22 @@ pub const TranscriptRuntime = struct {
         }
     }
 
+    /// Writes an OSC 7501 report between frames, like the notification bell.
+    pub fn writeProgramStatus(
+        self: *TranscriptRuntime,
+        metrics: *Metrics,
+        report: []const u8,
+    ) void {
+        switch (transcript_io.writeFrameBytes(self, metrics, report)) {
+            .complete => {},
+            .partial => |partial| debug_trace.logf(
+                "program_status",
+                "report write failed accepted_bytes={d} err={s}",
+                .{ partial.accepted_bytes, @errorName(partial.err) },
+            ),
+        }
+    }
+
     fn writeFrameSink(ctx: *anyopaque, metrics: *Metrics, bytes: []const u8) render_engine.terminal_diff.FrameSinkWriteResult {
         const self: *TranscriptRuntime = @ptrCast(@alignCast(ctx));
         return transcript_io.writeFrameBytes(self, metrics, bytes);
@@ -10150,6 +10412,53 @@ pub const TranscriptRuntime = struct {
             .has_committed_frame = self.has_committed_frame,
         });
         return cached.clone(alloc);
+    }
+
+    /// Takes ownership of the source a recorded mutation commit prepared for
+    /// the committed entries and caches it for the next inline frame, which
+    /// would otherwise render every entry again. Discards it whenever a frame
+    /// would prepare differently from the commit: the content revision did not
+    /// advance, no frame has committed yet, a resume source owns preparation,
+    /// the full transcript is open, or released rows are still published.
+    pub fn adoptCommittedTranscriptSource(
+        self: *TranscriptRuntime,
+        alloc: Allocator,
+        committed: TranscriptPreparationSource,
+        previous_revision: u64,
+    ) void {
+        var source = committed;
+        const publishes_released_rows = if (self.committedRetentionIdentity()) |identity|
+            identity.publication_entries.len > 0
+        else
+            false;
+        if (self.full_transcript_content_revision == previous_revision or
+            !self.has_committed_frame or
+            self.pending_resume_source != null or
+            self.fullTranscriptActive() or
+            publishes_released_rows or
+            source.cols != self.layout.cols)
+        {
+            source.deinit(alloc);
+            return;
+        }
+        // The commit prepares from a shadow that has not committed a frame;
+        // a frame-time source never carries the welcome cut after the first one.
+        source.welcome_cut_line = null;
+        source.ensureLineIndex(alloc) catch |err| {
+            debug_trace.logf(
+                "render",
+                "committed transcript source dropped before reuse err={s}",
+                .{@errorName(err)},
+            );
+            source.deinit(alloc);
+            return;
+        };
+        _ = self.compact_transcript_source_cache.insert(alloc, .{
+            .source = source,
+            .content_revision = self.full_transcript_content_revision,
+            .cols = self.layout.cols,
+            .has_committed_frame = self.has_committed_frame,
+        });
     }
 
     pub fn prepareTranscriptSourceForFrameInterruptible(

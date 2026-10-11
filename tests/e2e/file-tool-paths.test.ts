@@ -12,6 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EVAL_MODEL, HAS_API_KEY, runFx } from "../evals/eval-helpers";
+import { pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import { fakeGatewayTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 
 const TIMEOUT = 20_000;
@@ -518,6 +519,142 @@ describe("filesystem path handling", () => {
         );
         expect(delivered).toContain(base64A);
         expect(delivered).toContain(base64B);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "read_file sends eligible originals and guides the model to reread an oversized copy",
+    async () => {
+      const root = createIsolatedRoot();
+      const frame = solidPng(3420, 2224);
+      const frameBase64 = frame.toString("base64");
+      const smallBase64 =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+      const oversizedBase64 = solidPng(8001, 1).toString("base64");
+      const gateway = startFakeGateway(
+        [
+          toolCall("read_frame", "read_file", { path: "frame.png" }),
+          (body) => {
+            const files = JSON.parse(body).prompt
+              .filter((message: { role?: string; content?: unknown }) =>
+                message.role === "user" && Array.isArray(message.content)
+              )
+              .flatMap((message: { content: Array<Record<string, unknown>> }) => message.content)
+              .filter((entry: Record<string, unknown>) => entry.type === "file");
+            expect(toolResultOutput(body, "read_frame")).toContain("image attached");
+            expect(files).toHaveLength(1);
+            expect((files[0].data as Record<string, unknown>).data).toBe(frameBase64);
+            return toolCall("read_oversized", "read_file", { path: "oversized.png" });
+          },
+          (body) => {
+            const files = JSON.parse(body).prompt
+              .filter((message: { role?: string; content?: unknown }) =>
+                message.role === "user" && Array.isArray(message.content)
+              )
+              .flatMap((message: { content: Array<Record<string, unknown>> }) => message.content)
+              .filter((entry: Record<string, unknown>) => entry.type === "file");
+            expect(toolResultOutput(body, "read_oversized")).toContain("<path>oversized.png</path>");
+            expect(toolResultOutput(body, "read_oversized")).toContain("exceeds 8000 pixels per side");
+            expect(toolResultOutput(body, "read_oversized")).toContain("save a smaller copy to a new file");
+            expect(files).toHaveLength(1);
+            expect(JSON.stringify(files)).not.toContain(oversizedBase64);
+            return toolCall("read_small", "read_file", { path: "small.png" });
+          },
+          (body) => {
+            const files = JSON.parse(body).prompt
+              .filter((message: { role?: string; content?: unknown }) =>
+                message.role === "user" && Array.isArray(message.content)
+              )
+              .flatMap((message: { content: Array<Record<string, unknown>> }) => message.content)
+              .filter((entry: Record<string, unknown>) => entry.type === "file");
+            const sent = files.map((entry: Record<string, unknown>) =>
+              (entry.data as Record<string, unknown>).data
+            );
+            expect(toolResultOutput(body, "read_small")).toContain("image attached");
+            expect(sent).toEqual(expect.arrayContaining([frameBase64, smallBase64]));
+            expect(sent).not.toContain(oversizedBase64);
+            return finalText("frames inspected");
+          },
+        ],
+        { modelTags: ["tool-use", "vision", "file-input"] },
+      );
+      try {
+        writeFileSync(join(root.workspace, "frame.png"), frame);
+        writeFileSync(join(root.workspace, "oversized.png"), Buffer.from(oversizedBase64, "base64"));
+        writeFileSync(join(root.workspace, "small.png"), Buffer.from(smallBase64, "base64"));
+        const result = await runFx(
+          ["ask", "--auto", "--json", "--no-save", "Read the requested images, then stop."],
+          {
+            cwd: root.workspace,
+            env: gatewayEnv(root, gateway, root.home),
+            timeoutMs: TIMEOUT,
+          },
+        );
+        const json = parseFxJson(result);
+        expect(json.tool_calls).toEqual([
+          { name: "read_file", status: "success" },
+          { name: "read_file", status: "success" },
+          { name: "read_file", status: "success" },
+        ]);
+        expect(gateway.requests).toHaveLength(4);
+        expect(gateway.remainingResponseCount()).toBe(0);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "read_file withholds images over the strict request limit when more than 20 are requested",
+    async () => {
+      const root = createIsolatedRoot();
+      const frame = solidPng(3420, 2224);
+      const calls = Array.from({ length: 21 }, (_, index) => ({
+        type: "tool-call",
+        toolCallId: `read_frame_${index + 1}`,
+        toolName: "read_file",
+        input: { path: `frame-${index + 1}.png` },
+      }));
+      const gateway = startFakeGateway(
+        [
+          sse([
+            ...calls,
+            { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+          ]),
+          (body) => {
+            expect(occurrenceCount(body, "this request permits at most 2000 per side")).toBe(21);
+            expect(body).not.toContain('"type":"file"');
+            return finalText("frames withheld");
+          },
+        ],
+        { modelTags: ["tool-use", "vision", "file-input"] },
+      );
+      try {
+        for (let index = 0; index < calls.length; index++) {
+          writeFileSync(join(root.workspace, `frame-${index + 1}.png`), frame);
+        }
+        const result = await runFx(
+          ["ask", "--auto", "--json", "--no-save", "Read every requested frame, then stop."],
+          {
+            cwd: root.workspace,
+            env: gatewayEnv(root, gateway, root.home),
+            timeoutMs: TIMEOUT,
+          },
+        );
+        const json = parseFxJson(result);
+        expect(json.tool_calls).toHaveLength(21);
+        expect(json.tool_calls).toEqual(
+          Array.from({ length: 21 }, () => ({ name: "read_file", status: "success" })),
+        );
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.remainingResponseCount()).toBe(0);
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });

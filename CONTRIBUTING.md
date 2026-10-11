@@ -24,7 +24,7 @@ Requirements:
 
 * interactive terminal for manual shell testing
 
-* a model connection for model-backed flows. [Custom model connections](README.md#custom-model-connections) support local and remote endpoints. Vercel OAuth via `fx login`, macOS Keychain API keys via `fx setup`, `AI_GATEWAY_API_KEY`, and `VERCEL_OIDC_TOKEN` are also supported
+* a model connection for model-backed flows. [Custom model connections](https://fx.sh/docs/configure-fx/custom-model-connections) support local and remote endpoints. Vercel OAuth via `fx login`, macOS Keychain API keys via `fx setup`, `AI_GATEWAY_API_KEY`, and `VERCEL_OIDC_TOKEN` are also supported
 
 Common commands:
 
@@ -39,11 +39,13 @@ zig build run
 
 Keep the local development loop focused: run the narrowest test that covers the changed path, build fx, and exercise the change using `./zig-out/bin/fx`. The installed `fx` on `PATH` is not valid development evidence.
 
-Once the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. The **Full CI** workflow runs the complete deterministic suite on native Linux x86_64, Linux aarch64, macOS x86_64, and macOS aarch64 runners. The native matrix builds, tests, and smoke-tests ReleaseSafe on every platform; formatting and the public-surface audit run in those ReleaseSafe jobs. Four duration-balanced, isolated ReleaseSafe E2E shards per platform use checked-in weights to assign every Bun test file once; files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one bounded retry after tmux is reset.
+Once the focused checks pass, create a clean checkpoint commit, push the non-`main` feature branch, and open a draft PR immediately. **CI** runs the complete deterministic suite on Linux x86_64, which is the gate for every change. It checks formatting, the PGSO corpus, the public surface, and the compactor boundary, runs the ReleaseSafe unit tests, and builds fx once for the E2E jobs. Four duration-balanced E2E shards use checked-in weights to assign every Bun test file once, and files inside each shard run sequentially in separate Bun processes so terminal fixtures and process state cannot leak between files. A failed file receives one retry after tmux is reset, and a file that passes only on retry gets a warning annotation.
 
-Standard PR CI reports ReleaseSafe Build & Test and deterministic E2E results. Do not mark the draft PR ready until all four Full CI jobs and the final ship gate have succeeded for the exact current commit. Each platform aggregate requires its ReleaseSafe native check and all four ReleaseSafe E2E shards. A result from an older commit does not count. Live model evals are separate from this gate because they require credentials and are not deterministic.
+macOS checks run only when a change can behave differently on macOS: a Zig file with a macOS, BSD, or Linux code path, `build.zig`, the macOS signing script, the native SDK addon, an E2E file listed in `tests/e2e/macos-platform-tests.json`, or a shared E2E helper that reads the platform. Add the `ci:macos` label or run `gh workflow run macos.yml --ref <branch>` to request them for any other change. The `macOS arm64` check passes without a macOS runner when the change does not need one.
 
-Changes to `build.zig` or `scripts/pgso/` also run the native macOS arm64 PGSO candidate workflow. That lane produces retained size, behavior, and performance evidence but does not alter any release artifact or update channel. Its pinned toolchain, local reproduction command, corpus exclusions, and failure rules are documented in [`scripts/pgso/README.md`](scripts/pgso/README.md).
+Do not mark the draft PR ready until `Build & Test`, `E2E (deterministic)`, `Shellcheck`, `Startup Latency`, `macOS arm64`, and the final ship gate have succeeded for the exact current commit. A result from an older commit does not count. Live model evals are separate from this gate because they require credentials and are not deterministic.
+
+Changes to the PGSO pipeline also run the native macOS arm64 PGSO candidate workflow: `scripts/pgso/` other than `corpus.json`, the `setup-pgso` action, or the PGSO workflow. Run it on any other branch with `gh workflow run pgso-macos-arm64.yml --ref <branch>`. That lane produces retained size, behavior, and performance evidence but does not alter any release artifact or update channel. Its pinned toolchain, local reproduction command, corpus exclusions, and failure rules are documented in [`scripts/pgso/README.md`](scripts/pgso/README.md).
 
 Every pull request also receives informational ReleaseSafe binary-size
 comparisons for Linux x86_64, Linux arm64, macOS x86_64, and macOS arm64. Each
@@ -51,7 +53,8 @@ comparison builds the pull request merge commit and base commit on the same
 native runner, reports exact file and ELF or Mach-O section deltas, and emits a
 warning at increases of 52,429 bytes (0.050000 MiB) or more. The warning requests
 investigation but does not replace the full PGSO release gate or reject a valid
-feature solely for adding code.
+feature solely for adding code. The same jobs smoke-test each release-style
+binary; the Linux arm64 and macOS binaries run nowhere else on a pull request.
 
 ## Pull Requests
 
@@ -71,7 +74,11 @@ Every PR must carry exactly one label that describes its primary intent:
 
 * `type: security`: fixes or hardens a security boundary
 
-If you cannot manage labels, a maintainer or repository agent will apply the label before review. For a mixed PR, choose the label that best describes why the PR exists. Keep the title as a clean imperative sentence and do not add bracketed type prefixes such as `[bug]` or `[improvement]`.
+If you can manage labels on `vercel-labs/fx`, which takes triage access or higher, apply the label when you open the PR. For a mixed PR, choose the label that best describes why the PR exists. If you contribute from outside the organization, you cannot add labels and do not need to: a maintainer applies the label during review, so open your PR and mark it ready as usual. Keep the title as a clean imperative sentence and do not add bracketed type prefixes such as `[bug]` or `[improvement]`.
+
+Requesting extra CI also needs access: the `ci:macos` label takes triage access, and `gh workflow run` takes write access. If you need the macOS checks, a PGSO run, or another on-request run and cannot start it yourself, ask in your PR and a maintainer will start it.
+
+If an AI coding agent writes any of your contribution's prose, including the PR title and description, commit messages, documentation, and issues, it must use the `technical-writer` skill in `.fx/skills/technical-writer/`.
 
 ## Repo Shape
 
@@ -125,7 +132,9 @@ Config precedence (highest wins):
 4. `<workspace>/.fx.json` (committed project defaults)
 5. Built-in defaults
 
-Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `provider`, `providers`, `models`, `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `update_channel`, `permission_mode`, and `permission` are ignored from project config before their values are parsed.
+Project `.fx.json` accepts only repo-safe defaults: `sandbox`, `max_agent_steps`, `max_tool_result_bytes`, and `context`. Profile-owned keys such as `provider`, `providers`, `models`, `model`, `effort`, `fast_mode`, `slash_menu_categories`, `startup_scrollback`, `prompt_history`, `statusLine`, `skill_match_fuzzy`, `first_call_tool_choice`, `auto_upgrade`, `auto_compact_percent`, `update_channel`, `permission_mode`, `permission`, and `skill_symlink_authorities` are ignored from project config before their values are parsed.
+
+`skill_symlink_authorities` is an array of absolute directories that symlinked skills may resolve into, such as an app bundle or `/nix/store`. It is read at startup, a workspace override replaces the global list, and its entries are combined with the colon-separated `FX_SKILL_SYMLINK_AUTHORITIES` environment variable.
 
 Runtime state lives under `~/.fx/`:
 
@@ -365,6 +374,67 @@ persistent subagents receive an immutable, permission-filtered view of the
 parent or ACP session's admitted MCP tools, resources, prompts, and completion
 capability. Missing, revoked, stale, or closed authority fails before transport.
 
+ACP clients can also serve an MCP server over the ACP connection itself, as
+described in the MCP-over-ACP RFD, by declaring
+`{"type":"acp","name":"...","serverId":"..."}` in `mcpServers`. fx advertises
+`mcpCapabilities.acp` and sends each modern MCP request as an `mcp/message`
+request with a fresh logical `requestId`; the client answers with a `result` or
+`error` carrier, and timeouts or cancellation send `$/cancel_request`. These
+servers connect from the prompt worker at the start of the first turn, because
+discovery waits for replies that only the connection reader delivers, so a
+server that fails to connect appears in the model's server catalog instead of
+failing session setup. Request-scoped `mcp/message` notifications such as
+progress are not delivered to operations yet.
+
+## ACP Embedding
+
+`fx acp` extends ACP v1 for clients that embed it. Extensions are read and
+written under `_meta.fx`. Start the server with `fx acp --ultrafast` or
+`fx acp --no-ultrafast` to set a process-local default request for sessions
+created by that server; the request still requires a model that advertises
+Ultra eligibility.
+
+* **Client MCP tools stay loaded:** tool schemas from servers in `mcpServers`
+  are advertised on every turn within the `mcp_selected_schema_bytes` budget.
+  Set `_meta.fx.alwaysLoaded` to `false` on a server entry to load it on demand
+  instead. A model call naming a live MCP tool that is not loaded is loaded and
+  admitted through the normal MCP permission path instead of failing.
+* **Steering:** a `session/prompt` with `_meta.fx.steer` set to `true` while a
+  turn runs joins that turn at its next safe boundary and is replayed as a
+  `user_message_chunk` whose `_meta.fx.steering.requestId` names the request.
+  Its response arrives when that turn ends, with the turn's `stopReason` and
+  `_meta.fx.steering` set to `absorbed`. Steering queued when a turn is
+  cancelled answers `cancelled` with `dropped`; steering that a turn ended
+  without reading returns an error so the client can send it again. Without the
+  opt-in, a second prompt keeps the `Prompt already in progress` error.
+  `session/load` replays absorbed steering in place with a null `requestId`.
+  `initialize` reports support in `agentCapabilities._meta.fx.steering`.
+* **Client system prompt:** `session/new` accepts `systemPrompt` text blocks in
+  `append` mode, as proposed in the client system prompt RFD, and `initialize`
+  advertises `sessionCapabilities.systemPrompt`. `_meta.fx.systemPrompt`
+  accepts the same blocks for SDKs that drop unknown fields. The prompt follows
+  fx's own instructions in the system slot, is stored with the session, and is
+  restored on `session/load` and `session/resume`. Set `_meta.fx.terminal` to
+  `false` on `initialize` when fx is not presented in a terminal; fx then drops
+  its terminal identity and rendering guidance.
+* **Tool call metadata:** each `tool_call` update carries
+  `_meta.fx.toolCall.internal`, which is true for fx's own discovery and
+  bookkeeping steps such as `capability_search`, `mcp_select_tool`, and
+  `read_tool_result`. MCP tool calls add `mcp.server` and `mcp.tool` and use
+  the server's tool title, falling back to the tool's own name. `session/load`
+  replays the same metadata, including for servers that reconnect only on the
+  next turn.
+* **Session workspace:** an absolute `cwd` on `session/new`, `session/load`,
+  or `session/resume` becomes that session's workspace for file access, shell
+  commands, project instructions, project skills, project MCP servers, and the
+  session record. Model, provider, credentials, and permission policy stay as
+  resolved at `initialize` from the launch directory. A client without a
+  project can pass an empty directory it owns.
+* **Profile MCP servers:** ACP sessions use only client-supplied and approved
+  project servers. Set `_meta.fx.profileMcpServers` to `true` on a session
+  request to add the user's `~/.fx/mcp.json` servers. Request entries win name
+  collisions, and profile entries win over project entries.
+
 ## Permissions and Auto Mode
 
 Security is permission-first.
@@ -539,6 +609,26 @@ CI uses `--runs 100` with a reduced warmup and skips the build step because the
 workflow builds ReleaseSafe first. Results are written to
 `benchmarks/results/` (gitignored).
 
+`FX_BENCH` exits before the interactive shell starts, so it does not measure
+the time to the first frame. `benchmarks/first_frame.py` does: it launches fx
+on a pseudo-terminal, answers terminal queries like a fast emulator, and
+reports first byte, first frame, exit latency, CPU time, and peak RSS. Pass
+several binaries to compare them under the same machine load:
+
+```bash
+python3 benchmarks/first_frame.py --binary /tmp/fx-before --binary ./zig-out/bin/fx
+python3 benchmarks/first_frame.py --isolated-home --cwd /tmp   # empty profile
+```
+
+By default it uses your own HOME and working directory, which is what users
+feel. It disables auto-upgrade for the measured processes and fails if a
+binary changes during the run. Add `--no-background-reply` to act like a
+terminal that ignores the background color query.
+
+The libfx runtime and long-turn memory jobs run only on request. Start them by
+dispatching **Benchmarks** with `libfx_runtime` or `long_turn_memory` set, for
+example `gh workflow run bench.yml --ref <branch> -f libfx_runtime=true`.
+
 The libfx runtime job measures cold startup, warm prompts, host-tool calls,
 stream throughput, and Agent cleanup. Its direct Pi comparison uses an external
 Zig HTTP server, Pi 0.84.4, and three alternating 100-sample rounds. On Bun,
@@ -564,5 +654,5 @@ Minimum checklist:
 1. Run `zig fmt --check src/` and the focused tests for the changed path.
 2. Run `zig build`, then exercise the change with `./zig-out/bin/fx`.
 3. Push the feature branch and open a draft PR immediately.
-4. Require all four **Full CI** jobs and the final ship gate to pass for the exact current commit before marking the PR ready.
+4. Require **CI**, including the **macOS arm64** check, and the final ship gate to pass for the exact current commit before marking the PR ready.
 5. Update `README.md` if user-facing behavior changed.

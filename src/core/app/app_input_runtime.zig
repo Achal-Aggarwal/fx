@@ -102,6 +102,7 @@ const ExplicitModelSelection = struct {
     model: []const u8,
     effort: types.ReasoningEffort,
     fast_mode: bool,
+    ultrafast_mode: bool = false,
     has_fast_mode_token: bool = false,
 };
 
@@ -157,23 +158,30 @@ fn parseExplicitModelSelection(input: []const u8) ExplicitModelSelectionParse {
     }
 
     if (token_count != 3) return .invalid;
-    const fast_mode = if (std.ascii.eqlIgnoreCase(tokens[2], "fast"))
-        true
-    else if (std.ascii.eqlIgnoreCase(tokens[2], "normal"))
-        false
-    else
+    const fast_mode = std.ascii.eqlIgnoreCase(tokens[2], "fast");
+    const ultrafast_mode = std.ascii.eqlIgnoreCase(tokens[2], "ultrafast");
+    if (!fast_mode and !ultrafast_mode and !std.ascii.eqlIgnoreCase(tokens[2], "normal")) {
         return .invalid;
+    }
     return .{ .selection = .{
         .model = tokens[0],
         .effort = effort,
         .fast_mode = fast_mode,
+        .ultrafast_mode = ultrafast_mode,
         .has_fast_mode_token = true,
     } };
 }
 
 fn validateExplicitModelSelection(selection: ExplicitModelSelection, capabilities: model_capabilities.Capabilities) ExplicitModelSelectionParse {
     if (!model_capabilities.reasoningEffortSupported(capabilities, selection.effort)) return .invalid;
-    if (capabilities.supports_fast_mode != selection.has_fast_mode_token) return .invalid;
+    if (!selection.has_fast_mode_token) return .{ .selection = selection };
+    if (selection.ultrafast_mode and !capabilities.supports_ultrafast_mode) return .invalid;
+    if (selection.fast_mode and !capabilities.supports_fast_mode) return .invalid;
+    if (!selection.fast_mode and !selection.ultrafast_mode and
+        !capabilities.supports_fast_mode and !capabilities.supports_ultrafast_mode)
+    {
+        return .invalid;
+    }
     return .{ .selection = selection };
 }
 
@@ -691,6 +699,53 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        pub fn handleTerminalByteAcrossSessionTransition(
+            app: *App,
+            byte: u8,
+            input_limits: paste_framing.InputLimits,
+            max_prompt_history: usize,
+        ) !void {
+            const session_rt = app_session_runtime.Runtime(App);
+            defer session_rt.finishDeferredSessionInputReplay(app);
+            while (true) {
+                if (app.session_persistence.pending_live_session_policy != null or
+                    app.terminal_input_runtime.hasDeferredSessionInput())
+                {
+                    if (try app.terminal_input_runtime.deferSessionInputByte(app.alloc, byte, input_limits.composer_bytes)) return;
+                    if (app.session_persistence.pending_live_session_policy != null) {
+                        try session_rt.cancelPendingLiveSessionForInputLimit(app);
+                    }
+                    app.terminal_input_runtime.allowCurrentDeferredSessionInputForReplay();
+                }
+                _ = try flushDeferredSessionInput(app, input_limits, max_prompt_history);
+                if (app.should_exit) return;
+                if (app.session_persistence.pending_live_session_policy == null and
+                    !app.terminal_input_runtime.hasDeferredSessionInput()) break;
+            }
+            try handleTerminalByteWithLimits(app, byte, input_limits, max_prompt_history);
+        }
+
+        pub fn flushDeferredSessionInput(
+            app: *App,
+            input_limits: paste_framing.InputLimits,
+            max_prompt_history: usize,
+        ) !bool {
+            var delivered = false;
+            while (!app.should_exit and app.session_persistence.pending_live_session_policy == null) {
+                const item = app.terminal_input_runtime.takeDeferredSessionInput() orelse break;
+                delivered = true;
+                switch (item) {
+                    .byte => |byte| try handleTerminalByteWithLimits(app, byte, input_limits, max_prompt_history),
+                    .delivery_epoch => try settleTerminalPasteDeliveryEpochWithLimits(app, input_limits),
+                }
+            }
+            if (app.should_exit) {
+                const dropped = app.terminal_input_runtime.discardDeferredSessionInput();
+                if (dropped > 0) debug_trace.logf("input", "deferred session input dropped bytes={d} reason=quit", .{dropped});
+            }
+            return delivered;
+        }
+
         pub fn handleTerminalByte(app: *App, byte: u8, max_input_len: usize, max_prompt_history: usize) !void {
             return handleTerminalByteWithLimits(
                 app,
@@ -811,6 +866,7 @@ pub fn Runtime(comptime App: type) type {
                 modelMenuActive(app) or
                 sessionMenuActive(app) or
                 mcpMenuActive(app) or
+                mcpHostMenuActive(app) or
                 helpMenuActive(app);
             var authentication_active = false;
             if (comptime runtime_profile.allows(App, .native_auth)) {
@@ -1255,6 +1311,7 @@ pub fn Runtime(comptime App: type) type {
                 }
                 return true;
             }
+            if (try routeMcpHostMenuByte(app, byte)) return true;
             if (mcpMenuActive(app)) {
                 if (comptime @hasField(App, "mcp")) {
                     if (app.mcp.menu.screen == .add) {
@@ -1285,6 +1342,14 @@ pub fn Runtime(comptime App: type) type {
                     '\t' => _ = try cycleMcpMenuSection(app, 1),
                     '\r' => _ = try submitMcpMenuSelection(app),
                     'a', 'A' => _ = try handleMcpMenuPrimaryAction(app),
+                    's', 'S' => {
+                        if (comptime @hasDecl(App, "addMcpSlack") and @hasField(App, "mcp")) {
+                            if (app.mcp.menu.screen == .browse and app.mcp.menu.section == .servers) {
+                                if (comptime @hasDecl(App, "closeMcpMenu")) app.closeMcpMenu();
+                                try app.addMcpSlack();
+                            }
+                        }
+                    },
                     'd', 'D' => _ = confirmMcpMenuAction(app, .remove),
                     'l', 'L' => _ = confirmMcpMenuAction(app, .logout),
                     'x', 'X' => _ = confirmMcpMenuAction(app, .trust_reject),
@@ -1509,6 +1574,7 @@ pub fn Runtime(comptime App: type) type {
                 '\r' => {
                     if (try submitSettingsMenuSelection(app)) return;
                     if (try submitHelpMenuSelection(app, max_input_len, max_prompt_history)) return;
+                    if (try submitMcpHostMenu(app)) return;
                     if (try submitAuthPickerSelection(app)) return;
                     if (try submitModelMenuSelection(app)) return;
                     if (try submitSkillsMenuSelection(app, max_input_len)) return;
@@ -1609,8 +1675,22 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// Ctrl+C closes the MCP menu from any screen instead of arming the
+        /// exit; its filter lives in the composer, so that goes too, as when
+        /// Esc closes the list.
+        fn exitMcpHostMenuIfActive(app: *App) bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            if (!mcpHostMenuActive(app)) return false;
+            app.mcp.closeHostMenu();
+            app.input_runtime.inputResetState().clearCurrent(app.alloc);
+            paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+            app.shell.render_requests.request(.footer);
+            return true;
+        }
+
         fn handleSemanticCtrlC(app: *App) !void {
             if (exitModelPickerShortcutIfActive(app)) return;
+            if (exitMcpHostMenuIfActive(app)) return;
             if (app.stream.active and draftHasState(app)) {
                 clearDraftState(app, "ctrl_c");
                 app.shell.render_requests.request(.footer);
@@ -1708,6 +1788,8 @@ pub fn Runtime(comptime App: type) type {
 
         fn activeCatalogMenuOwnsByte(app: *App, byte: u8) bool {
             if (settingsMenuActive(app)) return true;
+            // Typing filters its list.
+            if (mcpHostMenuActive(app)) return true;
             if (helpMenuActive(app)) return true;
             if (modelMenuActive(app)) return true;
             if (sessionMenuActive(app)) return true;
@@ -1818,6 +1900,37 @@ pub fn Runtime(comptime App: type) type {
                 return app.mcp.menu.active;
             }
             return false;
+        }
+
+        /// The `/mcp` menu on MCP-v2.
+        fn mcpHostMenuActive(app: *App) bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            return app.mcp.hostMenuActive();
+        }
+
+        /// On the list and on a server's screen, typing goes to the composer,
+        /// which filters the servers or the server's tools. On a
+        /// confirmation any printable byte means no, like `[y/N]`. Control
+        /// bytes pass, so Ctrl+C and Ctrl+J/K still work.
+        fn routeMcpHostMenuByte(app: *App, byte: u8) !bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            if (!mcpHostMenuActive(app) or app.mcp.host_menu.screen == .list) return false;
+            if (app.mcp.host_menu.screen == .server and byte != '\r') return false;
+            if (byte == '\r') {
+                try app.mcpHostMenuKey(.enter);
+                return true;
+            }
+            if (byte < 0x20) return false;
+            if (byte >= 0x80) input_reset.resetPendingTextScalarWithTrace(&app.input_runtime.text_scalar, "mcp_host_menu");
+            if (app.mcp.host_menu.screen == .confirm) try app.mcpHostMenuKey(.escape);
+            return true;
+        }
+
+        fn submitMcpHostMenu(app: *App) !bool {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
+            if (!mcpHostMenuActive(app)) return false;
+            try app.mcpHostMenuKey(.enter);
+            return true;
         }
 
         fn mcpMenuProjection(app: *App) render_input.McpMenuProjection {
@@ -2344,7 +2457,7 @@ pub fn Runtime(comptime App: type) type {
         /// borrowing a composer they are already using.
         fn modelPickerShortcutBlocked(app: *App) bool {
             if (settingsMenuActive(app) or helpMenuActive(app) or
-                skillsMenuActive(app) or sessionMenuActive(app) or mcpMenuActive(app)) return true;
+                skillsMenuActive(app) or sessionMenuActive(app) or mcpMenuActive(app) or mcpHostMenuActive(app)) return true;
             if (comptime @hasField(App, "auth")) {
                 if (app.auth.pickerView().active) return true;
             }
@@ -2459,6 +2572,7 @@ pub fn Runtime(comptime App: type) type {
                 selected,
                 app.effort,
                 app.fast_mode,
+                false,
             );
             app.model_cache.closeMenu();
             app.shell.render_requests.request(.footer);
@@ -2810,7 +2924,7 @@ pub fn Runtime(comptime App: type) type {
                     try app.writeDomainNotice(.{
                         .topic = "",
                         .tone = .@"error",
-                        .body = "usage: /model <id> <effort> [normal|fast]",
+                        .body = "usage: /model <id> <effort> [normal|fast|ultrafast]",
                     }, true);
                 },
                 .selection => |selection| {
@@ -2819,6 +2933,7 @@ pub fn Runtime(comptime App: type) type {
                         selection.model,
                         selection.effort,
                         selection.fast_mode,
+                        selection.ultrafast_mode,
                     );
                     app.input_runtime.inputResetState().clearCurrent(app.alloc);
                 },
@@ -2860,6 +2975,12 @@ pub fn Runtime(comptime App: type) type {
             syncSkillsMenu(app);
             syncModelMenu(app);
             syncSessionMenu(app);
+            syncMcpHostMenu(app);
+        }
+
+        fn syncMcpHostMenu(app: *App) void {
+            if (comptime !@hasDecl(App, "mcpHostMenuKey")) return;
+            app.mcp.hostMenuFilterChanged(app.input_runtime.edit_state.input.items);
         }
 
         fn syncSettingsMenu(app: *App) void {
@@ -3197,6 +3318,15 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn cancelMcpMenu(app: *App) !bool {
+            if (comptime @hasDecl(App, "mcpHostMenuKey")) if (mcpHostMenuActive(app)) {
+                // Back a screen; closing the list clears its filter too.
+                try app.mcpHostMenuKey(.escape);
+                if (!mcpHostMenuActive(app)) {
+                    app.input_runtime.inputResetState().clearCurrent(app.alloc);
+                    paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
+                }
+                return true;
+            };
             if (!mcpMenuActive(app)) return false;
             if (comptime @hasField(App, "mcp")) {
                 debug_trace.logf("mcp", "MCP menu escape screen={s} filter={}", .{ @tagName(app.mcp.menu.screen), app.mcp.menu.filter_active });
@@ -3549,6 +3679,7 @@ const RoutingWorker = struct {
     queued_steer_text: ?[]const u8 = null,
     synced_permission_mode: ?types.PermissionMode = null,
     permission_mode_sync_count: usize = 0,
+    agent_turn_settings: worker_runtime.AgentTurnSettings = .{},
 
     pub fn compactionActivitySnapshot(self: *RoutingWorker) @import("../output/compaction_activity.zig").Snapshot {
         return self.compaction.snapshot;
@@ -3658,6 +3789,10 @@ const RoutingWorker = struct {
     }
 
     pub fn syncQueuedPromptFastMode(_: *RoutingWorker, _: bool) void {}
+
+    pub fn syncQueuedPromptUltrafastMode(self: *RoutingWorker, enabled: bool) void {
+        self.agent_turn_settings.ultrafast_mode = enabled;
+    }
 
     pub fn syncQueuedPromptEffort(_: *RoutingWorker, _: types.ReasoningEffort) void {}
 
@@ -6504,6 +6639,7 @@ test "explicit model selection parser accepts complete picker syntax" {
     );
     try std.testing.expectEqual(types.ReasoningEffort.auto, selection.effort);
     try std.testing.expect(!selection.fast_mode);
+    try std.testing.expect(!selection.ultrafast_mode);
     try std.testing.expect(selection.has_fast_mode_token);
 }
 
@@ -6556,6 +6692,21 @@ test "explicit model selection semantic validation uses resolved capabilities" {
             .supports_fast_mode = true,
         }),
     ) != .invalid);
+
+    const ultrafast = switch (parseExplicitModelSelection(
+        "/model provider/astra high ultrafast",
+    )) {
+        .selection => |selection| selection,
+        else => return error.TestExpectedEqual,
+    };
+    try std.testing.expect(ultrafast.ultrafast_mode);
+    try std.testing.expect(validateExplicitModelSelection(
+        ultrafast,
+        model_capabilities.resolveCapabilities(ultrafast.model, .{
+            .reasoning_efforts = .fromSlice(&high_efforts),
+            .supports_ultrafast_mode = true,
+        }),
+    ) != .invalid);
 }
 
 test "model picker spaces do not commit before enter" {
@@ -6571,6 +6722,7 @@ test "model picker spaces do not commit before enter" {
         "anthropic/claude-sonnet-4.6",
         0,
         false,
+        false,
         .effort,
     );
 
@@ -6583,7 +6735,7 @@ test "model picker spaces do not commit before enter" {
     );
 }
 
-test "model picker enter commits selected fast option from fast stage" {
+test "model picker enter commits normal speed from the speed stage" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -6598,6 +6750,7 @@ test "model picker enter commits selected fast option from fast stage" {
         alloc,
         "anthropic/claude-opus-4.7",
         0,
+        false,
         false,
         .fast,
     );
@@ -6619,7 +6772,7 @@ test "model picker enter commits selected fast option from fast stage" {
     try std.testing.expectEqual(false, app.last_preference_fast_mode.?);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqualStrings(
-        "Switched to anthropic/claude-opus-4.7",
+        "Switched to anthropic/claude-opus-4.7 (effort: default, speed: normal)",
         app.notice_body.items,
     );
     try std.testing.expect(std.mem.find(u8, app.transcript.items, "Invalid /model selection") == null);
@@ -6639,6 +6792,7 @@ test "active stream Enter commits a complete model choice for the next turn" {
         model,
         0,
         false,
+        false,
         .effort,
     );
     app.stream.active = true;
@@ -6655,7 +6809,7 @@ test "active stream Enter commits a complete model choice for the next turn" {
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
     try std.testing.expectEqualStrings(
-        "Next turn will use " ++ model,
+        "Next turn will use " ++ model ++ " (effort: default, speed: normal)",
         app.notice_body.items,
     );
 }
@@ -6677,7 +6831,7 @@ test "active stream Enter selects the visible model choice" {
     try std.testing.expectEqualStrings(model, app.selected_model.items);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqualStrings(
-        "Next turn will use " ++ model,
+        "Next turn will use " ++ model ++ " (effort: default, speed: normal)",
         app.notice_body.items,
     );
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
@@ -6902,7 +7056,7 @@ test "app_input_runtime fast-only model opens the Fast stage while streaming" {
     try std.testing.expectEqualStrings(model, app.selected_model.items);
     try std.testing.expect(app.fast_mode);
     try std.testing.expectEqual(@as(usize, 1), app.preference_commit_count);
-    try std.testing.expectEqualStrings("Next turn will use " ++ model, app.notice_body.items);
+    try std.testing.expectEqualStrings("Next turn will use " ++ model ++ " (effort: default, speed: fast)", app.notice_body.items);
 }
 
 test "app_input_runtime Enter submits a dismissed slash skill query as text" {
@@ -12702,7 +12856,7 @@ test "composer shortcut line delete handles decoded and raw mutations" {
         try primeComposerHistoryForTest(RoutingFakeApp, &app, "draft");
         try app.input_runtime.textReplacementState().replace(alloc, "alpha\nleftMIDright\ngamma");
         app.input_runtime.edit_state.cursor = "alpha\nleftMID".len;
-        try app.input_runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, .fast);
+        try app.input_runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, false, .fast);
         app.input_runtime.picker.file_completion_index = 4;
 
         _ = try Runtime(RoutingFakeApp).routeResolvedEscapeAction(
@@ -12771,7 +12925,7 @@ test "composer shortcut line delete preserves no-op picker redraw and metadata s
         .path = try alloc.dupe(u8, "/tmp/8.png"),
         .media_type = try alloc.dupe(u8, "image/png"),
     });
-    try app.input_runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, .effort);
+    try app.input_runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 3, true, false, .effort);
     app.input_runtime.edit_state.cursor = 0;
 
     const line_start_action = test_ui_input.shortcutFromControlByte(21);
@@ -12797,7 +12951,7 @@ test "composer shortcut line delete preserves no-op picker redraw and metadata s
     try std.testing.expectEqual(picker_state.ModelPickerStage.effort, app.input_runtime.picker.model_picker_stage);
 
     app.shell.render_requests.clearReason(.footer);
-    try app.input_runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 4, true, .fast);
+    try app.input_runtime.picker.beginModelPickerFlow(alloc, "openai/gpt-5", 4, true, false, .fast);
     app.input_runtime.edit_state.cursor = app.input_runtime.edit_state.input.items.len;
     _ = try Runtime(RoutingFakeApp).routeResolvedEscapeAction(
         &app,
@@ -15251,7 +15405,7 @@ test "app_input_runtime image path paste rejects the complete edit without chang
     defer app.deinit();
     try app.input_runtime.edit_state.input.appendSlice(alloc, "draft");
     app.input_runtime.edit_state.cursor = 2;
-    try app.input_runtime.picker.beginModelPickerFlow(alloc, "test/model", 2, true, .fast);
+    try app.input_runtime.picker.beginModelPickerFlow(alloc, "test/model", 2, true, false, .fast);
     app.input_runtime.picker.file_completion_index = 4;
     try appendOwnedPendingImage(&app, 3, "/tmp/original.png");
     app.next_image_id_counter = 7;

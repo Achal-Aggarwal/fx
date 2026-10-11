@@ -1,471 +1,336 @@
 # libfx
 
-`libfx` is the small fx agent kernel for JavaScript hosts. One agent is one
-in-memory conversation with `prompt`, `checkpoint`, and `close` operations,
-plus mid-turn steering on each running turn.
+libfx is the agent from [fx](https://github.com/vercel-labs/fx), the open source coding agent from Vercel Labs, as a JavaScript library. You give it a model, instructions and your own tools, and it runs the conversation: streaming, tool calls, retries, steering and images. It's the same Zig engine that runs fx in your terminal, built as a native addon and as WebAssembly.
+
+Sessions are durable. libfx records each step of a turn as it happens, so when a server crashes, a function hits its time limit or you redeploy in the middle of a reply, the next process picks the turn up where it stopped. On Vercel, that takes one route and one line of `vercel.json`.
 
 ```sh
 npm install libfx
 ```
 
-Node.js uses the native addon when available and falls back to WebAssembly.
-Browsers use WebAssembly with JSPI. The default package has no runtime
-dependencies and performs no MCP connection, skill scan, process spawn, or
-filesystem read when imported.
-
-## Agent
-
 ```js
 import { createFxAgent } from "libfx";
 
-const agent = await createFxAgent({
-  apiKey: process.env.AI_GATEWAY_API_KEY,
-  model: "google/gemini-2.5-flash-lite",
-  onEvent(event) {
-    if (event.type === "transport.response") console.log(event.elapsedMs);
-  },
+const agent = createFxAgent({
+  model: "anthropic/claude-haiku-5.5",
+  instructions: "Answer in one paragraph.",
 });
 
-const turn = agent.prompt("Explain this project.");
+const turn = agent.session().prompt("What is an agent loop?");
 
 for await (const event of turn) {
   if (event.type === "text_delta") process.stdout.write(event.delta);
 }
 
-console.log(await turn.result); // { stopReason, usage }
-const checkpoint = await agent.checkpoint();
 await agent.close();
 ```
 
-`apiKey` is required. `model` is optional and defaults to fx's built-in model.
-Agent configuration uses named options; `env` is reserved for
-`createFxTerminal()`. The canonical model configuration groups the model ID
-and model-specific options:
+Model calls go through [AI Gateway](https://vercel.com/docs/ai-gateway), so any model it lists works. Set `AI_GATEWAY_API_KEY` on your machine. On Vercel, libfx uses the deployment's OIDC token and there's no key to manage.
+
+Importing libfx doesn't touch the network, read files or start processes, and `createFxAgent()` returns right away. Nothing loads until a session runs its first turn.
+
+The full documentation is at [fx.sh/docs/lib](https://fx.sh/docs/lib).
+
+## Features
+
+- [Streams](https://fx.sh/docs/lib/prompts) text, reasoning and tool calls as the agent works
+- Runs your JavaScript functions as [tools](https://fx.sh/docs/lib/tools), along with [MCP](https://fx.sh/docs/lib/mcp) clients and [skills](https://fx.sh/docs/lib/skills)
+- Keeps [sessions](https://fx.sh/docs/lib/durability) going through crashes, deploys and function timeouts
+- Reconnects to a running turn from any server, starting at the last event you saw
+- [Steers](https://fx.sh/docs/lib/steering) a turn while it runs
+- Takes [images](https://fx.sh/docs/lib/images) in prompts and tool results
+- Gives each conversation its own model, instructions and context
+- Runs on AI Gateway, or on a user's [ChatGPT plan](#chatgpt-plans) through Codex
+- Uses a native addon on macOS and Linux, and WebAssembly everywhere else, including browsers
+- Puts the [fx terminal](https://fx.sh/docs/lib/webassembly#embed-the-terminal) in a web page
+- Ships TypeScript types for every entry point, with no runtime dependencies
+
+## Sessions
+
+An agent is configuration. Create one per server and open a session per conversation:
 
 ```js
-const agent = await createFxAgent({
-  apiKey,
-  model: { id: "anthropic/claude-opus-5.5-fast", effort: "low", fast: true },
+const turn = agent.session().prompt("Plan the migration.");
+const { sessionId } = await turn.accepted;
+
+// Later, from any process that creates the same agent:
+agent.session(sessionId).prompt("Start with the schema.");
+```
+
+A session runs one turn at a time. A prompt that arrives while a turn is running waits behind it, even when it reaches a different server. A turn runs to the end whether or not anyone reads it; stop it with `session.cancel()` or the prompt's `signal`. `session.steer(text)` adds guidance to the running turn at its next model request.
+
+If a client might send the same request twice, give the prompt a `messageId`. A prompt with an id the session already accepted runs nothing and follows the original turn.
+
+Each conversation can bring its own settings. They apply to the turns that call starts:
+
+```js
+agent.session(sessionId, {
+  model: { id: "anthropic/claude-opus-5.5", effort: "high" },
+  instructions: "You review pull requests.",
+  context: { userId }, // handed to every tool call
 });
 ```
 
-A string `model` remains supported as shorthand. Top-level `effort` and
-`fast` are deprecated but remain supported with a string model or no model;
-they cannot be mixed with a model object. New code should use the model object.
+### Streaming to a browser
 
-`model.effort` sets the reasoning effort for models that advertise effort
-levels. It uses the same vocabulary as the fx CLI's `--effort` flag:
-`"default"` leaves the choice to the model; named levels such as `"low"`,
-`"medium"`, `"high"`, or `"xhigh"` request a specific level. A named level is
-validated at creation; an unsupported level rejects with an Error carrying
-`code: "LIBFX_MODEL_UNSUPPORTED_EFFORT"`, `model`, and
-`capability: "effort"`. Its message names the supported set when available.
-Omitting effort or using `"default"` leaves the model default in place.
-
-`model.fast` enables the fast lane for models that advertise one, matching the
-fx CLI's `--fast` flag. A model without a fast path rejects at creation with
-`code: "LIBFX_MODEL_UNSUPPORTED_FAST"`, `model`, and `capability: "fast"`.
-Omitting fast or setting it to `false` leaves the model default in place.
-The new codes replace `LIBFX_UNSUPPORTED_EFFORT` and `LIBFX_UNSUPPORTED_FAST`
-for both nested and legacy top-level settings. Callers that check the old codes
-must update their error handling.
-
-The host selects the model. Agent creation does not fetch the Gateway model
-catalog unless effort requests a named level or fast is enabled. Prompting
-can resolve model capabilities and context capacity through the supplied
-`fetch`; fx caches that metadata for the agent.
-
-`onEvent` receives runtime diagnostics separately from model output. Transport
-events report request start, response status and elapsed time, safe Gateway
-request metadata, failures, and throttled `transport.activity` liveness while a
-response body is streaming. Activity events include the attempt, current chunk
-bytes, and cumulative response bytes. They call the host directly at most once
-per 250 ms rather than entering the normalized turn queue, so an unread turn
-cannot accumulate heartbeat events. Credentials and raw headers are never
-included.
-
-libfx makes at most one automatic retry after a retryable transport failure and
-only before model output or tool effects escape. Cancellation prevents a retry.
-
-`prompt(input, { signal? })` accepts a string or text, image, and resource
-blocks. It returns an async iterable of normalized events:
-
-- `text_delta`
-- `reasoning_delta` when supplied by the provider
-- `tool_start` with `id`, `name`, and the tool's `input` object. Inputs over
-  64 KiB of JSON arrive as an `inputPreview` string prefix plus
-  `inputTruncated: true` instead; the tool still receives complete arguments.
-- `tool_end`
-- `user_message` with `text` when accepted mid-turn steering enters the turn
-
-Consume the turn while it runs, then await `turn.result`. Streamed text and
-tool results are lossless and backpressured: a slow reader pauses production
-instead of growing an unlimited event queue. Awaiting only `turn.result` can wait for an unread stream to drain.
-If you only need the result, explicitly discard events:
+`turn.readable` is the turn as newline-delimited JSON, ready to return from a route. Every line has a `cursor`. `session.stream(cursor)` replays everything from that point and stays open, so a client that loses its connection can reconnect to any server and carry on.
 
 ```js
-const turn = agent.prompt("Update the index.");
-for await (const _ of turn) {}
-const result = await turn.result;
+// app/api/chat/route.js
+import { agent } from "@/lib/agent";
+
+export async function POST(request) {
+  const sessionId = new URL(request.url).searchParams.get("sessionId") ?? undefined;
+  // Check that the caller may use this session.
+  const turn = agent.session(sessionId).prompt(await request.text());
+  return new Response(turn.readable);
+}
+
+export async function GET(request) {
+  const params = new URL(request.url).searchParams;
+  const sessionId = params.get("sessionId");
+  if (!sessionId) return new Response("sessionId is required", { status: 400 });
+  // Same check as POST.
+  const stream = agent.session(sessionId).stream(Number(params.get("cursor") ?? 0));
+  return new Response(stream);
+}
 ```
 
-A turn has one event consumer. Breaking out of its iterator cancels the turn;
-`turn.cancel()` and `agent.close()` also release blocked output. Transport or
-message-decoding failures reject the result instead of returning success with
-missing text.
+## Durability
 
-Native transport buffers at most 8 MiB of output bytes. Unread SDK events apply
-backpressure at 1 MiB of encoded messages or 256 events. One message can exceed
-that threshold when the queue is empty; an individual encoded ACP message is
-limited to 64 MiB on both backends. These are transport bounds, not a total
-answer-size limit or a bound on retained conversation history.
+libfx stores a prompt before it reports the prompt as accepted, and it stores each step of a turn while the turn runs. If the process running a turn dies, the next process that gets work for that session continues the turn from its last step. The model is told the turn was interrupted, so it can check what happened before going on.
 
-Image blocks accept a `Blob` or `File` with a non-empty `type`, or the
-existing canonical base64 (no line wrapping) and explicit `mimeType` of a PNG,
-JPEG, GIF, or WebP payload:
+Where sessions live depends on where your code runs, and libfx picks for you:
+
+| Where | Durability | Sessions live in |
+| --- | --- | --- |
+| Vercel | `vercel()` | Vercel's [Workflow World](https://workflow-sdk.dev/worlds) |
+| Node.js | `local()` | files in `$TMPDIR/libfx/sessions`, or `FX_SESSIONS_DIR` |
+| Browsers | `memory()` | the page's memory |
+
+To choose yourself, pass `durability`:
 
 ```js
-const turn = agent.prompt([
-  { type: "text", text: "What does this screenshot show?" },
-  { type: "image", data: file }, // File or Blob, with file.type
-  // Or: { type: "image", data: base64Png, mimeType: "image/png" }
-]);
+import { createFxAgent, memory } from "libfx";
+import { local } from "libfx/durable-local";
+
+createFxAgent({ durability: local({ dir: ".fx/sessions" }) });
+createFxAgent({ durability: memory() }); // nothing survives the process
 ```
 
-A prompt may contain up to 8 images, each with up to 5 MiB of base64 data,
-with at most 8 MiB of image data per prompt. The SDK checks Blob size before
-reading it, encodes it for the same ACP wire format, and rejects larger input
-with typed `RangeError`s. The total frame size is checked before reading a
-Blob, and the actual byte count is checked before encoding it. Blob reads are
-asynchronous: `prompt()` returns a turn, and read failures reject
-`turn.result`. Cancelling or closing while a Blob is being read settles the
-turn without sending its prompt. For base64 input, size errors still throw
-synchronously from `prompt()`.
+To keep sessions in your own database, create a World such as Workflow's Postgres World and pass it to `world()` from `libfx/durable-world`. The [durability guide](https://fx.sh/docs/lib/durability) shows how.
 
-The kernel sniffs decoded bytes and compares them with the claimed MIME type
-for both input forms; a mismatch fails the turn with
-`Invalid image prompt block`. Images are routed only to models that advertise
-image input; for any other model the turn fails with
-`Image prompts are unavailable for the selected model` and no image bytes
-leave the process. Prompt images are retained in checkpoints within the
-existing 4 MiB checkpoint bound, so a restored agent can refer to earlier
-images on either backend.
+With `local()` and `vercel()`, a session id is a Workflow run id. Take it from `turn.accepted` or `await agent.newSessionId()` instead of making one up.
 
-Only one top-level prompt may run at a time. While it runs,
-`await turn.steer(text)` appends guidance at the next safe model boundary
-without discarding the in-flight response or completed tool work. Steering also
-accepts an array of text blocks; image and resource steering blocks are rejected.
-Each message is limited to 64 KiB, with at most 64 queued messages and 1 MiB of
-queued steering text. Accepted steering appears as a `user_message` event before
-the model's continued output. For a Blob prompt, steering during the read
-waits for the prompt to be sent; cancelling before then rejects the pending
-steering. Calling `steer()` after the turn settles rejects with
-`no prompt is running`.
+A session stores only the conversation. Every process passes its own model, credentials, tools, MCP clients and skills when it creates the agent.
+
+### On Vercel
+
+Add a route for libfx's queue deliveries:
 
 ```js
-const turn = agent.prompt("Build the feature.");
-for await (const event of turn) {
-  if (event.type === "tool_end" && event.name === "read_file") {
-    await turn.steer("Keep the public API backward compatible.");
+// app/api/libfx/route.js
+import { agent } from "@/lib/agent";
+
+export const POST = agent.wakeHandler();
+```
+
+Then subscribe it to libfx's topic in `vercel.json`:
+
+```json
+{
+  "functions": {
+    "app/api/libfx/route.js": {
+      "experimentalTriggers": [{ "type": "queue/v2beta", "topic": "__libfx_wkf_workflow_session" }]
+    }
   }
 }
 ```
 
-Cancelling a steered turn drops any guidance that has not reached a safe
-boundary and releases its queue. Applied guidance is part of the same history
-turn, so an idle `checkpoint()` includes the full steered conversation.
-`checkpoint()` returns opaque, bounded, versioned bytes. Restore them only when
-creating a fresh agent:
+That's all. `prompt()` sends each turn to Vercel Queues, and this route runs it. When a turn gets close to the function's time limit, libfx saves it and the next invocation continues it. When a function dies mid-turn, its session frees about 15 seconds after it last checked in, and the turn carries on in a new invocation. `vercel({ reserveMs, leaseMs })` from `libfx/durable-vercel` changes both timings.
+
+### Tools with side effects
+
+When a process dies during a tool call, libfx can't know whether the call finished. Mark a tool `idempotent: true` if running it twice is harmless, like a lookup, and it runs again when the turn continues. Any other tool never runs twice on its own: the model gets an error saying the call may have partly run, and decides whether to check, try again or ask the user.
+
+Each call also gets an `executionId` that stays the same when the call runs again. Pass it to the service your tool calls as an idempotency key, and a repeated call won't change anything twice.
+
+## Tools
 
 ```js
-const restored = await createFxAgent({ apiKey, model, checkpoint });
-```
-
-An already-aborted prompt signal returns `cancelled` without a model request
-or a history change. The next prompt can run normally.
-
-The checkpoint contains conversation history and usage only. The host owns
-durable storage and must resupply models, credentials, instructions, tools,
-MCP clients, and skill records. Reasoning effort and fast mode are
-agent-creation options and are not stored in a checkpoint: recreate the agent
-with new `model.effort` or `model.fast` values to change them, the same path as
-switching models.
-
-## Models
-
-Model discovery is explicit and does not create an Agent or load native or Wasm
-artifacts:
-
-```js
-import { listModels } from "libfx";
-
-const models = await listModels({
-  apiKey: process.env.AI_GATEWAY_API_KEY,
-});
-```
-
-`listModels()` performs one bounded Gateway request and returns sorted, unique
-language-model IDs. It accepts the same optional `fetch` override as the Agent
-API.
-
-## JavaScript tools and instructions
-
-```js
-const agent = await createFxAgent({
-  apiKey,
-  model,
-  instructions: "Keep answers concise.",
+const agent = createFxAgent({
   tools: [{
-    name: "lookup",
-    description: "Look up a value.",
-    inputSchema: {
-      type: "object",
-      properties: { key: { type: "string" } },
-      required: ["key"],
-    },
-    async execute(input, { signal }) {
-      return database.get(input.key, { signal });
+    name: "get_order",
+    description: "Look up an order by id.",
+    inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
+    idempotent: true,
+    async execute({ id }, { signal, executionId, context }) {
+      return orders.get(id, { signal });
     },
   }],
 });
 ```
 
-Gateway web search can run at the provider instead of in the JavaScript host.
-Mark its canonical tool name with `providerExecuted: true` and omit `execute`:
+`execute` gets a `signal` that aborts when the turn is cancelled, the call's `executionId`, and the session's `context`. Return any JSON value, or `{ type: "libfx.tool-result", text, images }` to return images.
 
-```js
-const agent = await createFxAgent({
-  apiKey,
-  tools: [{ name: "web_search", providerExecuted: true }],
-});
-```
+On the native backend, the calls from one model response run at the same time. Mark a tool `writes: true` to keep it from overlapping with others. Add `{ name: "web_search", providerExecuted: true }` for AI Gateway's web search, which runs at the provider instead of in your code.
 
-The kernel supplies the canonical schema and Gateway advertisement. Currently
-`web_search` is the supported provider-executed descriptor; unknown or local
-names reject agent creation. Provider-executed tools do not
-call host code or require a separate provider key; their `tool_start` and
-`tool_end` events, results, and checkpoint history use the same turn contract.
-Their built-in permission policy is enforced when the request is projected, as
-there is no local call-time effect to approve.
-
-For ordinary tools, the JavaScript host is the authority for effects. The same
-descriptors, schemas, cancellation, results, and events are used by N-API and
-WebAssembly.
-Cancelling a prompt aborts its tools' signals and stops waiting for their
-callbacks. Late results and rejections are ignored. Tools remain responsible
-for stopping their own work when their signal is aborted.
-
-A host tool may use any name, including the kernel's builtin names such as
-`write_file` and `edit_file`: the kernel routes by the registered executor, so
-a host-defined `write_file` calls the host's `execute()` rather than the
-builtin file mutation.
-Instructions are limited to 64 KiB of UTF-8 text, including text assembled by
-the MCP and skills adapters. They are the complete host-owned system context:
-libfx adds no hidden base prompt, and omitting `instructions` sends no system
-message.
-
-## MCP
-
-`libfx/mcp` accepts a host-owned MCP client. Transport, authentication,
-elicitation, and cleanup remain outside the kernel. The client uses the MCP
-TypeScript SDK v1 signature: `callTool(params, resultSchema?, options?)`, with
-cancellation passed in `options`. Tool text and structured data
-reach the model together. PNG, JPEG, GIF, and WebP tool images reach models that
-advertise image input support; other models receive an explicit omission notice.
-Images are retained in checkpoints within the existing checkpoint size limit.
-Each image may contain up to 5 MiB of base64 data, with at most eight images and
-an 8 MiB result frame. Ordinary host tool objects remain JSON text. Resource and
-prompt options supply text instructions; non-text context has an omission notice.
-Tool catalogs are paginated up to the existing 64-tool bound. Tool names are
-normalized for model APIs, with collisions kept distinct and original names used
-for calls to the MCP client. Each tool description and JSON schema may contain up
-to 64 KiB, within the control message's 8 MiB limit.
+### MCP and skills
 
 ```js
 import { createMcpAdapter } from "libfx/mcp";
+import { createSkillsAdapter } from "libfx/skills";
+import { loadSkillFile } from "libfx/skills/node";
 
-const mcp = await createMcpAdapter(client, {
-  prefix: "github_",
-  resources: ["repo://instructions"],
-  prompts: ["review"],
+const mcp = await createMcpAdapter(client, { prefix: "github_" }); // your MCP SDK client
+const skills = createSkillsAdapter([await loadSkillFile("./skills/review/SKILL.md")]);
+
+const agent = createFxAgent({
+  tools: [...mcp.tools, ...skills.tools],
+  instructions: [mcp.instructions, skills.instructions].join("\n\n"),
 });
 
-const agent = await createFxAgent({
-  apiKey,
-  model,
-  tools: mcp.tools,
-  instructions: mcp.instructions,
-});
-
-// ...
+// When you're done:
 await agent.close();
 await mcp.close();
 ```
 
-## Skills
+libfx doesn't own the MCP connection. You create the client, handle its auth and close it after the agent.
 
-Use `libfx/skills` for already-loaded records or `libfx/skills/node` to load a
-`SKILL.md` explicitly in Node or Bun.
+## Models
 
 ```js
-import { loadSkillFile } from "libfx/skills/node";
-import { createSkillsAdapter } from "libfx/skills";
-
-const record = await loadSkillFile("./skills/review/SKILL.md");
-const skills = createSkillsAdapter([record]);
-const agent = await createFxAgent({ apiKey, model, ...skills });
+createFxAgent({ model: { id: "anthropic/claude-opus-5.5", effort: "low", fast: true } });
 ```
 
-## Backends
+`effort` and `fast` mean the same as the fx CLI's `--effort` and `--fast` flags. `ultrafast: true` asks for the faster, more expensive service tier on models that offer it. A setting the model doesn't support fails with an error whose `code` names it, such as `LIBFX_MODEL_UNSUPPORTED_EFFORT`.
+
+`listModels({ apiKey })` returns the Gateway's language models. Behind a proxy that only forwards chat requests, pass the catalog yourself as `modelCatalog`, and the agent won't fetch it.
+
+`onEvent` receives diagnostics apart from the model's output: request timing, and session events such as `session.deadline` and `checkpoint.mismatch`. Credentials never appear in them.
+
+### ChatGPT plans
+
+An agent can run on a user's ChatGPT plan through Codex instead of AI Gateway. Set `provider: "codex"` and hand libfx the user's ChatGPT credentials:
 
 ```js
-await createFxAgent({ apiKey, backend: "auto" });   // native, then Wasm fallback
-await createFxAgent({ apiKey, backend: "native" }); // require N-API
-await createFxAgent({ apiKey, backend: "wasm" });   // require Wasm + JSPI
+const agent = createFxAgent({
+  provider: "codex",
+  model: "gpt-6.1-sol",
+  chatgpt: ({ sessionId }) => tokens.load(sessionId),
+  onChatgptCredentials: (credentials, { sessionId }) => tokens.save(sessionId, credentials),
+});
 ```
 
-CommonJS applications can load the same Node API with `require("libfx")`. The
-package chooses its generated CommonJS entry automatically and keeps asset
-paths relative to the installed package.
+libfx calls `chatgpt()` before Codex requests, in whichever process runs the turn, and adds the credentials to those requests itself, so they never reach the engine or a saved session. It refreshes them shortly before they expire and once after a rejected request, then passes the new ones to `onChatgptCredentials` for you to save. Codex doesn't accept requests from web pages, so these turns run on your server.
 
-Use `getBackendInfo()` to inspect backend availability without creating an
-Agent or terminal:
+To sign a user in, use `libfx/chatgpt`:
 
 ```js
-import { getBackendInfo } from "libfx";
+import { startSignIn, finishSignIn } from "libfx/chatgpt";
 
-const info = await getBackendInfo({ surface: "agent", backend: "auto" });
-// {
-//   surface: "agent",
-//   backend: "native" | "wasm-jspi" | "unavailable",
-//   attempts: [{ backend, available, reason }]
-// }
+// One request: send the user to signIn.url and keep signIn on the server.
+const signIn = await startSignIn();
+
+// A later request: the user pastes the address OpenAI opened.
+const credentials = await finishSignIn(signIn, pastedAddress);
 ```
 
-`surface` is `agent` by default and may also be `terminal`. `backend` has the
-same `auto`, `native`, and `wasm` selection as the factories. `nativeAddon` and
-`wasm` select explicit assets with the same meanings as their factory options.
-The probe loads and validates the native module or compiles the selected Wasm
-asset, then stops. It does not create a core, open a runtime socket, read
-credentials, start a model request, or write session state. A remote Wasm
-source can perform its normal asset fetch.
+After the user signs in, OpenAI opens a page at `localhost:1455` that doesn't load. That's expected. Ask the user to copy the page's whole address and paste it back. If their account or ChatGPT workspace allows device code sign-in, `startDeviceSignIn()` and `pollDeviceSignIn()` show a short code to enter on OpenAI's site instead. Each step returns plain data, so it can finish in another request or function.
 
-Expected environmental failures resolve as structured attempts. Invalid
-options reject with `TypeError`. The stable reason codes are:
+The sign-in uses the same OpenAI client as the Codex CLI, and the user's ChatGPT plan and OpenAI's terms apply to the turns.
 
-| Code | Meaning |
-| --- | --- |
-| `LIBFX_UNSUPPORTED_PLATFORM` | No packaged native addon supports the current platform and architecture. |
-| `LIBFX_NATIVE_ARTIFACT_MISSING` | The selected native addon file is absent. |
-| `LIBFX_NATIVE_LOAD_FAILED` | Node could not load the selected native addon. |
-| `LIBFX_NATIVE_API_MISMATCH` | The addon API version is incompatible. |
-| `LIBFX_NATIVE_SURFACE_MISSING` | The addon does not implement the selected Agent or terminal surface. |
-| `LIBFX_NATIVE_DISABLED` | `nativeAddon: false` disabled native loading. |
-| `LIBFX_JSPI_UNAVAILABLE` | The current JavaScript runtime does not provide JSPI. |
-| `LIBFX_WASM_LOAD_FAILED` | The selected Wasm asset could not be loaded or compiled. |
+## One conversation, no sessions
 
-The optional `causeCode` field retains a Node error code such as `ENOENT` or
-`ERR_DLOPEN_FAILED` when one exists. Probe success establishes backend loading
-only; it does not validate credentials, a future Agent initialization, or a
-model request.
-
-Within one loaded SDK module, libfx compiles each stable Wasm source once and
-creates a separate WebAssembly instance for every Agent. Agent memory, history,
-tools, cancellation, and shutdown remain isolated. Workers and separate
-processes maintain their own module caches, as do the ESM and CommonJS entries.
-
-Node factories and `getBackendInfo()` also accept a `wasm` Promise resolving
-to an HTTP(S) URL string, a `Response`, Wasm bytes, or a compiled
-`WebAssembly.Module`. Asset resolver failures propagate from factories and
-appear as `LIBFX_WASM_LOAD_FAILED` in diagnostics.
-
-Node.js 20+ is supported. Browser WebAssembly requires a JSPI-capable browser.
-The Linux x64 and arm64 native addons require glibc 2.34 or newer. Native
-agents do not require JSPI or experimental Node flags.
-Some Node versions require `--experimental-wasm-jspi`.
-Bun 1.4.2 is the tested recommendation for Bun's WebAssembly backend.
-Bun 1.3.14 can crash when a hot WebAssembly loop resumes through JSPI during
-JIT tier-up.
-
-### Next.js and Vercel
-
-Create agents in a server route using the Node.js runtime. Import `libfx`
-normally; the package includes its native assets and exposes both ESM and
-CommonJS Node entrypoints. Native agents support Next.js 15 with webpack and
-Next.js 16 with webpack or Turbopack, without `serverExternalPackages` or manual
-native-file inclusion. Webpack's emitted assets are resolved relative to the
-server bundle, including standalone builds with a custom `distDir` or `assetPrefix`.
-
-This native setup does not require JSPI. Explicit WebAssembly use still needs
-JSPI and available Wasm assets; Next.js's standalone tracer excludes `.wasm`
-files, so a standalone Wasm host must supply those assets separately.
+`createFxEngine()` is the engine under the agent: one conversation in the memory of the process that runs it, with no queue and no session store. Use it for a single request, or to keep the conversation in storage of your own.
 
 ```js
-import { createFxAgent } from "libfx";
+import { createFxEngine } from "libfx";
 
-export const runtime = "nodejs";
+const engine = await createFxEngine({ apiKey: process.env.AI_GATEWAY_API_KEY, model: "anthropic/claude-haiku-5.5" });
 
-export async function POST(request) {
-  const { prompt } = await request.json();
-  const agent = await createFxAgent({ apiKey: process.env.AI_GATEWAY_API_KEY });
-  try {
-    let text = "";
-    const turn = agent.prompt(prompt, { signal: request.signal });
-    for await (const event of turn) {
-      if (event.type === "text_delta") text += event.delta;
-    }
-    await turn.result;
-    return Response.json({ text });
-  } finally {
-    await agent.close();
-  }
+const turn = engine.prompt("Summarize this file.");
+for await (const event of turn) {
+  // ...
+}
+
+const checkpoint = await engine.checkpoint(); // opaque bytes
+const restored = await createFxEngine({ apiKey, model, checkpoint });
+```
+
+Pass a `persistence` store instead, and the engine records the conversation as it runs, so a new engine can `resume()` a turn the last process left open. A store needs two methods and can add a third. The bytes are opaque, so it never has to understand them:
+
+```ts
+interface Persistence {
+  load(): Promise<{
+    checkpoint?: { data: Uint8Array; through: string };
+    journal?: Iterable<JournalRecord> | AsyncIterable<JournalRecord>;
+  }>;
+  append(input: { expected: string | null; idempotencyKey: string; data: Uint8Array }): Promise<{ cursor: string }>;
+  saveCheckpoint?(input: { through: string; data: Uint8Array }): Promise<void>;
+}
+
+interface JournalRecord {
+  cursor: string;
+  data: Uint8Array;
 }
 ```
 
-Use the application's normal authentication and request limits around the
-route. JavaScript tools and MCP clients remain host-owned and must be supplied
-when creating an agent, including after checkpoint restoration. The native
-backend does not enable the CLI's built-in shell or filesystem tools.
+Reject an `append()` whose `expected` isn't the last stored cursor with `FxFencedError`, so two processes can't write the same conversation at once. `createMemoryPersistence()` is a reference store for tests. [Save and restore](https://fx.sh/docs/lib/checkpoints) has the details.
 
-## Interactive terminal
+### Upgrading from 0.0.13
 
-`createFxTerminal()` remains a separate terminal harness API. In browsers,
-connect it to xterm.js with `xtermAdapter()`:
+In libfx 0.0.13 and earlier, `createFxAgent()` created this engine. It now creates the durable agent, so rename those calls to `createFxEngine()`. Old code keeps running against the agent, with a few differences: breaking out of a turn's events no longer cancels it, turns have no `cancel()` or `steer()` (the session does), and `persistence` and `sessionId` throw because the durability holds the session.
+
+## Runtimes
+
+| Runtime | Backend |
+| --- | --- |
+| Node.js 20+ on macOS or Linux, x64 or arm64 | Native addon. Linux needs glibc 2.34 or newer. |
+| Node.js elsewhere | WebAssembly with JSPI. Some Node versions need `--experimental-wasm-jspi`. |
+| Browsers | WebAssembly with JSPI, from `libfx/browser` |
+| Bun | The same as Node.js. For WebAssembly, use Bun 1.4.2 or newer. |
+
+The default `backend: "auto"` tries native first. Pass `"native"` or `"wasm"` to require one, and call `getBackendInfo()` to see what would load without creating anything.
+
+Next.js works in Node.js route handlers, with webpack or Turbopack, and doesn't need `serverExternalPackages`. CommonJS apps can `require("libfx")`. With TypeScript's `moduleResolution: "bundler"`, add `"node"` to `customConditions` to get the Node.js types.
+
+## The fx terminal in a browser
 
 ```js
 import { createFxTerminal, xtermAdapter } from "libfx/browser";
 
-const runtime = await createFxTerminal({
-  terminal: xtermAdapter(term),
-  env: { AI_GATEWAY_API_KEY: "<short-lived credential>" },
+const terminal = await createFxTerminal({
+  terminal: xtermAdapter(term), // an xterm.js Terminal
+  env: { AI_GATEWAY_API_KEY: shortLivedKey },
 });
 
-await runtime.interactive;
+await terminal.interactive;
 ```
 
-The xterm adapter preserves browser-style composer editing for Shift+Enter,
-Command+A, Command+C, Command+X, Command+Z, and Command+Shift+Z. Shift+Enter
-inserts a newline without submitting. A click inside the visible composer moves
-its caret; pointer drags remain xterm terminal-output selections.
-When xterm already has an output selection, Command+C copies that selection
-instead of the composer selection.
+This is the fx CLI's interface compiled to WebAssembly. Your page supplies storage for its sessions, settings and sign-in, and can give it a workspace that runs commands. See [WebAssembly](https://fx.sh/docs/lib/webassembly).
 
-The terminal runtime exposes `interactive`, `exited`, `write`, `resize`, and
-`abort`. Terminal session, config, OAuth, prompt-history, clipboard, URL, and
-workspace stores remain terminal-only host integrations. Clipboard copy writes
-through the host `clipboard.writeText(text)` adapter and defaults to
-`navigator.clipboard`.
+## Entry points
 
-During `/compact` and automatic compaction, the terminal shows a live
-`Compacting` activity row with elapsed time. Input and cancellation remain
-responsive while the summary request is pending. Compaction progress and
-outcomes do not add transcript entries, including cancellation after resume.
-Stored snapshots retain cancellation-origin metadata; keep them opaque and
-resume with the same or a newer SDK build. Older snapshots remain readable.
+| Import | What's in it |
+| --- | --- |
+| `libfx` | `createFxAgent`, `createFxEngine`, `memory`, `listModels`, `getBackendInfo`, `createMemoryPersistence`, `FxFencedError` |
+| `libfx/node` | The same, for Node.js explicitly |
+| `libfx/browser` | The browser build, plus `createFxTerminal` and `xtermAdapter` |
+| `libfx/wasm` | The WebAssembly SDK without packaged asset paths, so you pass `wasm` yourself |
+| `libfx/durable-local`, `libfx/durable-vercel`, `libfx/durable-world` | `local()`, `vercel()` and `world()` |
+| `libfx/chatgpt` | `startSignIn`, `finishSignIn`, `startDeviceSignIn`, `pollDeviceSignIn`, `completeDeviceSignIn`, `refreshCredentials` |
+| `libfx/mcp` | `createMcpAdapter` |
+| `libfx/skills`, `libfx/skills/node` | `createSkillsAdapter`, and `loadSkillFile` for Node.js and Bun |
 
 ## Security
 
-Treat `nativeAddon` and `gatewayChatUrl` as trusted host
-configuration. Do not embed long-lived credentials in public browser code.
-Host tool functions, MCP clients, and skill loaders retain their own authority;
-libfx validates and sequences them but does not grant operating-system access.
+Your tools, MCP clients and skill loaders have whatever access your code gives them. libfx validates and orders their calls but grants nothing itself, and the native backend doesn't turn on fx's built-in shell or file tools. Don't put long-lived keys in browser code, and treat the `nativeAddon` and `gatewayChatUrl` options as trusted configuration. Keep ChatGPT credentials, and the `signIn` object `startSignIn()` returns, on the server.
+
+## Contributing
+
+libfx is developed in the [fx repository](https://github.com/vercel-labs/fx), under `sdk/`. Bug reports and pull requests are welcome. See [CONTRIBUTING.md](https://github.com/vercel-labs/fx/blob/main/CONTRIBUTING.md) to get started.
+
+## License
+
+[Apache-2.0](https://github.com/vercel-labs/fx/blob/main/LICENSE)

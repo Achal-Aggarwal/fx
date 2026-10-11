@@ -9,9 +9,14 @@ const mcp_health = @import("../core/mcp/health.zig");
 const project_config = @import("../core/mcp/project_config.zig");
 const workspace_config = @import("../core/mcp/workspace_config.zig");
 const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
+const mcp_host = @import("../core/mcp_host/host.zig");
+const config_file = @import("../core/mcp_host/config_file.zig");
+const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
+const build_options = @import("build_options");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
 const streamable_http = @import("../core/mcp/streamable_http.zig");
+const slack_preset = @import("../core/mcp/slack_preset.zig");
 const profile_paths = @import("../core/shared/profile_paths.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 
@@ -21,8 +26,7 @@ const CommandResult = command_provider_contract.Result;
 const McpServerConfig = mcp_contract.McpServerConfig;
 const McpTransport = mcp_contract.McpTransport;
 
-const add_usage = "usage: /mcp add <name> <command> [args...] or /mcp add --transport http <name> <url>";
-const profile_lock_deadline_ms: u64 = 2_000;
+const add_usage = "usage: /" ++ @import("../core/slash_commands/command_specs.zig").mcp_add_usage;
 
 pub const command_provider = command_provider_contract.Provider{ .handle_fn = handleCommand };
 
@@ -303,6 +307,7 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
             ),
         };
         const warning = addProfileServerToPath(alloc, config_path, intent) catch |err| {
+            if (err == error.SlackConfigurationConflict) return lineLiteral(alloc, slack_preset.configuration_conflict, false);
             return lineParts(
                 alloc,
                 &.{ "Failed to save MCP server config: ", @errorName(err), "." },
@@ -310,9 +315,20 @@ fn handleCommand(alloc: Allocator, rest: []const u8, command_request: CommandReq
             );
         };
         const name = switch (intent) {
+            .slack => "slack",
             .local => |local| local.name,
             .http => |http| http.name,
         };
+        if (intent == .slack) {
+            const message = "Connecting Slack. Keep fx running while you authorize in your browser.";
+            var result = if (warning) |value| result: {
+                const warning_text = try renderProfileWarning(alloc, value);
+                defer alloc.free(warning_text);
+                break :result try lineParts(alloc, &.{ warning_text, "\n", message }, true);
+            } else try lineLiteral(alloc, message, true);
+            result.connect_slack = true;
+            return result;
+        }
         if (warning) |value| {
             const warning_text = try renderProfileWarning(alloc, value);
             defer alloc.free(warning_text);
@@ -533,13 +549,23 @@ pub fn removeProfileServer(
     };
 }
 
-pub fn loadRuntime(
-    alloc: Allocator,
-    workspace_root: []const u8,
-    elicitation_capabilities: elicitation.Capabilities,
-) !?*mcp_runtime.McpRuntime {
+/// The servers fx runs in `workspace_root`: the profile's, then the project's
+/// that no profile server shadows, with project trust applied. Owns both lists.
+pub const NativeConfigs = struct {
+    configs: std.ArrayList(McpServerConfig) = .empty,
+    diagnostics: std.ArrayList(project_config.WorkspaceDiagnostic) = .empty,
+
+    pub fn deinit(self: *NativeConfigs, alloc: Allocator) void {
+        freeConfigs(alloc, &self.configs);
+        for (self.diagnostics.items) |*diagnostic| diagnostic.deinit(alloc);
+        self.diagnostics.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub fn loadNativeConfigs(alloc: Allocator, workspace_root: []const u8) !NativeConfigs {
     var profile: std.ArrayList(McpServerConfig) = .empty;
-    defer freeConfigs(alloc, &profile);
+    errdefer freeConfigs(alloc, &profile);
     if (io_mod.getenv("HOME")) |home| {
         const config_path = try configPathFromHome(alloc, home);
         defer alloc.free(config_path);
@@ -549,7 +575,7 @@ pub fn loadRuntime(
     var choice_load = config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("mcp", "workspace MCP choices unavailable err={s}", .{@errorName(err)});
-        return runtimeFromConfigs(alloc, &profile, elicitation_capabilities);
+        return .{ .configs = profile };
     };
     defer choice_load.deinit(alloc);
     for (choice_load.diagnostics.items) |diagnostic| {
@@ -576,10 +602,26 @@ pub fn loadRuntime(
     defer workspace.deinit(alloc);
     traceWorkspaceDiagnostics(workspace.diagnostics.items);
 
-    var configs = try project_config.mergeNative(alloc, &profile, &workspace.configs);
-    defer freeConfigs(alloc, &configs);
-    var runtime = try runtimeFromConfigs(alloc, &configs, elicitation_capabilities);
-    if (runtime == null and workspace.diagnostics.items.len > 0) {
+    var loaded: NativeConfigs = .{
+        .configs = try project_config.mergeNative(alloc, &profile, &workspace.configs),
+    };
+    profile.deinit(alloc);
+    loaded.diagnostics = workspace.diagnostics;
+    workspace.diagnostics = .empty;
+    return loaded;
+}
+
+pub fn loadRuntime(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    elicitation_capabilities: elicitation.Capabilities,
+) !?*mcp_runtime.McpRuntime {
+    // MCP-v2 runs the servers instead (`loadHost`).
+    if (mcp_host.selected()) return null;
+    var loaded = try loadNativeConfigs(alloc, workspace_root);
+    defer loaded.deinit(alloc);
+    var runtime = try runtimeFromConfigs(alloc, &loaded.configs, elicitation_capabilities);
+    if (runtime == null and loaded.diagnostics.items.len > 0) {
         runtime = try alloc.create(mcp_runtime.McpRuntime);
         runtime.?.* = mcp_runtime.McpRuntime.initWithElicitation(
             alloc,
@@ -587,13 +629,51 @@ pub fn loadRuntime(
         );
     }
     if (runtime) |value| {
-        value.takeWorkspaceDiagnostics(&workspace.diagnostics) catch |err| {
+        value.takeWorkspaceDiagnostics(&loaded.diagnostics) catch |err| {
             value.deinit();
             alloc.destroy(value);
             return err;
         };
     }
     return runtime;
+}
+
+/// MCP-v2's host for the workspace when FX_MCP_ENGINE=v2 selects it,
+/// or null. Its servers start when the model first needs them.
+pub fn loadHost(
+    alloc: Allocator,
+    workspace_root: []const u8,
+    builtins: tool_dispatch.Registry,
+    extras: mcp_host.Extras,
+) !?*mcp_host.Host {
+    if (!mcp_host.selected()) return null;
+    var loaded = try loadNativeConfigs(alloc, workspace_root);
+    defer loaded.deinit(alloc);
+    const home = io_mod.getenv("HOME") orelse return null;
+    // Read only while the host starts.
+    var inherited = try io_mod.cloneEnvironMap(alloc);
+    defer inherited.deinit();
+    try project_config.expandProfileConfigs(alloc, &loaded.configs, &loaded.diagnostics, &inherited);
+    // A host with no servers still carries the notes saying why.
+    if (loaded.configs.items.len == 0 and loaded.diagnostics.items.len == 0) return null;
+    const notes = try alloc.alloc([]const u8, loaded.diagnostics.items.len);
+    var rendered: usize = 0;
+    errdefer {
+        for (notes[0..rendered]) |note| alloc.free(note);
+        alloc.free(notes);
+    }
+    for (loaded.diagnostics.items, notes) |diagnostic, *note| {
+        note.* = try project_config.renderWorkspaceDiagnostic(alloc, diagnostic);
+        rendered += 1;
+    }
+    const h = try mcp_host.Host.create(alloc, io_mod.getIo(), loaded.configs.items, &inherited, .{
+        .client_version = build_options.app_version,
+        .credentials = .detect(alloc, home),
+        .questions = extras.questions,
+        .notify = extras.notify,
+    }, builtins);
+    h.notes = notes;
+    return h;
 }
 
 pub fn previewNativeWorkspaceAuthority(
@@ -830,7 +910,9 @@ fn addProfileServerToPath(
     path: []const u8,
     intent: command_provider_contract.AddIntent,
 ) !?project_config.ProfileDiagnostic {
+    if (intent == .slack) return addSlackToPath(alloc, path);
     const next = switch (intent) {
+        .slack => unreachable,
         .local => |local| try configFromCommandParts(alloc, local.name, local.command, local.args),
         .http => |http| blk: {
             const owned_name = try alloc.dupe(u8, http.name);
@@ -847,6 +929,49 @@ fn addProfileServerToPath(
     return addOrReplaceServer(alloc, path, next);
 }
 
+fn addSlackToPath(alloc: Allocator, path: []const u8) !?project_config.ProfileDiagnostic {
+    var lock = try config_file.lockProfile(path);
+    defer lock.release();
+    var document = try loadProfileDocumentFromPath(alloc, path);
+    defer document.deinit(alloc);
+    if (!document.mutation_allowed) return error.McpConfigAmbiguousServerKey;
+    const endpoint = try slack_preset.endpoint_alloc(alloc);
+    defer alloc.free(endpoint);
+    for (document.configs.items) |*existing| {
+        if (!std.mem.eql(u8, existing.name, "slack")) continue;
+        if (existing.transport != .http or existing.url == null or
+            !std.mem.eql(u8, existing.url.?, endpoint) or
+            existing.headers.len > 0 or existing.header_env.len > 0 or existing.bearer_token_env != null)
+            return error.SlackConfigurationConflict;
+        if (existing.auth) |auth| {
+            if (auth.client_id) |id| {
+                if (!std.mem.eql(u8, id, slack_preset.client_id)) return error.SlackConfigurationConflict;
+            }
+            if (auth.resource != null or auth.issuer != null or auth.client_secret_env != null or auth.client_metadata_url != null)
+                return error.SlackConfigurationConflict;
+        }
+        if (existing.auth == null) existing.auth = .{};
+        if (existing.auth.?.client_id == null) existing.auth.?.client_id = try alloc.dupe(u8, slack_preset.client_id);
+        existing.enabled = true;
+        existing.allow_stored_credentials = true;
+        try saveConfigsToPath(alloc, path, document.configs.items);
+        return document.diagnostic;
+    }
+    var next = McpServerConfig{
+        .name = try alloc.dupe(u8, "slack"),
+        .transport = .http,
+        .allow_stored_credentials = true,
+    };
+    var owned = true;
+    errdefer if (owned) next.deinit(alloc);
+    next.url = try alloc.dupe(u8, endpoint);
+    next.auth = .{ .client_id = try alloc.dupe(u8, slack_preset.client_id) };
+    try document.configs.append(alloc, next);
+    owned = false;
+    try saveConfigsToPath(alloc, path, document.configs.items);
+    return document.diagnostic;
+}
+
 fn addOrReplaceServer(
     alloc: Allocator,
     path: []const u8,
@@ -856,7 +981,7 @@ fn addOrReplaceServer(
     var moved = false;
     errdefer if (!moved) next.deinit(alloc);
 
-    var lock = try acquireProfileMutationLock(path);
+    var lock = try config_file.lockProfile(path);
     defer lock.release();
     var document = try loadProfileDocumentFromPath(alloc, path);
     defer document.deinit(alloc);
@@ -889,7 +1014,7 @@ fn removeProfileServerFromPath(
     path: []const u8,
     name: []const u8,
 ) !ProfileRemoveFromPathResult {
-    var lock = try acquireProfileMutationLock(path);
+    var lock = try config_file.lockProfile(path);
     defer lock.release();
     var document = try loadProfileDocumentFromPath(alloc, path);
     defer document.deinit(alloc);
@@ -930,32 +1055,10 @@ fn loadProfileDocumentFromPath(
     return project_config.parseProfileDocument(alloc, json_text);
 }
 
-fn acquireProfileMutationLock(path: []const u8) !io_mod.TimedAdvisoryLock {
-    const parent = std.fs.path.dirname(path) orelse return error.McpConfigPathInvalid;
-    const grandparent = std.fs.path.dirname(parent) orelse return error.McpConfigPathInvalid;
-    var enclosing = io_mod.VerifiedDir{
-        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), grandparent, .{ .iterate = true }),
-    };
-    defer enclosing.close();
-    var dir = try io_mod.openOrCreateVerifiedPrivateDir(&enclosing, std.fs.path.basename(parent));
-    defer dir.close();
-    return io_mod.acquireTimedAdvisoryLock(&dir, "mcp.lock", profile_lock_deadline_ms);
-}
-
 fn saveConfigsToPath(alloc: Allocator, path: []const u8, configs: []const McpServerConfig) !void {
     const json = try renderConfigJson(alloc, configs);
     defer alloc.free(json);
-
-    const parent = std.fs.path.dirname(path) orelse return error.McpConfigPathInvalid;
-    const grandparent = std.fs.path.dirname(parent) orelse return error.McpConfigPathInvalid;
-
-    var enclosing = io_mod.VerifiedDir{
-        .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), grandparent, .{ .iterate = true }),
-    };
-    defer enclosing.close();
-    var dir = try io_mod.openOrCreateVerifiedPrivateDir(&enclosing, std.fs.path.basename(parent));
-    defer dir.close();
-    try io_mod.durableReplaceVerified(alloc, &dir, std.fs.path.basename(path), json);
+    try config_file.replaceProfile(alloc, path, json);
 }
 
 fn freeConfigs(alloc: Allocator, configs: *std.ArrayList(McpServerConfig)) void {
@@ -1802,7 +1905,7 @@ test "built-in MCP command rejects invalid remote add forms without mutation" {
         defer result.deinit(alloc);
         try expectLine(
             result,
-            "usage: /mcp add <name> <command> [args...] or /mcp add --transport http <name> <url>",
+            add_usage,
             false,
         );
     }
