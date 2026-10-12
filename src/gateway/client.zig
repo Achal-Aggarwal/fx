@@ -2067,7 +2067,7 @@ pub fn runBoundedHttpOperation(
 }
 
 /// Watches one bounded request for cancellation and its deadline. The request
-/// owner stops it with `finish` instead of cancelling it: in Zig 0.16 a cancel
+/// owner stops it with `finish` instead of cancelling it: in Zig 0.17 a cancel
 /// can interrupt whatever task the watch's worker thread runs next, and an
 /// interrupted connect then fails with ISCONN.
 const BoundedRequestWatch = struct {
