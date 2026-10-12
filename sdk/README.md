@@ -57,7 +57,7 @@ const { sessionId } = await turn.accepted;
 agent.session(sessionId).prompt("Start with the schema.");
 ```
 
-A session runs one turn at a time. A prompt that arrives while a turn is running waits behind it, even when it reaches a different server. A turn runs to the end whether or not anyone reads it; stop it with `session.cancel()` or the prompt's `signal`. `session.steer(text)` adds guidance to the running turn at its next model request.
+A session runs one turn at a time. A prompt that arrives while a turn is running waits behind it, even when it reaches a different server. A turn runs to the end whether or not anyone reads it, and a turn nobody reads holds no connection open: its view starts reading only once you use its events, `readable` or `result`. Stop a turn with `session.cancel()` or the prompt's `signal`. `session.steer(text)` adds guidance to the running turn at its next model request.
 
 If a client might send the same request twice, give the prompt a `messageId`. A prompt with an id the session already accepted runs nothing and follows the original turn.
 

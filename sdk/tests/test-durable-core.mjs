@@ -889,6 +889,54 @@ if (durabilityKind === "world") {
   });
 }
 
+// A World durability whose session stream reads are counted.
+function countingStreamReads(durability) {
+  const counts = { reads: 0 };
+  const worldOf = durability.world;
+  const bound = (target, key) => {
+    const value = Reflect.get(target, key);
+    return typeof value === "function" ? value.bind(target) : value;
+  };
+  return [{
+    ...durability,
+    async world() {
+      const world = await worldOf();
+      const streams = new Proxy(world.streams, {
+        get(target, key) {
+          if (key !== "get") return bound(target, key);
+          return (...args) => {
+            counts.reads += 1;
+            return target.get(...args);
+          };
+        },
+      });
+      return new Proxy(world, { get: (target, key) => (key === "streams" ? streams : bound(target, key)) });
+    },
+  }, counts];
+}
+
+if (durabilityKind !== "memory") {
+  test("a prompt nobody reads holds no read of the session stream, and a later reader still sees its turn", async () => {
+    const [durability, counts] = countingStreamReads(await durabilityFor());
+    const agent = createAgent({ durability });
+    const turn = agent.session().prompt("alpha", { messageId: "turn-a" });
+    const { sessionId } = await turn.accepted;
+    // The turn runs to its end with nobody reading it.
+    let words = [];
+    for (let waited = 0; words.length < 3 && waited < 5000; waited += 20) {
+      await sleep(20);
+      words = JSON.parse(decoder.decode(await agent.session(sessionId).checkpoint()));
+    }
+    assert.deepEqual(words, ["alpha-0", "alpha-1", "alpha-2"]);
+    assert.equal(counts.reads, 0, "nothing read the session stream");
+    const { text, result } = await textOf(turn);
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "alpha-0 alpha-1 alpha-2", "a reader that comes later sees the whole turn");
+    assert.ok(counts.reads > 0, "reading the view read the stream");
+    await agent.close();
+  });
+}
+
 let failed = 0;
 for (const [name, fn] of tests) {
   const started = performance.now();
