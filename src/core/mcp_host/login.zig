@@ -42,7 +42,13 @@ pub const Listener = struct {
     /// The redirect URI to sign in with, in `buffer`.
     pub fn redirectUri(l: *const Listener, buffer: *[64]u8) []const u8 {
         if (l.bridge) |b| return b.redirect;
-        return std.fmt.bufPrint(buffer, "http://127.0.0.1:{d}/callback", .{l.port}) catch unreachable;
+        const origin = "http://127.0.0.1:";
+        const path = "/callback";
+        comptime std.debug.assert(origin.len + std.fmt.count("{d}", .{std.math.maxInt(@TypeOf(l.port))}) + path.len <= buffer.len);
+        buffer[0..origin.len].* = origin.*;
+        const port_end = origin.len + std.fmt.printInt(buffer[origin.len..], l.port, 10, .lower, .{});
+        buffer[port_end..][0..path.len].* = path.*;
+        return buffer[0 .. port_end + path.len];
     }
 
     /// Waits for the browser's `GET /callback` and returns the full address it
@@ -89,7 +95,7 @@ fn answer(stream: std.Io.net.Stream, io: std.Io, alloc: Allocator, port: u16, br
     const outcome: browser_callback.Response = if (!ours) .unrelated else if (hasParam(query, "error")) .failed else .ok;
     browser_callback.writeResponse(stream, outcome, null) catch {};
     if (!ours) return null;
-    return try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}{s}", .{ port, target });
+    return try alloc.print("http://127.0.0.1:{d}{s}", .{ port, target });
 }
 
 /// A bridge's form, posted by its page in the browser: `POST` to its path,
@@ -97,7 +103,7 @@ fn answer(stream: std.Io.net.Stream, io: std.Io, alloc: Allocator, port: u16, br
 /// the query of the redirect MCP-v2 signed in with; anything else gets a 404.
 fn answerForm(stream: std.Io.net.Stream, reader: *std.Io.Reader, alloc: Allocator, port: u16, b: Bridge, method: []const u8, target: []const u8, head: *const Head) !?[]u8 {
     var host_buf: [32]u8 = undefined;
-    const host = try std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{port});
+    const host = try std.mem.print(&host_buf, "127.0.0.1:{d}", .{port});
     const kind = if (head.content_type.get()) |t| std.mem.trim(u8, t[0 .. std.mem.findScalar(u8, t, ';') orelse t.len], " ") else "";
     const length = if (head.length.get()) |v| std.fmt.parseInt(usize, v, 10) catch 0 else 0;
     const ours = std.mem.eql(u8, method, "POST") and std.mem.eql(u8, target, b.path) and
@@ -112,7 +118,7 @@ fn answerForm(stream: std.Io.net.Stream, reader: *std.Io.Reader, alloc: Allocato
     reader.readSliceAll(body[0..length]) catch return null;
     const form = body[0..length];
     browser_callback.writeResponse(stream, if (hasParam(form, "error")) .failed else .ok, null) catch {};
-    return try std.fmt.allocPrint(alloc, "{s}?{s}", .{ b.redirect, form });
+    return try alloc.print("{s}?{s}", .{ b.redirect, form });
 }
 
 fn eqlField(value: ?[]const u8, want: []const u8) bool {
@@ -211,7 +217,7 @@ test "the browser's return is the callback address; other requests get a 404 and
     };
     thread.join();
     defer testing.allocator.free(url);
-    const want = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/callback?code=c1&state=s1", .{listener.port});
+    const want = try testing.allocator.print("http://127.0.0.1:{d}/callback?code=c1&state=s1", .{listener.port});
     defer testing.allocator.free(want);
     try testing.expectEqualStrings(want, url);
     try testing.expect(std.mem.startsWith(u8, browser.icon_reply, "HTTP/1.1 404"));
@@ -289,4 +295,16 @@ test "a refused sign-in comes back to the failure page" {
     testing.allocator.free(url);
     try testing.expect(std.mem.startsWith(u8, browser.reply, "HTTP/1.1 400"));
     try testing.expect(std.mem.find(u8, browser.reply, "Authorization failed") != null);
+}
+
+test "the redirect URI spells out every port in full" {
+    var buffer: [64]u8 = undefined;
+    for ([_]struct { u16, []const u8 }{
+        .{ 1, "http://127.0.0.1:1/callback" },
+        .{ 8080, "http://127.0.0.1:8080/callback" },
+        .{ 65535, "http://127.0.0.1:65535/callback" },
+    }) |case| {
+        const listener: Listener = .{ .server = undefined, .port = case[0] };
+        try testing.expectEqualStrings(case[1], listener.redirectUri(&buffer));
+    }
 }

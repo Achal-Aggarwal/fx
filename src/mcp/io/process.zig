@@ -565,7 +565,7 @@ test "a command that can't start counts as a failure" {
 test "a spawn that works clears the last spawn error" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}/server", .{tmp.sub_path});
+    const path = try testing.allocator.print(".zig-cache/tmp/{s}/server", .{tmp.sub_path});
     defer testing.allocator.free(path);
     const argv = [_][]const u8{path};
     var p: Process = undefined;
@@ -627,7 +627,7 @@ test "a stop signals the server's whole process group, so its children stop too"
     try expectState(&p, .stopped);
     try testing.expect(p.conn.term_sent);
     for (0..100) |_| {
-        std.posix.kill(child, @enumFromInt(0)) catch |err| switch (err) {
+        std.posix.kill(child, @fromBackingInt(@intCast(0))) catch |err| switch (err) {
             error.ProcessNotFound => return,
             else => return err,
         };
