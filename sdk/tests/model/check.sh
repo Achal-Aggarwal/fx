@@ -12,6 +12,7 @@
 # Then drive the code along the graphs:
 #   bun drive.mjs send && bun drive.mjs lookup && bun drive.mjs cutoff
 #   bun drive.mjs leased   # the Heartbeat graph, on a World without liveness
+#   bun drive.mjs queue    # the QueueHeld graph, on a World whose queue shows it
 #   bun drive-intake.mjs   # prompts with image bytes and files
 #   bun drive-images.mjs   # images stored once, across crashes and reopens
 set -eu
@@ -28,7 +29,7 @@ done
 work="${TMPDIR:-/tmp}/libfx-model-tlc"
 mkdir -p "$work" graphs
 status=0
-for tool in send lookup cutoff leased; do
+for tool in send lookup cutoff leased queue; do
     echo "== DurableSession ($tool)"
     if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
         -metadir "$work/$tool" -dump dot,actionlabels "graphs/$tool" \
