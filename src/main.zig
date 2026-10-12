@@ -1662,7 +1662,7 @@ const App = struct {
     }
 
     pub fn runMcpVerbs(self: *App, rest: []const u8) !void {
-        try self.mcp.runVerbs(io_mod.getenv("HOME") orelse "", self.workspace_root, rest);
+        try self.mcp.runVerbs(io_mod.homeDir() orelse "", self.workspace_root, rest);
     }
 
     pub fn takeMcpHostNotices(self: *App) []app_mcp_runtime.State.HostNotice {
@@ -1680,7 +1680,7 @@ const App = struct {
     /// The composer's text is the menu's filter.
     pub fn mcpHostMenuKey(self: *App, key: mcp_host.menu.Key) !void {
         const was = self.mcp.host_menu.screen;
-        try self.mcp.hostMenuKey(key, self.input_runtime.edit_state.input.items, io_mod.getenv("HOME") orelse "", self.workspace_root);
+        try self.mcp.hostMenuKey(key, self.input_runtime.edit_state.input.items, io_mod.homeDir() orelse "", self.workspace_root);
         try self.mcp.swapHostMenuFilter(was, self.alloc, &self.input_runtime.edit_state);
         self.shell.render_requests.request(.footer);
     }

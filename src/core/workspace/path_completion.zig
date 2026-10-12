@@ -33,7 +33,7 @@ pub fn complete(
     match_spans: []file_index.MatchSpan,
     path_storage: []u8,
 ) Error!usize {
-    return completeCancellable(workspace_root, io_mod.getenv("HOME"), query, null, out, match_spans, path_storage) catch |err| switch (err) {
+    return completeCancellable(workspace_root, io_mod.homeDir(), query, null, out, match_spans, path_storage) catch |err| switch (err) {
         error.Cancelled => unreachable,
         else => |failure| return failure,
     };

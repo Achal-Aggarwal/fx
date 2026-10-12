@@ -653,7 +653,7 @@ fn runPendingCapture(pending: *PendingCapture) void {
 
 fn currentFingerprint(shell_path: []const u8, snapshot_zdotdir: ?[]const u8) Fingerprint {
     const kind = shell_resolver.shellKind(shell_path) orelse return .{};
-    const dirs = [_]?[]const u8{ io_mod.getenv("ZDOTDIR"), io_mod.getenv("HOME"), snapshot_zdotdir };
+    const dirs = [_]?[]const u8{ io_mod.getenv("ZDOTDIR"), io_mod.homeDir(), snapshot_zdotdir };
     return fingerprintFor(kind, if (kind == .zsh) &dirs else dirs[1..2]);
 }
 

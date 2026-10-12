@@ -307,7 +307,7 @@ pub const Context = struct {
     /// belongs to `arena`.
     pub fn fromEnvironment(arena: Allocator, layout: ?layout_mod.Layout) Allocator.Error!Context {
         var context: Context = .{
-            .home = io_mod.getenv("HOME"),
+            .home = io_mod.homeDir(),
             .xdg_config_home = if (io_mod.getenv("XDG_CONFIG_HOME")) |xdg| if (xdg.len > 0) xdg else null else null,
             .global_override = io_mod.getenv("GIT_CONFIG_GLOBAL"),
             .no_system = if (io_mod.getenv("GIT_CONFIG_NOSYSTEM")) |v| parseBool(v) orelse false else false,

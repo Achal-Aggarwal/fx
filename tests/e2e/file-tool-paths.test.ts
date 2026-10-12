@@ -309,6 +309,7 @@ async function runTerminalToolScenario(args: {
   name: string;
   input: object;
   unsetHome?: boolean;
+  home?: string;
   expectedResultRequest: string[];
 }) {
   const gateway = startFakeGateway([
@@ -323,7 +324,7 @@ async function runTerminalToolScenario(args: {
         env: gatewayEnv(
           args.root,
           gateway,
-          args.unsetHome ? undefined : args.root.home,
+          args.unsetHome ? undefined : (args.home ?? args.root.home),
         ),
         timeoutMs: TIMEOUT,
       },
@@ -1712,6 +1713,31 @@ describe("filesystem path handling", () => {
         });
 
         expect(existsSync(literalWorkspacePath)).toBe(false);
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "relative HOME is treated like a missing HOME instead of aborting",
+    async () => {
+      const root = createIsolatedRoot();
+      try {
+        await runTerminalToolScenario({
+          root,
+          id: "read_relative_home_1",
+          name: "read_file",
+          input: { path: "~/fx-path-fixture.txt" },
+          home: "relative/home",
+          expectedResultRequest: ["HomeNotSet"],
+        });
+
+        // Nothing resolves against the workspace: no tilde folder, and no
+        // profile written under the relative path.
+        expect(existsSync(join(root.workspace, "~"))).toBe(false);
+        expect(existsSync(join(root.workspace, "relative"))).toBe(false);
       } finally {
         rmSync(root.root, { recursive: true, force: true });
       }

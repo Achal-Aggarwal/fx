@@ -475,7 +475,7 @@ pub fn handleNewSession(state: *server.ServerState, alloc: Allocator, msg: *json
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
-    _ = try session_rt.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
+    _ = try session_rt.initializeProfileUsage(alloc, io_mod.homeDir());
     if (writable.state.usage) |usage| {
         try session_rt.usage.restore(
             alloc,
@@ -593,7 +593,7 @@ fn startV2Session(
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
-    _ = try session_rt.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
+    _ = try session_rt.initializeProfileUsage(alloc, io_mod.homeDir());
     session_rt.usage.restoreLegacyWallDuration(io_mod.milliTimestamp());
     session_rt.configureWebFetchArtifactBlobs(alloc, try v2.childCapability(), v2.id());
     server.cancelAndReapActivePrompt(state);
@@ -1041,7 +1041,7 @@ fn handleRestoreSession(
     );
     var session_rt_owned = true;
     defer if (session_rt_owned) session_rt.deinit(alloc);
-    _ = try session_rt.initializeProfileUsage(alloc, io_mod.getenv("HOME"));
+    _ = try session_rt.initializeProfileUsage(alloc, io_mod.homeDir());
     try session_rt.restoreWithPermissionState(
         alloc,
         durable.conversation_language,
@@ -1171,7 +1171,7 @@ fn appendProfileMcpConfigsIfRequested(
     configs: *mcp_servers.OwnedServerConfigs,
 ) !void {
     if (!profileMcpRequested(alloc, params_raw)) return;
-    const home = state.cfg.home_override orelse io_mod.getenv("HOME") orelse {
+    const home = state.cfg.home_override orelse io_mod.homeDir() orelse {
         debug_trace.logf("mcp", "ACP profile MCP servers skipped reason=no_home", .{});
         return;
     };
