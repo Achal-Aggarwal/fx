@@ -257,7 +257,7 @@ test "Agent request size limit only lowers, follows the model, and dies with cle
     try std.testing.expectEqual(@as(?usize, 7000), agent.requestByteLimit("other/model"));
     try std.testing.expectEqual(@as(?usize, null), agent.requestByteLimit("fixture/model"));
 
-    agent.lowerRequestByteLimit("x" ** (max_request_calibration_model_bytes + 1), 10);
+    agent.lowerRequestByteLimit(text_utils.repeat("x", max_request_calibration_model_bytes + 1), 10);
     try std.testing.expectEqual(@as(?usize, 7000), agent.requestByteLimit("other/model"));
 
     agent.clearHistory(alloc);

@@ -326,7 +326,7 @@ pub const Log = struct {
     pub fn append(log: *Log, batch: []const u8, line_count: u64) AppendError!void {
         if (log.status != .open or log.access != .read_write) return error.NotWritable;
         std.debug.assert(batch.len > 0 and batch[batch.len - 1] == '\n');
-        if (std.debug.runtime_safety) std.debug.assert(log.seqsMatch(batch, line_count));
+        if (builtin.optimize.runtimeSafety()) std.debug.assert(log.seqsMatch(batch, line_count));
         const traced = if (hooks) log.hook.tracer != null else false;
         if (traced) {
             try log.appendTraced(batch);

@@ -103,7 +103,7 @@ fn answer(stream: std.Io.net.Stream, io: std.Io, alloc: Allocator, port: u16, br
 /// the query of the redirect MCP-v2 signed in with; anything else gets a 404.
 fn answerForm(stream: std.Io.net.Stream, reader: *std.Io.Reader, alloc: Allocator, port: u16, b: Bridge, method: []const u8, target: []const u8, head: *const Head) !?[]u8 {
     var host_buf: [32]u8 = undefined;
-    const host = try std.fmt.bufPrint(&host_buf, "127.0.0.1:{d}", .{port});
+    const host = try std.mem.print(&host_buf, "127.0.0.1:{d}", .{port});
     const kind = if (head.content_type.get()) |t| std.mem.trim(u8, t[0 .. std.mem.findScalar(u8, t, ';') orelse t.len], " ") else "";
     const length = if (head.length.get()) |v| std.fmt.parseInt(usize, v, 10) catch 0 else 0;
     const ours = std.mem.eql(u8, method, "POST") and std.mem.eql(u8, target, b.path) and
