@@ -206,6 +206,7 @@ export async function worlds(): Promise<void> {
   world(fake);
   world(() => fake);
   world(async () => fake, { name: "postgres", pollMs: 500, maxDurationMs: 800_000, reserveMs: 30_000, leaseMs: 10_000 });
+  world(fake, { name: "queues", queueLeases: true, queueDurable: true });
   world(fake, {
     livenessKnown: true,
     holderInfo: () => ({ pid: 42, host: "worker-1" }),

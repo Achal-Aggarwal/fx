@@ -49,10 +49,18 @@ const defaultReserveMs = 30_000;
 // after its last renewal, not at its function's deadline.
 const defaultLeaseMs = 15_000;
 
+// Whether the queue shows whether a worker lives, delivering the message its
+// delivery held again once it is gone, so the worker holds its lease to the
+// deadline that bounds it and renews nothing.
+const queueHeld = (backend, deadline) => !backend.livenessKnown && backend.queueLeases === true && deadline !== null;
+// Whether a worker holds its lease to its deadline and renews nothing: when
+// whether it lives is known, or the queue shows it.
+const heldToDeadline = (backend, deadline) => backend.livenessKnown || queueHeld(backend, deadline);
+
 // When a lease taken or renewed now runs out: never past the deadline its
-// worker stops at, and with liveness known, only at that deadline.
+// worker stops at, and when it is held to that deadline, only there.
 function leaseEnd(backend, deadline) {
-  if (backend.livenessKnown) return deadline;
+  if (heldToDeadline(backend, deadline)) return deadline;
   const renewed = Date.now() + backend.leaseMs;
   return deadline === null ? renewed : Math.min(renewed, deadline);
 }
@@ -538,7 +546,7 @@ const listenersOf = new WeakMap();
 
 // libfx starts and closes a World it `owned`, having created it; a World the
 // app passed in stays the app's.
-function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, holderInfo, livenessKnown = false, queueDurable = false, maxDurationMs, owned = true }) {
+function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, holderInfo, livenessKnown = false, queueLeases = false, queueDurable = false, maxDurationMs, owned = true }) {
   const spec = world.specVersion === undefined ? {} : { specVersion: world.specVersion };
   const created = new Set();
   // Runs being created now: writes that go out together create a run once.
@@ -565,6 +573,9 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
       throw new Error("no libfx agent is listening; the queue delivers this again");
     }
     const result = await handle(input, meta);
+    // The queue delivers this same message again, which takes back a lease
+    // its worker could not let go.
+    if (result?.redeliver === true) throw new Error("libfx asks the queue to deliver this message again");
     return Number.isFinite(result?.timeoutSeconds) ? { timeoutSeconds: result.timeoutSeconds } : undefined;
   };
   // The route a deployment mounts delivers to this agent.
@@ -572,6 +583,7 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
   const backend = {
     name,
     livenessKnown,
+    queueLeases,
     queueDurable,
     pollMs: pollMs ?? 1000,
     reserveMs: reserveMs ?? defaultReserveMs,
@@ -994,8 +1006,11 @@ class SessionWorker {
       }
       if (outcome === "yielded") return { timeoutSeconds: 0 };
       // A write that failed for any other reason: the same message runs the
-      // session again shortly.
-      if (outcome === "failed") return { timeoutSeconds: 1 };
+      // session again shortly. A lease held to the deadline, which a release
+      // that failed may leave standing, is let go only by a later delivery of
+      // this message, and a queue may send `{ timeoutSeconds }` on as a new
+      // one, so the queue is asked for this one again.
+      if (outcome === "failed") return queueHeld(this.backend, deadline) ? { redeliver: true } : { timeoutSeconds: 1 };
       if (outcome === "fenced") {
         // Another worker took the session over; this one stops.
         this.agent.emit("session.fenced", { sessionId: this.sessionId, epoch: state.lastEpoch + 1 });
@@ -1177,7 +1192,7 @@ class SessionWorker {
     // The turn running now, which a deadline or a lost lease cancels.
     let turnNow = null;
     let renew = null;
-    if (!this.backend.livenessKnown) {
+    if (!heldToDeadline(this.backend, deadline)) {
       // A lease nothing else shows alive is renewed while its worker runs,
       // and never after its release, which would take the session back. A
       // renewal fenced out by another worker's write stops the turn at once,

@@ -8,9 +8,11 @@
 //   sent again that much later as a new message, as world-vercel does;
 // - one that throws gets the same message again shortly;
 // - `lapse(message)` delivers a message again while its delivery still runs,
-//   as the queue does once the process holding it died or lost it, and
+//   as the queue does once the process holding it died or lost it;
 //   `rerun(message)` runs its delivery again, attempt and all, as Vercel
-//   does when a function's process exits mid-delivery.
+//   does when a function's process exits mid-delivery; and `adopt(message)`
+//   delivers here a message another of these Worlds held, as one queue
+//   shared by two processes hands a message on.
 //
 // The test starts the World and passes it to world(), so it stays the
 // test's: `closeQueueWorlds()` closes them after the agents.
@@ -27,6 +29,8 @@ function createBroker({ retryMs }) {
   const messages = new Map();
   const keys = new Map();
   const sent = [];
+  // Ids stay distinct across Worlds, so one can take another's message.
+  const tag = crypto.randomUUID().slice(0, 8);
   let count = 0;
   let closed = false;
   const later = (fn, ms) => {
@@ -41,7 +45,7 @@ function createBroker({ retryMs }) {
   const send = async (queueName, payload, { delaySeconds = 0, idempotencyKey } = {}) => {
     if (idempotencyKey !== undefined && keys.has(idempotencyKey)) return { messageId: keys.get(idempotencyKey) };
     count += 1;
-    const message = { id: `msg_${String(count).padStart(8, "0")}`, queueName, payload, attempt: 0, key: idempotencyKey };
+    const message = { id: `msg_${tag}${String(count).padStart(8, "0")}`, queueName, payload, attempt: 0, key: idempotencyKey };
     messages.set(message.id, message);
     if (idempotencyKey !== undefined) keys.set(idempotencyKey, message.id);
     sent.push(message);
@@ -77,6 +81,12 @@ function createBroker({ retryMs }) {
     rerun(message) {
       deliver(message, true);
     },
+    adopt(message) {
+      const copy = { ...message };
+      messages.set(copy.id, copy);
+      deliver(copy);
+      return copy;
+    },
     queue: send,
     createQueueHandler(_prefix, handler) {
       const route = async () => new Response("this test World delivers in process", { status: 404 });
@@ -110,7 +120,9 @@ export async function queueWorldAt(dir, { retryMs = 20, ...options } = {}) {
     },
   };
   opened.push(instance);
-  return { durability: world(instance, { name: "queue", pollMs: 250, queueDurable: true, ...options }), broker };
+  // The broker keeps its messages in memory, so a message dies with the
+  // process and prompt() stores each prompt before it sends it.
+  return { durability: world(instance, { name: "queue", pollMs: 250, queueDurable: false, ...options }), broker };
 }
 
 export async function closeQueueWorlds() {

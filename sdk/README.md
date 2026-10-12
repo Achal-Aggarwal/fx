@@ -147,7 +147,9 @@ Then subscribe it to libfx's topic in `vercel.json`:
 }
 ```
 
-That's all. `prompt()` sends each turn to Vercel Queues, and this route runs it. When a turn gets close to the function's time limit, libfx saves it and the next invocation continues it. When a function dies mid-turn, its session frees about 15 seconds after it last checked in, and the turn carries on in a new invocation. `vercel({ reserveMs, leaseMs })` from `libfx/durable-vercel` changes both timings.
+That's all. `prompt()` sends each turn to Vercel Queues, and this route runs it. When a turn gets close to the function's time limit, libfx saves it and the next invocation continues it. `vercel({ reserveMs })` from `libfx/durable-vercel` changes how long before the limit that happens.
+
+A function holds its session for as long as Vercel Queues keeps the turn's message for it, so nothing is written while a turn runs to show the function is alive. When a function's process exits mid-turn, Vercel runs the same delivery again about a second later, and that invocation continues the turn. A function that stops without its process exiting holds the message until the queue's hold on it runs out, up to five minutes; a prompt sent to the session in the meantime continues the turn once that function's time limit has passed. To bound that case, pass `leaseMs`: `vercel({ leaseMs: 15_000 })` renews a 15-second lease in the session's log every 5 seconds while a turn runs, and the session frees about 15 seconds after the last renewal.
 
 ### Tools with side effects
 
