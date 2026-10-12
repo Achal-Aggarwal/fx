@@ -1677,7 +1677,7 @@ fn testSnapshot(status: usage.Status, budget: bool, month: []const ModelRow) !us
             try testView(.month, month, budget),
         },
         .status = status,
-        .label = "vercel-internal-playground (fx login)",
+        .label = "acme-design-tools-platform (fx login)",
         .now_ms = test_now,
     };
 }
@@ -1757,10 +1757,10 @@ test "the df view lines its numbers up under the headers at every width" {
         var screen = try draw(p, width, 40);
         defer screen.deinit();
         // The label on the left, the freshness in the right corner.
-        try testing.expect(std.mem.startsWith(u8, screen.row(0), "usage: vercel-"));
+        try testing.expect(std.mem.startsWith(u8, screen.row(0), "usage: acme-de"));
         try testing.expect(std.mem.endsWith(u8, screen.row(0), "updated 2m ago"));
         try testing.expectEqual(@as(usize, width), display_width.visibleWidth(screen.row(0)));
-        try testing.expectEqual(width >= 61, std.mem.find(u8, screen.row(0), "vercel-internal-playground (fx login)") != null);
+        try testing.expectEqual(width >= 61, std.mem.find(u8, screen.row(0), "acme-design-tools-platform (fx login)") != null);
 
         // Period table: numbers end where their headers end.
         try testing.expectEqualStrings("period        spent  requests  tokens", screen.row(2));
@@ -1908,7 +1908,7 @@ test "states without numbers say so in one line" {
     }
     var first = try draw(.{ .active = true, .snapshot = &fetching }, 80, 40);
     defer first.deinit();
-    try testing.expect(std.mem.startsWith(u8, first.row(0), "usage: vercel-internal-playground (fx login)  "));
+    try testing.expect(std.mem.startsWith(u8, first.row(0), "usage: acme-design-tools-platform (fx login)  "));
     try testing.expect(std.mem.endsWith(u8, first.row(0), "fetching…"));
     try testing.expectEqual(@as(usize, 80), display_width.visibleWidth(first.row(0)));
 

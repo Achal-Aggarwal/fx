@@ -75,7 +75,7 @@ pub const Credential = struct {
     /// For `.codex` and `.grok`: the provider account the plan belongs to.
     account_id: ?[]const u8 = null,
     /// Who the numbers belong to, shown in the heading, e.g.
-    /// `vercel-internal-playground (fx login)`. Never a secret.
+    /// `acme-design-tools-platform (fx login)`. Never a secret.
     label: []const u8 = "",
 };
 
