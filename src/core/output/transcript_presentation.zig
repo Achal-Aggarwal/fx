@@ -141,6 +141,18 @@ pub const State = struct {
         return next;
     }
 
+    /// Pins the reading position to the entry it shows on the page that
+    /// `item_rows` measured, so the next selection keeps that entry in view.
+    /// `scroll_rows` counts rows of that page; a rebuilt page whose earlier
+    /// entries changed height would show other content at the same offset.
+    pub fn pin_reading_position(self: State, item_rows: []const ItemRow) State {
+        if (self.follow_tail or self.bookmark_pending or self.anchor_pending) return self;
+        if (item_rows.len == 0) return self;
+        var next = self.refresh_bookmark(item_rows, self.scroll_rows);
+        next.bookmark_pending = true;
+        return next;
+    }
+
     pub fn select_visual_offset(
         self: State,
         total_rows: u32,
@@ -370,6 +382,45 @@ test "transcript presentation clamps bookmarks and selects retained neighbor" {
     }).select_visual_offset(14, 4, &item_rows);
     try std.testing.expectEqual(@as(u32, 2), following.offset);
     try std.testing.expectEqual(@as(?u32, 10), following.state.bookmark_entry_id);
+}
+
+test "transcript presentation pins the reading position to its entry for a rebuilt page" {
+    const outgoing = [_]ItemRow{
+        .{ .entry_id = 1, .row = 0 },
+        .{ .entry_id = 2, .row = 2 },
+        .{ .entry_id = 3, .row = 5 },
+    };
+    // Entry 2 grew by four rows on the rebuilt page.
+    const rebuilt = [_]ItemRow{
+        .{ .entry_id = 1, .row = 0 },
+        .{ .entry_id = 2, .row = 2 },
+        .{ .entry_id = 3, .row = 9 },
+    };
+    // Row 6 is one row into entry 3 on the outgoing page.
+    const reading = State{ .depth = .full, .scroll_rows = 6, .follow_tail = false };
+    try std.testing.expectEqual(@as(u32, 6), reading.select_visual_offset(20, 4, &rebuilt).offset);
+    try std.testing.expectEqual(
+        @as(u32, 10),
+        reading.pin_reading_position(&outgoing).select_visual_offset(20, 4, &rebuilt).offset,
+    );
+
+    const following_tail = State{ .depth = .full };
+    try std.testing.expectEqualDeep(following_tail, following_tail.pin_reading_position(&outgoing));
+    const queued = State{
+        .depth = .full,
+        .follow_tail = false,
+        .bookmark_entry_id = 2,
+        .bookmark_pending = true,
+    };
+    try std.testing.expectEqualDeep(queued, queued.pin_reading_position(&outgoing));
+    const anchored = State{
+        .depth = .full,
+        .follow_tail = false,
+        .anchor_entry_id = 3,
+        .anchor_pending = true,
+    };
+    try std.testing.expectEqualDeep(anchored, anchored.pin_reading_position(&outgoing));
+    try std.testing.expectEqualDeep(reading, reading.pin_reading_position(&.{}));
 }
 
 test "transcript presentation snapshot round trips all state" {
