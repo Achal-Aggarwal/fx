@@ -25,7 +25,7 @@ for await (const event of turn) {
 await agent.close();
 ```
 
-Set `AI_GATEWAY_API_KEY` and run it with Node.js 20 or newer. Model calls go through [AI Gateway](https://vercel.com/docs/ai-gateway), so any model it lists works, and on Vercel libfx uses the deployment's OIDC token instead of a key. libfx can also run on a user's own ChatGPT or Grok plan, or on any OpenAI-compatible server. See [Providers](#providers).
+Set `AI_GATEWAY_API_KEY` and run it with Node.js 20 or newer. Model calls go through [AI Gateway](https://vercel.com/docs/ai-gateway), so any model it lists works, and on Vercel libfx uses the deployment's OIDC token instead of a key. libfx can also run on a user's own ChatGPT or Grok plan, or on another server through the OpenAI Chat Completions API. See [Providers](#providers).
 
 Importing libfx and calling `createFxAgent()` touch no network, files or processes. The engine loads when a session runs its first turn.
 
@@ -39,7 +39,7 @@ The full documentation is at [fx.sh/docs/lib](https://fx.sh/docs/lib).
 | Session | One conversation | As long as its store keeps it |
 | Turn | One prompt and everything the agent does to answer it | Until it ends with a stop reason |
 
-An agent is cheap to create and holds no conversation of its own. Create it once per process with the same options on every server, and open a session for each conversation. Any process with that agent can run, continue or stream any of its sessions.
+An agent is configuration, and its conversations live in its sessions. Create it once per process with the same options on every server, and open a session for each conversation. Any process with that agent can run, continue or stream any of its sessions.
 
 Underneath the agent is `createFxEngine()`, a single conversation with no store, for when you don't want sessions. See [Without sessions](#without-sessions).
 
@@ -55,7 +55,7 @@ agent.session(sessionId).prompt("Start with the schema.");
 
 - **One turn at a time.** A prompt sent while a turn runs waits behind it, even when it reaches a different server.
 - **Turns finish on their own.** A turn runs to the end whether or not anyone reads its events. Stop it with `session.cancel()`, or with the `signal` you passed to `prompt()`.
-- **Steering.** `session.steer(text)` adds guidance to the running turn at its next model request, or to the next turn when none is running.
+- **Steering.** `session.steer(text)` adds guidance to the running turn at its next model request. When no turn is running, the text becomes the next turn.
 - **Retries are safe.** Give a prompt a `messageId`, and a repeated request with the same id runs nothing new. It follows the original turn, and its result has `repeated: true`.
 
 Each conversation can bring its own settings, which apply to the turns that session object starts:
@@ -161,7 +161,7 @@ That's all. `prompt()` sends each turn to Vercel Queues, and this route runs it:
 
 ### Tools that change things
 
-When a process dies during a tool call, libfx can't know whether the call finished. So it asks you which tools are safe to run twice:
+When a process dies during a tool call, libfx can't know whether the call finished. So each tool says whether it's safe to run twice:
 
 ```js
 const byId = { type: "object", properties: { id: { type: "string" } }, required: ["id"] };
@@ -185,11 +185,11 @@ const tools = [
 
 When the turn continues, a call to an `idempotent: true` tool runs again. A call to any other tool never runs twice on its own: the model gets an error saying the call may have partly run, and decides whether to check, try again or ask the user.
 
-Each call's `executionId` stays the same when it runs again. Pass it to the service your tool calls as an idempotency key, and a repeated call can't refund twice.
+Each call's `executionId` stays the same when it runs again. Pass it to the service your tool calls as an idempotency key, and a service that honors idempotency keys won't refund twice.
 
 ### Your own store
 
-`world()` from `libfx/durable-world` keeps sessions in any [Workflow World](https://workflow-sdk.dev/worlds) you create, such as Workflow's Postgres World:
+`world()` from `libfx/durable-world` keeps sessions in a [Workflow World](https://workflow-sdk.dev/worlds) you create, such as Workflow's Postgres World:
 
 ```js
 import { createWorld } from "@workflow/world-postgres";
@@ -219,7 +219,7 @@ const agent = createFxAgent({
     description: "Look up an order by id.",
     inputSchema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
     idempotent: true,
-    async execute({ id }, { signal, executionId, sessionId, context }) {
+    async execute({ id }, { signal }) {
       return orders.get(id, { signal });
     },
   }],
@@ -308,7 +308,7 @@ const signIn = await startSignIn();
 const credentials = await finishSignIn(signIn, pastedAddress);
 ```
 
-After the user signs in, OpenAI opens a page at `localhost:1455` that doesn't load. That's expected: ask the user to copy the page's whole address and paste it back. If their account or ChatGPT workspace allows device code sign-in, `startDeviceSignIn()` and `pollDeviceSignIn()` show a short code to enter on OpenAI's site instead. Each step returns plain data, so a later request or function can finish it.
+After the user signs in, OpenAI opens a page at `localhost:1455` that doesn't load. That's expected: ask the user to copy the page's whole address and paste it back. If their account or ChatGPT workspace allows device code sign-in, `startDeviceSignIn()` returns a short code to enter on OpenAI's site instead, and `pollDeviceSignIn()` or `completeDeviceSignIn()` waits for it. Each step returns plain data, so a later request or function can finish it.
 
 The sign-in uses the same OpenAI client as the Codex CLI, and the user's ChatGPT plan and OpenAI's terms apply to the turns.
 
@@ -342,7 +342,7 @@ libfx calls it with a function to run while you hold a lock on that user's accou
 
 ### Custom providers
 
-An agent can run on any server that speaks the OpenAI Chat Completions API, such as a local model server or a router:
+An agent can run on a server that speaks the OpenAI Chat Completions API, such as a local model server or a router:
 
 ```js
 const router = {
@@ -486,7 +486,7 @@ In libfx 0.0.13 and earlier, `createFxAgent()` created the engine. It now create
 
 ## Security
 
-Your tools, MCP clients and skill loaders have whatever access your code gives them. libfx validates and orders their calls but grants nothing itself, and the native backend doesn't turn on fx's built-in shell or file tools. Don't put long-lived keys in browser code, and treat the `nativeAddon` and `gatewayChatUrl` options as trusted configuration.
+Your tools, MCP clients and skill loaders have whatever access your code gives them. libfx orders their calls but grants nothing itself, and the native backend doesn't turn on fx's built-in shell or file tools. Don't put long-lived keys in browser code, and treat the `nativeAddon` and `gatewayChatUrl` options as trusted configuration.
 
 ## Contributing
 
