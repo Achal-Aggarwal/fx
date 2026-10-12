@@ -134,12 +134,12 @@ The source is laid out like this:
 fx/
 ├── src/
 │   ├── main.zig     entry point that wires everything together
-│   ├── core/        agent loop, sessions, config, permissions, skills
+│   ├── core/        agent loop, sessions, config, permissions, MCP, skills
 │   ├── builtins/    built-in tool specs, providers, and the system prompt
 │   ├── tools/       built-in tools: files, shell, web, skills, subagents
 │   ├── ui/          terminal rendering and input
 │   ├── gateway/     model provider transport
-│   ├── mcp/         MCP client
+│   ├── mcp/         MCP v2 engine, behind FX_MCP_ENGINE=v2
 │   └── acp/         Agent Client Protocol server
 ├── sdk/             libfx, the JavaScript library
 ├── tests/           end-to-end tests and model evals

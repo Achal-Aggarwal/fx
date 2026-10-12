@@ -395,13 +395,13 @@ When adding or changing user-facing behavior, update the documentation this repo
 
 1. `--help` output via command specs in `src/builtins/commands.zig`
 2. `sdk/README.md` if libfx's supported public behavior or setup changes, as `sdk/AGENTS.md` describes
-3. `CONTRIBUTING.md` if build steps, configuration, or collaboration rules change
+3. `CONTRIBUTING.md` if build steps, development setup, or collaboration rules change
 
 The user manual at fx.sh/docs is built from a private repository. When a change makes a page wrong or incomplete, updating the manual is part of the change:
 
-* If you are a member of the `vercel-labs` organization on GitHub, you can fetch the private repository behind fx.sh. Update the page there in a companion pull request and link it from this one. A page's source is `apps/marketing/app/(site)/(docs)/docs/<path>/page.mdx`, where `<path>` is the part of its URL after `fx.sh/docs/`.
+* If you are a member of the `vercel-labs` organization on GitHub, you can fetch the private repository behind fx.sh. When you can push to it, update the page there in a companion pull request and link it from this one. A page's source is `apps/marketing/app/(site)/(docs)/docs/<path>/page.mdx`, where `<path>` is the part of its URL after `fx.sh/docs/`.
 
-* Otherwise, add a `## Docs` section to the PR description with the exact change each affected page needs, as `CONTRIBUTING.md` describes, so a maintainer can make it.
+* If you can't push to that repository, add a `## Docs` section to the PR description with the exact change each affected page needs, as `CONTRIBUTING.md` describes, so a maintainer can make it.
 
 Do not move feature descriptions, option lists, or usage examples into `README.md` in place of the manual.
 

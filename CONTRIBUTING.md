@@ -71,7 +71,7 @@ Zig unit tests sit in `test` blocks inside the source file they cover, and `zig 
 
 ### Add an end-to-end test file
 
-Every root `tests/e2e/*.test.ts` file needs an entry in each of these files, and CI fails when an entry is missing or stale:
+Every root `tests/e2e/*.test.ts` file needs an entry in the first two files below, and in the third only when it branches on the platform. CI fails when a required entry is missing or stale:
 
 | File | Entry |
 | --- | --- |
@@ -124,8 +124,8 @@ bun test
 
 ## Open a pull request
 
-1. Push your branch. Maintainers push to `vercel-labs/fx`. Outside contributors push to their fork and open the pull request against `main`.
-2. Sign every commit. `main` accepts only commits with verified signatures, and squash merging is turned off, so a single unsigned commit blocks the merge. GitHub explains how to set up [commit signature verification](https://docs.github.com/en/authentication/managing-commit-signature-verification/about-commit-signature-verification) with an SSH or GPG key.
+1. Sign every commit before you push it. `main` accepts only commits with verified signatures, and squash merging is turned off, so a single unsigned commit blocks the merge. GitHub explains how to set up [commit signature verification](https://docs.github.com/en/authentication/managing-commit-signature-verification/about-commit-signature-verification) with an SSH or GPG key.
+2. Push your branch. Maintainers push to `vercel-labs/fx`. Outside contributors push to their fork and open the pull request against `main`.
 3. Open the pull request as a draft once your focused checks pass, so CI starts on it.
 4. Write the title as a plain imperative sentence, such as `Restore feedback report file clipboard`. Leave out bracketed prefixes like `[bug]`, because the type goes in a label.
 5. In the description, say what changes for users or callers, why it changes, and how you verified it, including what you ran with `./zig-out/bin/fx`.
@@ -156,8 +156,8 @@ These five checks must pass before a pull request merges:
 | --- | --- |
 | `Build & Test` | Formatting, the PGSO corpus, the public-surface and compactor-boundary checks, the ReleaseSafe unit tests, and the SDK package jobs |
 | `E2E (deterministic)` | Every end-to-end file, split across four weighted shards, plus the MCP conformance baseline |
-| `Shellcheck` | `bash -n` and `shellcheck` on the shell scripts that CI and the startup benchmark use |
-| `Startup Latency` | Six CLI commands on a ReleaseSafe build, each held to 2 ms, plus the interactive performance test in `tests/e2e/tui-performance.test.ts` |
+| `Shellcheck` | `bash -n` and `shellcheck` on the scripts listed in the job, such as `benchmarks/startup.sh` and `scripts/detect-macos-need.sh` |
+| `Startup Latency` | The benchmarked CLI commands on a ReleaseSafe build, each held to 2 ms, plus the interactive performance test in `tests/e2e/tui-performance.test.ts` |
 | `macOS arm64` | The macOS checks when the change needs them, and otherwise a pass without starting a macOS runner |
 
 CI retries a failed end-to-end file once. A file that passes only on the retry gets a warning annotation, and you should investigate it as a possible race.
@@ -207,7 +207,7 @@ Update the documentation in the same pull request as the behavior it describes:
 
 - The `--help` output comes from the command specs in `src/builtins/commands.zig`.
 - `sdk/README.md` documents libfx. Update it when libfx's public behavior or setup changes, as [sdk/AGENTS.md](sdk/AGENTS.md) describes.
-- Update this file when build steps, configuration, or collaboration rules change.
+- Update this file when build steps, development setup, or collaboration rules change.
 
 Change `README.md` only when one of its statements becomes false, or when a change adds a capability as broad as the ones in its feature list. A new option, command, or environment variable belongs in `--help` and the manual.
 
@@ -215,7 +215,7 @@ Don't edit `CHANGELOG.md` or the version in `src/main.zig`. Maintainers write th
 
 ### Changes to the manual
 
-The user manual at [fx.sh/docs](https://fx.sh/docs) is built from a private repository, so only maintainers can edit it. When your change makes a manual page wrong or incomplete:
+The user manual at [fx.sh/docs](https://fx.sh/docs) is built from a private repository, so outside contributors can't edit it. When your change makes a manual page wrong or incomplete:
 
 - Maintainers update the page in a companion pull request and link it from theirs.
 - Outside contributors add a `## Docs` section to the pull request description with the exact change each affected page needs: the page URL, the section, and the text to add, replace, or remove. A maintainer makes the change in the manual.
@@ -233,7 +233,7 @@ For example:
 
 Maintainers prepare each release in a pull request that bumps `pub const version` in `src/main.zig` and adds the new entry to `CHANGELOG.md`. When that pull request merges, the release workflow finds no tag for the new version, builds the binaries for every platform, creates the tag, and publishes the GitHub Release along with the binaries that the install script and `fx upgrade` download. Never create a version tag by hand. The [Releasing](AGENTS.md#releasing) section of AGENTS.md describes the changelog format and release markers.
 
-To check release artifacts without publishing anything, run **Actions > Release** on `main` with `validate_only` enabled. The run builds every target, runs the PGSO qualification, and notarizes the macOS binaries, but it creates no tag or release and uploads nothing.
+To check release artifacts without publishing anything, run **Actions > Release** on `main` with `validate_only` enabled. The run builds every target, runs the PGSO qualification, and notarizes the macOS binaries. It creates no tag or GitHub Release, uploads nothing to the CDN, and changes no update channel.
 
 After CI passes on `main`, the dev release workflow publishes binaries for that commit. Run `fx upgrade --channel dev` to follow those builds, and `fx upgrade --channel stable` to go back to tagged releases.
 
