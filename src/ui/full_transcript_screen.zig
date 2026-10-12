@@ -19,6 +19,7 @@ const tool_group_projection = @import("transcript/tool_group_projection.zig");
 const user_message_card = @import("assistant/user_message_card.zig");
 const ui_render = @import("render.zig");
 const types = @import("../core/shared/types.zig");
+const vt_emulator = @import("../core/terminal/engine.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -923,7 +924,49 @@ test "full projection retains consecutive in-memory tool details" {
     try std.testing.expect(std.mem.find(u8, source, "READ_FULL_DETAIL_MARKER") != null);
 }
 
-test "full projection applies modern width clipping to a tool status" {
+/// Paints the whole measured projection through the terminal engine, as the
+/// Ctrl-O screen shows it, and returns each row's visible text on its own
+/// line. The caller owns the result.
+fn paintProjectionRowsForTest(alloc: Allocator, projection: *Projection, cols: u16) ![]u8 {
+    const measurement = try measureProjection(alloc, projection, null, cols);
+    const rows: u16 = @intCast(measurement.total_rows);
+    const source = try renderProjectionViewportSource(alloc, projection, null, cols, rows, 0);
+    defer alloc.free(source);
+    var grid = try vt_emulator.Grid.init(alloc, cols, rows);
+    defer grid.deinit();
+    try grid.feed(source);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var row: u16 = 1;
+    while (row <= rows) : (row += 1) {
+        try grid.rowTextTrimmed(row, &out);
+        try out.append(alloc, '\n');
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Painted text with tree rails, line breaks, and spaces removed, so a wrapped
+/// heading compares equal to its source wherever the wrap fell.
+fn compactPaintedTextForTest(alloc: Allocator, text: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var index: usize = 0;
+    while (index < text.len) {
+        const glyph = for ([_][]const u8{ "│", "├", "└" }) |candidate| {
+            if (std.mem.startsWith(u8, text[index..], candidate)) break candidate;
+        } else null;
+        if (glyph) |matched| {
+            index += matched.len;
+            continue;
+        }
+        if (text[index] != ' ' and text[index] != '\n') try out.append(alloc, text[index]);
+        index += 1;
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+test "full projection wraps a long tool status instead of clipping it" {
     const alloc = std.testing.allocator;
     var entries = [_]transcript_blocks.TranscriptEntry{.{ .raw_bytes = .{
         .id = 1,
@@ -942,14 +985,65 @@ test "full projection applies modern width clipping to a tool status" {
         null,
     );
     defer projection.deinit(alloc);
-    const source = try renderProjectionViewportSource(alloc, &projection, null, 24, 8, 0);
-    defer alloc.free(source);
+    const painted = try paintProjectionRowsForTest(alloc, &projection, 24);
+    defer alloc.free(painted);
 
-    try std.testing.expect(std.mem.find(u8, source, "FULL_STATUS_TAIL") == null);
-    try std.testing.expect(std.mem.find(u8, source, "…") != null);
+    try std.testing.expect(std.mem.find(u8, painted, "└ Searched a") != null);
+    try std.testing.expect(std.mem.find(u8, painted, "\n  ") != null);
+    try std.testing.expect(std.mem.find(u8, painted, "FULL_STATUS_TAIL") != null);
+    try std.testing.expect(std.mem.find(u8, painted, "…") == null);
 }
 
-test "full projection preserves semantic arguments clipped from a tool heading" {
+test "full projection shows a terminal session launch command in full" {
+    const alloc = std.testing.allocator;
+    // `interact` carries no command argument, so the launch command reaches
+    // the full transcript only through the stored command display. The status
+    // phrase itself was frozen at the compact activity bound.
+    const launch = "cd . && python3 - <<'PYEOF' import pathlib led = pathlib.Path(\"docs/workflows/ledger.md\"); " ++
+        "s = led.read_text() old = \"Fixed in draft (b226cd28e,\" assert old in s LAUNCH_COMMAND_TAIL";
+    var entries = [_]transcript_blocks.TranscriptEntry{.{ .raw_bytes = .{
+        .id = 1,
+        .bytes = try alloc.dupe(u8, "● Observed " ++ launch[0..109] ++ "...\n"),
+        .class = .tool_status,
+    } }};
+    defer entries[0].deinit(alloc);
+    var details = [_]ToolDetailRecord{.{
+        .entry_id = 1,
+        .tool_name = try alloc.dupe(u8, "shell"),
+        .activity_kind = .command,
+        .arguments_json = try alloc.dupe(u8, "{\"action\":\"interact\",\"session_id\":\"shell-922\"}"),
+        .command_display = try alloc.dupe(u8, launch),
+        .command_action_label = try alloc.dupe(u8, "Observed"),
+        .outcome = .completed,
+    }};
+    defer details[0].deinit(alloc);
+
+    var projection = try buildProjection(
+        alloc,
+        &entries,
+        &details,
+        &.{},
+        .{ .system_notice_label_style = "", .system_notice_text_style = "", .reset_style = "", .dim_style = "", .red_style = "" },
+        60,
+        null,
+    );
+    defer projection.deinit(alloc);
+    const painted = try paintProjectionRowsForTest(alloc, &projection, 60);
+    defer alloc.free(painted);
+    const compact = try compactPaintedTextForTest(alloc, painted);
+    defer alloc.free(compact);
+    const expected = try compactPaintedTextForTest(alloc, "Observed " ++ launch);
+    defer alloc.free(expected);
+
+    try std.testing.expect(std.mem.find(u8, painted, "└ Observed cd . && python3") != null);
+    try std.testing.expect(std.mem.find(u8, compact, expected) != null);
+    try std.testing.expect(std.mem.find(u8, painted, "…") == null);
+    try std.testing.expect(std.mem.find(u8, painted, "...") == null);
+    try std.testing.expect(std.mem.find(u8, painted, "action: interact") != null);
+    try std.testing.expect(std.mem.find(u8, painted, "session_id: shell-922") != null);
+}
+
+test "full projection omits arguments its wrapped heading already shows" {
     const alloc = std.testing.allocator;
     const command = "printf a deliberately long command with FULL_ARGUMENT_TAIL";
     const entries = [_]transcript_blocks.TranscriptEntry{.{ .raw_bytes = .{
@@ -979,22 +1073,50 @@ test "full projection preserves semantic arguments clipped from a tool heading" 
         null,
     );
     defer projection.deinit(alloc);
-    const measurement = try measureProjection(alloc, &projection, null, 24);
-    const source = try renderProjectionViewportSource(
-        alloc,
-        &projection,
-        null,
-        24,
-        @intCast(measurement.total_rows),
-        0,
-    );
-    defer alloc.free(source);
+    const painted = try paintProjectionRowsForTest(alloc, &projection, 24);
+    defer alloc.free(painted);
 
-    try std.testing.expect(std.mem.find(u8, source, "command: printf") != null);
-    try std.testing.expect(std.mem.find(u8, source, "FULL_ARGUMENT_TAIL") != null);
-    try std.testing.expect(std.mem.find(u8, source, "action: exec") == null);
-    try std.testing.expect(std.mem.find(u8, source, "profile: clean") != null);
-    try std.testing.expect(std.mem.find(u8, source, "{\"command\"") == null);
+    // The heading wraps to show the whole command at this width, so the
+    // command argument would only repeat it.
+    try std.testing.expect(std.mem.find(u8, painted, "FULL_ARGUMENT_TAIL") != null);
+    try std.testing.expect(std.mem.find(u8, painted, "…") == null);
+    try std.testing.expect(std.mem.find(u8, painted, "command: printf") == null);
+    try std.testing.expect(std.mem.find(u8, painted, "action: exec") == null);
+    try std.testing.expect(std.mem.find(u8, painted, "profile: clean") != null);
+    try std.testing.expect(std.mem.find(u8, painted, "{\"command\"") == null);
+}
+
+test "full projection keeps arguments that appear only past the first status line" {
+    const alloc = std.testing.allocator;
+    const entries = [_]transcript_blocks.TranscriptEntry{.{ .raw_bytes = .{
+        .id = 1,
+        .bytes = @constCast("● Read notes\n  SECOND_LINE_ARGUMENT\n"),
+        .class = .tool_status,
+    } }};
+    var details = [_]ToolDetailRecord{.{
+        .entry_id = 1,
+        .tool_name = try alloc.dupe(u8, "read_file"),
+        .arguments_json = try alloc.dupe(u8, "{\"path\":\"SECOND_LINE_ARGUMENT\"}"),
+        .outcome = .completed,
+    }};
+    defer details[0].deinit(alloc);
+
+    var projection = try buildProjection(
+        alloc,
+        &entries,
+        &details,
+        &.{},
+        .{ .system_notice_label_style = "", .system_notice_text_style = "", .reset_style = "", .dim_style = "", .red_style = "" },
+        80,
+        null,
+    );
+    defer projection.deinit(alloc);
+    const painted = try paintProjectionRowsForTest(alloc, &projection, 80);
+    defer alloc.free(painted);
+
+    // The heading shows only the first status line, so the argument keeps
+    // its own row even though the raw status mentions it later.
+    try std.testing.expect(std.mem.find(u8, painted, "path: SECOND_LINE_ARGUMENT") != null);
 }
 
 test "stored result projection streams terminal-safe head middle and tail pages" {
@@ -3503,7 +3625,6 @@ fn buildProjectionWithDiffResolverInterruptible(
             .text_style = ui_render.statusline_style,
             .reset_style = "\x1b[0m",
         },
-        styles,
         checkpoint,
     );
     defer group_projection.deinit(alloc);
@@ -6429,11 +6550,12 @@ fn containsIgnoringSgr(haystack: []const u8, needle: []const u8) bool {
     return std.mem.find(u8, plain_buf[0..n], needle) != null;
 }
 
+/// Full-transcript headings wrap instead of clipping, so the first status line
+/// is always shown whole. An argument found there needs no row of its own.
 fn argumentVisibleInToolHeading(
     entries: []const transcript_blocks.TranscriptEntry,
     entry_id: u32,
     value: []const u8,
-    cols: u16,
 ) bool {
     if (value.len == 0) return false;
     for (entries) |entry| {
@@ -6442,8 +6564,9 @@ fn argumentVisibleInToolHeading(
             .raw_bytes => |candidate| candidate,
             else => return false,
         };
-        if (raw.class != .tool_status or !containsIgnoringSgr(raw.bytes, value)) return false;
-        return display_width.visibleWidthIgnoringAnsi(raw.bytes) <= cols;
+        if (raw.class != .tool_status) return false;
+        const heading_end = std.mem.findAny(u8, raw.bytes, "\r\n") orelse raw.bytes.len;
+        return containsIgnoringSgr(raw.bytes[0..heading_end], value);
     }
     return false;
 }
@@ -6505,7 +6628,6 @@ fn appendFullSemanticArguments(
             entries,
             detail.entry_id,
             value.string,
-            cols,
         )) continue;
 
         var line: std.Io.Writer.Allocating = .init(alloc);
