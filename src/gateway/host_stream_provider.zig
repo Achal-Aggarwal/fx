@@ -4,6 +4,7 @@ const io_mod = @import("../core/shared/io.zig");
 const gateway_client = @import("client.zig");
 const vercel_protocol = @import("vercel_protocol.zig");
 const vercel_failure_diagnostics = @import("vercel_failure_diagnostics.zig");
+const chat_completions_protocol = @import("chat_completions_protocol.zig");
 const credential_authority = @import("../core/auth/credential_authority.zig");
 
 const Allocator = std.mem.Allocator;
@@ -168,9 +169,10 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         // Gateway reports the last provider it tried, so a provider's size
         // rejection can arrive as a 400 from a later fallback.
         const kind = failureKind(opened.status);
+        const size_rejected = kind == .invalid_request and vercel_failure_diagnostics.providerRejectedRequestSize(alloc, body);
         return .{ .failed = .{
-            .kind = if (kind == .invalid_request and vercel_failure_diagnostics.providerRejectedRequestSize(alloc, body)) .request_too_large else kind,
-            .detail = body,
+            .kind = if (size_rejected) .request_too_large else kind,
+            .detail = try withoutCredential(alloc, body, request.credential.secret()),
             .ownership = .owned,
         } };
     }
@@ -244,6 +246,16 @@ pub fn openPost(
     }
     const http_status = httpStatus(status_code) orelse return error.HostStreamFailed;
     return .{ .handle = handle, .status = http_status };
+}
+
+/// `body` with the request's own key masked, as fx masks a configured
+/// provider's: the detail reaches the turn, its events and the saved session,
+/// so a server that quotes the key back must not put it there. Takes `body`;
+/// the caller owns the result.
+fn withoutCredential(alloc: Allocator, body: []u8, secret: ?[]const u8) Allocator.Error![]u8 {
+    const credential = secret orelse return body;
+    defer alloc.free(body);
+    return chat_completions_protocol.redact_error_detail(alloc, body, credential);
 }
 
 /// Reads a non-success response body, bounded. The caller owns the bytes.
@@ -694,6 +706,94 @@ test "error response bodies are bounded" {
         error.HostStreamFailed,
         readBody(std.testing.allocator, transport, 1, &cancel_flag, null, null),
     );
+}
+
+test "a key quoted in a gateway error never reaches the failure detail" {
+    const FakeTransport = struct {
+        body: []const u8,
+        offset: usize = 0,
+        cancel_flag: std.atomic.Value(bool) = .init(false),
+
+        fn build(_: Allocator, _: stream_provider.RequestData) ![]u8 {
+            return error.UnexpectedRequest;
+        }
+        fn open(_: ?*anyopaque, _: []const u8, _: []const u8, _: []const u8, _: []const u8) !i32 {
+            return 3;
+        }
+        fn status(_: ?*anyopaque, _: i32, status_out: *u16) i32 {
+            status_out.* = 403;
+            return 1;
+        }
+        fn next(raw: ?*anyopaque, _: i32, out: []u8) i32 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const len = @min(out.len, self.body.len - self.offset);
+            @memcpy(out[0..len], self.body[self.offset..][0..len]);
+            self.offset += len;
+            return @intCast(len);
+        }
+        fn close(_: ?*anyopaque, _: i32) void {}
+        fn emit(_: *anyopaque, _: stream_provider.Event) void {}
+        fn admit(_: *anyopaque) !void {}
+    };
+    const key = "gw-key-0123456789";
+    const cases = [_]struct {
+        body: []const u8,
+        credential: @import("../core/shared/types.zig").CredentialLease,
+        expected: []const u8,
+    }{
+        .{
+            .body = "{\"detail\":\"bad credential Bearer " ++ key ++ "\"}",
+            .credential = .{ .direct = .{ .secret_bytes = key } },
+            .expected = "{\"detail\":\"bad credential Bearer *****************\"}",
+        },
+        // An escaped copy decodes to the key, so it is masked once decoded.
+        .{
+            .body = "{\"detail\":\"\\u0067w-key-0123456789\"}",
+            .credential = .{ .direct = .{ .secret_bytes = key } },
+            .expected = "{\"detail\":\"*****************\"}",
+        },
+        .{
+            .body = "rejected " ++ key,
+            .credential = .{ .direct = .{ .secret_bytes = key } },
+            .expected = "rejected *****************",
+        },
+        // A host-managed request carries no key here; the host masks its own.
+        .{
+            .body = "{\"detail\":\"bad credential Bearer " ++ key ++ "\"}",
+            .credential = .host_managed,
+            .expected = "{\"detail\":\"bad credential Bearer " ++ key ++ "\"}",
+        },
+    };
+    for (cases) |case| {
+        var fake: FakeTransport = .{ .body = case.body };
+        var context = initContext(FakeTransport.build, .{ .fixed = "https://example.invalid" }, .{
+            .context = &fake,
+            .open_fn = FakeTransport.open,
+            .status_fn = FakeTransport.status,
+            .next_fn = FakeTransport.next,
+            .close_fn = FakeTransport.close,
+        });
+        var delivery: stream_provider.DeliveryCertainty = .init();
+        var attempt: stream_provider.AttemptEvidence = .{};
+        var result = try stream(&context, std.testing.allocator, .{
+            .credential = case.credential,
+            .model = "fixture-model",
+            .retry_count = 0,
+            .messages = &.{},
+            .tool_choice = .auto,
+            .provider_options = .{},
+            .prepared_request_body = "{}",
+            .trace_ctx = .{},
+            .content_capture_limit = null,
+            .delivery = &delivery,
+            .attempt_evidence = &attempt,
+            .events = .{ .context = &fake, .emit_fn = FakeTransport.emit },
+            .admission = .{ .context = &fake, .admit_fn = FakeTransport.admit },
+            .cancel_flag = &fake.cancel_flag,
+        });
+        defer result.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(case.expected, result.failed.detail.?);
+    }
 }
 
 test "host stream reader omits pulse timing state without callback" {
