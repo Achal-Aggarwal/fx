@@ -2102,7 +2102,10 @@ const BoundedRequestWatch = struct {
     /// Call only when the watch event is the one still outstanding.
     fn finish(watch: *BoundedRequestWatch, select: anytype) void {
         watch.stopped.set(select.io);
-        const event = select.queue.getOneUncancelable(select.io) catch unreachable;
+        const event = select.queue.getOneUncancelable(select.io) catch |err| switch (err) {
+            // Only Select.cancel closes the queue, so nothing is outstanding.
+            error.Closed => return,
+        };
         std.debug.assert(event == .watch);
         std.debug.assert(select.cancel() == null);
     }

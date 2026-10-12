@@ -5869,7 +5869,7 @@ fn testCaptureToken(
 ) process_provider_mod.ProviderError!process_identity.ProcessInstanceToken {
     return process_identity.ProcessInstanceToken.parse(
         "macos:00000000000000000000000000000000:1:2",
-    ) catch unreachable;
+    ) catch return error.Unexpected;
 }
 
 fn testMatchToken(
