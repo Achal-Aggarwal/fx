@@ -128,7 +128,9 @@ fn sameSource(recorded: SourceStamp, now: SourceStamp) bool {
 
 /// Whether `tree` still describes `root` under the same options, so it can be
 /// answered from without a new scan. With `subtree` (relative to the root),
-/// only the folders at or below it are checked; every source always is.
+/// only the folders at, below or above it are checked; every source always
+/// is. A folder above it counts because a `.gitignore` it gains changes what
+/// the subtree lists, and only that folder's stamp shows the new file.
 pub fn isCurrent(tree: *const Tree, root: []const u8, skipped_names: []const []const u8, subtree: ?[]const u8) bool {
     if (tree.incomplete or !std.mem.eql(u8, tree.root, root)) return false;
     if (tree.skipped_names.len != skipped_names.len) return false;
@@ -148,8 +150,7 @@ pub fn isCurrent(tree: *const Tree, root: []const u8, skipped_names: []const []c
     }
     for (tree.folders) |folder| {
         if (subtree) |sub| {
-            if (sub.len > 0 and !(std.mem.eql(u8, folder.rel, sub) or
-                (folder.rel.len > sub.len and std.mem.startsWith(u8, folder.rel, sub) and folder.rel[sub.len] == '/'))) continue;
+            if (sub.len > 0 and !onSubtreePath(folder.rel, sub)) continue;
         }
         if (!folder.reusable) return false;
         const stat = root_dir.statFile(io, if (folder.rel.len == 0) "." else folder.rel, .{ .follow_symlinks = false }) catch return false;
@@ -159,6 +160,24 @@ pub fn isCurrent(tree: *const Tree, root: []const u8, skipped_names: []const []c
         if (current.mtime_ns > now or current.ctime_ns > now) return false;
     }
     return true;
+}
+
+/// Whether folder `rel` is `sub`, below it, or above it (the root included).
+fn onSubtreePath(rel: []const u8, sub: []const u8) bool {
+    if (rel.len == 0 or std.mem.eql(u8, rel, sub)) return true;
+    if (rel.len > sub.len) return std.mem.startsWith(u8, rel, sub) and rel[sub.len] == '/';
+    return std.mem.startsWith(u8, sub, rel) and sub[rel.len] == '/';
+}
+
+test "a subtree check covers the folder, the folders below it and the folders above it" {
+    try std.testing.expect(onSubtreePath("", "a/b"));
+    try std.testing.expect(onSubtreePath("a", "a/b"));
+    try std.testing.expect(onSubtreePath("a/b", "a/b"));
+    try std.testing.expect(onSubtreePath("a/b/c", "a/b"));
+    try std.testing.expect(!onSubtreePath("a/bc", "a/b"));
+    try std.testing.expect(!onSubtreePath("ab", "a/b"));
+    try std.testing.expect(!onSubtreePath("a/c", "a/b"));
+    try std.testing.expect(!onSubtreePath("b", "a/b"));
 }
 
 test "stamps reuse only times older than the scan start by the margin" {

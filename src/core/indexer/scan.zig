@@ -878,6 +878,13 @@ test "refresh trusts an old unchanged tree and rejects every kind of change" {
     }
     const future: std.Io.Timestamp = .{ .nanoseconds = @as(i96, tree_mod.nowNs()) + 3600 * std.time.ns_per_s };
     try tree.tmp.dir.setTimestamps(std.testing.io, "future/docs", .{ .modify_timestamp = .{ .new = future } });
+    // Folders above a searched one that have no `.gitignore` yet.
+    const first_rules = [_][]const u8{ "root_rules", "parent_rules" };
+    for (first_rules) |name| {
+        try tree.repo(arena, name, &.{.{ .path = "a/b/x.txt" }});
+        try tree.file(try std.fmt.allocPrint(arena, "{s}/a/b/x.txt", .{name}), "x");
+        try tree.file(try std.fmt.allocPrint(arena, "{s}/a/b/y.secret", .{name}), "y");
+    }
 
     // A tree scanned right after its files changed is never reused.
     {
@@ -895,6 +902,14 @@ test "refresh trusts an old unchanged tree and rejects every kind of change" {
         results[i] = try scan(std.testing.allocator, roots[i], .{}, null);
     }
     defer for (&results) |*result| result.deinit();
+    var rule_results: [first_rules.len]Result = undefined;
+    var rule_roots: [first_rules.len][]const u8 = undefined;
+    for (first_rules, 0..) |name, i| {
+        rule_roots[i] = try std.fs.path.join(arena, &.{ tree.root, name });
+        rule_results[i] = try scan(std.testing.allocator, rule_roots[i], .{}, null);
+    }
+    defer for (&rule_results) |*result| result.deinit();
+    for (&rule_results, rule_roots) |*result, root| try std.testing.expect(tree_mod.isCurrent(&result.tree, root, &default_skipped_names, "a/b"));
 
     try std.testing.expect(tree_mod.isCurrent(&results[0].tree, roots[0], &default_skipped_names, null));
     try std.testing.expect(!tree_mod.isCurrent(&results[0].tree, roots[0], &.{"node_modules"}, null));
@@ -908,6 +923,15 @@ test "refresh trusts an old unchanged tree and rejects every kind of change" {
 
     // A change in `src` leaves a check of `docs` alone.
     try std.testing.expect(tree_mod.isCurrent(&results[1].tree, roots[1], &default_skipped_names, "docs"));
+    // A first `.gitignore` above a searched folder makes it stale.
+    try tree.file("root_rules/.gitignore", "*.secret\n");
+    try tree.file("parent_rules/a/.gitignore", "*.secret\n");
+    for (&rule_results, rule_roots, first_rules) |*result, root, name| {
+        if (tree_mod.isCurrent(&result.tree, root, &default_skipped_names, "a/b")) {
+            std.debug.print("subtree reported current after a new .gitignore above it: {s}\n", .{name});
+            return error.TestExpectedStale;
+        }
+    }
     for (results[1..], roots[1..], cases[1..]) |*result, root, name| {
         if (tree_mod.isCurrent(&result.tree, root, &default_skipped_names, null)) {
             std.debug.print("stale tree reported current: {s}\n", .{name});
