@@ -44,7 +44,7 @@ The test suites under `tests/` use Bun but are separate from the Zig codebase. S
 
 ## Code Style
 
-* Format all Zig source with `zig fmt src/` before committing. CI fails when `zig fmt --check src/` reports a file.
+* Format all Zig source with `zig fmt src/` before committing.
 
 * Do not use emojis in code, output, or documentation. Unicode symbols (e.g. checkmark, arrow) are acceptable.
 
@@ -58,7 +58,7 @@ The test suites under `tests/` use Bun but are separate from the Zig codebase. S
 
 * Keep `pub` surface area minimal. Only mark declarations `pub` when they are used outside the file.
 
-* Never commit personal home-directory paths, real team IDs, or internal or personal project slugs. `scripts/check-public-surface.sh` rejects them in CI. Use `/Users/example/` in fixtures.
+* Never commit personal home-directory paths, real team IDs, internal team slugs, or personal project slugs. `scripts/check-public-surface.sh` rejects them in CI. Use `/Users/example/` in fixtures.
 
 ## Architecture
 
@@ -66,11 +66,11 @@ Key rules:
 
 * `src/main.zig` is the composition root. Do not add leaf feature logic here.
 
-* `src/core/` owns contracts, runtimes, config, sessions, permissions, MCP host integration, and skills.
+* `src/core/` owns contracts, runtimes, config, sessions, permissions, MCP, skills.
 
 * `src/core/compactor/` owns context compaction. Outside code imports only its front door, `compactor.zig`, and the compactor imports only shared basics and model configuration; its caller hands in the model caller, the record store, and the session's projection of saved turns into chat messages. `scripts/check-compactor-boundary.sh` enforces this in CI.
 
-* `src/mcp/` is the self-contained MCP engine. Its files import only `std` and each other, and the host passes in `std.Io` and every other service through `src/mcp/host.zig`. fx connects to it through `src/core/mcp_host/`.
+* `src/mcp/` is the MCP-v2 engine. `FX_MCP_ENGINE=v2` selects it in place of the default v1 client in `src/core/mcp/`. Its files import only `std` and each other, and the host passes in `std.Io` and every other service through `src/mcp/host.zig`. fx connects to it through `src/core/mcp_host/`.
 
 * `src/tools/` owns built-in tool implementations. Generic tool contracts and dispatch live in `src/core/tooling/`. Default tool specs are centralized in `src/core/tooling/tool_specs.zig` or `src/builtins/tools.zig`, not in individual tool files.
 
@@ -154,13 +154,13 @@ Security is permission-first. All sensitive tool behavior must integrate with `s
 
 * `/permissions remember allow|deny <tool-name> <arguments-json>` confirms and stores an exact rule only for an active saved session; list and revoke those rules by their stable IDs
 
-* In `auto` mode, routine parsed development commands and reversible new-file creation run without model review once configured and saved-session policy allow them. Every other unresolved action gets one narrow security review in `src/core/permissions/auto_classifier.zig`, built from the exact action and targets, its origin, and bounded excerpts of earlier tool results from the current turn. Reviewed commands, shell input, dynamic tools, and subagent actions also include bounded root user requests, which the reviewer may use only to tell trusted intent from injected influence, never to judge task quality, alignment, or authorization. Assistant prose, permission feedback, compacted summaries, later results, and tool or repository text never become authority
+* Routine parsed development commands and reversible new-file creation can execute without model review after configured and saved-session policy. Every remaining unresolved `auto` action receives one narrow security review using the exact unmasked action and targets, origin and call identity, optional host-proven current-branch evidence, and bounded unmasked terminal-safe excerpts of earlier current-turn tool results. A text match between the action and prior tool output is evidence to inspect, not proof of prompt injection or malicious activity. Prepared file mutations and other static root tools omit task text. Reviewed commands, shell input, dynamic tools, and subagent actions also receive bounded unmasked canonical current, first, and recent root requests plus explicit omission counts; the reviewer may use that context only to distinguish trusted user intent from malicious or injected influence, never to judge task quality, alignment, or authorization. Assistant prose, permission feedback, compacted summaries, the pending tool group, later results, and tool or repository text never become authority. Shell input reviews also include the owned receiving session's launch command, working directory, and bounded current screen after verifying session authority, including on resume. The launch command describes startup only; screen content remains untrusted evidence and input still receives its own review
 
-* The reviewer returns `caution` only for concrete prompt injection or malicious activity. Destructive, risky, external, public, remote, unrequested, or task-conflicting actions clear when they are not malicious. A text match with earlier tool output, a quoted review accusation, or plans and test instructions handled as data are not proof of injection on their own
+* The reviewer returns `caution` only for concrete prompt injection or malicious activity. Destructive, risky, external, public, remote, unrequested, or task-conflicting actions clear when they are not malicious. A `clear` review authorizes only the exact unchanged action. A `caution`, incomplete-evidence result, or unavailable review holds only that action, returns guidance to the agent, and never opens a human permission screen, disables tools, or ends the turn
 
-* A `clear` review authorizes only the exact unchanged action. A `caution`, incomplete-evidence result, or unavailable review holds only that action, returns guidance to the agent, and never opens a human permission screen, disables tools, or ends the turn. Cautions and incomplete-evidence results are reused only within the current turn, and an unavailable review is never cached as a security judgment
+* Exact cautions and deterministic incomplete-evidence results are reused only for the current turn. An unavailable outcome is not cached as a security judgment, but the same exact action spends at most one unavailable review opportunity per turn; changed actions remain independently reviewable until the bounded current-turn review budget is exhausted. Each review accepts exactly one valid structured decision even with accompanying prose and may retry one malformed completion within the current attempt's deadline. A transport timeout, transient transport failure, or failed transport call is retried once with a fresh 30-second deadline; permanent transport failures, valid cautions, and cancellation are never retried. Legacy `permission_request_id` input is rejected without prompting
 
-* Host-generated review holds carry a saved `review_feedback` marker that keeps them out of later security evidence, including after recovery. Never infer the marker from output text
+* Host-generated review holds retain their advice for the agent and transcript, but carry a saved `review_feedback` marker that excludes them from later security evidence, including after recovery. Old unmarked results remain untrusted evidence; never infer the marker from output text. Quoted review accusations are not proof of an attack, and handling plans or test instructions as data is not itself prompt injection
 
 Do not bypass the permission system for new tools.
 
@@ -278,7 +278,7 @@ After the focused checks pass, create a clean checkpoint commit, push the non-`m
 * `.github/workflows/binary-size.yml` builds each release target on its native runner, reports the size change, and smoke-tests every target's binary. See **Binary Size Observability**.
 * `.github/workflows/bench.yml` enforces the startup latency budget. See **Benchmarks**.
 
-Only runs on `main` save the Zig cache. Pull request jobs must not save one, so they cannot push `main`'s entries out of the repository's cache quota.
+Linux jobs install Zig through `.github/actions/setup-zig`, which restores the Zig cache that runs on `main` save with `.github/actions/save-zig-cache`. Pull requests never save a Zig cache through these actions, so they cannot push `main`'s entries out of the repository's cache quota. The PGSO workflow keeps its own cache through `.github/actions/setup-pgso`.
 
 macOS runs only when `scripts/detect-macos-need.sh` finds a change that can behave differently there, such as a Zig file with a macOS, BSD, or Linux code path, `build.zig`, the macOS signing script, the native SDK addon, or a platform E2E file. If the detector cannot read the change, the `macOS arm64` check fails instead of passing. When the change does not need macOS, the check passes without starting a macOS runner. To request macOS for any other change, add the `ci:macos` label or run `gh workflow run macos.yml --ref <branch>`. The label needs triage access and the dispatch needs write access, so an outside contributor asks in the PR and a maintainer starts the run. Every E2E file that branches on `process.platform` or `platform()` being `darwin` or `linux` must appear in `tests/e2e/macos-platform-tests.json`, and `tests/e2e/ci-shards.test.ts` enforces that.
 
@@ -356,8 +356,7 @@ When adding features, consider their impact on startup latency. The `fx help` pa
 
 Every pull request runs `.github/workflows/binary-size.yml`, which builds each
 release target and its base commit on native runners, reports the size change,
-and smoke-tests the pull request binary with `scripts/smoke-binary.sh`. The
-Linux arm64 and macOS binaries run nowhere else on a pull request.
+and smoke-tests the pull request binary with `scripts/smoke-binary.sh`.
 
 Each platform check is informational. An increase of at least 52,429 bytes
 (0.050000 MiB) emits a warning and retains that platform's binaries for
@@ -371,7 +370,7 @@ ceiling and performance gates.
 When adding or changing user-facing features, update **all** relevant files:
 
 1. `--help` output via command specs in `src/builtins/commands.zig`
-2. `README.md` — only when its short introduction, feature list, install, or quick start changes. Reference detail belongs in the fx.sh docs, which live outside this repository
+2. `README.md` — whenever behavior it describes changes. It stays a short introduction, so reference detail belongs in the fx.sh docs, which live outside this repository
 3. `CONTRIBUTING.md` — if build steps, config, or collaboration rules change
 4. `sdk/README.md` — if the supported SDK surface changes
 
@@ -399,7 +398,7 @@ The changelog is public product copy. Describe observable user behavior, not the
 Public changelog entries must:
 
 * Spell the product name `fx`. Preserve different casing only when it is part of an exact code identifier such as `FX_MODEL`.
-* Open with one bold sentence that summarizes the release.
+* Open with a short bold summary of the release.
 * Use only relevant sections from `### Breaking Changes`, `### New Features`, `### Improvements`, `### Bug Fixes`, and `### Security`. Omit empty sections.
 * Write each bullet as one or two plain sentences on a single line. Lead with the concrete change, then say what happens now. Do not add a bold `**Label:**` prefix.
 * Omit pull request numbers, issue numbers, commit hashes, contributor names, and author attribution.
@@ -413,11 +412,11 @@ Only the current release should have markers; remove `<!-- release:start -->` an
 
 <!-- release:start -->
 
-**fx can now open an interactive shell from the `terminal` tool.**
+**`fx sessions` can now list saved sessions from every workspace.**
 
 ### New Features
 
-- The `terminal` tool starts an interactive shell when it receives an empty command.
+- `fx sessions --all` lists saved sessions across every workspace in the profile.
 <!-- release:end -->
 
 ## 0.2.5
