@@ -655,4 +655,4 @@ Minimum checklist:
 2. Run `zig build`, then exercise the change with `./zig-out/bin/fx`.
 3. Push the feature branch and open a draft PR immediately.
 4. Require **CI**, including the **macOS arm64** check, and the final ship gate to pass for the exact current commit before marking the PR ready.
-5. Update `README.md` if user-facing behavior changed.
+5. If user-facing behavior changed, update the docs as [Documentation](AGENTS.md#documentation) describes.
