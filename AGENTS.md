@@ -391,12 +391,15 @@ ceiling and performance gates.
 
 ## Documentation
 
-When adding or changing user-facing features, update **all** relevant files:
+When adding or changing user-facing behavior, update the documentation this repository owns in the same change:
 
 1. `--help` output via command specs in `src/builtins/commands.zig`
-2. `README.md` — whenever behavior it describes changes. It stays a short introduction, so reference detail belongs in the fx.sh docs, which live outside this repository
-3. `CONTRIBUTING.md` — if build steps, config, or collaboration rules change
-4. `sdk/README.md` — if the supported SDK surface changes
+2. `sdk/README.md` if libfx's supported public behavior or setup changes, as `sdk/AGENTS.md` describes
+3. `CONTRIBUTING.md` if build steps, configuration, or collaboration rules change
+
+The user manual at fx.sh/docs lives in `vercel-labs/fx-web`, an internal Vercel repository. A page's source is `apps/marketing/app/(site)/(docs)/docs/<path>/page.mdx`, where `<path>` is the part of its URL after `fx.sh/docs/`. If a change makes a page wrong or incomplete and you have access, update it in a companion fx-web pull request and link that pull request from this one. Otherwise, name the page in the PR description so a maintainer can update it. Do not move feature descriptions, option lists, or usage examples into `README.md` in place of the manual.
+
+`README.md` is a short introduction that links to fx.sh/docs. Change it only when one of its statements becomes false, such as a command, flag, path, or link it names, or when a change adds a capability as broad as the ones in its feature list. A single new option, command, or environment variable belongs in `--help` and the manual, not in `README.md`.
 
 Do not document intended behavior as if it already exists.
 
