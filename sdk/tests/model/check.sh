@@ -57,10 +57,9 @@ for pair in UiInOrder:UiInOrder NoStaleShown:NoStaleShown NotTwoActive:NotTwoAct
     fi
 done
 # DurableSteer.tla: where each message a user sends ends up. The ideal graph
-# has no faults, the faults graph adds cancels, deadline handoffs and client
-# retries, and the current graph is libfx before the CLI steering rules, so
-# drive-steer.mjs can show the driver tells the two apart.
-for graph in ideal faults current; do
+# has no faults, and the faults graph adds cancels, deadline handoffs and
+# client retries.
+for graph in ideal faults; do
     echo "== DurableSteer ($graph)"
     if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
         -metadir "$work/steer-$graph" -dump dot,actionlabels "graphs/steer-$graph" \

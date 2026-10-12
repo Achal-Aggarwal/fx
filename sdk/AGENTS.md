@@ -22,6 +22,7 @@ The SDK has two WebAssembly surfaces and one shared JavaScript host layer:
 | Core browser fixture and its automation contract | `sdk/index.html` and `sdk/tests/test-core-browser.mjs` |
 | Terminal fixture and static packaging contract | `sdk/term-demo.html` and `sdk/scripts/package-term-demo.mjs` |
 | Durable sessions: log, leases, queue, deadlines, UI stream, and the harness contract | `sdk/durable.js` (no fx imports) |
+| When a libfx steer interrupts, waits, joins, or hands off a turn | `src/acp/libfx_steering.zig`, used by `src/acp/server.zig` and `src/acp/prompt.zig`; the durable placement rules in `sdk/durable.js` |
 | fx as a durable harness: engine options, rerun policy | `sdk/fx-harness.js` |
 | A durability over a World the app supplies; `local()` and `vercel()` are built on it | `sdk/durable/world.mjs` |
 | TypeScript declarations for every entry point | `sdk/types/`, checked by `sdk/tests/test-types.mjs` |
@@ -59,6 +60,7 @@ Do not treat the demos or this file as the implementation contract. When prose a
 | Core debugger query behavior or automation state | `sdk/tests/test-core-browser.mjs` |
 | Terminal demo asset references, integrity, or cache policy | Package into a fresh temporary directory and inspect the generated HTML, manifest, and headers |
 | Durable sessions: leases, fencing, takeovers, tool reruns, the UI stream | `sdk/tests/test-durable-core.mjs` on memory, local, and world (the core with a scripted harness; world is an app-built World passed to `world()`), `sdk/tests/test-durable.mjs` on the same three, then `sdk/tests/model/check.sh` and `bun sdk/tests/model/drive.mjs send`, `lookup`, `cutoff` (deadline cut-offs up to their bound), and `leased` (a World without liveness, where each worker renews a short lease), which walk the real code along the TLC state graphs of `DurableSession.tla`; change the spec with the code. With a Vercel access token, also run both against Vercel's World: `test-durable.mjs vercel native` and `drive.mjs --durability vercel`, configured as `sdk/tests/vercel-storage.mjs` describes |
+| Steering: interrupts, waits during tools, joins, hand-backs on cancel, image handoffs, steer ids | The libfx steering tests in `src/acp/libfx_steering.zig`, `sdk/tests/test-agent-steering.mjs` and `sdk/tests/test-durable.mjs` on native and wasm, then `sdk/tests/model/check.sh` and `bun sdk/tests/model/drive-steer.mjs ideal` and `faults`, with `--backend wasm` too, which walk the real code along the TLC state graphs of `DurableSteer.tla`; change the spec with the code |
 | Supported public behavior or setup | Update `sdk/README.md` in the same change |
 
 Use Node.js 24 for SDK tests. CI relies on its JSPI implementation behind `--experimental-wasm-jspi`.

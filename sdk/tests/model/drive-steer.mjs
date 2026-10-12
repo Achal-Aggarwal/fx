@@ -3,13 +3,12 @@
 // WebAssembly, along paths of the TLC state graph of DurableSteer.tla, and
 // checks after every step that the code is in a state the model allows.
 //
-//   bun sdk/tests/model/drive-steer.mjs [ideal|faults|current] [--walks N] [--seed S]
+//   bun sdk/tests/model/drive-steer.mjs [ideal|faults] [--walks N] [--seed S]
 //     [--backend native|wasm] [--durability local|world] [--verbose]
 //
 // `./check.sh` model-checks the spec and writes graphs/steer-<graph>.dot. The
 // ideal graph has no faults; the faults graph adds cancels, deadline handoffs
-// and client retries; the current graph is libfx before the CLI steering
-// rules, which today's code should match and the new code should not.
+// and client retries.
 //
 // Each walk starts one agent on a fresh local() World directory. Every model
 // request streams only what the driver sends it, every tool call waits until
@@ -33,7 +32,7 @@ const option = (name, fallback) => {
   const index = args.indexOf(`--${name}`);
   return index >= 0 ? args[index + 1] : fallback;
 };
-const graphName = args.find((arg) => ["ideal", "faults", "current"].includes(arg)) ?? "ideal";
+const graphName = args.find((arg) => ["ideal", "faults"].includes(arg)) ?? "ideal";
 const walks = Number(option("walks", 30));
 const backend = option("backend", "native");
 const durabilityKind = option("durability", "local");

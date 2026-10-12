@@ -1211,7 +1211,8 @@ class SessionWorker {
         // inputs before it that no turn took or that the open turn holds
         // unplaced, the ids it ran, the turn a yield left open, and the lease.
         const now = this.fold(await log.read());
-        const kept = [...now.unconsumed, ...now.held].filter((input) => input.cursor <= Number(through));
+        // In log order, so a fold from here orders turns as one from the start.
+        const kept = [...now.unconsumed, ...now.held].filter((input) => input.cursor <= Number(through)).sort((a, b) => a.cursor - b.cursor);
         await log.append({
           k: "checkpoint",
           through,
@@ -2070,9 +2071,12 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
          * turn waiting to start. A steer with images or resources cannot
          * join a turn: the running one ends at its next safe point and the
          * steer runs next. With `messageId`, a retried call adds nothing;
-         * one id names one input of the session, prompt or steer. Resolves
-         * once the steer is stored, with its id, which the stream's events
-         * for it carry.
+         * one id names one input of the session, prompt or steer: reusing a
+         * prompt's id throws `FX_MESSAGE_ID_IN_USE`, or, where the queue
+         * outlives the process and the sender reads no log, the worker drops
+         * the steer and emits a `session.error` with that code. Resolves once
+         * the steer is stored, with its id, which the stream's events for it
+         * carry.
          */
         async steer(input, steerOptions = {}) {
           if (typeof input === "string" ? input.length === 0 : !Array.isArray(input) || input.length === 0) {

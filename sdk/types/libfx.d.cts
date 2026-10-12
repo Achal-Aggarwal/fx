@@ -599,7 +599,11 @@ export interface FxPromptOptions {
 
 /** Options for a durable session's `steer()`. */
 export interface FxSteerOptions {
-  /** The steer's id, so a retried request adds nothing. Follows the session id rule, and names no prompt of the session. */
+  /**
+   * The steer's id, so a retried request adds nothing. Follows the session id rule. Reusing a prompt's id rejects
+   * with `FX_MESSAGE_ID_IN_USE`; on a queue that outlives the process, the worker drops the steer and emits a
+   * `session.error` with that code instead.
+   */
   messageId?: string;
 }
 

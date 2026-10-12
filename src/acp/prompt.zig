@@ -1172,6 +1172,8 @@ pub fn handlePrompt(
     try sessions.sendActiveSessionInfoUpdate(state, alloc);
     try sessions.sendActiveSessionUsageUpdate(state, alloc);
 
+    // A steer's interrupt the turn finished before reaching is not a cancel.
+    if (state.cfg.minimal_kernel) server.releaseSteeringInterrupt(state);
     if (session.cancel_flag.load(.seq_cst)) {
         ctx.stop_reason = .cancelled;
     }
@@ -1983,12 +1985,19 @@ fn takeSteeringBoundary(
         // The host closes its steering when the user cancels the turn, which
         // wins over a steer's interrupt. A handoff ends the turn here.
         const host_steering = js_host_steering.state();
-        const handoff = host_steering == .open and host_steering.open.handoff;
-        if (handoff) return if (kind == .cancelled) .interrupt else .handoff;
+        if (host_steering == .open and host_steering.open.handoff) {
+            // As on native: a handoff's interrupt is spent and the turn ends.
+            server.noteHostSteeringHandoff(ctx.state);
+            if (kind != .cancelled) return .handoff;
+            _ = server.takeSteeringInterrupt(ctx.state);
+            return .interrupt;
+        }
         const steered = kind == .cancelled and host_steering != .closed and
             server.takeSteeringInterrupt(ctx.state) != null;
         const taken = try js_host_steering.takeAll(arena);
         if (taken.len > 0) {
+            // As on native, an interrupt this boundary beat is spent here.
+            if (kind != .cancelled) server.releaseSteeringInterrupt(ctx.state);
             try acceptHostSteering(ctx, taken);
             const texts = try arena.alloc([]u8, taken.len);
             for (taken, texts) |entry, *text| {
@@ -2021,6 +2030,8 @@ fn takeSteeringBoundary(
     // withdrawn meanwhile: the cut-off request goes out again.
     if (drained.texts.len == 0) return if (kind == .cancelled) .{ .continue_turn = &.{} } else .none;
     try noteJournalPlacement(ctx, drained.input_ids);
+    // A steer's interrupt that a later boundary beat is spent with its steer.
+    if (kernel and kind != .cancelled) server.releaseSteeringInterrupt(ctx.state);
     // Steering shows where it joined the turn, a libfx steer by its input id.
     for (drained.texts, drained.request_ids, 0..) |text, request_id, index| {
         const input_id: ?[]const u8 = if (index < drained.input_ids.len) drained.input_ids[index] else null;
@@ -2035,8 +2046,10 @@ fn pulseHostSteering(raw_ctx: *anyopaque) anyerror!void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     switch (js_host_steering.state()) {
         .closed => {},
-        .open => |open| if (server.claimHostSteeringInterrupt(ctx.state, open.queued + @intFromBool(open.handoff))) {
-            debug_trace.logf("acp", "host steering interrupts the streaming reply queued={d} handoff={}", .{ open.queued, open.handoff });
+        .open => |open| if (open.handoff) {
+            server.noteHostSteeringHandoff(ctx.state);
+        } else if (server.claimHostSteeringInterrupt(ctx.state, open.queued)) {
+            debug_trace.logf("acp", "host steering interrupts the streaming reply queued={d}", .{open.queued});
         },
     }
 }
@@ -3184,6 +3197,8 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     switch (event) {
         .provisional => |provisional| {
+            // A tool call the model announced is no reply a steer cuts short.
+            if (ctx.state.cfg.minimal_kernel) server.noteSteeringToolsPhase(ctx.state);
             const tool_name = provisional.tool_name orelse return;
             if (!tool_presentation.isProviderSearchAlias(tool_name)) return;
             var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);

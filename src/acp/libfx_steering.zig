@@ -136,6 +136,14 @@ pub const Runtime = struct {
         };
     }
 
+    /// Records that the current step works on a tool call the model has
+    /// announced, before its arguments or its run are known.
+    pub fn noteToolsPhase(self: *Runtime) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (self.step != null) self.phase = .tools;
+    }
+
     fn untrackedToolLocked(self: *Runtime) void {
         debug_trace.logf("acp", "libfx steering could not track a tool call; the step waits for its boundary", .{});
         self.phase = .tools;
@@ -237,6 +245,17 @@ pub const Runtime = struct {
         return .steering;
     }
 
+    /// A steer's interrupt the turn no longer needs, because a boundary
+    /// placed its steer or the turn ended first, is spent: `cancel_flag` is
+    /// cleared. A user cancel stays.
+    pub fn releaseInterrupt(self: *Runtime, cancel_flag: *std.atomic.Value(bool)) void {
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        if (!self.interrupt_pending or self.user_cancelled) return;
+        self.interrupt_pending = false;
+        cancel_flag.store(false, .seq_cst);
+    }
+
     /// The user cancels the turn: it stops taking steering, a steer's
     /// interrupt is overridden, and `cancel_flag` is set. Queued steering is
     /// kept, so the turn's end can hand back the libfx inputs among it.
@@ -252,10 +271,12 @@ pub const Runtime = struct {
     /// Removes the queued libfx inputs, which the model never saw, and returns
     /// their ids in order, owned by `result_alloc`. Called as a turn ends, so
     /// a journaled session records them as withdrawn while they still belong
-    /// to that turn, and its host can run them next.
+    /// to that turn, and its host can run them next. The turn takes no more
+    /// steering from here: a later steer is refused instead of dropped.
     pub fn takeUnplacedInputs(self: *Runtime, backing: Allocator, result_alloc: Allocator) Allocator.Error![][]u8 {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
+        self.accepting = false;
         var count: usize = 0;
         for (self.messages.items) |entry| {
             if (entry.input_id != null) count += 1;
@@ -716,6 +737,40 @@ test "a libfx handoff ends a streaming reply at once and a tool step at its boun
     runtime.cancelForUser(&cancel_flag);
     try std.testing.expect(!runtime.requestHandoff(&cancel_flag));
     try std.testing.expect(!runtime.handoffPending());
+}
+
+test "a libfx steer's interrupt is spent once its steer is placed or its turn ends, and the turn's end refuses more" {
+    const alloc = std.testing.allocator;
+    var runtime: Runtime = .{};
+    defer runtime.deinit(alloc);
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    runtime.open(alloc);
+
+    // A model announcing a tool call ends what a steer may cut short.
+    _ = runtime.notePhase(1, .reply, &cancel_flag);
+    runtime.noteToolsPhase();
+    try runtime.enqueueInput(alloc, "use tabs", "in_1");
+    try std.testing.expect(!runtime.claimInterrupt(&cancel_flag));
+
+    // An interrupt a boundary no longer needs is spent; a user cancel is not.
+    try std.testing.expect(runtime.notePhase(2, .reply, &cancel_flag));
+    runtime.releaseInterrupt(&cancel_flag);
+    try std.testing.expect(!cancel_flag.load(.seq_cst));
+    try std.testing.expectEqual(@as(?Runtime.Interrupt, null), runtime.takeInterrupt(&cancel_flag));
+    runtime.cancelForUser(&cancel_flag);
+    runtime.releaseInterrupt(&cancel_flag);
+    try std.testing.expect(cancel_flag.load(.seq_cst));
+
+    // After the turn's end hands back its inputs, a late steer is refused.
+    runtime.open(alloc);
+    try runtime.enqueueInput(alloc, "late enough", "in_2");
+    const unplaced = try runtime.takeUnplacedInputs(alloc, alloc);
+    defer {
+        for (unplaced) |id| alloc.free(id);
+        alloc.free(unplaced);
+    }
+    try std.testing.expectEqual(@as(usize, 1), unplaced.len);
+    try std.testing.expectError(error.SteeringNotActive, runtime.enqueueInput(alloc, "too late", "in_3"));
 }
 
 test "steering a web host keeps interrupts the reply under the same rule" {

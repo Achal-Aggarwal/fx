@@ -2347,6 +2347,19 @@ pub fn takeSteeringInterrupt(state: *ServerState) ?libfx_steering.Runtime.Interr
     return active.steering.takeInterrupt(&active.cancel_flag);
 }
 
+/// Spends a steer's interrupt the running libfx turn no longer needs, so its
+/// cancel flag reports only a user cancel.
+pub fn releaseSteeringInterrupt(state: *ServerState) void {
+    const active = if (state.active_session) |*session| session else return;
+    active.steering.releaseInterrupt(&active.cancel_flag);
+}
+
+/// Records that the running libfx turn's step works on an announced tool call.
+pub fn noteSteeringToolsPhase(state: *ServerState) void {
+    const active = if (state.active_session) |*session| session else return;
+    active.steering.noteToolsPhase();
+}
+
 /// Whether the running libfx turn ends at this boundary for a handoff.
 pub fn steeringHandoffPending(state: *ServerState) bool {
     const active = if (state.active_session) |*session| session else return false;
@@ -2367,6 +2380,13 @@ pub fn noteSteeringPhase(state: *ServerState, step: u64, phase: libfx_steering.P
 pub fn claimHostSteeringInterrupt(state: *ServerState, queued: usize) bool {
     const active = if (state.active_session) |*session| session else return false;
     return active.steering.claimHostInterrupt(queued, &active.cancel_flag);
+}
+
+/// A handoff a web host holds for the running libfx turn: the turn ends at its
+/// next safe point, as with `libfx/handoff`.
+pub fn noteHostSteeringHandoff(state: *ServerState) void {
+    const active = if (state.active_session) |*session| session else return;
+    _ = active.steering.requestHandoff(&active.cancel_flag);
 }
 
 /// A boundary of a libfx turn whose web host keeps the steering queue.

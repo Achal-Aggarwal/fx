@@ -65,8 +65,8 @@ const answer = (text) => [{ type: "text-delta", id: "answer", delta: text }, fin
 // The model, by the newest user message of the request, past any resume
 // notice: "use <tool>" calls the tool once, then answers with its result;
 // "loop" calls lookup three times; "stall" never answers; "slow reply"
-// streams its answer a word at a time for a few seconds; anything else is
-// echoed.
+// streams its answer a word at a time for a few seconds; "stalled reply"
+// sends one word and goes quiet for `stallMs`; anything else is echoed.
 function framesFor(prompt) {
   const users = userTexts(prompt).filter((text) => text !== resumeNotice);
   const text = users.at(-1) ?? "";
@@ -79,6 +79,7 @@ function framesFor(prompt) {
   }
   if (text === "stall") return null;
   if (text === "slow reply") return slowReply;
+  if (text === "stalled reply") return stalledReply;
   if (text === "loop") {
     if (turnResults.length < 3) return toolCall(`call-${users.length}-${turnResults.length}`, "lookup", { key: `k${turnResults.length}` });
     return answer(`looped ${turnResults.length}`);
@@ -92,6 +93,8 @@ const slowReply = Symbol("slow reply");
 const slowFrames = 75;
 const slowReplyMs = slowFrames * 40;
 const slow = [];
+const stalledReply = Symbol("stalled reply");
+const stallMs = 4000;
 
 const requests = [];
 // Each chat request's model and prompt, for the tests of a session's settings.
@@ -112,6 +115,13 @@ const server = createServer((request, response) => {
     chats.push({ model: request.headers["ai-language-model-id"] ?? null, prompt });
     const frames = framesFor(prompt);
     if (frames === null) return;
+    if (frames === stalledReply) {
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      response.write(`data: ${JSON.stringify({ type: "text-delta", id: "answer", delta: "first " })}\n\n`);
+      const timer = setTimeout(() => response.end(`data: ${JSON.stringify(finish("stop"))}\n\ndata: [DONE]\n\n`), stallMs);
+      response.on("close", () => clearTimeout(timer));
+      return;
+    }
     if (frames === slowReply) {
       const record = { sent: 0 };
       slow.push(record);
@@ -589,6 +599,23 @@ if (durabilityKind === "memory") {
     await second.close();
   });
 
+  // A sender whose queue outlives the process does not read the log first,
+  // so the worker reports a steer that reuses a prompt's id.
+  test("on a queue that outlives the process, a steer reusing a prompt's id is reported and runs nothing", async () => {
+    const errors = [];
+    const agent = createFxAgent(agentOptions(queueOutlivesProcess(await durabilityFor()), {
+      onEvent: (event) => { if (event.type === "session.error") errors.push(event); },
+    }));
+    const session = agent.session();
+    assert.equal((await session.prompt("hello there", { messageId: "m-dup" }).result).stopReason, "end_turn");
+    await session.steer("again", { messageId: "m-dup" });
+    await until(() => errors.length > 0, "the collision's session.error");
+    assert.equal(errors[0].error?.code, "FX_MESSAGE_ID_IN_USE");
+    const lines = await readLines(session.stream(0), 64);
+    assert.equal(lines.filter((line) => line.type === "turn_start").length, 1, "the steer ran no turn");
+    await agent.close();
+  });
+
   // With a queue that outlives the process, as on Vercel, a message's input
   // is written with its claim's lease, so the lease can land first.
   test("a prompt whose input landed after another worker took the session over still runs", async () => {
@@ -751,7 +778,6 @@ const onePixelPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mN
 test("a steer cuts a streaming reply short, and the turn goes on with it", async () => {
   const agent = createFxAgent(agentOptions(await durabilityFor()));
   const session = agent.session();
-  const before = slow.length;
   const started = Date.now();
   const turn = session.prompt("slow reply");
   const { messageId } = await turn.accepted;
@@ -772,6 +798,22 @@ test("a steer cuts a streaming reply short, and the turn goes on with it", async
   assert.deepEqual(lines.filter((line) => line.type === "turn_start").map((line) => line.messageId), [messageId], "the steer joined the turn");
   const joined = lines.filter((line) => line.type === "user_message");
   assert.deepEqual(joined.map((line) => [line.id, line.messageId]), [["m-brief", messageId]], "the stream shows where the steer joined, by its id");
+  await agent.close();
+});
+
+test("a steer cuts short a reply that has gone quiet", async () => {
+  const agent = createFxAgent(agentOptions(await durabilityFor()));
+  const session = agent.session();
+  const turn = session.prompt("stalled reply");
+  const events = turn[Symbol.asyncIterator]();
+  for (let next = await events.next(); !next.done && next.value.type !== "text_delta"; next = await events.next());
+  const steeredAt = Date.now();
+  await session.steer("go on without it", { messageId: "m-quiet" });
+  for (let next = await events.next(); !next.done; next = await events.next());
+  assert.equal((await turn.result).stopReason, "end_turn");
+  const waited = Date.now() - steeredAt;
+  assert.ok(waited < stallMs / 2, `the turn ended ${waited} ms after the steer, not after the model's next byte`);
+  assert.ok(userTexts(requests.at(-1)).some((text) => text.includes("go on without it")), "the next request carried the steer");
   await agent.close();
 });
 
