@@ -1,6 +1,6 @@
 # Contributing to fx
 
-fx is open source and developed in public at [vercel-labs/fx](https://github.com/vercel-labs/fx). Most changes come from the fx team at Vercel, and pull requests from outside contributors are welcome and go through the same CI checks. A few steps need access to the repository, such as labeling a pull request or starting an optional CI run. Where a step needs that access, this guide says so, and a maintainer handles it for outside contributors.
+fx is open source and developed in public at [vercel-labs/fx](https://github.com/vercel-labs/fx). The fx team at Vercel maintains it and makes most changes, and pull requests from outside contributors are welcome and go through the same CI checks. Only maintainers can push branches to the repository, add labels, or start optional CI runs. Outside contributors work from a fork, and a maintainer handles those steps for them.
 
 Code conventions live in [AGENTS.md](AGENTS.md): which module owns which behavior, how fx uses Zig 0.17, how permissions and tests are structured, and the rules coding agents follow. Read it before you change code, whether you write the change yourself or with a coding agent.
 
@@ -20,7 +20,7 @@ You need:
 
 The unit tests and most end-to-end tests don't call a model. To try a change that does, sign in as the [README](README.md#quick-start) describes or set `AI_GATEWAY_API_KEY`.
 
-Clone the repository, or your fork if you don't have write access, and build fx:
+Clone the repository, or your fork if you're an outside contributor, and build fx:
 
 ```bash
 git clone https://github.com/vercel-labs/fx.git
@@ -124,7 +124,7 @@ bun test
 
 ## Open a pull request
 
-1. Push your branch. If you have write access, push it to `vercel-labs/fx`. Otherwise, push it to your fork and open the pull request against `main`.
+1. Push your branch. Maintainers push to `vercel-labs/fx`. Outside contributors push to their fork and open the pull request against `main`.
 2. Sign every commit. `main` accepts only commits with verified signatures, and squash merging is turned off, so a single unsigned commit blocks the merge. GitHub explains how to set up [commit signature verification](https://docs.github.com/en/authentication/managing-commit-signature-verification/about-commit-signature-verification) with an SSH or GPG key.
 3. Open the pull request as a draft once your focused checks pass, so CI starts on it.
 4. Write the title as a plain imperative sentence, such as `Restore feedback report file clipboard`. Leave out bracketed prefixes like `[bug]`, because the type goes in a label.
@@ -144,7 +144,7 @@ Every pull request needs exactly one `type:` label before it merges. Choose the 
 | `type: release` | Prepares or repairs a release |
 | `type: security` | Fixes or hardens a security boundary |
 
-Setting labels takes triage access or higher. If you have it, add the label when you open the pull request and update it if the scope changes. When a pull request mixes kinds of change, choose the label for its main purpose, and ask a maintainer when that isn't clear. Outside contributors can't set labels and don't need to: a maintainer adds one during review, and a missing label never holds a pull request in draft.
+Only maintainers can add labels. Maintainers add the label when they open the pull request and update it if the scope changes. When a pull request mixes kinds of change, the label follows its main purpose. Outside contributors leave the label off, and a maintainer adds it during review. A missing label never holds a pull request in draft.
 
 ## CI checks
 
@@ -188,7 +188,7 @@ Other runs start only on request:
 | Long-turn memory benchmark | `gh workflow run bench.yml --ref your-branch -f long_turn_memory=true` |
 | libfx runtime benchmark | `gh workflow run bench.yml --ref your-branch -f libfx_runtime=true` |
 
-Starting a workflow takes write access, and the `ci:macos` label takes triage access. If your change needs one of these runs and you can't start it, ask in the pull request and a maintainer will start it. If CI doesn't start at all on your first pull request, a maintainer may need to approve the workflow run.
+Only maintainers can start these runs or add the `ci:macos` label. If you're an outside contributor and your change needs one of them, ask in the pull request and a maintainer will start it. If CI doesn't start at all on your first pull request, a maintainer may need to approve the workflow run.
 
 ## Mark it ready for review
 
@@ -209,7 +209,7 @@ Update the documentation in the same pull request as the behavior it describes:
 - `sdk/README.md` documents libfx. Update it when libfx's public behavior or setup changes, as [sdk/AGENTS.md](sdk/AGENTS.md) describes.
 - Update this file when build steps, configuration, or collaboration rules change.
 
-The user manual at [fx.sh/docs](https://fx.sh/docs) lives in `vercel-labs/fx-web`, an internal Vercel repository. A page's source is `apps/marketing/app/(site)/(docs)/docs/<path>/page.mdx`, where `<path>` is the part of the page's URL after `fx.sh/docs/`. If you have access, update the page in a companion fx-web pull request and link it from yours. If you don't, name the page in your pull request description and a maintainer will update it.
+The user manual at [fx.sh/docs](https://fx.sh/docs) lives in `vercel-labs/fx-web`, an internal Vercel repository. A page's source is `apps/marketing/app/(site)/(docs)/docs/<path>/page.mdx`, where `<path>` is the part of the page's URL after `fx.sh/docs/`. Maintainers update the page in a companion fx-web pull request and link it from theirs. Outside contributors name the page in the pull request description, and a maintainer updates it.
 
 Change `README.md` only when one of its statements becomes false, or when a change adds a capability as broad as the ones in its feature list. A new option, command, or environment variable belongs in `--help` and the manual.
 
