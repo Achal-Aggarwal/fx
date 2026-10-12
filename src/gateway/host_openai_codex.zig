@@ -26,6 +26,7 @@ pub fn provider(context: *Context) stream_provider.Provider {
         .stream_fn = stream,
         .build_request_fn = buildRequest,
         .project_replay_fn = responses_protocol.selectReplayParts,
+        .max_request_bytes = context.transport.max_request_bytes,
     };
 }
 

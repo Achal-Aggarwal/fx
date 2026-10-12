@@ -19,6 +19,8 @@ pub const Transport = struct {
     close_fn: *const fn (?*anyopaque, i32) void,
     // Optional logical-completion signal, independent of HTTP EOF or close.
     consumed_fn: ?*const fn (?*anyopaque, i32) void = null,
+    /// The largest request body `open_fn` accepts, when the host bounds it.
+    max_request_bytes: ?usize = null,
 
     fn open(self: Transport, method: []const u8, url: []const u8, headers: []const u8, body: []const u8) !i32 {
         return self.open_fn(self.context, method, url, headers, body);
@@ -72,6 +74,7 @@ pub fn provider(context: *ProviderContext) stream_provider.Provider {
         .stream_fn = stream,
         .build_request_fn = buildRequest,
         .project_replay_fn = vercel_protocol.selectReplayParts,
+        .max_request_bytes = context.transport.max_request_bytes,
     };
 }
 

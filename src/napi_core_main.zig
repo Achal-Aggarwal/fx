@@ -31,6 +31,9 @@ const max_input_bytes = 8 * 1024 * 1024;
 const max_output_bytes = 8 * 1024 * 1024;
 const max_output_message_bytes = 64 * 1024 * 1024;
 const max_fetch_request_bytes = 8 * 1024 * 1024;
+/// Room kept beside a request body for its method, URL, and headers, which
+/// share the bridge's budget with it.
+const fetch_request_metadata_reserve = 64 * 1024;
 const max_fetch_response_bytes = 8 * 1024 * 1024;
 // One attachment holds one prompt image or one kernel checkpoint, the larger.
 const max_attachment_bytes = agent_checkpoint.max_checkpoint_bytes;
@@ -1050,6 +1053,8 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         .next_fn = FetchBridge.next,
         .close_fn = FetchBridge.close,
         .consumed_fn = FetchBridge.markConsumed,
+        // Requests leave out their oldest images to fit, instead of failing.
+        .max_request_bytes = max_fetch_request_bytes - fetch_request_metadata_reserve,
     });
     runtime.codex_context = .{ .transport = runtime.stream_context.transport };
     runtime.grok_context = .{ .transport = runtime.stream_context.transport };

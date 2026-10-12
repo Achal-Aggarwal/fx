@@ -49,6 +49,7 @@ pub fn bundle(raw: ?*anyopaque, definition: *const definitions.Definition) provi
             .stream_fn = stream,
             .build_request_fn = buildRequest,
             .project_replay_fn = chat_completions.project_replay,
+            .max_request_bytes = context.transport.max_request_bytes,
         },
         .model_catalog = chat_completions.model_catalog_provider(own),
     };
