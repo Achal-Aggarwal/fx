@@ -1590,6 +1590,38 @@ describe("filesystem path handling", () => {
   );
 
   test(
+    "grep_files searches a file larger than 200 KiB by path and by include",
+    async () => {
+      const root = createIsolatedRoot();
+      try {
+        mkdirSync(join(root.workspace, "src"), { recursive: true });
+        // 3,000 lines of 100 bytes, then the match on line 3,001.
+        writeFileSync(
+          join(root.workspace, "src", "big.txt"),
+          `${"x".repeat(99)}\n`.repeat(3000) + "LARGE_FILE_NEEDLE\n",
+        );
+        const cases = [
+          { id: "grep_large_path_1", input: { pattern: "LARGE_FILE_NEEDLE", path: "src/big.txt" } },
+          { id: "grep_large_include_1", input: { pattern: "LARGE_FILE_NEEDLE", include: "src/*.txt" } },
+        ];
+        for (const scenario of cases) {
+          await runFirstCallToolScenario({
+            root,
+            id: scenario.id,
+            name: "grep_files",
+            input: scenario.input,
+            expectedResultRequest: [],
+            expectedResultOutput: ["big.txt:3001", "LARGE_FILE_NEEDLE"],
+          });
+        }
+      } finally {
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "glob pattern cannot escape the separately approved search root",
     async () => {
       const root = createIsolatedRoot();
