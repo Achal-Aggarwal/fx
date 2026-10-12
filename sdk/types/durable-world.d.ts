@@ -45,6 +45,14 @@ export type WorldOptions = {
   queueDurable?: boolean;
   /** How often a waiting worker reads the session again. Default 1000. */
   pollMs?: number;
+  /**
+   * The queue keeps a message from every other delivery while one handles it, and delivers it again once that
+   * delivery's process is gone, as Vercel Queues does. Without liveness, a worker then holds its session for as long as
+   * its delivery runs, up to its deadline, and renews nothing: the next delivery of the same message takes the session
+   * over. The World must pass each handler call the queue's `messageId` and delivery `attempt`. A worker with no
+   * deadline renews its lease all the same. Default false.
+   */
+  queueLeases?: boolean;
   /** Without liveness, how long a lease lasts after its worker took or last renewed it; renewed every third of that. At least 1000. Default 15000. */
   leaseMs?: number;
   /** Each delivery stops `reserveMs` before `maxDurationMs`, or before the World's `getRuntimeDeadline()`. No limit by default. */

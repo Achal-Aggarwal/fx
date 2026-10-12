@@ -49,10 +49,18 @@ const defaultReserveMs = 30_000;
 // after its last renewal, not at its function's deadline.
 const defaultLeaseMs = 15_000;
 
+// Whether the queue shows whether a worker lives, delivering the message its
+// delivery held again once it is gone, so the worker holds its lease to the
+// deadline that bounds it and renews nothing.
+const queueHeld = (backend, deadline) => !backend.livenessKnown && backend.queueLeases === true && deadline !== null;
+// Whether a worker holds its lease to its deadline and renews nothing: when
+// whether it lives is known, or the queue shows it.
+const heldToDeadline = (backend, deadline) => backend.livenessKnown || queueHeld(backend, deadline);
+
 // When a lease taken or renewed now runs out: never past the deadline its
-// worker stops at, and with liveness known, only at that deadline.
+// worker stops at, and when it is held to that deadline, only there.
 function leaseEnd(backend, deadline) {
-  if (backend.livenessKnown) return deadline;
+  if (heldToDeadline(backend, deadline)) return deadline;
   const renewed = Date.now() + backend.leaseMs;
   return deadline === null ? renewed : Math.min(renewed, deadline);
 }
@@ -207,7 +215,7 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
         if ((entry.a ?? null) !== head) break;
         head = cursor;
         if (entry.k === "lease") {
-          lease = { holder: entry.holder, epoch: entry.epoch, expiresAt: entry.expiresAt ?? null, pid: entry.pid, host: entry.host, cursor };
+          lease = { holder: entry.holder, epoch: entry.epoch, expiresAt: entry.expiresAt ?? null, pid: entry.pid, host: entry.host, delivery: entry.delivery, cursor };
           if (Number.isSafeInteger(entry.epoch) && entry.epoch > epoch) epoch = entry.epoch;
         } else if (entry.k === "release") {
           if (lease?.holder === entry.holder) lease = null;
@@ -334,6 +342,29 @@ function leaseStands(lease, now, alive) {
   return true;
 }
 
+// Which queue message a delivery carries, by the queue's own id, and which
+// delivery of it this is, when the World reports both.
+function deliveryOf(meta) {
+  const messageId = meta?.messageId;
+  const attempt = meta?.attempt;
+  return typeof messageId === "string" && messageId.length > 0 && Number.isSafeInteger(attempt) && attempt > 0
+    ? { messageId, attempt }
+    : null;
+}
+
+// Whether `delivery`, in another process, carries the message whose delivery
+// took `lease`. A queue hands a message on only once the delivery holding it
+// let it go unacknowledged: its handler failed, or its process died or lost
+// the message. On Vercel, a function whose process exits mid-delivery runs
+// the same delivery again, attempt and all, in a new process. Either way the
+// holder no longer runs the session, or runs it replaced without knowing,
+// and its next write is fenced.
+function redelivers(delivery, lease) {
+  const held = lease?.delivery;
+  return Boolean(delivery && held && held.messageId === delivery.messageId &&
+    Number.isSafeInteger(held.attempt) && delivery.attempt >= held.attempt);
+}
+
 // ---------------------------------------------------------------------------
 // Backends. Each gives sessions a log, a stream, and a queue.
 
@@ -356,15 +387,16 @@ function createMemoryBackend({ maxDurationMs, reserveMs } = {}) {
     const timer = setTimeout(() => { timers.delete(timer); fn(); }, ms);
     timers.add(timer);
   };
-  const deliver = (message, attempt) => {
-    if (handlers.length === 0) return later(() => deliver(message, attempt), 10);
+  // A message keeps its id across its deliveries, as a queue's does.
+  const deliver = (message, attempt, messageId = newId("qmsg")) => {
+    if (handlers.length === 0) return later(() => deliver(message, attempt, messageId), 10);
     const handler = handlers[turnOf++ % handlers.length];
     Promise.resolve()
-      .then(() => handler(message, { attempt }))
+      .then(() => handler(message, { messageId, attempt }))
       .then((result) => {
-        if (Number.isFinite(result?.timeoutSeconds)) later(() => deliver(message, attempt + 1), result.timeoutSeconds * 1000);
+        if (Number.isFinite(result?.timeoutSeconds)) later(() => deliver(message, attempt + 1, messageId), result.timeoutSeconds * 1000);
       }, () => {
-        if (attempt < 48) later(() => deliver(message, attempt + 1), 1000);
+        if (attempt < 48) later(() => deliver(message, attempt + 1, messageId), 1000);
       });
   };
   return {
@@ -514,7 +546,7 @@ const listenersOf = new WeakMap();
 
 // libfx starts and closes a World it `owned`, having created it; a World the
 // app passed in stays the app's.
-function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, holderInfo, livenessKnown = false, queueDurable = false, maxDurationMs, owned = true }) {
+function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, holderInfo, livenessKnown = false, queueLeases = false, queueDurable = false, maxDurationMs, owned = true }) {
   const spec = world.specVersion === undefined ? {} : { specVersion: world.specVersion };
   const created = new Set();
   // Runs being created now: writes that go out together create a run once.
@@ -530,7 +562,8 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
     pagination: { sortOrder: "desc", limit, ...(cursor ? { cursor } : {}) },
     resolveData: "all",
   });
-  const deliverTo = async (handle, message) => {
+  // `meta` says which queue message this is and which delivery of it.
+  const deliverTo = async (handle, message, meta) => {
     const input = message?.input;
     if (!input || typeof input !== "object") return undefined;
     if (!handle) {
@@ -539,14 +572,18 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
       if (owned) return undefined;
       throw new Error("no libfx agent is listening; the queue delivers this again");
     }
-    const result = await handle(input);
+    const result = await handle(input, meta);
+    // The queue delivers this same message again, which takes back a lease
+    // its worker could not let go.
+    if (result?.redeliver === true) throw new Error("libfx asks the queue to deliver this message again");
     return Number.isFinite(result?.timeoutSeconds) ? { timeoutSeconds: result.timeoutSeconds } : undefined;
   };
   // The route a deployment mounts delivers to this agent.
-  const queueHandler = world.createQueueHandler(queuePrefix, (message) => deliverTo(handler, message));
+  const queueHandler = world.createQueueHandler(queuePrefix, (message, meta) => deliverTo(handler, message, meta));
   const backend = {
     name,
     livenessKnown,
+    queueLeases,
     queueDurable,
     pollMs: pollMs ?? 1000,
     reserveMs: reserveMs ?? defaultReserveMs,
@@ -557,9 +594,14 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
     validSessionId: (id) => typeof id === "string" && /^wrun_[0-9A-Za-z]{10,64}$/.test(id),
     deadline: () => null,
     holderInfo: holderInfo ?? (() => ({})),
-    alive(lease) {
+    // Whether a lease's holder still runs, as `delivery` can tell: a worker
+    // of this process runs while it holds it, and the message its delivery
+    // held, delivered to this process, means it no longer does.
+    alive(lease, delivery = null) {
+      if (liveHolders.has(lease.holder)) return true;
       const mine = holderInfo?.() ?? {};
-      if (mine.pid !== undefined && lease.pid === mine.pid && lease.host === mine.host) return liveHolders.has(lease.holder);
+      if (mine.pid !== undefined && lease.pid === mine.pid && lease.host === mine.host) return false;
+      if (redelivers(delivery, lease)) return false;
       return alive ? alive(lease) : null;
     },
     holding(holder, held) {
@@ -761,9 +803,9 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
       if (!listeners) {
         listeners = { handlers: [], turn: 0 };
         listenersOf.set(world, listeners);
-        world.registerHandler(queuePrefix, world.createQueueHandler(queuePrefix, (message) => {
+        world.registerHandler(queuePrefix, world.createQueueHandler(queuePrefix, (message, meta) => {
           const { handlers } = listeners;
-          return deliverTo(handlers.length === 0 ? null : handlers[listeners.turn++ % handlers.length], message);
+          return deliverTo(handlers.length === 0 ? null : handlers[listeners.turn++ % handlers.length], message, meta);
         }));
       }
       listeners.handlers.push(fn);
@@ -919,33 +961,35 @@ class SessionWorker {
     this.holder = null;
   }
 
-  fold(entries) {
-    return foldSessionLog(entries, { now: Date.now(), alive: (lease) => this.backend.alive(lease) });
+  // The log folded as `delivery` judges whether a lease's holder lives.
+  fold(entries, delivery = null) {
+    return foldSessionLog(entries, { now: Date.now(), alive: (lease) => this.backend.alive(lease, delivery) });
   }
 
-  // One queue delivery. Its input reaches the log at once, even while this
+  // One queue delivery, `delivery` its message's id and attempt when the
+  // queue reports them. Its input reaches the log at once, even while this
   // process runs the session, so a steer or cancel reaches the running turn.
   // Then it runs the session when no live worker holds it. Returns
   // `{ timeoutSeconds }` to have the same message delivered again later.
-  async consume(message) {
+  async consume(message, delivery = null) {
     const log = await this.backend.session(this.sessionId);
     await this.backend.refreshDeadline?.();
     // When this delivery's function stops, if it does.
     const deadline = this.backend.deadline() ?? (this.backend.maxDurationMs === null ? null : Date.now() + this.backend.maxDurationMs);
     let entries = await log.read();
-    let state = this.fold(entries);
+    let state = this.fold(entries, delivery);
     for (let claims = 0; claims < 8; claims += 1) {
       // A session with no open turn starts its next prompt at once: the
       // first model request goes out while the input and the lease are
       // written, and nothing else is written until both land.
-      const early = this.running || state.lease ? null : earlyStart(entries, state, message, (items) => this.fold(items));
+      const early = this.running || state.lease ? null : earlyStart(entries, state, message, (items) => this.fold(items, delivery));
       let outcome;
       if (early) {
-        outcome = await this.claim(log, state, deadline, early);
+        outcome = await this.claim(log, state, deadline, early, delivery);
       } else {
         if (await recordMessage(log, state, message) > 0) {
           entries = await log.read();
-          state = this.fold(entries);
+          state = this.fold(entries, delivery);
         }
         if (this.running) return { timeoutSeconds: runningBackstopSeconds };
         if (!state.hasWork) {
@@ -958,12 +1002,15 @@ class SessionWorker {
           const left = state.lease.expiresAt ? Math.ceil((state.lease.expiresAt - Date.now()) / 1000) + 1 : 5;
           return { timeoutSeconds: Math.max(1, Math.min(maxBackstopSeconds, left)) };
         }
-        outcome = await this.claim(log, state, deadline, null);
+        outcome = await this.claim(log, state, deadline, null, delivery);
       }
       if (outcome === "yielded") return { timeoutSeconds: 0 };
       // A write that failed for any other reason: the same message runs the
-      // session again shortly.
-      if (outcome === "failed") return { timeoutSeconds: 1 };
+      // session again shortly. A lease held to the deadline, which a release
+      // that failed may leave standing, is let go only by a later delivery of
+      // this message, and a queue may send `{ timeoutSeconds }` on as a new
+      // one, so the queue is asked for this one again.
+      if (outcome === "failed") return queueHeld(this.backend, deadline) ? { redeliver: true } : { timeoutSeconds: 1 };
       if (outcome === "fenced") {
         // Another worker took the session over; this one stops.
         this.agent.emit("session.fenced", { sessionId: this.sessionId, epoch: state.lastEpoch + 1 });
@@ -972,7 +1019,7 @@ class SessionWorker {
       // The turns ran, or another worker's write came before this claim:
       // read the log again.
       entries = await log.read();
-      state = this.fold(entries);
+      state = this.fold(entries, delivery);
     }
     return { timeoutSeconds: 1 };
   }
@@ -980,9 +1027,10 @@ class SessionWorker {
   // Claims the session where `state` read it, with a lease that continues
   // the chain there, and runs it. With `early`, what `earlyStart` returned,
   // the message's input is written with the lease and the next turn starts
-  // before either lands. Returns what run() returns, or "refused" when
-  // another worker's write came before the claim.
-  async claim(log, state, deadline, early) {
+  // before either lands. The lease names `delivery`, so a later delivery of
+  // the same message can tell it lost its holder. Returns what run()
+  // returns, or "refused" when another worker's write came before the claim.
+  async claim(log, state, deadline, early, delivery = null) {
     // Claimed before the first await, so a delivery that arrives meanwhile
     // sees the session running here.
     this.running = true;
@@ -994,6 +1042,7 @@ class SessionWorker {
       epoch: state.lastEpoch + 1,
       expiresAt: leaseEnd(this.backend, deadline),
       ...this.backend.holderInfo(),
+      ...(delivery ? { delivery } : {}),
     };
     this.backend.holding(this.holder, true);
     try {
@@ -1136,14 +1185,14 @@ class SessionWorker {
           recent: now.recent,
           lastTurnId: now.lastTurnId,
           ...(now.openTurn ? { openTurn: now.openTurn, yielded: now.yielded } : {}),
-          lease: { holder: this.holder, epoch: lease.epoch, expiresAt: leaseExpiresAt, pid: lease.pid, host: lease.host },
+          lease: { holder: this.holder, epoch: lease.epoch, expiresAt: leaseExpiresAt, pid: lease.pid, host: lease.host, ...(lease.delivery ? { delivery: lease.delivery } : {}) },
         });
       },
     };
     // The turn running now, which a deadline or a lost lease cancels.
     let turnNow = null;
     let renew = null;
-    if (!this.backend.livenessKnown) {
+    if (!heldToDeadline(this.backend, deadline)) {
       // A lease nothing else shows alive is renewed while its worker runs,
       // and never after its release, which would take the session back. A
       // renewal fenced out by another worker's write stops the turn at once,
@@ -1151,7 +1200,7 @@ class SessionWorker {
       renew = setInterval(() => {
         if (released || failed || this.stopping) return;
         leaseExpiresAt = leaseEnd(this.backend, deadline);
-        void chained({ k: "lease", holder: this.holder, epoch: lease.epoch, expiresAt: leaseExpiresAt, ...this.backend.holderInfo() })
+        void chained({ k: "lease", holder: this.holder, epoch: lease.epoch, expiresAt: leaseExpiresAt, ...this.backend.holderInfo(), ...(lease.delivery ? { delivery: lease.delivery } : {}) })
           .catch((error) => { if (isFenced(error)) turnNow?.cancel({ reason: "handoff" }); });
       }, Math.max(1, Math.floor(this.backend.leaseMs / 3)));
     }
@@ -1761,14 +1810,14 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
         chosenDurability = chosen;
         const created = await createBackend(chosen);
         await created.start?.();
-        unlisten = created.listen((message) => {
+        unlisten = created.listen((message, meta) => {
           let worker = workers.get(message.sessionId);
           if (!worker) {
             worker = new SessionWorker(agent, created, message.sessionId);
             workers.set(message.sessionId, worker);
           }
           worker.deliveries += 1;
-          const work = worker.consume(message);
+          const work = worker.consume(message, deliveryOf(meta));
           active.add(work);
           void work.catch((error) => {
             // Its queue delivers the message again; the host hears why.

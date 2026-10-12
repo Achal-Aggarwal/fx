@@ -3,7 +3,7 @@
 // WebAssembly, along paths of the TLC state graph of DurableSession.tla, and
 // checks after every step that the code is in a state the model allows.
 //
-//   bun sdk/tests/model/drive.mjs [send|lookup|cutoff|leased] [--walks N] [--seed S] [--backend native|wasm]
+//   bun sdk/tests/model/drive.mjs [send|lookup|cutoff|leased|queue] [--walks N] [--seed S] [--backend native|wasm]
 //     [--durability local|world|vercel]
 //
 // The leased graph is the send graph with Heartbeat: its agents keep the
@@ -13,7 +13,14 @@
 //
 // With --durability world each agent is given its own app-built World on the
 // directory through world(), as servers with their own instances would (see
-// sdk/tests/app-world.mjs). With --durability vercel the agents keep the
+// sdk/tests/app-world.mjs).
+//
+// The queue graph is the send graph with QueueHeld: each agent's World has a
+// queue that delivers as Vercel Queues does and no other sign of whether a
+// worker lives (see sdk/tests/queue-world.mjs), so a worker holds the
+// session for as long as its delivery holds its message. A freeze is the
+// queue giving up on that delivery, and the Start that finds the frozen
+// holder is that holder's message, delivered to the other agent. With --durability vercel the agents keep the
 // session in Vercel's World (see sdk/tests/vercel-storage.mjs for what it
 // needs) instead of files.
 //
@@ -41,15 +48,17 @@ const option = (name, fallback) => {
   const index = args.indexOf(`--${name}`);
   return index >= 0 ? args[index + 1] : fallback;
 };
-const graphName = args.find((arg) => ["send", "lookup", "cutoff", "leased"].includes(arg)) ?? "send";
-const tool = graphName === "cutoff" ? "lookup" : graphName === "leased" ? "send" : graphName;
+const graphName = args.find((arg) => ["send", "lookup", "cutoff", "leased", "queue"].includes(arg)) ?? "send";
+const tool = graphName === "cutoff" ? "lookup" : graphName === "leased" || graphName === "queue" ? "send" : graphName;
 const walks = Number(option("walks", 40));
 const backend = option("backend", "native");
 const leased = graphName === "leased";
-const durabilityKind = option("durability", leased ? "leased" : "local");
-if (!["local", "world", "vercel", "leased"].includes(durabilityKind)) throw new Error("--durability is local, world or vercel");
-// Only the leased graph has the heartbeat's steps, and only its World renews leases.
+const durabilityKind = option("durability", leased ? "leased" : graphName === "queue" ? "queue" : "local");
+if (!["local", "world", "vercel", "leased", "queue"].includes(durabilityKind)) throw new Error("--durability is local, world or vercel");
+// Only the leased graph has the heartbeat's steps, and only its World renews
+// leases; only the queue graph has a queue that shows whether a worker lives.
 if (leased !== (durabilityKind === "leased")) throw new Error("the leased graph runs on its own World, and only it does");
+if ((graphName === "queue") !== (durabilityKind === "queue")) throw new Error("the queue graph runs on its own World, and only it does");
 // How long a leased worker's lease lasts after its last renewal.
 const leaseMs = 1000;
 const leasedWorld = leased ? await (async () => {
@@ -65,6 +74,8 @@ const streamQuietMs = remote ? 2500 : 120;
 const stepTimeoutMs = remote ? 30_000 : 5000;
 const { vercelStorage } = remote ? await import("../vercel-storage.mjs") : {};
 const { appWorldAt, closeAppWorlds } = durabilityKind === "world" ? await import("../app-world.mjs") : {};
+const queued = durabilityKind === "queue";
+const { queueWorldAt, closeQueueWorlds } = queued ? await import("../queue-world.mjs") : {};
 const verbose = args.includes("--verbose");
 let seed = Number(option("seed", 1));
 const here = fileURLToPath(new URL(".", import.meta.url));
@@ -249,6 +260,10 @@ async function harness() {
   const writes = {};
   // The renewals a frozen leased worker has not been let to write.
   const renewals = { A: [], B: [] };
+  // On the queue's World: each agent's queue, and the message a frozen
+  // holder's delivery held, which the queue delivers again.
+  const brokers = {};
+  const lapsed = { A: null, B: null };
   let runs = 0;
   let sessionId = null;
   const remove = (list, entry) => {
@@ -258,7 +273,10 @@ async function harness() {
   const agents = {};
   for (const w of Workers) {
     const claims = new Set();
-    const stored = leased ? leasedWorld(dir) : durabilityKind === "world" ? await appWorldAt(dir) : remote ? vercelStorage({ dir }) : local({ dir });
+    // A queue-held lease runs to its worker's deadline, ten minutes away.
+    const queueWorld = queued ? await queueWorldAt(dir, { queueLeases: true, maxDurationMs: 600_000 }) : null;
+    if (queueWorld) brokers[w] = queueWorld.broker;
+    const stored = leased ? leasedWorld(dir) : durabilityKind === "world" ? await appWorldAt(dir) : remote ? vercelStorage({ dir }) : queueWorld ? queueWorld.durability : local({ dir });
     const [durability, held] = holdWrites(withoutBackstops(stored), (entry) => {
       if (entry.k !== "lease") return false;
       if (!claims.has(entry.holder)) {
@@ -387,10 +405,18 @@ async function harness() {
     if (name === "Start") {
       // w receives work for the session; its claim waits for the driver.
       const before = new Set(liveHolders);
+      // The queue hands on the message of a worker it gave up on, frozen or
+      // woken since, while that worker still holds the session.
+      const head = sessionId ? (await agents[w][durableInternals].lastLease(sessionId))?.holder : null;
+      const handedOn = Workers.find((v) => v !== w && lapsed[v] && holders[v].includes(head));
       if (!sessionId) {
         const turn = agents[w].session().prompt(`use ${tool}`, { messageId: "turn-1" });
         void turn.result.catch(() => {});
         sessionId = (await turn.accepted).sessionId;
+      } else if (handedOn) {
+        // The queue hands the frozen holder's message to w.
+        brokers[w].adopt(lapsed[handedOn]);
+        lapsed[handedOn] = null;
       } else {
         void agents[w].session(sessionId).resume().result.catch(() => {});
       }
@@ -430,6 +456,11 @@ async function harness() {
       for (const holder of holders[w]) liveHolders.delete(holder);
       frozen[w] = true;
       if (leased) await sleep(leaseMs + 400);
+      // On the queue's World, the queue gives up on w's delivery; once w
+      // holds the lease, the message comes back for the next Start.
+      if (queued && holders[w].includes((await agents[w][durableInternals].lastLease(sessionId))?.holder)) {
+        lapsed[w] = brokers[w].held((input) => input.sessionId === sessionId).filter((message) => message.attempt > 0).at(-1) ?? null;
+      }
     } else if (name === "Wake") {
       frozen[w] = false;
       if (leased && renewals[w].length > 0) {
@@ -475,6 +506,7 @@ async function harness() {
     for (const entry of [...calls]) entry.end();
     await Promise.race([Promise.all(Workers.map((w) => agents[w].close().catch(() => {}))), sleep(3000)]);
     await closeAppWorlds?.();
+    await closeQueueWorlds?.();
     await rm(dir, { recursive: true, force: true });
   }
 
