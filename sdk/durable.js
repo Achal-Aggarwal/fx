@@ -763,27 +763,46 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
           // one it continues, so a competing continuation is seen.
           const after = chained ? (entry.a === null || entry.a === undefined ? 0 : Number(entry.a)) : known;
           const continues = entry.a === null || entry.a === undefined ? "null" : String(entry.a);
-          const expected = chained && inBand ? inBandAt.get(continues) : undefined;
+          let expected = chained && inBand ? inBandAt.get(continues) : undefined;
           const event = {
             eventType: "step_created",
             correlationId: `step_${ulid()}`,
             eventData: { stepName: logStep, input: encoder.encode(JSON.stringify(entry)) },
           };
           let result;
-          try {
-            result = await world.events.create(runId, event, expected === undefined ? { eventCount: after } : { eventCount: after, inBand: true, expectedSeqInBand: expected });
-          } catch (error) {
-            if (expected === undefined) throw error;
-            if (inBandSuperseded(error)) {
-              // The next read maps the head afresh.
-              inBandAt.delete(continues);
-              throw new FencedError(`another worker continued session ${runId}`);
+          for (let recounted = false; ;) {
+            try {
+              result = await world.events.create(runId, event, expected === undefined ? { eventCount: after } : { eventCount: after, inBand: true, expectedSeqInBand: expected });
+              break;
+            } catch (error) {
+              if (expected === undefined) throw error;
+              if (inBandSuperseded(error)) {
+                // The next read maps the head afresh.
+                inBandAt.delete(continues);
+                // A World counts a write after it publishes it, so a read
+                // between the two gave this head the count before its own
+                // write. When nothing else continued the head, the write goes
+                // again once at the count the World reports.
+                if (!recounted && Number.isSafeInteger(error?.seqInBand)) {
+                  const { events: since } = await newestFirst(after, false);
+                  const rivals = since.filter(({ entry: other }) => chainedKind(other.k) && (other.a ?? null) === (entry.a ?? null));
+                  // Our own earlier write of this entry landed first.
+                  const ours = rivals.find(({ entry: other }) => other.key !== undefined && other.key === entry.key && other.k === entry.k);
+                  if (ours) return ours.cursor;
+                  if (rivals.length === 0) {
+                    recounted = true;
+                    expected = error.seqInBand;
+                    continue;
+                  }
+                }
+                throw new FencedError(`another worker continued session ${runId}`);
+              }
+              // A World may refuse in-band writes on a run it stamped before
+              // it had the fence; the write goes out-of-band, as before.
+              if (!(error?.status >= 400 && error?.status < 500) || error?.status === 409) throw error;
+              inBand = false;
+              expected = undefined;
             }
-            // A World may refuse in-band writes on a run it stamped before it
-            // had the fence; the write goes out-of-band, as before.
-            if (!(error?.status >= 400 && error?.status < 500) || error?.status === 409) throw error;
-            inBand = false;
-            result = await world.events.create(runId, event, { eventCount: after });
           }
           const slot = slotOf(result.event);
           if (slot > known) known = slot;

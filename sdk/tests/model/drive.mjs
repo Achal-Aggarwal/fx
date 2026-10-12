@@ -472,7 +472,12 @@ async function harness() {
       const holder = writes[w].held.filter((entry) => entry.k === "lease").at(-1).holder;
       const before = new Set(liveHolders);
       await writes[w].releaseHeld();
-      if ((await agents[w][durableInternals].lastLease(sessionId))?.holder === holder) {
+      // A lease the World's in-band fence refused only because a count was
+      // still settling goes out again, so the claim has settled once w holds
+      // the session, holds a new write, or has let the session go.
+      const holds = async () => (await agents[w][durableInternals].lastLease(sessionId))?.holder === holder;
+      await until(async () => (await holds()) || writes[w].held.length > 0 || agents[w][durableInternals].liveWorkers() === 0);
+      if (await holds()) {
         claimed[w] = { fenced: fenced[w], epoch: expectedEpoch };
         await until(() => waiting(w) || stopped());
       } else {

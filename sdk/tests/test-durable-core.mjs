@@ -796,6 +796,41 @@ if (durabilityKind === "queue") {
     assert.equal(foldSessionLog(await second.read()).lastLease, null);
     await agent.close();
   });
+
+  test("a worker that read the head while its in-band count was settling still continues it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-fence-settle-"));
+    dirs.push(dir);
+    const { durability } = await queueWorldAt(dir, { queueLeases: true, maxDurationMs: 600_000, inBandFence: { settleMs: 300 } });
+    const agent = createAgent({ durability });
+    const internals = agent[Symbol.for("libfx.durableInternals")];
+    const session = agent.session();
+    assert.equal((await textOf(session.prompt("pi"))).result.stopReason, "end_turn");
+    for (let tries = 0; internals.liveWorkers() > 0; tries += 1) {
+      assert.ok(tries < 200, "the worker never let go");
+      await sleep(10);
+    }
+    const first = await internals.openLog(session.id);
+    const { head } = foldSessionLog(await first.read());
+    const lease = { k: "lease", a: head, holder: "wkr_first", epoch: 90, expiresAt: Date.now() + 60_000, pid: 1, host: "test" };
+    const writing = first.append(lease);
+    // A second worker reads after the lease is published, but before the
+    // World counts it.
+    const second = await internals.openLog(session.id);
+    let seen = null;
+    for (let tries = 0; seen === null; tries += 1) {
+      assert.ok(tries < 100, "the lease never showed");
+      const { head: now } = foldSessionLog(await second.read());
+      if (now !== head) seen = now;
+      else await sleep(5);
+    }
+    assert.equal(seen, await writing);
+    // Nothing else continued the lease, so the release goes through.
+    const released = await second.append({ k: "release", a: seen, holder: "wkr_first" });
+    assert.equal(foldSessionLog(await first.read()).head, released);
+    // One that continues a head another worker continued is still refused.
+    await assert.rejects(first.append({ k: "release", a: seen, holder: "wkr_first" }), (error) => error.code === "FX_FENCED");
+    await agent.close();
+  });
 }
 
 if (durabilityKind === "queue") {

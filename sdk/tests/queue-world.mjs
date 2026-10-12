@@ -109,7 +109,9 @@ function createBroker({ retryMs }) {
 // each listing, read before it, and a refusal, before anything is written,
 // of an in-band write that expects another count. A world-local with its own
 // fence keeps it. Either way it keeps what each create was asked, for tests.
-function withInBandFence(stored) {
+// `settleMs` holds an accepted write's count back that long after its event
+// is published, as world-local's count on disk lags its event.
+function withInBandFence(stored, { settleMs = 0 } = {}) {
   const own = stored.capabilities?.inBandFence === true;
   const counts = new Map();
   const seqs = new Map();
@@ -137,6 +139,7 @@ function withInBandFence(stored) {
       }
       const result = await stored.events.create(runId, data, params);
       noteSeq(runId, result.event);
+      if (settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs));
       const allocated = result.event ? 1 : 0;
       counts.set(runId, current + allocated);
       return { ...result, allocated };
@@ -156,14 +159,14 @@ function withInBandFence(stored) {
 
 /**
  * The durability, a World at `dir` with that queue passed to world(), and its
- * broker. With `inBandFence`, the World has the in-band writer fence, and
- * `fence.creates` holds what each create was asked.
+ * broker. With `inBandFence`, `true` or `{ settleMs }`, the World has the
+ * in-band writer fence, and `fence.creates` holds what each create was asked.
  */
 export async function queueWorldAt(dir, { retryMs = 20, inBandFence = false, ...options } = {}) {
   const stored = createWorld({ dataDir: dir, recoverActiveRuns: false });
   await stored.start();
   const broker = createBroker({ retryMs });
-  const fence = inBandFence ? withInBandFence(stored) : null;
+  const fence = inBandFence ? withInBandFence(stored, inBandFence === true ? {} : inBandFence) : null;
   const instance = {
     ...stored,
     ...(fence ? { events: fence.events, capabilities: fence.capabilities } : {}),
