@@ -251,7 +251,7 @@ fn requestAuthHeaders(alloc: Allocator, auth: stream_provider.CredentialLease) !
     return switch (auth) {
         .host_managed => .{},
         .direct => |direct| .{
-            .authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{direct.secret_bytes}),
+            .authorization = try alloc.print("Bearer {s}", .{direct.secret_bytes}),
             .account_id = direct.account_id,
             .include_subscription_headers = true,
         },
@@ -918,8 +918,7 @@ test "xAI Grok request deadline closes slow headers and stalled SSE" {
         var fixture = try TestResponseFixture.init(mode);
         defer fixture.deinit();
         try fixture.start();
-        const url = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const url = try std.testing.allocator.print(
             "http://127.0.0.1:{d}/responses",
             .{fixture.port()},
         );
@@ -962,8 +961,7 @@ test "xAI Grok error-body reader accepts the exact bound and replaces one beyond
         var fixture = try TestResponseFixture.init(mode);
         defer fixture.deinit();
         try fixture.start();
-        const url = try std.fmt.allocPrint(
-            std.testing.allocator,
+        const url = try std.testing.allocator.print(
             "http://127.0.0.1:{d}/responses",
             .{fixture.port()},
         );

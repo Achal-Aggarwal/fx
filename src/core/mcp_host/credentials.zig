@@ -31,7 +31,7 @@ pub const Store = struct {
 
     /// The Keychain on macOS unless it is turned off or unusable, else the file.
     pub fn detect(alloc: Allocator, home: []const u8) Store {
-        const keychain = builtin.os.tag == .macos and !native_keychain.isDisabled() and
+        const keychain = builtin.target.os.tag == .macos and !native_keychain.isDisabled() and
             (native_keychain.userDefaultKeychainAvailable(alloc) catch false);
         return .{ .home = home, .backend = if (keychain) .keychain else .file };
     }
