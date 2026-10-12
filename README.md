@@ -72,8 +72,8 @@ fx ask --json "summarize the failing tests" | jq -r .final_output
 
 | Surface | Use it for |
 | --- | --- |
-| `fx ask` | One request from a script or CI job. `--json` returns structured output, and `--resume` continues a saved session. |
-| `fx acp` | Editors and other [Agent Client Protocol](https://fx.sh/docs/using-fx/acp) clients, over stdio. |
+| <code>fx&nbsp;ask</code> | One request from a script or CI job. `--json` returns structured output, and `--resume` continues a saved session. |
+| <code>fx&nbsp;acp</code> | Editors and other [Agent Client Protocol](https://fx.sh/docs/using-fx/acp) clients, over stdio. |
 | [libfx](https://www.npmjs.com/package/libfx) | The agent core as a JavaScript library, built as a native Node.js addon and as WebAssembly. `createFxAgent()` runs an agent with your own tools, MCP clients, and skills, and `createFxTerminal()` embeds the fx terminal. |
 
 The [libfx README](sdk/README.md) and the [libfx docs](https://fx.sh/docs/lib) cover the API. The WebAssembly build is experimental.
@@ -131,18 +131,19 @@ Test your changes with the freshly built `./zig-out/bin/fx`, because a bare `fx`
 The source is laid out like this:
 
 ```text
-src/
-  main.zig    entry point that wires everything together
-  core/       agent loop, sessions, config, permissions, skills
-  builtins/   built-in tool specs, providers, and the system prompt
-  tools/      built-in tools: files, shell, web, skills, subagents
-  ui/         terminal rendering and input
-  gateway/    model provider transport
-  mcp/        MCP client
-  acp/        Agent Client Protocol server
-sdk/          libfx, the JavaScript library
-tests/        end-to-end tests and model evals
-benchmarks/   startup, memory, and latency benchmarks
+fx/
+├── src/
+│   ├── main.zig     entry point that wires everything together
+│   ├── core/        agent loop, sessions, config, permissions, skills
+│   ├── builtins/    built-in tool specs, providers, and the system prompt
+│   ├── tools/       built-in tools: files, shell, web, skills, subagents
+│   ├── ui/          terminal rendering and input
+│   ├── gateway/     model provider transport
+│   ├── mcp/         MCP client
+│   └── acp/         Agent Client Protocol server
+├── sdk/             libfx, the JavaScript library
+├── tests/           end-to-end tests and model evals
+└── benchmarks/      startup, memory, and latency benchmarks
 ```
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before you open a pull request. It covers verification, CI, and PR labels. If a coding agent is helping you, point it at [For coding agents](#for-coding-agents).
