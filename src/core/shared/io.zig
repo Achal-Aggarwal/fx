@@ -449,6 +449,7 @@ pub fn cloneEnvironMap(
         try map.putPosixBlock(.{ .slice = entries });
         return map;
     }
+    if (comptime builtin.is_test) return std.process.Environ.createMap(std.testing.environ, alloc);
     return error.EnvironmentUnavailable;
 }
 
@@ -1137,6 +1138,26 @@ test "environMap returns borrowed process environment map" {
     const borrowed = environMap().?;
     try std.testing.expectEqualStrings("present", borrowed.get("FX_CORE2_IO_TEST").?);
     global_environ = null;
+}
+
+test "cloneEnvironMap falls back to the test runner environment" {
+    const previous_map = global_environ;
+    const previous_block = global_environ_block;
+    const previous_raw = global_raw_environ;
+    global_environ = null;
+    global_environ_block = null;
+    global_raw_environ = null;
+    defer {
+        global_environ = previous_map;
+        global_environ_block = previous_block;
+        global_raw_environ = previous_raw;
+    }
+
+    var expected = try std.process.Environ.createMap(std.testing.environ, std.testing.allocator);
+    defer expected.deinit();
+    var cloned = try cloneEnvironMap(std.testing.allocator);
+    defer cloned.deinit();
+    try std.testing.expectEqualStrings(expected.get("PATH").?, cloned.get("PATH").?);
 }
 
 test "cloneEnvironMap owns an independent copy of map environment state" {

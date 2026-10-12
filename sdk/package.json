@@ -70,6 +70,10 @@
       "types": "./types/chatgpt.d.ts",
       "default": "./chatgpt-sign-in.js"
     },
+    "./grok": {
+      "types": "./types/grok.d.ts",
+      "default": "./grok-sign-in.js"
+    },
     "./mcp": {
       "types": "./types/mcp.d.ts",
       "default": "./mcp.js"
@@ -97,8 +101,13 @@
     "types/*.d.cts",
     "wasm-module.js",
     "core-output.js",
+    "subscription.js",
+    "oauth.js",
     "chatgpt.js",
     "chatgpt-sign-in.js",
+    "grok.js",
+    "grok-sign-in.js",
+    "custom-provider.js",
     "fetch-cleanup.js",
     "mcp.js",
     "skills.js",

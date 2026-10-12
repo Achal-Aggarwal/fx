@@ -1,5 +1,6 @@
 const std = @import("std");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
+const host_stream = @import("host_stream_provider.zig");
 const builtin_gateway = @import("../builtins/gateway.zig");
 
 const Allocator = std.mem.Allocator;
@@ -74,8 +75,9 @@ fn fetch(
     );
     if (response_len < 0) return .{ .failure = .{ .category = .transport, .retryable = true } };
     if (response_len > response.len) return .{ .failure = .{ .category = .resource_exhausted } };
-    if (status != 200) {
-        return .{ .failure = model_catalog.failureForHttpStatus(@fromBackingInt(@intCast(status))) };
+    const http_status = host_stream.httpStatus(status) orelse return .{ .failure = .{ .category = .transport } };
+    if (http_status != .ok) {
+        return .{ .failure = model_catalog.failureForHttpStatus(http_status) };
     }
 
     const catalog = builtin_gateway.parseModelCatalogForView(
