@@ -938,6 +938,17 @@ if (durabilityKind !== "memory") {
         // The turn went on at once, and the model was told the call may have
         // partly run.
         assert.ok(JSON.stringify(requests.at(-1)).includes("may have partly run"), "the model hears the call may have run");
+        // Its viewers see the call end as the model does, once the turn
+        // resumed. The dead worker's `tool_start` may not have landed.
+        const lines = await readLines(session.stream(0), 64);
+        const ended = lines.filter((line) => line.type === "tool_end" && line.name === "send");
+        assert.equal(ended.length, 1, "the call ended once");
+        assert.equal(ended[0].isError, true);
+        const answer = toolResults(requests.at(-1)).find((part) => part.toolName === "send");
+        assert.equal(ended[0].id, answer?.toolCallId, "the end names the call the model heard about");
+        assert.ok(JSON.stringify(answer).includes(ended[0].content), `the line says what the model heard: ${ended[0].content}`);
+        assert.ok(lines.indexOf(ended[0]) > lines.findIndex((line) => line.type === "turn_resume"), "the end comes after the turn resumed");
+        for (const start of lines.filter((line) => line.type === "tool_start" && line.name === "send")) assert.equal(start.id, ended[0].id);
       } else {
         // The last request shows how the resumed turn saw the call, if not.
         assert.equal(reran, 1, `the idempotent call ran again; the model last saw ${JSON.stringify(requests.at(-1)).slice(-600)}`);

@@ -151,7 +151,7 @@ That's all. `prompt()` sends each turn to Vercel Queues, and this route runs it.
 
 ### Tools with side effects
 
-When a process dies during a tool call, libfx can't know whether the call finished. Mark a tool `idempotent: true` if running it twice is harmless, like a lookup, and it runs again when the turn continues. Any other tool never runs twice on its own: the model gets an error saying the call may have partly run, and decides whether to check, try again or ask the user.
+When a process dies during a tool call, libfx can't know whether the call finished. Mark a tool `idempotent: true` if running it twice is harmless, like a lookup, and it runs again when the turn continues. Any other tool never runs twice on its own: the model gets an error saying the call may have partly run, and decides whether to check, try again or ask the user. The turn's events end the call with that error too, as a `tool_end` with `isError: true`.
 
 Each call also gets an `executionId` that stays the same when the call runs again. Pass it to the service your tool calls as an idempotency key, and a repeated call won't change anything twice.
 
