@@ -538,8 +538,10 @@ pub fn composeHintRow(
         ""
     else if (danger_text.len > 0)
         danger_text
+    else if (ctx.upgrade_status.len > 0)
+        ctx.upgrade_status
     else
-        ctx.upgrade_status;
+        ctx.mcp_status;
     const right_width = display_width.visibleWidth(right_text);
     const danger_visible = danger_text.len > 0 and right_text.ptr == danger_text.ptr;
     const left_width: u16 = if (!danger_visible and right_width > 0 and width_usize > right_width)

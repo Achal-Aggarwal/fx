@@ -14,7 +14,7 @@ const version_lookup = @import("provider_versions.zig");
 const max_catalog_models: usize = 128;
 pub const title_model = "grok-4.5";
 const max_model_id_bytes: usize = 256;
-const max_catalog_bytes: usize = 1024 * 1024;
+pub const max_catalog_bytes: usize = 1024 * 1024;
 const fetch_timeout_ms: i64 = 30_000;
 const default_models_endpoint = "https://cli-chat-proxy.grok.com/v1/models";
 const default_modalities_endpoint = "https://api.x.ai/v1/language-models";
@@ -133,7 +133,17 @@ fn fetchCatalogForProvider(
         debug_trace.logf("catalog", "Grok modality enrichment unavailable status={d}", .{@intFromEnum(metadata.status)});
         break :blk null;
     } else null;
-    const catalog = parseCatalog(alloc, response.body, modalities_json) catch |err| {
+    return catalogFromBodies(alloc, response.body, modalities_json);
+}
+
+/// The catalog from the subscription proxy's model list and, when available,
+/// xAI's modality metadata. The result owns its catalog.
+pub fn catalogFromBodies(
+    alloc: std.mem.Allocator,
+    subscription_json: []const u8,
+    modalities_json: ?[]const u8,
+) std.mem.Allocator.Error!model_catalog.ProviderResult {
+    const catalog = parseCatalog(alloc, subscription_json, modalities_json) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return .{ .failure = .{ .category = .malformed_response, .http_status = .ok } };
     };
@@ -267,7 +277,8 @@ fn fetchCatalogResponse(
     );
 }
 
-fn modelsUrl(alloc: std.mem.Allocator) ![]u8 {
+/// The subscription model list, or a loopback test endpoint. Caller owns it.
+pub fn modelsUrl(alloc: std.mem.Allocator) ![]u8 {
     const base = io_mod.getenv(e2e_models_endpoint_env) orelse default_models_endpoint;
     if (io_mod.getenv(e2e_models_endpoint_env) != null and !gateway_client.isLoopbackHttpUrl(base)) {
         return error.InvalidE2EGrokModelsEndpoint;
@@ -275,7 +286,8 @@ fn modelsUrl(alloc: std.mem.Allocator) ![]u8 {
     return alloc.dupe(u8, base);
 }
 
-fn modalitiesUrl(alloc: std.mem.Allocator) ![]u8 {
+/// xAI's modality metadata, or a loopback test endpoint. Caller owns it.
+pub fn modalitiesUrl(alloc: std.mem.Allocator) ![]u8 {
     const base = io_mod.getenv(e2e_modalities_endpoint_env) orelse default_modalities_endpoint;
     if (io_mod.getenv(e2e_modalities_endpoint_env) != null and !gateway_client.isLoopbackHttpUrl(base)) {
         return error.InvalidE2EGrokModalitiesEndpoint;

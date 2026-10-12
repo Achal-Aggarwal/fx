@@ -1676,12 +1676,30 @@ const App = struct {
 
     /// The composer's text is the menu's filter.
     pub fn mcpHostMenuKey(self: *App, key: mcp_host.menu.Key) !void {
+        const was = self.mcp.host_menu.screen;
         try self.mcp.hostMenuKey(key, self.input_runtime.edit_state.input.items, io_mod.getenv("HOME") orelse "", self.workspace_root);
+        try self.mcp.swapHostMenuFilter(was, self.alloc, &self.input_runtime.edit_state);
         self.shell.render_requests.request(.footer);
     }
 
+    pub fn mcpHostStatuses(self: *App, alloc: Allocator) Allocator.Error!?[]mcp_host.Status {
+        return self.mcp.hostStatuses(alloc);
+    }
+
+    pub fn refreshMcpHostStatus(self: *App) void {
+        if (self.mcp.refreshHostStatus(io_mod.milliTimestamp())) RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
+    }
+
+    pub fn startMcpHostServers(self: *App) void {
+        self.mcp.startHostServers();
+    }
+
     pub fn refreshMcpHostMenu(self: *App) void {
-        if (self.mcp.refreshHostMenu()) self.shell.render_requests.request(.footer);
+        const was = self.mcp.host_menu.screen;
+        const changed = self.mcp.refreshHostMenu(self.input_runtime.edit_state.input.items);
+        self.mcp.swapHostMenuFilter(was, self.alloc, &self.input_runtime.edit_state) catch |err|
+            debug_trace.logf("mcp", "MCP menu kept the tool filter in the composer err={s}", .{@errorName(err)});
+        if (changed) self.shell.render_requests.request(.footer);
     }
 
     pub fn applyMcpHostReload(self: *App) !void {
@@ -5035,4 +5053,6 @@ test {
     _ = @import("gateway/host_stream_provider.zig");
     _ = @import("gateway/host_model_catalog.zig");
     _ = @import("gateway/host_openai_codex.zig");
+    _ = @import("gateway/host_xai_grok.zig");
+    _ = @import("gateway/host_chat_completions.zig");
 }

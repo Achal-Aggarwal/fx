@@ -35,7 +35,7 @@ pub const Lookup = struct {
     fetch: *const fn (?*anyopaque, Allocator, Provider) Error!Version,
 };
 
-const Cached = struct {
+pub const Cached = struct {
     version: Version,
     checked_at_ms: i64,
 
@@ -45,7 +45,9 @@ const Cached = struct {
     }
 };
 
-const Cache = struct {
+/// Where resolved versions are kept. Defaults to the profile's cache files; a
+/// host runtime without a profile passes its own.
+pub const Cache = struct {
     context: ?*anyopaque = null,
     load: *const fn (?*anyopaque, Allocator, Provider) anyerror!?Cached = loadCache,
     save: *const fn (?*anyopaque, Allocator, Provider, Cached) anyerror!void = saveCache,
@@ -55,7 +57,7 @@ pub fn resolve(alloc: Allocator, provider: Provider, lookup: Lookup) Error!Versi
     return resolveWithCache(alloc, provider, lookup, .{}, io_mod.milliTimestamp());
 }
 
-fn resolveWithCache(alloc: Allocator, provider: Provider, lookup: Lookup, cache: Cache, now_ms: i64) Error!Version {
+pub fn resolveWithCache(alloc: Allocator, provider: Provider, lookup: Lookup, cache: Cache, now_ms: i64) Error!Version {
     const cached = cache.load(cache.context, alloc, provider) catch |err| blk: {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("models", "provider version cache unreadable provider={t} err={s}", .{ provider, @errorName(err) });
