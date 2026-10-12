@@ -6593,9 +6593,10 @@ fn containsIgnoringSgr(haystack: []const u8, needle: []const u8) bool {
 
 /// Skips an argument row when the tool heading already shows its value. The
 /// heading shows only the status's first line, so later lines never count.
-/// The match is by substring, so it applies only to statuses that fit one
-/// row: inside a long wrapped heading, a short value such as `chars: "y"` can
-/// match by coincidence.
+/// The match is by substring, so it can hit by coincidence: a short value
+/// such as `chars: "y"` occurs inside many commands. Limiting it to statuses
+/// that fit one row keeps it from hiding more than it did when headings were
+/// clipped; wrapped headings are longer and would match more often.
 fn argumentVisibleInToolHeading(
     entries: []const transcript_blocks.TranscriptEntry,
     entry_id: u32,
