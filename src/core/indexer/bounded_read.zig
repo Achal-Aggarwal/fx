@@ -44,21 +44,27 @@ fn readWith(
     max_bytes: usize,
     final_symlink: io_mod.FinalSymlinkPolicy,
 ) Allocator.Error!Outcome {
-    var file = io_mod.openExistingReadOnlyRegularFile(dir, sub_path, final_symlink) catch |err| return switch (err) {
+    const file = io_mod.openExistingReadOnlyRegularFile(dir, sub_path, final_symlink) catch |err| return switch (err) {
         error.FileNotFound, error.NotDir => .missing,
         else => .{ .unavailable = @errorName(err) },
     };
     defer file.close(io_mod.getIo());
     if (try readSized(alloc, file, max_bytes)) |outcome| return outcome;
-    // The file grew after the stat, or reports no size: read it as a stream.
-    // The reader reports a stream that fills its limit as too long, so allow
-    // one extra byte to accept a file of exactly `max_bytes`.
-    const data = io_mod.readFileToEnd(alloc, &file, max_bytes +| 1) catch |err| return switch (err) {
+    // The file holds more than its stat said: it grew, or its file system
+    // reports no size, as Linux does for /proc. A positional reader would stop
+    // at the stat size, so read it as a stream, which never trusts one.
+    var read_buffer: [8192]u8 = undefined;
+    var reader = file.readerStreaming(io_mod.getIo(), &read_buffer);
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(alloc);
+    // A stream that fills its limit reads as too long, so allow one extra byte
+    // to accept a file of exactly `max_bytes`.
+    reader.interface.appendRemaining(alloc, &content, .limited(max_bytes +| 1)) catch |err| return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.StreamTooLong => .{ .unavailable = "too_large" },
-        else => .{ .unavailable = @errorName(err) },
+        error.ReadFailed => .{ .unavailable = if (reader.err) |read_err| @errorName(read_err) else @errorName(err) },
     };
-    return .{ .content = data };
+    return .{ .content = try content.toOwnedSlice(alloc) };
 }
 
 /// Reads the whole file into a buffer sized from its stat, so a small file
