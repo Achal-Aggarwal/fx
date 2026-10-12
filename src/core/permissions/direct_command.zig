@@ -433,7 +433,7 @@ fn environmentForProfile(
 }
 
 test "direct commands receive fx agent environment" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return;
 
     const stages = [_]command_effect.DirectStage{.{
         .executable = "/usr/bin/env",

@@ -43,7 +43,7 @@ pub const Transport = struct {
 /// A host can report any `u16`, and `std.http.Status` cannot hold most of them.
 pub fn httpStatus(code: u16) ?std.http.Status {
     if (code < 100 or code > 599) return null;
-    return @enumFromInt(code);
+    return @fromBackingInt(@intCast(code));
 }
 
 pub const ProviderContext = struct {
@@ -283,7 +283,7 @@ test "host statuses outside 100 to 599 are not HTTP statuses" {
     }
     try std.testing.expectEqual(@as(?std.http.Status, .@"continue"), httpStatus(100));
     try std.testing.expectEqual(@as(?std.http.Status, .ok), httpStatus(200));
-    try std.testing.expectEqual(@as(u16, 599), @intFromEnum(httpStatus(599).?));
+    try std.testing.expectEqual(@as(u16, 599), @backingInt(httpStatus(599).?));
 }
 
 test "host provider signals logical consumption only after valid uncancelled completion" {

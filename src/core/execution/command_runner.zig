@@ -1285,7 +1285,7 @@ fn executeProcessWithInput(
         .stderr = .pipe,
         .cwd = .{ .path = cwd },
         .environ_map = &environment,
-        .pgid = if (isolate_process_group and builtin.os.tag != .windows and builtin.os.tag != .wasi) 0 else null,
+        .pgid = if (isolate_process_group and builtin.target.os.tag != .windows and builtin.target.os.tag != .wasi) 0 else null,
     });
     if (child.stdin) |input| {
         input.close(io_mod.getIo());
@@ -3580,7 +3580,7 @@ test "commands receive fx agent environment" {
 }
 
 test "agent environment preserves the supplied environment without mutating it" {
-    if (builtin.os.tag != .macos and builtin.os.tag != .linux) return error.SkipZigTest;
+    if (builtin.target.os.tag != .macos and builtin.target.os.tag != .linux) return error.SkipZigTest;
 
     var environment = std.process.Environ.Map.init(std.testing.allocator);
     defer environment.deinit();
