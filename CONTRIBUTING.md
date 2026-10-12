@@ -209,11 +209,25 @@ Update the documentation in the same pull request as the behavior it describes:
 - `sdk/README.md` documents libfx. Update it when libfx's public behavior or setup changes, as [sdk/AGENTS.md](sdk/AGENTS.md) describes.
 - Update this file when build steps, configuration, or collaboration rules change.
 
-The user manual at [fx.sh/docs](https://fx.sh/docs) lives in `vercel-labs/fx-web`, an internal Vercel repository. A page's source is `apps/marketing/app/(site)/(docs)/docs/<path>/page.mdx`, where `<path>` is the part of the page's URL after `fx.sh/docs/`. Maintainers update the page in a companion fx-web pull request and link it from theirs. Outside contributors name the page in the pull request description, and a maintainer updates it.
-
 Change `README.md` only when one of its statements becomes false, or when a change adds a capability as broad as the ones in its feature list. A new option, command, or environment variable belongs in `--help` and the manual.
 
 Don't edit `CHANGELOG.md` or the version in `src/main.zig`. Maintainers write the changelog when they prepare a release.
+
+### Changes to the manual
+
+The user manual at [fx.sh/docs](https://fx.sh/docs) is built from a private repository, so only maintainers can edit it. When your change makes a manual page wrong or incomplete:
+
+- Maintainers update the page in a companion pull request and link it from theirs.
+- Outside contributors add a `## Docs` section to the pull request description with the exact change each affected page needs: the page URL, the section, and the text to add, replace, or remove. A maintainer makes the change in the manual.
+
+For example:
+
+```md
+## Docs
+
+- https://fx.sh/docs/configure-fx/permissions, "Change the mode": replace "<current text>" with "<new text>".
+- https://fx.sh/docs/using-fx/sessions: add "<new paragraph>" after the first paragraph.
+```
 
 ## Releases
 
