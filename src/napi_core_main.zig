@@ -4,6 +4,7 @@ const acp_server = @import("acp/server.zig");
 const jsonrpc = @import("acp/jsonrpc.zig");
 const gateway_provider = @import("core/gateway/gateway_provider.zig");
 const provider_set = @import("core/gateway/provider_set.zig");
+const stream_provider = @import("core/agent/stream_provider.zig");
 const agent_steps = @import("core/config/agent_steps.zig");
 const context_contract = @import("core/workspace/context_contract.zig");
 const host = @import("core/hosts/host.zig");
@@ -31,9 +32,23 @@ const max_input_bytes = 8 * 1024 * 1024;
 const max_output_bytes = 8 * 1024 * 1024;
 const max_output_message_bytes = 64 * 1024 * 1024;
 const max_fetch_request_bytes = 8 * 1024 * 1024;
-/// Room kept beside a request body for its method, URL, and headers, which
-/// share the bridge's budget with it.
-const fetch_request_metadata_reserve = 64 * 1024;
+/// The largest request body a provider sends over the fetch bridge: its
+/// budget less room for the request's method, URL, and headers.
+const max_bridge_request_body_bytes = max_fetch_request_bytes - 64 * 1024;
+
+/// `provider` with its requests fit to the fetch bridge, so they leave out
+/// their oldest images instead of failing.
+fn bridgeBound(provider: stream_provider.Provider) stream_provider.Provider {
+    var bound = provider;
+    bound.max_request_bytes = max_bridge_request_body_bytes;
+    return bound;
+}
+
+fn configuredBridgeBundle(raw: ?*anyopaque, definition: *const configured_provider.Definition) provider_set.Bundle {
+    var bundle = host_chat_completions.bundle(raw, definition);
+    if (bundle.agent_stream) |stream| bundle.agent_stream = bridgeBound(stream);
+    return bundle;
+}
 const max_fetch_response_bytes = 8 * 1024 * 1024;
 // One attachment holds one prompt image or one kernel checkpoint, the larger.
 const max_attachment_bytes = agent_checkpoint.max_checkpoint_bytes;
@@ -678,23 +693,23 @@ const Runtime = struct {
             .presentation = builtin_gateway.provider_bundle.presentation,
             .auth_strategy = .vercel,
             .fallback_model_capabilities_fn = builtin_gateway.provider_bundle.fallback_model_capabilities_fn,
-            .agent_stream = host_stream_provider.provider(&self.stream_context),
+            .agent_stream = bridgeBound(host_stream_provider.provider(&self.stream_context)),
             .model_catalog = @import("gateway/host_model_catalog.zig").provider(&self.stream_context.transport),
         });
         providers.codex = .{
             .presentation = provider_catalog.find(.codex),
             .auth_strategy = .chatgpt,
-            .agent_stream = host_openai_codex.provider(&self.codex_context),
+            .agent_stream = bridgeBound(host_openai_codex.provider(&self.codex_context)),
             .model_catalog = host_openai_codex.modelCatalogProvider(&self.codex_context),
         };
         providers.grok = .{
             .presentation = provider_catalog.find(.grok),
             .auth_strategy = .grok,
-            .agent_stream = host_xai_grok.provider(&self.grok_context),
+            .agent_stream = bridgeBound(host_xai_grok.provider(&self.grok_context)),
             .model_catalog = host_xai_grok.modelCatalogProvider(&self.grok_context),
         };
         if (self.custom_context) |*context| {
-            providers.configured_fn = host_chat_completions.bundle;
+            providers.configured_fn = configuredBridgeBundle;
             providers.configured_context = context;
         }
         acp_server.runWithTransport(
@@ -1053,8 +1068,6 @@ fn createRuntime(env: c.napi_env, options: c.napi_value) CreateError!*Runtime {
         .next_fn = FetchBridge.next,
         .close_fn = FetchBridge.close,
         .consumed_fn = FetchBridge.markConsumed,
-        // Requests leave out their oldest images to fit, instead of failing.
-        .max_request_bytes = max_fetch_request_bytes - fetch_request_metadata_reserve,
     });
     runtime.codex_context = .{ .transport = runtime.stream_context.transport };
     runtime.grok_context = .{ .transport = runtime.stream_context.transport };
