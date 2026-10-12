@@ -1015,6 +1015,14 @@ pub fn handlePrompt(
         }
     }
 
+    // A v2 prompt opens its turn on disk before the model is asked, so a full
+    // or read-only disk fails the prompt without a model call.
+    if (session.v2) |v2| {
+        session.session_write_mutex.lockUncancelable(io_mod.getIo());
+        defer session.session_write_mutex.unlock(io_mod.getIo());
+        try v2.beginTurn();
+    }
+
     if (comptime !host_target.is_wasm) connectHostChannelServers(session);
 
     var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(state), captured_mode, .{

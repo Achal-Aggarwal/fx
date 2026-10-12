@@ -1214,8 +1214,10 @@ pub const Session = struct {
         self.startedTurn();
     }
 
-    /// Opens a subagent child's turn as its work starts: a child streams
-    /// nothing, and its tools may store bodies before the commit (D44).
+    /// Opens the turn as its work starts. A subagent child streams nothing,
+    /// and its tools may store bodies before the commit (D44); an ACP prompt
+    /// opens it before the model is asked, so a disk that cannot take the
+    /// turn fails the prompt first.
     pub fn beginTurn(self: *Session) !void {
         self.mutex.lockUncancelable(io_mod.getIo());
         defer self.mutex.unlock(io_mod.getIo());
