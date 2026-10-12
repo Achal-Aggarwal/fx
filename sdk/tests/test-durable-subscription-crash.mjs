@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-// A durable Codex session survives a SIGKILL. A child process runs a turn on a
-// local() durability and is killed during the model's reply or during a tool
-// call; a fresh agent here resumes the turn on the credentials its own
-// credentials() supplies. No ChatGPT token reaches the saved session. No network.
+// A durable subscription session (Codex on a ChatGPT plan, Grok on a Grok plan)
+// survives a SIGKILL. A child process runs a turn on a local() durability and
+// is killed during the model's reply or during a tool call; a fresh agent here
+// resumes the turn on the credentials its own credentials() supplies. No
+// subscription token reaches the saved session. No network.
 //
-//   node test-durable-codex-crash.mjs [native|wasm]
+//   node test-durable-subscription-crash.mjs [native|wasm]
 import { strict as assert } from "node:assert";
 import { spawn } from "node:child_process";
 import { mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
@@ -17,7 +18,7 @@ import { local } from "../durable/local.mjs";
 const args = process.argv.slice(2);
 const childAt = args.indexOf("--child");
 const backend = args[0] && args[0] !== "--child" ? args[0] : "native";
-if (!new Set(["native", "wasm"]).has(backend)) throw new Error("usage: test-durable-codex-crash.mjs [native|wasm]");
+if (!new Set(["native", "wasm"]).has(backend)) throw new Error("usage: test-durable-subscription-crash.mjs [native|wasm]");
 if (backend === "wasm" && !supportsJspi()) {
   console.error("Node JSPI is disabled. Run with --experimental-wasm-jspi");
   process.exit(2);
@@ -31,21 +32,54 @@ const backendOptions = {
 };
 
 const accountId = "acct-crash";
-function jwt(label) {
+function codexJwt(label) {
   const part = (value) => Buffer.from(JSON.stringify(value)).toString("base64url");
   return `${part({ alg: "none" })}.${part({ exp: Math.floor(Date.now() / 1000) + 864000, "https://api.openai.com/auth": { chatgpt_account_id: accountId }, label })}.sig`;
 }
+
+// What differs between the subscription providers: the fake endpoints besides
+// the reply, the token shape, and the headers that carry session and account.
+const providers = {
+  codex: {
+    label: "Codex",
+    model: "gpt-6.1-sol",
+    token: codexJwt,
+    credentials: (token) => ({ accessToken: token, refreshToken: "rt-crash" }),
+    replyUrl: "https://chatgpt.com/backend-api/codex/responses",
+    sessionHeader: "session-id",
+    accountHeader: "chatgpt-account-id",
+    serve(url) {
+      if (url === "https://registry.npmjs.org/@openai/codex/latest") return Response.json({ version: "0.162.1" });
+      if (url.startsWith("https://chatgpt.com/backend-api/codex/models")) {
+        return Response.json({ models: [
+          { slug: "gpt-6.1-sol", visibility: "list", supported_in_api: true, priority: 1, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
+          { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, priority: 2, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
+        ] });
+      }
+      return null;
+    },
+  },
+  grok: {
+    label: "Grok",
+    model: "grok-4.5",
+    token: (label) => `at-${label}`,
+    credentials: (token) => ({ accessToken: token, refreshToken: "rt-crash", accountId, expiresAt: Date.now() + 6 * 3600 * 1000 }),
+    replyUrl: "https://cli-chat-proxy.grok.com/v1/responses",
+    sessionHeader: "x-grok-conv-id",
+    accountHeader: "x-grok-user-id",
+    serve(url) {
+      if (url === "https://x.ai/cli/stable") return new Response("1.0.50\n");
+      if (url === "https://cli-chat-proxy.grok.com/v1/models") {
+        return Response.json({ data: [{ id: "grok-4.5", model: "grok-4.5", api_backend: "responses", context_window: 500000, supports_reasoning_effort: true, reasoning_efforts: [{ value: "low" }] }] });
+      }
+      if (url === "https://api.x.ai/v1/language-models") return Response.json({ models: [] });
+      return null;
+    },
+  },
+};
 // The dying process and the resuming one hold different tokens, so a request
 // can show which process authorized it.
-const childToken = jwt("child-process");
-const parentToken = jwt("resuming-process");
-
-const models = {
-  models: [
-    { slug: "gpt-6.1-sol", visibility: "list", supported_in_api: true, priority: 1, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
-    { slug: "gpt-5.6-luna", visibility: "list", supported_in_api: true, priority: 2, supported_reasoning_levels: [{ effort: "low" }], additional_speed_tiers: [], input_modalities: ["text"], context_window: 272000 },
-  ],
-};
+const tokensFor = (spec) => ({ child: spec.token("child-process"), parent: spec.token("resuming-process") });
 const event = (value) => `data: ${JSON.stringify(value)}\n\n`;
 const textReply = (text) =>
   event({ type: "response.output_item.added", output_index: 0, item: { type: "message" } }) +
@@ -56,17 +90,17 @@ const lookupCall =
   event({ type: "response.function_call_arguments.delta", output_index: 0, delta: JSON.stringify({ key: "order-7" }) }) +
   event({ type: "response.completed", response: { status: "completed", usage: { input_tokens: 5, output_tokens: 2 } } });
 
-/** A fake Codex. `holdReply` streams the first event of a reply and then never finishes it. */
-function codex({ holdReply = false, onReply } = {}) {
+/** A fake provider. `holdReply` streams the first event of a reply and then never finishes it. */
+function fakeProvider(spec, { holdReply = false, onReply } = {}) {
   const log = [];
   const fetch = async (input, init = {}) => {
     const url = String(input?.url ?? input);
     const method = (init.method ?? "GET").toUpperCase();
     const body = init.body === undefined ? undefined : typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body);
     log.push({ method, url, headers: new Headers(init.headers), body });
-    if (url === "https://registry.npmjs.org/@openai/codex/latest") return Response.json({ version: "0.162.1" });
-    if (url.startsWith("https://chatgpt.com/backend-api/codex/models")) return Response.json(models);
-    if (url === "https://chatgpt.com/backend-api/codex/responses" && method === "POST") {
+    const served = spec.serve(url);
+    if (served) return served;
+    if (url === spec.replyUrl && method === "POST") {
       const payload = JSON.parse(body);
       const sawLookup = JSON.stringify(payload.input).includes("function_call_output");
       const wantsLookup = JSON.stringify(payload.input).includes("use lookup");
@@ -87,15 +121,15 @@ function codex({ holdReply = false, onReply } = {}) {
   return { fetch, log };
 }
 
-function agentOptions(dir, { fetch, token, asked, lookupRuns, lookupStarted, events }) {
+function agentOptions(dir, spec, { fetch, token, asked, lookupRuns, lookupStarted, events }) {
   return {
     ...backendOptions,
     ...(events ? { onEvent: (event) => events.push(event) } : {}),
     durability: local({ dir }),
-    provider: "codex",
-    model: "gpt-6.1-sol",
+    provider: spec === providers.codex ? "codex" : "grok",
+    model: spec.model,
     fetch,
-    credentials: (request) => { asked?.push(request.sessionId); return { accessToken: token, refreshToken: "rt-crash" }; },
+    credentials: (request) => { asked?.push(request.sessionId); return spec.credentials(token); },
     tools: [{
       name: "lookup",
       description: "Looks up an order",
@@ -117,13 +151,14 @@ function agentOptions(dir, { fetch, token, asked, lookupRuns, lookupStarted, eve
 
 // The child: start a turn, report the session once the crash point is reached, wait to be killed.
 if (childAt !== -1) {
-  const [dir, phase] = args.slice(childAt + 1);
+  const [dir, phase, provider] = args.slice(childAt + 1);
+  const spec = providers[provider];
   let reached;
   const crashPoint = new Promise((resolveReached) => { reached = resolveReached; });
-  const fake = codex({ holdReply: phase === "reply", onReply: () => { if (phase === "reply") reached(); } });
-  const agent = createFxAgent(agentOptions(dir, {
+  const fake = fakeProvider(spec, { holdReply: phase === "reply", onReply: () => { if (phase === "reply") reached(); } });
+  const agent = createFxAgent(agentOptions(dir, spec, {
     fetch: fake.fetch,
-    token: childToken,
+    token: tokensFor(spec).child,
     ...(phase === "tool" ? { lookupStarted: () => reached() } : {}),
   }));
   const turn = agent.session().prompt(phase === "tool" ? "use lookup for order-7" : "say hello");
@@ -155,10 +190,12 @@ async function filesUnder(dir) {
   return out;
 }
 
-async function crashAndResume(phase) {
-  const dir = await mkdtemp(join(tmpdir(), "libfx-codex-crash-"));
+async function crashAndResume(provider, phase) {
+  const spec = providers[provider];
+  const tokens = tokensFor(spec);
+  const dir = await mkdtemp(join(tmpdir(), `libfx-${provider}-crash-`));
   try {
-    const child = spawn(process.execPath, [...process.execArgv, fileURLToPath(import.meta.url), backend, "--child", dir, phase], {
+    const child = spawn(process.execPath, [...process.execArgv, fileURLToPath(import.meta.url), backend, "--child", dir, phase, provider], {
       stdio: ["ignore", "pipe", "inherit"],
       env: { ...process.env },
     });
@@ -175,11 +212,11 @@ async function crashAndResume(phase) {
     const [, signal] = await new Promise((exited) => child.once("exit", (code, sig) => exited([code, sig])));
     assert.equal(signal, "SIGKILL", "the child died by SIGKILL, mid-turn");
 
-    const fake = codex();
+    const fake = fakeProvider(spec);
     const asked = [];
     const lookupRuns = [];
     const events = [];
-    const agent = createFxAgent(agentOptions(dir, { fetch: fake.fetch, token: parentToken, asked, lookupRuns, events }));
+    const agent = createFxAgent(agentOptions(dir, spec, { fetch: fake.fetch, token: tokens.parent, asked, lookupRuns, events }));
     let text = "";
     const lines = [];
     try {
@@ -195,17 +232,17 @@ async function crashAndResume(phase) {
         events: events.map(({ type, error, message, status, reason }) => ({ type, error, message, status, reason })),
         result,
       }).slice(0, 6000);
-      assert.equal(result.stopReason, "end_turn", `the ${phase} crash leaves a turn that resumes to its end; saw ${seen()}`);
+      assert.equal(result.stopReason, "end_turn", `the ${spec.label} ${phase} crash leaves a turn that resumes to its end; saw ${seen()}`);
     } finally {
       await agent.close();
     }
 
-    const replies = fake.log.filter((entry) => entry.url === "https://chatgpt.com/backend-api/codex/responses");
-    assert.ok(replies.length >= 1, "the resumed turn called Codex");
+    const replies = fake.log.filter((entry) => entry.url === spec.replyUrl);
+    assert.ok(replies.length >= 1, `the resumed turn called ${spec.label}`);
     for (const reply of replies) {
-      assert.equal(reply.headers.get("authorization"), `Bearer ${parentToken}`, "the resuming process authorizes with its own credentials");
-      assert.equal(reply.headers.get("chatgpt-account-id"), accountId);
-      assert.equal(reply.headers.get("session-id"), sessionId, "the resumed requests belong to the crashed session");
+      assert.equal(reply.headers.get("authorization"), `Bearer ${tokens.parent}`, "the resuming process authorizes with its own credentials");
+      assert.equal(reply.headers.get(spec.accountHeader), accountId);
+      assert.equal(reply.headers.get(spec.sessionHeader), sessionId, "the resumed requests belong to the crashed session");
     }
     assert.ok(asked.includes(sessionId), "credentials() is asked for the crashed session's credentials");
     assert.equal(fake.log.some((entry) => entry.url.includes("ai-gateway.vercel.sh")), false);
@@ -220,24 +257,27 @@ async function crashAndResume(phase) {
       assert.equal(text, "found order-7");
     }
 
-    // The saved session holds no ChatGPT credentials from either process.
+    // The saved session holds no subscription credentials from either process.
     const files = await filesUnder(dir);
     assert.ok(files.length > 0, "the session was saved");
     for (const path of files) {
       const bytes = await readFile(path, "latin1");
-      assert.equal(holdsSecret(bytes, [childToken, parentToken, "rt-crash"]), false, `${path} must not contain ChatGPT credentials`);
+      assert.equal(holdsSecret(bytes, [tokens.child, tokens.parent, "rt-crash"]), false, `${path} must not contain ${spec.label} credentials`);
     }
-    return { phase, sessionId, replies: replies.length, resumeMs: Date.now() - started };
+    return { sessionId, replies: replies.length, resumeMs: Date.now() - started };
   } catch (error) {
-    if (process.env.CODEX_CRASH_KEEP) console.error(`kept ${dir}`);
+    if (process.env.SUBSCRIPTION_CRASH_KEEP) console.error(`kept ${dir}`);
     throw error;
   } finally {
-    if (!process.env.CODEX_CRASH_KEEP) await rm(dir, { recursive: true, force: true });
+    if (!process.env.SUBSCRIPTION_CRASH_KEEP) await rm(dir, { recursive: true, force: true });
   }
 }
 
-for (const phase of ["reply", "tool"]) {
-  const result = await crashAndResume(phase);
-  console.log(`  ${backend} crash during the ${phase === "reply" ? "Codex reply" : "lookup tool"}: resumed with ${result.replies} Codex request(s), ${result.resumeMs} ms from start to resumed end`);
+for (const provider of Object.keys(providers)) {
+  for (const phase of ["reply", "tool"]) {
+    const result = await crashAndResume(provider, phase);
+    const label = providers[provider].label;
+    console.log(`  ${backend} crash during the ${phase === "reply" ? `${label} reply` : `${label} lookup tool`}: resumed with ${result.replies} request(s), ${result.resumeMs} ms from start to resumed end`);
+  }
 }
-console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} durable Codex crash passed`);
+console.log(`${process.versions.bun ? "Bun" : "Node"} ${backend} durable subscription crash passed`);

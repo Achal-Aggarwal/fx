@@ -18,6 +18,8 @@ const scripts = [
   "test-agent-transport-retry.mjs",
   "test-agent-codex.mjs",
   "test-chatgpt-sign-in.mjs",
+  "test-agent-grok.mjs",
+  "test-grok-sign-in.mjs",
   "test-native-core-stream.mjs",
   "test-native-core-http-cleanup.mjs",
   "test-native-core-fetch-failure.mjs",

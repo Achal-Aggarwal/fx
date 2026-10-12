@@ -48,9 +48,10 @@ pub const Config = struct {
     /// Provider for every session this server runs, like model_override. Null
     /// keeps the startup provider and each saved session's own provider.
     provider_override: ?model_provider.ProviderId = null,
-    /// `.host_managed` sends Codex requests without a credential; the host adds
-    /// one at its fetch edge. Other routes keep `auth_mode`.
-    codex_auth_mode: credentials.AuthMode = .local,
+    /// `.host_managed` sends subscription (Codex and Grok) requests without a
+    /// credential; the host adds one at its fetch edge. Other routes keep
+    /// `auth_mode`.
+    subscription_auth_mode: credentials.AuthMode = .local,
     credential_override: ?[]const u8 = null,
     home_override: ?[]const u8 = null,
     workspace_root_override: ?[]const u8 = null,

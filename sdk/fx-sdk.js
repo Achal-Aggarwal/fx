@@ -1,6 +1,11 @@
 import { CoreOutput, maxCoreMessageBytes } from "./core-output.js";
-import { createChatgptAuthorizer, isCodexRequest } from "./chatgpt.js";
+import { codexSubscription } from "./chatgpt.js";
+import { grokSubscription } from "./grok.js";
+import { createSubscriptionAuthorizer, credentialMemory } from "./subscription.js";
 import { loadModule } from "./wasm-module.js";
+
+// Providers that run on a user's plan, authorized by the host's credentials.
+const subscriptionProviders = new Set(["codex", "grok"]);
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -144,20 +149,20 @@ export function normalizeAgentOptions(value) {
   if (Object.hasOwn(options, "env")) {
     throw new TypeError("createFxEngine() does not accept env; pass apiKey and model directly");
   }
-  if (options.provider !== undefined && options.provider !== "gateway" && options.provider !== "codex") {
-    throw new TypeError("provider must be \"gateway\" or \"codex\"");
+  if (options.provider !== undefined && options.provider !== "gateway" && !subscriptionProviders.has(options.provider)) {
+    throw new TypeError("provider must be \"gateway\", \"codex\" or \"grok\"");
   }
-  const codex = options.provider === "codex";
-  // A Codex agent runs on the host's ChatGPT credentials; Gateway needs its key.
-  options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, !codex);
-  if (codex && typeof options.credentials !== "function") {
-    throw new TypeError("provider \"codex\" needs a credentials() function");
+  const subscription = subscriptionProviders.has(options.provider);
+  // A subscription agent runs on the host's credentials; Gateway needs its key.
+  options.apiKey = boundedString(options.apiKey, "apiKey", maxApiKeyBytes, !subscription);
+  if (subscription && typeof options.credentials !== "function") {
+    throw new TypeError(`provider "${options.provider}" needs a credentials() function`);
   }
-  for (const name of ["credentials", "onCredentials"]) {
-    if (!codex && options[name] !== undefined) throw new TypeError(`${name} needs provider "codex"`);
+  for (const name of ["credentials", "onCredentials", "refreshLock"]) {
+    if (!subscription && options[name] !== undefined) throw new TypeError(`${name} needs provider "codex" or "grok"`);
   }
-  if (options.onCredentials !== undefined && typeof options.onCredentials !== "function") {
-    throw new TypeError("onCredentials must be a function");
+  for (const name of ["onCredentials", "refreshLock"]) {
+    if (options[name] !== undefined && typeof options[name] !== "function") throw new TypeError(`${name} must be a function`);
   }
   Object.assign(options, normalizeModelChoice(options));
   validateGatewayChatUrl(options.gatewayChatUrl);
@@ -2411,8 +2416,8 @@ export async function createFxEngine(options = {}) {
     return checkpointing;
   };
   const hostFetch = options.fetch ?? globalThis.fetch?.bind(globalThis);
-  const codexAuth = options.provider === "codex"
-    ? createChatgptAuthorizer({ credentials: options.credentials, onCredentials: options.onCredentials, fetch: hostFetch })
+  const subscriptionAuth = subscriptionProviders.has(options.provider)
+    ? createSubscriptionAuthorizer([codexSubscription, grokSubscription], { credentials: options.credentials, onCredentials: options.onCredentials, refreshLock: options.refreshLock, fetch: hostFetch, memory: options[credentialMemory] })
     : null;
   const transportFetch = async (input, init = {}) => {
     const method = String(init.method ?? input?.method ?? "GET").toUpperCase();
@@ -2441,8 +2446,9 @@ export async function createFxEngine(options = {}) {
           throw new DOMException("Aborted", "AbortError");
         }
         if (!hostFetch) throw new TypeError("fetch is unavailable");
-        const response = codexAuth && isCodexRequest(endpoint)
-          ? await codexAuth.fetch(hostFetch, input, init)
+        const subscription = subscriptionAuth?.specFor(endpoint);
+        const response = subscription
+          ? await subscriptionAuth.fetch(subscription, endpoint, hostFetch, input, init)
           : await hostFetch(input, init);
         const headers = response.headers;
         emit("transport.response", {

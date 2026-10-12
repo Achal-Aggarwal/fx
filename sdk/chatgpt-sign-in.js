@@ -7,29 +7,18 @@
 // - Device code: the user enters a short code on OpenAI's page. ChatGPT
 //   workspaces and accounts must turn device code sign-in on first.
 import { chatgptClientId, chatgptIssuer, normalizeChatgptCredentials, refreshChatgptCredentials } from "./chatgpt.js";
+import { hostFetch, pkceChallenge, randomSecret, readSignInAddress, signInError, wait } from "./oauth.js";
 
 const redirectUri = "http://localhost:1455/auth/callback";
 const deviceRedirectUri = `${chatgptIssuer}/deviceauth/callback`;
 const scope = "openid profile email offline_access api.connectors.read api.connectors.invoke";
 const deviceCodeLifetimeMs = 15 * 60 * 1000;
-const maxAddressBytes = 16 * 1024;
-const encoder = new TextEncoder();
-
-function signInError(code, message, fields = {}) {
-  const error = new Error(message);
-  error.code = code;
-  return Object.assign(error, fields);
-}
-
-const base64url = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-const randomSecret = () => base64url(crypto.getRandomValues(new Uint8Array(32)));
-const hostFetch = (fetch) => fetch ?? globalThis.fetch?.bind(globalThis);
 
 /** Starts a sign-in. Keep the result on the server: `verifier` is secret. */
 export async function startSignIn() {
   const verifier = randomSecret();
   const state = randomSecret();
-  const challenge = base64url(new Uint8Array(await crypto.subtle.digest("SHA-256", encoder.encode(verifier))));
+  const challenge = await pkceChallenge(verifier);
   const url = new URL(`${chatgptIssuer}/oauth/authorize`);
   for (const [key, value] of Object.entries({
     response_type: "code",
@@ -44,35 +33,6 @@ export async function startSignIn() {
     originator: "fx",
   })) url.searchParams.set(key, value);
   return { url: url.href, state, verifier };
-}
-
-/**
- * Reads the sign-in result from a pasted address: the whole address, its query,
- * or either wrapped in quotes, backticks or angle brackets.
- */
-function parseSignInAddress(text) {
-  if (typeof text !== "string" || encoder.encode(text).length > maxAddressBytes) {
-    throw signInError("LIBFX_CHATGPT_SIGN_IN_INVALID_ADDRESS", "Paste the address of the page OpenAI opened after you signed in.");
-  }
-  const trimmed = text.trim().replace(/^[`'"<\s]+|[`'">\s]+$/g, "");
-  let params;
-  try {
-    params = new URL(trimmed).searchParams;
-  } catch {
-    params = new URLSearchParams(trimmed.includes("?") ? trimmed.slice(trimmed.indexOf("?") + 1) : trimmed);
-  }
-  const error = params.get("error");
-  if (error) {
-    throw signInError("LIBFX_CHATGPT_SIGN_IN_DENIED", `OpenAI did not sign you in: ${params.get("error_description") || error}`, { reason: error });
-  }
-  const code = params.get("code");
-  if (!code) {
-    throw signInError(
-      "LIBFX_CHATGPT_SIGN_IN_INVALID_ADDRESS",
-      `That address has no sign-in code. Copy the whole address of the page OpenAI opened after you signed in; it starts with ${redirectUri}?code=`,
-    );
-  }
-  return { code, state: params.get("state") };
 }
 
 async function exchangeCode({ code, verifier, redirect, fetch, signal }) {
@@ -103,7 +63,7 @@ export async function finishSignIn(signIn, address, { fetch, signal } = {}) {
   if (!signIn || typeof signIn.state !== "string" || typeof signIn.verifier !== "string") {
     throw new TypeError("finishSignIn() needs the object startSignIn() returned");
   }
-  const { code, state } = parseSignInAddress(address);
+  const { code, state } = readSignInAddress(address, { prefix: "LIBFX_CHATGPT", issuer: "OpenAI", redirectUri });
   if (state !== signIn.state) {
     throw signInError("LIBFX_CHATGPT_SIGN_IN_STATE_MISMATCH", "That address is from a different sign-in. Start again and paste the address from this one.");
   }
@@ -171,12 +131,7 @@ export async function completeDeviceSignIn(device, { fetch, signal } = {}) {
   for (;;) {
     const credentials = await pollDeviceSignIn(device, { fetch, signal });
     if (credentials) return credentials;
-    await new Promise((resolve, reject) => {
-      if (signal?.aborted) return reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
-      const timer = setTimeout(() => { signal?.removeEventListener("abort", onAbort); resolve(); }, device.intervalMs);
-      const onAbort = () => { clearTimeout(timer); reject(signal.reason ?? new DOMException("Aborted", "AbortError")); };
-      signal?.addEventListener("abort", onAbort, { once: true });
-    });
+    await wait(device.intervalMs, signal);
   }
 }
 

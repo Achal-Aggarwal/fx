@@ -51,6 +51,7 @@ export type {
   FxFetch,
   FxFollowUp,
   FxGatewayProvider,
+  FxGrokProvider,
   FxHostTool,
   FxIdleResult,
   FxImageBlock,
