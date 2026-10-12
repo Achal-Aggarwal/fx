@@ -182,7 +182,7 @@ const tools = [
 ];
 ```
 
-When the turn continues, a call to an `idempotent: true` tool runs again. A call to any other tool never runs twice on its own: the model gets an error saying the call may have partly run, and decides whether to check, try again or ask the user.
+When the turn continues, a call to an `idempotent: true` tool runs again. A call to any other tool never runs twice on its own: the model gets an error saying the call may have partly run, and decides whether to check, try again or ask the user. The turn's events end the call with that error too, as a `tool_end` with `isError: true`.
 
 Each call's `executionId` stays the same when it runs again. Pass it to the service your tool calls as an idempotency key, and a service that honors idempotency keys won't refund twice.
 
