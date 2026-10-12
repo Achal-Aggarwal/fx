@@ -68,6 +68,8 @@ Each request runs as a loop. fx sends the model your message, the conversation s
 
 Skill instructions and MCP tool schemas don't go to the model up front. They load when the model asks for them, which keeps the context small and leaves more room for your code.
 
+Commands run by fx receive `AI_AGENT=fx` in their environment. Development tools can use it to detect fx.
+
 fx prints every step inline as it happens and saves the session under `~/.fx/sessions/`, so you can resume it later.
 
 ## Use fx from other programs
