@@ -869,16 +869,46 @@ pub fn formatCompactCommandStatus(
 }
 
 fn formatFullToolStatus(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
-    return wrapFullToolStatus(alloc, text, cols, if (cols >= 6) "  " else "");
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    if (cols == 0 or text.len == 0) return out.toOwnedSlice(alloc);
+
+    var start: usize = 0;
+    var continuation = false;
+    while (start < text.len) {
+        const indent: usize = if (continuation and cols >= 6) 2 else 0;
+        const line = scanToolStatusLine(text, start, @as(usize, cols) - indent);
+        if (continuation) {
+            try out.append(alloc, '\n');
+            try appendToolStatusSgrReplay(alloc, &out, text[0..start]);
+            try out.appendNTimes(alloc, ' ', indent);
+        }
+        try out.appendSlice(alloc, text[start..line.end]);
+
+        if (line.next > start) {
+            start = line.next;
+        } else if (line.end > start) {
+            start = line.end;
+        } else {
+            const unit = display_width.displayUnitAt(text, start);
+            try out.append(alloc, '?');
+            start += unit.byte_len;
+        }
+        continuation = true;
+
+        if (line.hard_break and start == text.len) try out.append(alloc, '\n');
+    }
+    return out.toOwnedSlice(alloc);
 }
 
-/// Word-wraps a tool status for full presentation without dropping any of it.
-/// Each continuation row starts with `continuation_prefix` in the default
-/// style, then reopens the attributes and foreground active at the wrap
-/// point. The reopen is built from tracked state, so output stays linear in
-/// the status length. A prefix that leaves no room for content is omitted,
-/// and a wide character that cannot fit leaves a `?` marker. The caller owns
-/// the result.
+/// Word-wraps one expanded tool row for the full transcript without dropping
+/// any of its text. Each continuation row starts with `continuation_prefix`
+/// in the default style, then reopens the attributes and foreground color
+/// active at the wrap point. The reopen comes from tracked state, so output
+/// stays linear in the row length; styles the shared SGR state does not
+/// track, such as backgrounds, are not reopened. A prefix that leaves no room
+/// for content is omitted, and a wide character that cannot fit leaves a `?`
+/// marker. The caller owns the result.
 pub fn wrapFullToolStatus(
     alloc: Allocator,
     text: []const u8,
