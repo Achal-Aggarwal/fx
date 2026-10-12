@@ -187,7 +187,8 @@ Claim(w) ==
 \* continues the turn from what it read before its claim. A call left
 \* running is rerun only when it is safe to run twice; otherwise the model
 \* is told it may have partly run, which is stored as the call's result,
-\* and the turn goes on to the answer. The records this writes are left out
+\* its viewers see the call end with that answer, and the turn goes on to
+\* the answer. The records this writes are left out
 \* of `chain`: in the code it follows its claim at once, and fewer chain
 \* moves only let the model do more. A step
 \* cut off MaxCutoffs times in a row is not run again: a call is answered
@@ -217,8 +218,9 @@ Announce(w) ==
                             [] from = "intent" -> IF rerun THEN "tool" ELSE "model2"
                             [] from \in {"result", "done"} -> "model2"]
                /\ runs' = IF rerun THEN runs + 1 ELSE runs
-               \* then tool_start for a rerun
-               /\ ui' = IF rerun THEN ui \o <<Line(w), Line(w)>> ELSE Append(ui, Line(w))
+               \* then tool_start for a rerun, or tool_end for a call answered
+               \* as possibly run
+               /\ ui' = IF from = "intent" THEN ui \o <<Line(w), Line(w)>> ELSE Append(ui, Line(w))
                \* a call answered as possibly run is the turn's next record
                /\ IF from = "intent" /\ ~rerun /\ Heads(w)
                      THEN /\ progress' = "result"
