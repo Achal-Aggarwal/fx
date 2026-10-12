@@ -118,7 +118,7 @@ pub fn Commands(comptime App: type) type {
             attached.id = id;
 
             var buf: [32]u8 = undefined;
-            const placeholder = image_attachments.formatImagePlaceholder(&buf, id) catch unreachable;
+            const placeholder = try image_attachments.formatImagePlaceholder(&buf, id);
             const max_input_len = if (comptime @hasDecl(A, "input_limits"))
                 A.input_limits.composer_bytes
             else if (comptime @hasDecl(A, "input_byte_limit"))

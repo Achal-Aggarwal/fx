@@ -3,6 +3,7 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const gateway_client = @import("client.zig");
 const vercel_protocol = @import("vercel_protocol.zig");
+const vercel_failure_diagnostics = @import("vercel_failure_diagnostics.zig");
 const credential_authority = @import("../core/auth/credential_authority.zig");
 
 const Allocator = std.mem.Allocator;
@@ -162,11 +163,17 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
 
     const opened = try openPost(alloc, transport, request, context.endpoint.url(), headers.items, payload);
     defer transport.close(opened.handle);
-    if (opened.status != .ok) return .{ .failed = .{
-        .kind = failureKind(opened.status),
-        .detail = try readErrorBody(alloc, transport, opened.handle, request),
-        .ownership = .owned,
-    } };
+    if (opened.status != .ok) {
+        const body = try readErrorBody(alloc, transport, opened.handle, request);
+        // Gateway reports the last provider it tried, so a provider's size
+        // rejection can arrive as a 400 from a later fallback.
+        const kind = failureKind(opened.status);
+        return .{ .failed = .{
+            .kind = if (kind == .invalid_request and vercel_failure_diagnostics.providerRejectedRequestSize(alloc, body)) .request_too_large else kind,
+            .detail = body,
+            .ownership = .owned,
+        } };
+    }
 
     var reader: HostStreamReader = undefined;
     reader.init(
