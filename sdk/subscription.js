@@ -2,7 +2,8 @@
 // a Grok plan. The engine sends these providers' requests without credentials;
 // this module adds them at the fetch edge, from the host's `credentials`
 // callback, refreshing near expiry and once after a rejection. Credentials
-// never enter the engine or a session's saved records.
+// never enter the engine or a session's saved records, and are masked in the
+// body of a failed response.
 //
 // A provider spec supplies what differs: which requests it authorizes, how its
 // credentials are checked and refreshed, and which headers carry them.
@@ -10,6 +11,7 @@
 const refreshSkewMs = 5 * 60 * 1000;
 const maxRememberedCredentials = 256;
 const maxTokenBytes = 64 * 1024;
+const maxErrorBodyBytes = 64 * 1024;
 const encoder = new TextEncoder();
 
 /** A non-empty, bounded credential field, or undefined when optional and absent. */
@@ -61,6 +63,53 @@ export function normalizeCredentials(value, { label, accountClaim }) {
     throw new TypeError(`${label} credentials expiresAt must be milliseconds since the epoch`);
   }
   return { accessToken, ...(refreshToken === undefined ? {} : { refreshToken }), accountId, ...(expiresAt === undefined ? {} : { expiresAt }) };
+}
+
+/**
+ * A failed response whose body cannot repeat the credentials its request
+ * carried. Some servers quote the bearer token back in an error, and the
+ * engine shows and saves error details, so this edge, the only code that knows
+ * the token, masks it the way fx masks error details from its own providers.
+ * JSON is normalized first, so an escaped copy cannot survive.
+ */
+async function withoutCredentials(response, credentials) {
+  if (response.status < 400) return response;
+  const raw = await boundedText(response, maxErrorBodyBytes);
+  let body = raw ?? "Provider error details exceeded the local limit";
+  if (raw !== null && /^\s*[[{"]/.test(raw)) {
+    try {
+      body = JSON.stringify(JSON.parse(raw));
+    } catch {
+      body = "Provider error details could not be decoded";
+    }
+  }
+  for (const secret of [credentials.accessToken, credentials.refreshToken]) {
+    if (!secret) continue;
+    for (const form of new Set([secret, JSON.stringify(secret).slice(1, -1)])) body = body.split(form).join("*".repeat(form.length));
+  }
+  const headers = new Headers(response.headers);
+  headers.delete("content-length");
+  headers.delete("content-encoding");
+  return new Response(body, { status: response.status, statusText: response.statusText, headers });
+}
+
+/** The body as text, or null once it exceeds `limit` bytes. */
+async function boundedText(response, limit) {
+  if (!response.body) return "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let size = 0;
+  let text = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return text + decoder.decode();
+    size += value.byteLength;
+    if (size > limit) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    text += decoder.decode(value, { stream: true });
+  }
 }
 
 /** True when the credentials can and should be refreshed before use. */
@@ -188,7 +237,7 @@ export function createSubscriptionAuthorizer(specs, { credentials, onCredentials
       const sessionId = spec.sessionId(new Headers(init.headers)) || undefined;
       const { used } = await current(spec, sessionId, init.signal);
       const response = await hostFetch(input, withCredentials(spec, endpoint, init, used));
-      if (response.status !== 401 || used.refreshToken === undefined) return response;
+      if (response.status !== 401 || used.refreshToken === undefined) return withoutCredentials(response, used);
       await response.body?.cancel().catch(() => {});
       // Another request may have replaced these credentials while this one was
       // out. Only a rejection of the newest ones spends a refresh token.
@@ -196,7 +245,7 @@ export function createSubscriptionAuthorizer(specs, { credentials, onCredentials
       const next = latest.used.accessToken !== used.accessToken
         ? latest.used
         : await refresh(spec, latest.supplied, used, sessionId, init.signal);
-      return hostFetch(input, withCredentials(spec, endpoint, init, next));
+      return withoutCredentials(await hostFetch(input, withCredentials(spec, endpoint, init, next)), next);
     },
   };
 }

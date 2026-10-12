@@ -497,14 +497,47 @@ export type FxCodexProvider = FxSubscriptionProvider<"codex">;
 /** Runs on a Grok plan instead of AI Gateway. */
 export type FxGrokProvider = FxSubscriptionProvider<"grok">;
 
+/** What libfx knows about a model a custom provider serves. Unset fields are unknown. */
+export interface FxCustomProviderModel {
+  contextWindow?: number;
+  /** Less than `contextWindow` when both are set. */
+  maxOutputTokens?: number;
+  supportsToolUse?: boolean;
+  supportsVision?: boolean;
+}
+
+/** A server that speaks OpenAI Chat Completions, such as a local model server or a router. */
+export interface FxCustomProviderDefinition {
+  /** Names the provider to `credentials()`: a letter, then letters, digits, `_` or `-`, at most 64 characters. Not `gateway`, `codex` or `grok`. */
+  name: string;
+  /** The API prefix: requests go to `{baseUrl}/chat/completions`. HTTPS, or HTTP on localhost. */
+  baseUrl: string;
+  /** The models it serves, by id. */
+  models?: Record<string, FxCustomProviderModel>;
+}
+
+/** A custom provider's API key. */
+export interface FxApiKeyCredentials {
+  apiKey: string;
+}
+
+/** Runs on a custom provider instead of AI Gateway. */
+export interface FxCustomProvider {
+  provider: FxCustomProviderDefinition;
+  /** The API key for the provider's requests, asked for in whichever process runs the turn. Omit it for a server that needs no key. */
+  credentials?: ((request: { provider: string; sessionId?: string }) => FxApiKeyCredentials | Promise<FxApiKeyCredentials>) | undefined;
+  onCredentials?: undefined;
+  refreshLock?: undefined;
+}
+
 /** Options for `createFxEngine()`. */
 export type FxEngineOptions = FxSharedOptions<FxEngineEvent> & FxModelChoice & FxEngineStorage & (
   | (FxGatewayProvider & {
     /** The AI Gateway credential. Required. */
     apiKey: string;
   })
-  | ((FxCodexProvider | FxGrokProvider) & {
-    /** The AI Gateway credential, unused by subscription turns. */
+  | ((FxCodexProvider | FxGrokProvider | FxCustomProvider) & {
+    /** The AI Gateway credential, unused by this provider's turns. */
     apiKey?: string | undefined;
   })
 ) & {
@@ -537,7 +570,7 @@ export declare function memory(options?: MemoryOptions): Durability;
 // Durable agents
 
 /** Options for `createFxAgent()`. */
-export type FxAgentOptions = FxSharedOptions<FxAgentEvent> & FxModelChoice & (FxGatewayProvider | FxCodexProvider | FxGrokProvider) & {
+export type FxAgentOptions = FxSharedOptions<FxAgentEvent> & FxModelChoice & (FxGatewayProvider | FxCodexProvider | FxGrokProvider | FxCustomProvider) & {
   /** The AI Gateway credential. Without it, libfx uses `AI_GATEWAY_API_KEY`, then on Vercel the deployment's OIDC token. */
   apiKey?: string | undefined;
   /** Where sessions live. Without it, libfx picks one from the environment. */

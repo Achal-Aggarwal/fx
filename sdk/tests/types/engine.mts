@@ -250,8 +250,35 @@ export async function codexEngine(): Promise<FxEngine> {
   await createFxEngine({ apiKey, model, refreshLock: async (_info, refresh) => refresh() });
   // @ts-expect-error a Gateway engine needs apiKey
   await createFxEngine({ provider: "gateway", model });
-  // @ts-expect-error libfx runs Gateway, Codex or Grok
+  // @ts-expect-error a provider named by string is Gateway, Codex or Grok
   await createFxEngine({ provider: "custom", apiKey, model });
+  return engine;
+}
+
+// A custom provider: a local server needs no key; a hosted one gets the host's.
+declare const providerKeys: { load(provider: string, sessionId?: string): Promise<string> };
+export async function customEngine(): Promise<FxEngine> {
+  const local = await createFxEngine({
+    provider: { name: "local", baseUrl: "http://localhost:11434/v1", models: { "qwen3:8b": { contextWindow: 32768, supportsToolUse: true } } },
+    model: "qwen3:8b",
+  });
+  await local.close();
+  const router = { name: "router", baseUrl: "https://openrouter.ai/api/v1" };
+  const engine = await createFxEngine({
+    provider: router,
+    model: "qwen/qwen3-coder",
+    credentials: async ({ provider, sessionId }) => ({ apiKey: await providerKeys.load(provider, sessionId) }),
+  });
+  // @ts-expect-error a custom provider's credentials are an API key
+  await createFxEngine({ provider: router, model, credentials: () => tokenStore.load("codex") });
+  // @ts-expect-error a custom provider's key is never refreshed
+  await createFxEngine({ provider: router, model, onCredentials: () => {} });
+  // @ts-expect-error a custom provider's key is never refreshed, so it takes no lock
+  await createFxEngine({ provider: router, model, refreshLock: async (_info, refresh) => refresh() });
+  // @ts-expect-error a custom provider needs a base URL
+  await createFxEngine({ provider: { name: "router" }, model });
+  // @ts-expect-error model details use libfx's option names
+  await createFxEngine({ provider: { ...router, models: { m: { context_window: 1 } } }, model });
   return engine;
 }
 

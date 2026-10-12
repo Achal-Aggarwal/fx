@@ -40,7 +40,7 @@ The full documentation is at [fx.sh/docs/lib](https://fx.sh/docs/lib).
 - [Steers](https://fx.sh/docs/lib/steering) a turn while it runs
 - Takes [images](https://fx.sh/docs/lib/images) in prompts and tool results
 - Gives each conversation its own model, instructions and context
-- Runs on AI Gateway, or on a user's own [ChatGPT](#chatgpt-plans) or [Grok](#grok-plans) plan
+- Runs on AI Gateway, on a user's own [ChatGPT](#chatgpt-plans) or [Grok](#grok-plans) plan, or on [any OpenAI-compatible server](#custom-providers)
 - Uses a native addon on macOS and Linux, and WebAssembly everywhere else, including browsers
 - Puts the [fx terminal](https://fx.sh/docs/lib/webassembly#embed-the-terminal) in a web page
 - Ships TypeScript types for every entry point, with no runtime dependencies
@@ -276,6 +276,35 @@ const credentials = await completeDeviceSignIn(device);
 ```
 
 `startSignIn()` and `finishSignIn()` work like ChatGPT's: after the user signs in, xAI opens a page at `127.0.0.1` that doesn't load, and the user pastes its address back. The sign-in uses the same xAI client as the fx CLI, and the user's Grok plan and xAI's terms apply to the turns.
+
+### Custom providers
+
+An agent can also run on any server that speaks the OpenAI Chat Completions API, such as a local model server or a router. Pass the provider as an object and name the model it serves:
+
+```js
+const agent = createFxAgent({
+  provider: { name: "local", baseUrl: "http://localhost:11434/v1" },
+  model: "qwen3:8b",
+});
+```
+
+Requests go to `{baseUrl}/chat/completions`, which must use HTTPS, or HTTP on `localhost`. A server that needs a key gets it from the same `credentials` callback, which libfx calls with the provider's `name`:
+
+```js
+const agent = createFxAgent({
+  provider: {
+    name: "router",
+    baseUrl: "https://openrouter.ai/api/v1",
+    models: { "qwen/qwen3-coder": { contextWindow: 128000, supportsToolUse: true } },
+  },
+  model: "qwen/qwen3-coder",
+  credentials: async ({ provider, sessionId }) => ({ apiKey: await keys.load(provider, sessionId) }),
+});
+```
+
+libfx sends the key as a bearer token to that chat URL only, and the key never reaches the engine or a saved session. A key isn't refreshed, so a rejected one ends the turn with the server's error. `models` tells libfx what it can't ask the server: each model's context window and output limit, and whether it takes tools and images. Tool calls work when the model and server support them. In a browser, the server must accept cross-origin requests, and the page can read the key.
+
+Saved sessions follow the agent's provider: point an agent at another base URL and its sessions continue there, history included.
 
 ## One conversation, no sessions
 

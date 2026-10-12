@@ -48,10 +48,13 @@ pub const Config = struct {
     /// Provider for every session this server runs, like model_override. Null
     /// keeps the startup provider and each saved session's own provider.
     provider_override: ?model_provider.ProviderId = null,
-    /// `.host_managed` sends subscription (Codex and Grok) requests without a
-    /// credential; the host adds one at its fetch edge. Other routes keep
-    /// `auth_mode`.
-    subscription_auth_mode: credentials.AuthMode = .local,
+    /// `.host_managed` sends requests to every provider but Gateway (Codex,
+    /// Grok and a configured provider) without a credential; the host adds one
+    /// at its fetch edge. Gateway keeps `auth_mode`.
+    provider_auth_mode: credentials.AuthMode = .local,
+    /// For `minimal_kernel` runs: a settings-style providers object whose
+    /// providers the run may use. Borrowed for the server's lifetime.
+    configured_providers_json: ?[]const u8 = null,
     credential_override: ?[]const u8 = null,
     home_override: ?[]const u8 = null,
     workspace_root_override: ?[]const u8 = null,
