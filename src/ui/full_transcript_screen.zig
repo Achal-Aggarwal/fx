@@ -1043,7 +1043,7 @@ test "full projection shows a terminal session launch command in full" {
     try std.testing.expect(std.mem.find(u8, painted, "session_id: shell-922") != null);
 }
 
-test "full projection omits arguments its wrapped heading already shows" {
+test "full projection keeps semantic arguments beside a wrapped tool heading" {
     const alloc = std.testing.allocator;
     const command = "printf a deliberately long command with FULL_ARGUMENT_TAIL";
     const entries = [_]transcript_blocks.TranscriptEntry{.{ .raw_bytes = .{
@@ -1076,14 +1076,55 @@ test "full projection omits arguments its wrapped heading already shows" {
     const painted = try paintProjectionRowsForTest(alloc, &projection, 24);
     defer alloc.free(painted);
 
-    // The heading wraps to show the whole command at this width, so the
-    // command argument would only repeat it.
+    // The heading wraps instead of clipping, and the argument rows beside it
+    // stay: a heading wider than the terminal is never used to hide one.
     try std.testing.expect(std.mem.find(u8, painted, "FULL_ARGUMENT_TAIL") != null);
     try std.testing.expect(std.mem.find(u8, painted, "…") == null);
-    try std.testing.expect(std.mem.find(u8, painted, "command: printf") == null);
+    try std.testing.expect(std.mem.find(u8, painted, "command: printf") != null);
     try std.testing.expect(std.mem.find(u8, painted, "action: exec") == null);
     try std.testing.expect(std.mem.find(u8, painted, "profile: clean") != null);
     try std.testing.expect(std.mem.find(u8, painted, "{\"command\"") == null);
+}
+
+test "full projection keeps short session input that a long heading contains by chance" {
+    const alloc = std.testing.allocator;
+    const launch = "cd . && python3 - <<'PYEOF' import pathlib led = pathlib.Path(\"docs/workflows/ledger.md\"); " ++
+        "s = led.read_text() old = \"Fixed in draft\" assert old in s";
+    var entries = [_]transcript_blocks.TranscriptEntry{.{ .raw_bytes = .{
+        .id = 1,
+        .bytes = try alloc.dupe(u8, "● Sent input to " ++ launch[0..100] ++ "...\n"),
+        .class = .tool_status,
+    } }};
+    defer entries[0].deinit(alloc);
+    var details = [_]ToolDetailRecord{.{
+        .entry_id = 1,
+        .tool_name = try alloc.dupe(u8, "shell"),
+        .activity_kind = .command,
+        .arguments_json = try alloc.dupe(u8, "{\"action\":\"interact\",\"session_id\":\"shell-922\",\"chars\":\"y\"}"),
+        .command_display = try alloc.dupe(u8, launch),
+        .command_action_label = try alloc.dupe(u8, "Sent input to"),
+        .outcome = .completed,
+    }};
+    defer details[0].deinit(alloc);
+
+    var projection = try buildProjection(
+        alloc,
+        &entries,
+        &details,
+        &.{},
+        .{ .system_notice_label_style = "", .system_notice_text_style = "", .reset_style = "", .dim_style = "", .red_style = "" },
+        80,
+        null,
+    );
+    defer projection.deinit(alloc);
+    const painted = try paintProjectionRowsForTest(alloc, &projection, 80);
+    defer alloc.free(painted);
+
+    // "y" occurs inside "python3" in the heading, which does not make the
+    // typed input visible.
+    try std.testing.expect(std.mem.find(u8, painted, "Sent input to cd . && python3") != null);
+    try std.testing.expect(std.mem.find(u8, painted, "chars: y") != null);
+    try std.testing.expect(std.mem.find(u8, painted, "session_id: shell-922") != null);
 }
 
 test "full projection keeps arguments that appear only past the first status line" {
@@ -6550,12 +6591,16 @@ fn containsIgnoringSgr(haystack: []const u8, needle: []const u8) bool {
     return std.mem.find(u8, plain_buf[0..n], needle) != null;
 }
 
-/// Full-transcript headings wrap instead of clipping, so the first status line
-/// is always shown whole. An argument found there needs no row of its own.
+/// Skips an argument row when the tool heading already shows its value. The
+/// heading shows only the status's first line, so later lines never count.
+/// The match is by substring, so it applies only to statuses that fit one
+/// row: inside a long wrapped heading, a short value such as `chars: "y"` can
+/// match by coincidence.
 fn argumentVisibleInToolHeading(
     entries: []const transcript_blocks.TranscriptEntry,
     entry_id: u32,
     value: []const u8,
+    cols: u16,
 ) bool {
     if (value.len == 0) return false;
     for (entries) |entry| {
@@ -6566,7 +6611,8 @@ fn argumentVisibleInToolHeading(
         };
         if (raw.class != .tool_status) return false;
         const heading_end = std.mem.findAny(u8, raw.bytes, "\r\n") orelse raw.bytes.len;
-        return containsIgnoringSgr(raw.bytes[0..heading_end], value);
+        if (!containsIgnoringSgr(raw.bytes[0..heading_end], value)) return false;
+        return display_width.visibleWidthIgnoringAnsi(raw.bytes) <= cols;
     }
     return false;
 }
@@ -6628,6 +6674,7 @@ fn appendFullSemanticArguments(
             entries,
             detail.entry_id,
             value.string,
+            cols,
         )) continue;
 
         var line: std.Io.Writer.Allocating = .init(alloc);
