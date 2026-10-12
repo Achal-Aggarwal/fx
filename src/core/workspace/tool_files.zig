@@ -186,7 +186,7 @@ test "listing sees a file created a moment earlier and honors hidden and custom 
     const arena = arena_state.allocator();
     const io = std.testing.io;
     for ([_][]const u8{ "root/a.txt", "root/.hidden/h.txt", "root/build/out.o", "root/vendor/v.txt", "root/sub/s.txt" }) |sub_path| {
-        try tmp.dir.createDirPath(io, std.fs.path.dirname(sub_path).?);
+        try tmp.dir.createDirPath(io, std.Io.Dir.path.dirname(sub_path).?);
         try tmp.dir.writeFile(io, .{ .sub_path = sub_path, .data = "x" });
     }
     const root = try @import("../shared/io.zig").dirRealpathAlloc(arena, tmp.dir, "root");
@@ -205,11 +205,11 @@ test "listing sees a file created a moment earlier and honors hidden and custom 
     try std.testing.expectEqual(want.len, custom.files.len);
     for (want, custom.files) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
 
-    const sub = try list(std.testing.allocator, arena, root, try std.fs.path.join(arena, &.{ root, "sub" }), .{});
+    const sub = try list(std.testing.allocator, arena, root, try std.Io.Dir.path.join(arena, &.{ root, "sub" }), .{});
     try std.testing.expectEqual(@as(usize, 2), sub.files.len);
     try std.testing.expectEqualStrings("new.txt", sub.files[0]);
 
-    try std.testing.expectError(error.FileNotFound, list(std.testing.allocator, arena, root, try std.fs.path.join(arena, &.{ root, "missing" }), .{}));
+    try std.testing.expectError(error.FileNotFound, list(std.testing.allocator, arena, root, try std.Io.Dir.path.join(arena, &.{ root, "missing" }), .{}));
 }
 
 test "subfolder searches reuse the workspace tree only for ordinary folders" {

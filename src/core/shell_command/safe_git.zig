@@ -110,7 +110,7 @@ fn appendPrelude(arena: Allocator, argv: *std.ArrayList([]const u8), ready: Read
     for (ready.filter_names) |name| {
         for ([_][]const u8{ "clean", "smudge", "process" }) |program| {
             try argv.append(arena, "-c");
-            try argv.append(arena, try std.fmt.allocPrint(arena, "filter.{s}.{s}=", .{ name, program }));
+            try argv.append(arena, try arena.print("filter.{s}.{s}=", .{ name, program }));
         }
     }
 }
@@ -138,7 +138,7 @@ pub fn environment(alloc: Allocator) Allocator.Error!std.process.Environ.Map {
 /// The first git found at a fixed system location. git from PATH is never
 /// used, because PATH can include directories a repository controls.
 fn trustedExecutable() ?[]const u8 {
-    const candidates = switch (builtin.os.tag) {
+    const candidates = switch (builtin.target.os.tag) {
         .windows => &[_][]const u8{
             "C:\\Program Files\\Git\\cmd\\git.exe",
             "C:\\Program Files\\Git\\bin\\git.exe",
@@ -317,10 +317,10 @@ const SentinelRepo = struct {
             .arena = arena,
             .git = git,
             .root = root,
-            .repo = try std.fs.path.join(arena, &.{ root, "repo" }),
-            .home = try std.fs.path.join(arena, &.{ root, "home" }),
-            .log = try std.fs.path.join(arena, &.{ root, "sentinel.log" }),
-            .sentinel = try std.fs.path.join(arena, &.{ root, "sentinel.sh" }),
+            .repo = try std.Io.Dir.path.join(arena, &.{ root, "repo" }),
+            .home = try std.Io.Dir.path.join(arena, &.{ root, "home" }),
+            .log = try std.Io.Dir.path.join(arena, &.{ root, "sentinel.log" }),
+            .sentinel = try std.Io.Dir.path.join(arena, &.{ root, "sentinel.sh" }),
         };
         try dir.createDirPath(std.testing.io, "home");
         try dir.createDirPath(std.testing.io, "repo");
@@ -333,17 +333,17 @@ const SentinelRepo = struct {
     }
 
     fn path(self: SentinelRepo, sub_path: []const u8) ![]const u8 {
-        return std.fs.path.join(self.arena, &.{ self.root, sub_path });
+        return std.Io.Dir.path.join(self.arena, &.{ self.root, sub_path });
     }
 
     fn writeExecutable(self: SentinelRepo, absolute: []const u8) !void {
-        const script = try std.fmt.allocPrint(self.arena, "#!/bin/sh\necho ran >> '{s}'\ncat\n", .{self.log});
+        const script = try self.arena.print("#!/bin/sh\necho ran >> '{s}'\ncat\n", .{self.log});
         try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = absolute, .data = script, .flags = .{ .permissions = .fromMode(0o755) } });
     }
 
     fn write(self: SentinelRepo, sub_path: []const u8, data: []const u8) !void {
         const absolute = try self.path(sub_path);
-        if (std.fs.path.dirname(absolute)) |parent| try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
+        if (std.Io.Dir.path.dirname(absolute)) |parent| try std.Io.Dir.cwd().createDirPath(std.testing.io, parent);
         try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = absolute, .data = data });
     }
 
@@ -362,8 +362,8 @@ const SentinelRepo = struct {
             .safe => try environment(self.arena),
         };
         try env.put("HOME", self.home);
-        try env.put("XDG_CONFIG_HOME", try std.fs.path.join(self.arena, &.{ self.home, ".config" }));
-        try env.put("GIT_CONFIG_GLOBAL", try std.fs.path.join(self.arena, &.{ self.home, ".gitconfig" }));
+        try env.put("XDG_CONFIG_HOME", try std.Io.Dir.path.join(self.arena, &.{ self.home, ".config" }));
+        try env.put("GIT_CONFIG_GLOBAL", try std.Io.Dir.path.join(self.arena, &.{ self.home, ".gitconfig" }));
         const system: ?[]const u8 = switch (mode) {
             .plain => null,
             .safe => |value| value,
@@ -531,7 +531,7 @@ test "safe git blocks a repository signature program" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const repo = try SentinelRepo.init(arena_state.allocator(), tmp.dir);
-    const object = try std.fmt.allocPrint(repo.arena,
+    const object = try repo.arena.print(
         \\tree {s}
         \\parent {s}
         \\author fixture <fixture@example.invalid> 1 +0000
@@ -582,7 +582,7 @@ test "safe git keeps trusted system config filters" {
     const system = try repo.path("system.gitconfig");
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{
         .sub_path = system,
-        .data = try std.fmt.allocPrint(repo.arena, "[filter \"trusted\"]\n\tclean = {s}\n", .{repo.sentinel}),
+        .data = try repo.arena.print("[filter \"trusted\"]\n\tclean = {s}\n", .{repo.sentinel}),
     });
     try repo.write("repo/.git/info/attributes", "a.txt filter=trusted\n");
     try repo.write("repo/a.txt", "two\n");

@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../core/shared/testing_allocator.zig");
 const managed_execution = @import("../core/execution/managed_execution.zig");
 const acp_runner = @import("../core/cli/acp_runner.zig");
 const config_runtime = @import("../core/config/config_runtime.zig");
@@ -273,7 +274,7 @@ pub const ActiveSessionState = struct {
         const next = try alloc.alloc(types.PermissionGrant, self.session_grants.len + 1);
         errdefer alloc.free(next);
         if (self.session_grants.len > 0) {
-            std.mem.copyForwards(types.PermissionGrant, next[0..self.session_grants.len], self.session_grants);
+            @memmove(next[0..self.session_grants.len], self.session_grants);
             alloc.free(self.session_grants);
         }
         next[next.len - 1] = .{ .tool_name = name_copy, .target_path = target_copy };
@@ -366,7 +367,7 @@ pub const ServerState = struct {
     next_mcp_message_id: std.atomic.Value(u64) = .init(1),
     pending_outbound: std.AutoHashMapUnmanaged(u64, PendingOutbound) = .empty,
     legacy_url_mutex: std.Io.Mutex = .init,
-    pending_legacy_urls: std.ArrayListUnmanaged(PendingLegacyUrl) = .empty,
+    pending_legacy_urls: std.ArrayList(PendingLegacyUrl) = .empty,
 
     pub fn deinit(self: *ServerState) void {
         // Terminals end with this process. Ending them first also releases
@@ -498,7 +499,7 @@ pub fn selectCredentialForProvider(
 /// True when requests on the provider's route carry no credential from this
 /// server because the host authorizes them at its fetch edge.
 fn hostManagesRoute(cfg: Config, provider: model_provider.ProviderId) bool {
-    return provider == .codex and cfg.codex_auth_mode == .host_managed;
+    return provider != .gateway and cfg.provider_auth_mode == .host_managed;
 }
 
 /// A tokenless credential that marks a route as authorized by the host.
@@ -564,12 +565,12 @@ test "ACP credential preparation preserves the existing borrowed credential" {
     try std.testing.expectEqual(types.CredentialSource.configured, state.credential_source.?);
 }
 
-test "ACP Codex route is host-managed only when configured and never leaks into Gateway" {
+test "ACP provider routes are host-managed only when configured and never leak into Gateway" {
     const alloc = std.testing.allocator;
     var state: ServerState = undefined;
     state.alloc = alloc;
     state.cfg.auth_mode = .local;
-    state.cfg.codex_auth_mode = .host_managed;
+    state.cfg.provider_auth_mode = .host_managed;
     state.cfg.credential_override = "gateway-key";
     state.active_session = null;
     state.api_key = &.{};
@@ -591,9 +592,24 @@ test "ACP Codex route is host-managed only when configured and never leaks into 
     try std.testing.expectEqual(types.CredentialSource.ai_gateway_api_key, gateway.source);
     try std.testing.expectEqualStrings("gateway-key", gateway.token);
 
-    // Without the policy Codex needs its own credential.
-    state.cfg.codex_auth_mode = .local;
+    // A Grok turn is host-managed the same way.
+    var grok = (try prepareCredentialForProvider(&state, .grok)).?;
+    defer grok.deinit(alloc);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, grok.source);
+    try std.testing.expectEqual(@as(usize, 0), grok.token.len);
+
+    // So is a configured provider: the host adds its API key, if any.
+    const configured = model_provider.parse("local").?;
+    var custom = (try prepareCredentialForProvider(&state, configured)).?;
+    defer custom.deinit(alloc);
+    try std.testing.expectEqual(types.CredentialSource.host_managed, custom.source);
+    try std.testing.expectEqual(@as(usize, 0), custom.token.len);
+
+    // Without the policy each provider needs its own credential.
+    state.cfg.provider_auth_mode = .local;
     try std.testing.expect(!hostManagesRoute(state.cfg, .codex));
+    try std.testing.expect(!hostManagesRoute(state.cfg, .grok));
+    try std.testing.expect(!hostManagesRoute(state.cfg, configured));
     try std.testing.expect(!hostManagesRoute(state.cfg, .gateway));
 }
 
@@ -1786,7 +1802,7 @@ fn handleKernelCheckpoint(
         error.AttachmentStoreFull => return state.writer.writeError(alloc, msg.id, unavailable),
     };
     var response: [64]u8 = undefined;
-    const written = std.fmt.bufPrint(&response, "{{\"checkpointAttachment\":{d}}}", .{attachment}) catch unreachable;
+    const written = try std.mem.print(&response, "{{\"checkpointAttachment\":{d}}}", .{attachment});
     try state.writer.writeResponse(alloc, msg.id, written);
 }
 
@@ -2054,7 +2070,7 @@ fn handleKernelSnapshot(
         error.OutOfMemory => return error.OutOfMemory,
         error.AttachmentStoreFull => return state.writer.writeResponse(alloc, msg.id, none),
     };
-    const written = try std.fmt.allocPrint(alloc, "{{\"snapshotAttachment\":{d},\"atSeq\":{d}}}", .{ attachment, at_seq });
+    const written = try alloc.print("{{\"snapshotAttachment\":{d},\"atSeq\":{d}}}", .{ attachment, at_seq });
     defer alloc.free(written);
     try state.writer.writeResponse(alloc, msg.id, written);
 }
@@ -2064,7 +2080,7 @@ const SnapshotSkip = enum { too_large, too_many_turns, invalid };
 
 fn writeSnapshotSkipped(state: *ServerState, alloc: Allocator, id: ?jsonrpc.RequestId, reason: SnapshotSkip) !void {
     debug_trace.logf("session", "event=libfx_snapshot_skipped reason={s}", .{@tagName(reason)});
-    const body = try std.fmt.allocPrint(alloc, "{{\"snapshotAttachment\":null,\"skipped\":\"{s}\"}}", .{@tagName(reason)});
+    const body = try alloc.print("{{\"snapshotAttachment\":null,\"skipped\":\"{s}\"}}", .{@tagName(reason)});
     defer alloc.free(body);
     try state.writer.writeResponse(alloc, id, body);
 }
@@ -2516,12 +2532,17 @@ test "ordinary ACP ignores private libfx capabilities" {
 
 fn loadConfiguredStartupState(state: *const ServerState, alloc: Allocator) !app_lifecycle.StartupState {
     if (state.cfg.minimal_kernel) {
-        return app_lifecycle.loadLibfxStartupState(
+        var startup = try app_lifecycle.loadLibfxStartupState(
             alloc,
             state.cfg.workspace_root_override orelse "/",
             state.cfg.model_override orelse state.cfg.default_model,
             state.cfg.default_agent_step_limit,
         );
+        errdefer startup.deinit(alloc);
+        if (state.cfg.configured_providers_json) |json| {
+            startup.configured_providers = try @import("../core/config/configured_provider.zig").Registry.parse_json(alloc, json);
+        }
+        return startup;
     }
     if (state.cfg.home_override) |home_dir| {
         if (state.cfg.workspace_root_override) |workspace_root| {
@@ -2875,8 +2896,7 @@ fn effortOverrideRejection(
         if (index > 0) try set.appendSlice(alloc, ", ");
         try set.appendSlice(alloc, option.label());
     }
-    return try std.fmt.allocPrint(
-        alloc,
+    return try alloc.print(
         "Reasoning effort \"{s}\" is not available for model \"{s}\" (available: {s})",
         .{ effort.label(), model, set.items },
     );
@@ -2986,7 +3006,7 @@ fn fastOverrideRejection(
     model: []const u8,
 ) Allocator.Error!?[]u8 {
     if (capabilities.supports_fast_mode or capabilities.intrinsic_fast) return null;
-    return try std.fmt.allocPrint(alloc, "Fast mode is not available for model \"{s}\"", .{model});
+    return try alloc.print("Fast mode is not available for model \"{s}\"", .{model});
 }
 
 test "fastOverrideRejection accepts models with a fast path" {
@@ -3064,7 +3084,7 @@ fn ultrafastOverrideRejection(
     model: []const u8,
 ) Allocator.Error!?[]u8 {
     if (provider == .gateway and capabilities.supports_ultrafast_mode) return null;
-    return try std.fmt.allocPrint(alloc, "Ultrafast mode is not available for model \"{s}\"", .{model});
+    return try alloc.print("Ultrafast mode is not available for model \"{s}\"", .{model});
 }
 
 test "ultrafastOverrideRejection accepts only Gateway models with the catalog capability" {
@@ -3702,7 +3722,7 @@ fn applyActiveSessionFast(
 ) !bool {
     if (fast) {
         if (!activeSessionCapabilities(state, session).supports_fast_mode) {
-            const message = try std.fmt.allocPrint(alloc, "Fast mode is not available for model \"{s}\"", .{session.model});
+            const message = try alloc.print("Fast mode is not available for model \"{s}\"", .{session.model});
             defer alloc.free(message);
             try state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.invalid_params,
@@ -4257,7 +4277,7 @@ test "ACP legacy URL publication owns partial allocations" {
             try std.testing.expect(reserved);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Case.run, .{});
 }
 
 test "ACP legacy URL state requires consent and completion" {
@@ -4446,7 +4466,7 @@ fn acpModelTestState(
 }
 
 test "ACP ultrafast writes preserve v2 baselines across other preference changes" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
@@ -4655,7 +4675,7 @@ test "ACP rejects refreshed Codex tokens for another account" {
 }
 
 test "ACP usage flush preserves snapshot ownership on allocation failure" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var runtime: session_runtime.SessionRuntime = .{ .max_history_turns = 8 };
     var runtime_owned = true;
     defer if (runtime_owned) runtime.deinit(alloc);

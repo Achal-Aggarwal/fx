@@ -156,7 +156,7 @@ pub fn collectRegularFileRoot(
     errdefer matches.deinit(arena);
 
     if (include) |include_pattern| {
-        if (!include_pattern.matchesBasename(std.fs.path.basename(absolute_path))) {
+        if (!include_pattern.matchesBasename(std.Io.Dir.path.basename(absolute_path))) {
             return finishMatches(arena, &matches, null, .{
                 .cap = tool_files.default_candidate_cap,
             });
@@ -182,7 +182,7 @@ pub fn countRegularFileRoot(
 ) !CountResult {
     _ = workspace_root;
     if (include) |include_pattern| {
-        if (!include_pattern.matchesBasename(std.fs.path.basename(absolute_path))) {
+        if (!include_pattern.matchesBasename(std.Io.Dir.path.basename(absolute_path))) {
             return finishCount(.{}, .{ .cap = tool_files.default_candidate_cap });
         }
     }
@@ -334,7 +334,7 @@ const ParallelScan = struct {
     }
 
     fn scanOne(self: *ParallelScan, index: usize) Allocator.Error!void {
-        var absolute_match_buf: [std.fs.max_path_bytes]u8 = undefined;
+        var absolute_match_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
         const candidate_file = try resolveCandidateFile(self.work, self.workspace_root, self.provider_root, self.files[index], absolute_match_buf[0..]) orelse return;
         switch (self.mode) {
             .matches => {
@@ -490,7 +490,7 @@ const FileCount = struct {
 
 fn joinAbsolutePathScratch(buffer: []u8, absolute_root: []const u8, entry_path: []const u8) ![]const u8 {
     var fba = std.heap.FixedBufferAllocator.init(buffer);
-    return std.fs.path.join(fba.allocator(), &.{ absolute_root, entry_path }) catch |err| switch (err) {
+    return std.Io.Dir.path.join(fba.allocator(), &.{ absolute_root, entry_path }) catch |err| switch (err) {
         error.OutOfMemory => error.NameTooLong,
     };
 }
@@ -631,7 +631,7 @@ fn lineMatchesPattern(line: []const u8, pattern: []const u8, case_insensitive: b
 }
 
 fn writeTempFile(alloc: Allocator, tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) ![]u8 {
-    if (std.fs.path.dirname(sub_path)) |parent| {
+    if (std.Io.Dir.path.dirname(sub_path)) |parent| {
         try tmp.dir.createDirPath(io_mod.getIo(), parent);
     }
     var file = try tmp.dir.createFile(std.testing.io, sub_path, .{});
@@ -645,7 +645,7 @@ fn workspaceRoot(alloc: Allocator, tmp: std.testing.TmpDir) ![]u8 {
 }
 
 fn createBrokenSymlinkOrSkip(tmp: *std.testing.TmpDir, target_path: []const u8, link_path: []const u8) !void {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     tmp.dir.symLink(std.testing.io, target_path, link_path, .{ .is_directory = false }) catch |err| {
         if (err == error.AccessDenied or std.mem.eql(u8, @errorName(err), "Permission" ++ "Denied")) return error.SkipZigTest;
         return err;
@@ -653,7 +653,7 @@ fn createBrokenSymlinkOrSkip(tmp: *std.testing.TmpDir, target_path: []const u8, 
 }
 
 fn createSymlinkOrSkip(tmp: *std.testing.TmpDir, target_path: []const u8, link_path: []const u8) !void {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    if (comptime builtin.target.os.tag == .windows) return error.SkipZigTest;
     tmp.dir.symLink(std.testing.io, target_path, link_path, .{ .is_directory = false }) catch |err| {
         if (err == error.AccessDenied or std.mem.eql(u8, @errorName(err), "Permission" ++ "Denied")) return error.SkipZigTest;
         return err;
@@ -806,7 +806,7 @@ test "grep search logs skipped non-model-safe files" {
     defer alloc.free(workspace);
     const binary = try writeTempFile(alloc, &tmp, "binary.txt", "needle\x00binary\n");
     defer alloc.free(binary);
-    const trace_path = try std.fs.path.join(alloc, &.{ workspace, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -835,7 +835,7 @@ test "grep search logs skipped per-file scan errors during directory traversal" 
     const good = try writeTempFile(alloc, &tmp, "good.txt", "needle good\n");
     defer alloc.free(good);
     try createBrokenSymlinkOrSkip(&tmp, "missing-target.txt", "broken.txt");
-    const trace_path = try std.fs.path.join(alloc, &.{ workspace, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -873,7 +873,7 @@ test "grep search directory traversal skips external symlink targets with trace"
     try createSymlinkOrSkip(&workspace_tmp, "../target/internal.txt", "links/internal.txt");
     try createSymlinkOrSkip(&workspace_tmp, external_target, "links/external.txt");
 
-    const trace_path = try std.fs.path.join(alloc, &.{ workspace, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "trace.log" });
     defer alloc.free(trace_path);
     debug_trace.resetForTest();
     try debug_trace.configureForTest(alloc, trace_path);
@@ -964,7 +964,7 @@ test "grep search retained allocations scale with matches not scanned bytes" {
     var i: usize = 0;
     while (i < 4) : (i += 1) {
         var name_buf: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "large/file-{d}.txt", .{i});
+        const name = try std.mem.print(&name_buf, "large/file-{d}.txt", .{i});
         const path = try writeTempFile(alloc, &tmp, name, nonmatching_content);
         alloc.free(path);
     }
@@ -993,7 +993,7 @@ test "grep search logs oversized files and continues directory traversal" {
     defer alloc.free(content);
     const large = try writeTempFile(alloc, &tmp, "large.txt", content);
     defer alloc.free(large);
-    const trace_path = try std.fs.path.join(alloc, &.{ workspace, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -1023,7 +1023,7 @@ test "grep search skips oversized regular-file roots with trace" {
     defer alloc.free(content);
     const large = try writeTempFile(alloc, &tmp, "large.txt", content);
     defer alloc.free(large);
-    const trace_path = try std.fs.path.join(alloc, &.{ workspace, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ workspace, "trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -1051,7 +1051,7 @@ test "grep search finds match beyond former traversal cap" {
     var i: usize = 0;
     while (i < 2050) : (i += 1) {
         var name_buf: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "many/file-{d:0>4}.txt", .{i});
+        const name = try std.mem.print(&name_buf, "many/file-{d:0>4}.txt", .{i});
         const path = try writeTempFile(alloc, &tmp, name, "not here\n");
         alloc.free(path);
     }
@@ -1136,7 +1136,7 @@ test "grep search collection cap takes precedence at traversal boundary" {
     var i: usize = 0;
     while (i < 100) : (i += 1) {
         var name_buf: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "file-{d:0>4}.txt", .{i});
+        const name = try std.mem.print(&name_buf, "file-{d:0>4}.txt", .{i});
         const path = try writeTempFile(alloc, &tmp, name, "not here\n");
         alloc.free(path);
     }
@@ -1203,7 +1203,7 @@ test "grep search parallel scan matches single-threaded order and cap truncation
     const content = "needle one\nother\nneedle two\n";
     for (0..1500) |index| {
         var name_buf: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buf, "many/file-{d:0>4}.txt", .{index});
+        const name = try std.mem.print(&name_buf, "many/file-{d:0>4}.txt", .{index});
         alloc.free(try writeTempFile(alloc, &tmp, name, content));
     }
 
@@ -1215,7 +1215,7 @@ test "grep search parallel scan matches single-threaded order and cap truncation
         try std.testing.expectEqual(collection_cap, result.matches.len);
         for (result.matches, 0..) |match, position| {
             var want_buf: [64]u8 = undefined;
-            const want = try std.fmt.bufPrint(&want_buf, "many/file-{d:0>4}.txt", .{position / 2});
+            const want = try std.mem.print(&want_buf, "many/file-{d:0>4}.txt", .{position / 2});
             try std.testing.expect(std.mem.endsWith(u8, match.absolute_path, want));
             try std.testing.expectEqual(2 * (position % 2) + 1, match.line_number);
         }

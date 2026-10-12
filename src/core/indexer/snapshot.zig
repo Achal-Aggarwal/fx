@@ -108,14 +108,14 @@ pub fn save(alloc: Allocator, path: []const u8, trees: []const Tree) !void {
     try out.writer.writeAll(&digest);
     try out.writer.writeAll(payload.written());
 
-    const dir_path = std.fs.path.dirname(path) orelse return error.InvalidSnapshotPath;
+    const dir_path = std.Io.Dir.path.dirname(path) orelse return error.InvalidSnapshotPath;
     try io_mod.makeDirRecursive(dir_path);
     // `.iterate` matters on Linux: without it the descriptor is O_PATH and
     // the directory fsync inside durableReplaceVerified fails with EBADF.
     var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .follow_symlinks = false, .iterate = true });
     defer dir.close(io);
     var verified: io_mod.VerifiedDir = .{ .dir = dir };
-    try io_mod.durableReplaceVerified(alloc, &verified, std.fs.path.basename(path), out.written());
+    try io_mod.durableReplaceVerified(alloc, &verified, std.Io.Dir.path.basename(path), out.written());
     try dir.setPermissions(io, .fromMode(0o700));
 }
 
@@ -143,7 +143,7 @@ fn encode(writer: *std.Io.Writer, trees: []const Tree) !void {
         for (tree.skipped_names) |name| try writeString(writer, name);
         try writeInt(writer, u32, @intCast(tree.entries.len));
         for (tree.entries) |entry| {
-            try writer.writeByte(@intFromEnum(entry.kind));
+            try writer.writeByte(@backingInt(entry.kind));
             try writeString(writer, entry.path);
         }
         try writeInt(writer, u32, @intCast(tree.folders.len));
@@ -217,7 +217,7 @@ fn decode(arena: Allocator, bytes: []const u8, roots: []const []const u8) (Alloc
         for (entries) |*entry| {
             const kind = (try decoder.take(1))[0];
             if (kind > 1) return error.InvalidSnapshot;
-            entry.* = .{ .kind = @enumFromInt(kind), .path = try decoder.string(arena, max_path_bytes, false) };
+            entry.* = .{ .kind = @fromBackingInt(@intCast(kind)), .path = try decoder.string(arena, max_path_bytes, false) };
         }
         const folders = try arena.alloc(tree_mod.FolderStamp, try decoder.count(29));
         for (folders) |*folder| {
@@ -301,7 +301,7 @@ test "snapshot round trips, rejects tampering, other scopes and v1 files, and an
     defer tmp.cleanup();
     const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(home);
-    const path = try std.fs.path.join(alloc, &.{ home, "file-index", "scope.idx" });
+    const path = try std.Io.Dir.path.join(alloc, &.{ home, "file-index", "scope.idx" });
     defer alloc.free(path);
     const roots = [_][]const u8{ "/w", "/extra" };
     const trees = [_]Tree{

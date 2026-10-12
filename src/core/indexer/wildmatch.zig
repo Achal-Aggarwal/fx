@@ -318,9 +318,20 @@ test "wildmatch stops at a NUL byte like git's C strings" {
     try std.testing.expect(match("ab\x00zz", "ab", .{ .pathname = true }));
 }
 
+// The indexer imports nothing outside its boundary, so it keeps its own copy of
+// `text_utils.repeat` for tests.
+inline fn repeat(comptime text: []const u8, comptime count: usize) *const [text.len * count:0]u8 {
+    return comptime blk: {
+        var bytes: [text.len * count:0]u8 = @splat(0);
+        for (0..count) |i| @memcpy(bytes[i * text.len ..][0..text.len], text);
+        const final = bytes;
+        break :blk &final;
+    };
+}
+
 test "hostile patterns stop at the step budget instead of backtracking forever" {
-    const long_text = "a/" ** 200 ++ "b";
-    const hostile = [_][]const u8{ "*/" ** 40 ++ "c", "**/" ** 30 ++ "c", "*a*a*a*a*a*a*a*a*a*a*a*a*c", "a/**/a/**/a/**/a/**/a/**/a/**/c" };
+    const long_text = repeat("a/", 200) ++ "b";
+    const hostile = [_][]const u8{ repeat("*/", 40) ++ "c", repeat("**/", 30) ++ "c", "*a*a*a*a*a*a*a*a*a*a*a*a*c", "a/**/a/**/a/**/a/**/a/**/a/**/c" };
     for (hostile) |pattern| {
         try std.testing.expect(!match(pattern, long_text, .{ .pathname = true }));
         try std.testing.expect(!match(pattern, long_text, .{}));

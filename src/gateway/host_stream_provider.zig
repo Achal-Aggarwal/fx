@@ -3,6 +3,7 @@ const stream_provider = @import("../core/agent/stream_provider.zig");
 const io_mod = @import("../core/shared/io.zig");
 const gateway_client = @import("client.zig");
 const vercel_protocol = @import("vercel_protocol.zig");
+const vercel_failure_diagnostics = @import("vercel_failure_diagnostics.zig");
 const credential_authority = @import("../core/auth/credential_authority.zig");
 
 const Allocator = std.mem.Allocator;
@@ -38,6 +39,13 @@ pub const Transport = struct {
         if (self.consumed_fn) |notify| notify(self.context, handle);
     }
 };
+
+/// The HTTP status a host reported, or null when `code` is outside 100 to 599.
+/// A host can report any `u16`, and `std.http.Status` cannot hold most of them.
+pub fn httpStatus(code: u16) ?std.http.Status {
+    if (code < 100 or code > 599) return null;
+    return @fromBackingInt(@intCast(code));
+}
 
 pub const ProviderContext = struct {
     build_fn: *const fn (Allocator, stream_provider.RequestData) anyerror![]u8,
@@ -130,7 +138,7 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
         try context.build_fn(alloc, request.data());
     defer if (request.prepared_request_body == null) alloc.free(payload);
     const auth = if (request.credential.secret()) |credential|
-        try std.fmt.allocPrint(alloc, "Bearer {s}", .{credential})
+        try alloc.print("Bearer {s}", .{credential})
     else
         null;
     defer if (auth) |value| alloc.free(value);
@@ -155,11 +163,17 @@ fn stream(raw: ?*anyopaque, alloc: Allocator, request: stream_provider.ModelRequ
 
     const opened = try openPost(alloc, transport, request, context.endpoint.url(), headers.items, payload);
     defer transport.close(opened.handle);
-    if (opened.status != .ok) return .{ .failed = .{
-        .kind = failureKind(opened.status),
-        .detail = try readErrorBody(alloc, transport, opened.handle, request),
-        .ownership = .owned,
-    } };
+    if (opened.status != .ok) {
+        const body = try readErrorBody(alloc, transport, opened.handle, request);
+        // Gateway reports the last provider it tried, so a provider's size
+        // rejection can arrive as a 400 from a later fallback.
+        const kind = failureKind(opened.status);
+        return .{ .failed = .{
+            .kind = if (kind == .invalid_request and vercel_failure_diagnostics.providerRejectedRequestSize(alloc, body)) .request_too_large else kind,
+            .detail = body,
+            .ownership = .owned,
+        } };
+    }
 
     var reader: HostStreamReader = undefined;
     reader.init(
@@ -228,7 +242,8 @@ pub fn openPost(
         if (status_result < 0) return error.HostStreamFailed;
         try pulse(request.cooperative_pulse);
     }
-    return .{ .handle = handle, .status = @enumFromInt(status_code) };
+    const http_status = httpStatus(status_code) orelse return error.HostStreamFailed;
+    return .{ .handle = handle, .status = http_status };
 }
 
 /// Reads a non-success response body, bounded. The caller owns the bytes.
@@ -267,6 +282,15 @@ pub fn signalConsumed(
     {
         transport.consumed(handle);
     }
+}
+
+test "host statuses outside 100 to 599 are not HTTP statuses" {
+    for ([_]u16{ 0, 99, 600, 1023, 1024, 65535 }) |code| {
+        try std.testing.expectEqual(@as(?std.http.Status, null), httpStatus(code));
+    }
+    try std.testing.expectEqual(@as(?std.http.Status, .@"continue"), httpStatus(100));
+    try std.testing.expectEqual(@as(?std.http.Status, .ok), httpStatus(200));
+    try std.testing.expectEqual(@as(u16, 599), @backingInt(httpStatus(599).?));
 }
 
 test "host provider signals logical consumption only after valid uncancelled completion" {
@@ -355,6 +379,9 @@ test "host provider signals logical consumption only after valid uncancelled com
             "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"tool-calls\"}}\n\n" },
         .{ .body = text ++ stop, .cancel_on_content = true },
         .{ .body = "upstream failure", .status = 500 },
+        .{ .body = text ++ stop, .status = 0, .expected_error = error.HostStreamFailed },
+        .{ .body = text ++ stop, .status = 1024, .expected_error = error.HostStreamFailed },
+        .{ .body = text ++ stop, .status = 65535, .expected_error = error.HostStreamFailed },
         .{ .body = text, .read_error = -1, .expected_error = error.HostStreamFailed },
         .{ .body = "data: {not-json}\n\n", .expected_error = error.InvalidGatewaySseEvent },
     };

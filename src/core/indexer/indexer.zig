@@ -70,7 +70,7 @@ pub const RepoFiltersError = error{ OutOfMemory, RepoConfigUnavailable };
 /// bounds, a malformed one, or an invalid `.git` file fails closed with
 /// `error.RepoConfigUnavailable`.
 pub fn repoFilters(alloc: Allocator, workspace_root: []const u8) RepoFiltersError!RepoFilters {
-    if (!std.fs.path.isAbsolute(workspace_root)) return error.RepoConfigUnavailable;
+    if (!std.Io.Dir.path.isAbsolute(workspace_root)) return error.RepoConfigUnavailable;
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -121,15 +121,15 @@ test {
 }
 
 fn writeTestFile(dir: std.Io.Dir, path: []const u8, content: []const u8) !void {
-    if (std.fs.path.dirname(path)) |parent| try dir.createDirPath(std.testing.io, parent);
+    if (std.Io.Dir.path.dirname(path)) |parent| try dir.createDirPath(std.testing.io, parent);
     try dir.writeFile(std.testing.io, .{ .sub_path = path, .data = content });
 }
 
 fn makeTestRepo(dir: std.Io.Dir, name: []const u8) !void {
     var buffer: [64]u8 = undefined;
-    try writeTestFile(dir, try std.fmt.bufPrint(&buffer, "{s}/.git/HEAD", .{name}), "ref: refs/heads/main\n");
-    try dir.createDirPath(std.testing.io, try std.fmt.bufPrint(&buffer, "{s}/.git/objects", .{name}));
-    try dir.createDirPath(std.testing.io, try std.fmt.bufPrint(&buffer, "{s}/.git/refs", .{name}));
+    try writeTestFile(dir, try std.mem.print(&buffer, "{s}/.git/HEAD", .{name}), "ref: refs/heads/main\n");
+    try dir.createDirPath(std.testing.io, try std.mem.print(&buffer, "{s}/.git/objects", .{name}));
+    try dir.createDirPath(std.testing.io, try std.mem.print(&buffer, "{s}/.git/refs", .{name}));
 }
 
 test "repoFilters returns the repository and its drivers and fails closed on unreadable config" {
@@ -145,17 +145,17 @@ test "repoFilters returns the repository and its drivers and fails closed on unr
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
 
-    const repo_src = try std.fs.path.join(alloc, &.{ root, "repo/src" });
+    const repo_src = try std.Io.Dir.path.join(alloc, &.{ root, "repo/src" });
     defer alloc.free(repo_src);
     const filters = try repoFilters(alloc, repo_src);
     defer filters.deinit(alloc);
-    const expected_git_dir = try std.fs.path.join(alloc, &.{ root, "repo/.git" });
+    const expected_git_dir = try std.Io.Dir.path.join(alloc, &.{ root, "repo/.git" });
     defer alloc.free(expected_git_dir);
     try std.testing.expectEqualStrings(expected_git_dir, filters.git_dir.?);
     try std.testing.expectEqual(@as(usize, 1), filters.names.len);
     try std.testing.expectEqualStrings("x", filters.names[0]);
 
-    const bad = try std.fs.path.join(alloc, &.{ root, "bad" });
+    const bad = try std.Io.Dir.path.join(alloc, &.{ root, "bad" });
     defer alloc.free(bad);
     try std.testing.expectError(error.RepoConfigUnavailable, repoFilters(alloc, bad));
     try std.testing.expectError(error.RepoConfigUnavailable, repoFilters(alloc, "relative"));

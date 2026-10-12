@@ -31,7 +31,7 @@ pub const RepositoryWide = struct {
 pub fn loadRepositoryWide(arena: Allocator, layout: layout_mod.Layout, settings: git_config.IgnoreSettings) Allocator.Error!RepositoryWide {
     var lists: std.ArrayList(*const ignore.PatternList) = .empty;
     var unavailable: std.ArrayList(Unavailable) = .empty;
-    const info_exclude = try std.fs.path.join(arena, &.{ layout.common_dir, "info", "exclude" });
+    const info_exclude = try std.Io.Dir.path.join(arena, &.{ layout.common_dir, "info", "exclude" });
     const files = [_]struct { path: ?[]const u8, follow_symlinks: bool }{
         .{ .path = settings.excludes_file, .follow_symlinks = settings.excludes_file_follows_symlinks },
         .{ .path = info_exclude, .follow_symlinks = false },
@@ -81,7 +81,7 @@ pub fn loadDirectory(arena: Allocator, dir: std.Io.Dir, base: []const u8) Alloca
 }
 
 fn writeTestFile(dir: std.Io.Dir, path: []const u8, content: []const u8) !void {
-    if (std.fs.path.dirname(path)) |parent| try dir.createDirPath(std.testing.io, parent);
+    if (std.Io.Dir.path.dirname(path)) |parent| try dir.createDirPath(std.testing.io, parent);
     try dir.writeFile(std.testing.io, .{ .sub_path = path, .data = content });
 }
 
@@ -97,10 +97,10 @@ test "repository-wide ignore sources load in git's precedence and report unreada
     try writeTestFile(tmp.dir, "repo/.git/info/exclude", "!keep.tmp\n");
     try writeTestFile(tmp.dir, "global-ignore", "*.tmp\n");
     const root = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
-    const layout = (try layout_mod.discover(arena, try std.fs.path.join(arena, &.{ root, "repo" }))).?;
+    const layout = (try layout_mod.discover(arena, try std.Io.Dir.path.join(arena, &.{ root, "repo" }))).?;
 
     const settings: git_config.IgnoreSettings = .{
-        .excludes_file = try std.fs.path.join(arena, &.{ root, "global-ignore" }),
+        .excludes_file = try std.Io.Dir.path.join(arena, &.{ root, "global-ignore" }),
         .excludes_file_follows_symlinks = true,
         .ignore_case = false,
         .object_format = .sha1,
@@ -121,7 +121,7 @@ test "repository-wide ignore sources load in git's precedence and report unreada
     // A linked excludes file is followed only when the user's config named it.
     tmp.dir.symLink(std.testing.io, "global-ignore", "linked-ignore", .{}) catch return error.SkipZigTest;
     var linked = settings;
-    linked.excludes_file = try std.fs.path.join(arena, &.{ root, "linked-ignore" });
+    linked.excludes_file = try std.Io.Dir.path.join(arena, &.{ root, "linked-ignore" });
     const followed = try loadRepositoryWide(arena, layout, linked);
     try std.testing.expectEqual(@as(usize, 2), followed.lists.len);
     try std.testing.expectEqual(ignore.Decision.excluded, ignore.decide(followed.lists, "a.tmp", false, false));

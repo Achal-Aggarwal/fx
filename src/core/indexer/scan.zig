@@ -198,7 +198,7 @@ pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*std.at
     var result_arena = std.heap.ArenaAllocator.init(alloc);
     errdefer result_arena.deinit();
     const arena = result_arena.allocator();
-    if (!std.fs.path.isAbsolute(root)) return error.RootUnavailable;
+    if (!std.Io.Dir.path.isAbsolute(root)) return error.RootUnavailable;
     const io = io_mod.getIo();
     var root_dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch return error.RootUnavailable;
     defer root_dir.close(io);
@@ -310,9 +310,9 @@ fn repositoryRules(arena: Allocator, root: []const u8, rules: *Rules, incomplete
     const top = if (maybe_found) |found| found.worktree_root else "/";
     var ancestor = root;
     while (true) {
-        try rules.sources.append(arena, .{ .path = try std.fs.path.join(arena, &.{ ancestor, ".git" }), .identity_only = true });
+        try rules.sources.append(arena, .{ .path = try std.Io.Dir.path.join(arena, &.{ ancestor, ".git" }), .identity_only = true });
         if (std.mem.eql(u8, ancestor, top)) break;
-        ancestor = std.fs.path.dirname(ancestor) orelse break;
+        ancestor = std.Io.Dir.path.dirname(ancestor) orelse break;
     }
     const found = maybe_found orelse return null;
     const context = try git_config.Context.fromEnvironment(arena, found);
@@ -323,8 +323,8 @@ fn repositoryRules(arena: Allocator, root: []const u8, rules: *Rules, incomplete
     if (wide.unavailable.len > 0) incomplete.* = true;
     for (loaded.paths) |read| try rules.sources.append(arena, .{ .path = read.path, .identity_only = false, .follow_symlinks = read.follow_symlinks });
     if (settings.excludes_file) |path| try rules.sources.append(arena, .{ .path = path, .identity_only = false, .follow_symlinks = settings.excludes_file_follows_symlinks });
-    for ([_][]const u8{"info/exclude"}) |name| try rules.sources.append(arena, .{ .path = try std.fs.path.join(arena, &.{ found.common_dir, name }), .identity_only = false });
-    for ([_][]const u8{ "index", "HEAD", "commondir" }) |name| try rules.sources.append(arena, .{ .path = try std.fs.path.join(arena, &.{ found.git_dir, name }), .identity_only = false });
+    for ([_][]const u8{"info/exclude"}) |name| try rules.sources.append(arena, .{ .path = try std.Io.Dir.path.join(arena, &.{ found.common_dir, name }), .identity_only = false });
+    for ([_][]const u8{ "index", "HEAD", "commondir" }) |name| try rules.sources.append(arena, .{ .path = try std.Io.Dir.path.join(arena, &.{ found.git_dir, name }), .identity_only = false });
 
     var lists: std.ArrayList(*const ignore.PatternList) = .empty;
     try lists.appendSlice(arena, wide.lists);
@@ -338,14 +338,14 @@ fn repositoryRules(arena: Allocator, root: []const u8, rules: *Rules, incomplete
             try ancestors.append(arena, found.prefix[0..slash]);
         }
         for (ancestors.items) |rule_dir| {
-            const absolute = if (rule_dir.len == 0) found.worktree_root else try std.fs.path.join(arena, &.{ found.worktree_root, rule_dir });
+            const absolute = if (rule_dir.len == 0) found.worktree_root else try std.Io.Dir.path.join(arena, &.{ found.worktree_root, rule_dir });
             var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), absolute, .{}) catch {
                 incomplete.* = true;
                 continue;
             };
             defer dir.close(io_mod.getIo());
-            const base = if (rule_dir.len == 0) "" else try std.fmt.allocPrint(arena, "{s}/", .{rule_dir});
-            try rules.sources.append(arena, .{ .path = try std.fs.path.join(arena, &.{ absolute, ".gitignore" }), .identity_only = false });
+            const base = if (rule_dir.len == 0) "" else try arena.print("{s}/", .{rule_dir});
+            try rules.sources.append(arena, .{ .path = try std.Io.Dir.path.join(arena, &.{ absolute, ".gitignore" }), .identity_only = false });
             switch (try sources.loadDirectory(arena, dir, base)) {
                 .list => |list| try lists.append(arena, list),
                 .absent => {},
@@ -362,7 +362,7 @@ fn repositoryRules(arena: Allocator, root: []const u8, rules: *Rules, incomplete
     rules.repository = true;
     rules.fold_case = settings.ignore_case;
     rules.prefix = found.prefix;
-    const index_path = try std.fs.path.join(arena, &.{ found.git_dir, "index" });
+    const index_path = try std.Io.Dir.path.join(arena, &.{ found.git_dir, "index" });
     const hash: git_index.HashFormat = if (settings.object_format == .sha256) .sha256 else .sha1;
     switch (try git_index.read(arena, index_path, hash)) {
         .missing => {},
@@ -441,9 +441,9 @@ fn listDirectory(shared: *Shared, worker: *Worker, job: Job, children: *std.Arra
     // Below an excluded folder everything is excluded, as in git, which stops
     // reading `.gitignore` files there.
     if (!job.excluded) {
-        const base = if (job.rule_path.len == 0) "" else try std.fmt.allocPrint(arena, "{s}/", .{job.rule_path});
+        const base = if (job.rule_path.len == 0) "" else try arena.print("{s}/", .{job.rule_path});
         const loaded = try sources.loadDirectory(arena, dir, base);
-        if (loaded != .absent) listing.ignore_file = try std.fs.path.join(arena, &.{ shared.root_abs, job.rel, ".gitignore" });
+        if (loaded != .absent) listing.ignore_file = try std.Io.Dir.path.join(arena, &.{ shared.root_abs, job.rel, ".gitignore" });
         switch (loaded) {
             .list => |list| {
                 const extended = try arena.alloc(*const ignore.PatternList, lists.len + 1);
@@ -521,7 +521,7 @@ fn listDirectory(shared: *Shared, worker: *Worker, job: Job, children: *std.Arra
 
     // An untracked folder with its own repository is a boundary, as in git.
     if (rules.repository and saw_dot_git and !job.tracked and job.rel.len > 0) {
-        const absolute = try std.fs.path.join(arena, &.{ shared.root_abs, job.rel });
+        const absolute = try std.Io.Dir.path.join(arena, &.{ shared.root_abs, job.rel });
         if (try layout_mod.hasOwnRepository(arena, absolute)) {
             listing.boundary = true;
             children.clearRetainingCapacity();
@@ -545,7 +545,7 @@ fn excludedPath(lists: []const *const ignore.PatternList, path: []const u8, is_d
 
 fn joinPath(arena: Allocator, parent: []const u8, name: []const u8) Allocator.Error![]const u8 {
     if (parent.len == 0) return arena.dupe(u8, name);
-    return std.fmt.allocPrint(arena, "{s}/{s}", .{ parent, name });
+    return arena.print("{s}/{s}", .{ parent, name });
 }
 
 /// Applies git's folder rules bottom-up and gathers the visible entries.
@@ -595,7 +595,7 @@ fn entryLessThan(_: void, a: Entry, b: Entry) bool {
     return switch (std.mem.order(u8, a.path, b.path)) {
         .lt => true,
         .gt => false,
-        .eq => @intFromEnum(a.kind) < @intFromEnum(b.kind),
+        .eq => @backingInt(a.kind) < @backingInt(b.kind),
     };
 }
 
@@ -643,7 +643,7 @@ const TestTree = struct {
     }
 
     fn file(self: *TestTree, path: []const u8, data: []const u8) !void {
-        if (std.fs.path.dirname(path)) |parent| try self.tmp.dir.createDirPath(std.testing.io, parent);
+        if (std.Io.Dir.path.dirname(path)) |parent| try self.tmp.dir.createDirPath(std.testing.io, parent);
         try self.tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = data });
     }
 
@@ -653,10 +653,10 @@ const TestTree = struct {
 
     /// A repository whose index tracks `tracked`.
     fn repo(self: *TestTree, arena: Allocator, name: []const u8, tracked: []const git_index.TestEntry) !void {
-        try self.file(try std.fmt.allocPrint(arena, "{s}/.git/HEAD", .{name}), "ref: refs/heads/main\n");
-        try self.dir(try std.fmt.allocPrint(arena, "{s}/.git/objects", .{name}));
-        try self.dir(try std.fmt.allocPrint(arena, "{s}/.git/refs", .{name}));
-        try self.file(try std.fmt.allocPrint(arena, "{s}/.git/index", .{name}), try git_index.buildForTest(arena, 2, .sha1, tracked, ""));
+        try self.file(try arena.print("{s}/.git/HEAD", .{name}), "ref: refs/heads/main\n");
+        try self.dir(try arena.print("{s}/.git/objects", .{name}));
+        try self.dir(try arena.print("{s}/.git/refs", .{name}));
+        try self.file(try arena.print("{s}/.git/index", .{name}), try git_index.buildForTest(arena, 2, .sha1, tracked, ""));
     }
 };
 
@@ -702,7 +702,7 @@ test "repository scan follows git: index, ignore rules, folder rules and boundar
     try tree.tmp.dir.symLink(std.testing.io, "a.txt", "repo/link", .{});
     try tree.tmp.dir.symLink(std.testing.io, "dist", "repo/dirlink", .{});
 
-    var result = try scan(std.testing.allocator, try std.fs.path.join(arena, &.{ tree.root, "repo" }), .{}, null);
+    var result = try scan(std.testing.allocator, try std.Io.Dir.path.join(arena, &.{ tree.root, "repo" }), .{}, null);
     defer result.deinit();
     try std.testing.expect(result.tree.repository);
     try std.testing.expect(!result.tree.incomplete);
@@ -723,13 +723,13 @@ test "repository scan follows git: index, ignore rules, folder rules and boundar
 
     // Scanning a subfolder applies the rules above it, with paths relative to it.
     try tree.file("repo/.hidden/skip.log", "s");
-    var sub = try scan(std.testing.allocator, try std.fs.path.join(arena, &.{ tree.root, "repo/.hidden" }), .{}, null);
+    var sub = try scan(std.testing.allocator, try std.Io.Dir.path.join(arena, &.{ tree.root, "repo/.hidden" }), .{}, null);
     defer sub.deinit();
     try std.testing.expect(sub.tree.repository);
     try expectEntries(sub, &.{.{ .path = "h.txt", .kind = .file }});
 
     // U3: a root that is itself ignored is listed with plain rules.
-    var ignored_root = try scan(std.testing.allocator, try std.fs.path.join(arena, &.{ tree.root, "repo/dist" }), .{}, null);
+    var ignored_root = try scan(std.testing.allocator, try std.Io.Dir.path.join(arena, &.{ tree.root, "repo/dist" }), .{}, null);
     defer ignored_root.deinit();
     try std.testing.expect(!ignored_root.tree.repository);
     try expectEntries(ignored_root, &.{
@@ -756,7 +756,7 @@ test "plain scan applies .gitignore files and the skipped names, also below an i
     try tree.file("repo/plain/build/out.o", "o");
     try tree.file("repo/plain/sub/dist", "named like a skipped folder");
 
-    var result = try scan(std.testing.allocator, try std.fs.path.join(arena, &.{ tree.root, "repo/plain" }), .{}, null);
+    var result = try scan(std.testing.allocator, try std.Io.Dir.path.join(arena, &.{ tree.root, "repo/plain" }), .{}, null);
     defer result.deinit();
     try std.testing.expect(!result.tree.repository);
     try expectEntries(result, &.{
@@ -767,7 +767,7 @@ test "plain scan applies .gitignore files and the skipped names, also below an i
         .{ .path = "tracked.txt", .kind = .file },
     });
 
-    var custom = try scan(std.testing.allocator, try std.fs.path.join(arena, &.{ tree.root, "repo/plain" }), .{ .skipped_names = &.{"src"} }, null);
+    var custom = try scan(std.testing.allocator, try std.Io.Dir.path.join(arena, &.{ tree.root, "repo/plain" }), .{ .skipped_names = &.{"src"} }, null);
     defer custom.deinit();
     try expectEntries(custom, &.{
         .{ .path = ".gitignore", .kind = .file },
@@ -790,9 +790,9 @@ test "scan caps, skips overlong paths, cancels and is the same with one worker o
     defer tree.tmp.cleanup();
     try tree.repo(arena, "repo", &.{});
     for (0..60) |i| {
-        for (0..3) |j| try tree.file(try std.fmt.allocPrint(arena, "repo/d{d:0>2}/s{d}/f.txt", .{ i, j }), "x");
+        for (0..3) |j| try tree.file(try arena.print("repo/d{d:0>2}/s{d}/f.txt", .{ i, j }), "x");
     }
-    const root = try std.fs.path.join(arena, &.{ tree.root, "repo" });
+    const root = try std.Io.Dir.path.join(arena, &.{ tree.root, "repo" });
 
     var serial = try scan(std.testing.allocator, root, .{ .max_workers = 1 }, null);
     defer serial.deinit();
@@ -840,7 +840,7 @@ test "scan caps, skips overlong paths, cancels and is the same with one worker o
 
     var stop: std.atomic.Value(bool) = .init(true);
     try std.testing.expectError(error.Canceled, scan(std.testing.allocator, root, .{}, &stop));
-    try std.testing.expectError(error.RootUnavailable, scan(std.testing.allocator, try std.fs.path.join(arena, &.{ root, "missing" }), .{}, null));
+    try std.testing.expectError(error.RootUnavailable, scan(std.testing.allocator, try std.Io.Dir.path.join(arena, &.{ root, "missing" }), .{}, null));
 }
 
 test "repository scan reports an unusable index as incomplete and keeps untracked files" {
@@ -854,7 +854,7 @@ test "repository scan reports an unusable index as incomplete and keeps untracke
     try tree.file("repo/.gitignore", "*.log\n");
     try tree.file("repo/kept.txt", "k");
     try tree.file("repo/committed.log", "c");
-    var result = try scan(std.testing.allocator, try std.fs.path.join(arena, &.{ tree.root, "repo" }), .{}, null);
+    var result = try scan(std.testing.allocator, try std.Io.Dir.path.join(arena, &.{ tree.root, "repo" }), .{}, null);
     defer result.deinit();
     try std.testing.expect(result.tree.incomplete);
     try expectEntries(result, &.{
@@ -872,9 +872,9 @@ test "refresh trusts an old unchanged tree and rejects every kind of change" {
     const cases = [_][]const u8{ "unchanged", "new_file", "ignore_edit", "index", "config", "replaced", "future" };
     for (cases) |name| {
         try tree.repo(arena, name, &.{.{ .path = "src/a.txt" }});
-        try tree.file(try std.fmt.allocPrint(arena, "{s}/.gitignore", .{name}), "*.log\n");
-        try tree.file(try std.fmt.allocPrint(arena, "{s}/src/a.txt", .{name}), "a");
-        try tree.file(try std.fmt.allocPrint(arena, "{s}/docs/b.md", .{name}), "b");
+        try tree.file(try arena.print("{s}/.gitignore", .{name}), "*.log\n");
+        try tree.file(try arena.print("{s}/src/a.txt", .{name}), "a");
+        try tree.file(try arena.print("{s}/docs/b.md", .{name}), "b");
     }
     const future: std.Io.Timestamp = .{ .nanoseconds = @as(i96, tree_mod.nowNs()) + 3600 * std.time.ns_per_s };
     try tree.tmp.dir.setTimestamps(std.testing.io, "future/docs", .{ .modify_timestamp = .{ .new = future } });
@@ -882,13 +882,13 @@ test "refresh trusts an old unchanged tree and rejects every kind of change" {
     const first_rules = [_][]const u8{ "root_rules", "parent_rules" };
     for (first_rules) |name| {
         try tree.repo(arena, name, &.{.{ .path = "a/b/x.txt" }});
-        try tree.file(try std.fmt.allocPrint(arena, "{s}/a/b/x.txt", .{name}), "x");
-        try tree.file(try std.fmt.allocPrint(arena, "{s}/a/b/y.secret", .{name}), "y");
+        try tree.file(try arena.print("{s}/a/b/x.txt", .{name}), "x");
+        try tree.file(try arena.print("{s}/a/b/y.secret", .{name}), "y");
     }
 
     // A tree scanned right after its files changed is never reused.
     {
-        const root = try std.fs.path.join(arena, &.{ tree.root, "unchanged" });
+        const root = try std.Io.Dir.path.join(arena, &.{ tree.root, "unchanged" });
         var racy = try scan(std.testing.allocator, root, .{}, null);
         defer racy.deinit();
         try std.testing.expect(!tree_mod.isCurrent(&racy.tree, root, &default_skipped_names, null));
@@ -898,14 +898,14 @@ test "refresh trusts an old unchanged tree and rejects every kind of change" {
     var results: [cases.len]Result = undefined;
     var roots: [cases.len][]const u8 = undefined;
     for (cases, 0..) |name, i| {
-        roots[i] = try std.fs.path.join(arena, &.{ tree.root, name });
+        roots[i] = try std.Io.Dir.path.join(arena, &.{ tree.root, name });
         results[i] = try scan(std.testing.allocator, roots[i], .{}, null);
     }
     defer for (&results) |*result| result.deinit();
     var rule_results: [first_rules.len]Result = undefined;
     var rule_roots: [first_rules.len][]const u8 = undefined;
     for (first_rules, 0..) |name, i| {
-        rule_roots[i] = try std.fs.path.join(arena, &.{ tree.root, name });
+        rule_roots[i] = try std.Io.Dir.path.join(arena, &.{ tree.root, name });
         rule_results[i] = try scan(std.testing.allocator, rule_roots[i], .{}, null);
     }
     defer for (&rule_results) |*result| result.deinit();

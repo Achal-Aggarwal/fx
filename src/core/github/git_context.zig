@@ -1,4 +1,5 @@
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const io_mod = @import("../shared/io.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const safe_git = @import("../shell_command/safe_git.zig");
@@ -220,7 +221,7 @@ test "git argv: every snapshot command is built by the safe-git helper" {
 }
 
 test "git repository detection treats allocation failure as unavailable" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 0 });
     const ready: safe_git.Ready = .{ .executable = "/usr/bin/git", .filter_names = &.{} };
     try std.testing.expect(!isGitRepository(failing.allocator(), ready));
 }

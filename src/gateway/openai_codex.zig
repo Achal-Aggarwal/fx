@@ -250,7 +250,7 @@ pub fn requestAuthHeaders(alloc: Allocator, auth: stream_provider.CredentialLeas
     return switch (auth) {
         .host_managed => .{},
         .direct => |direct| blk: {
-            const authorization = try std.fmt.allocPrint(alloc, "Bearer {s}", .{direct.secret_bytes});
+            const authorization = try alloc.print("Bearer {s}", .{direct.secret_bytes});
             errdefer secret.zeroAndFree(alloc, authorization);
             const account_id = if (direct.account_id) |account|
                 try alloc.dupe(u8, account)
@@ -712,14 +712,20 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
         content: std.ArrayList(u8) = .empty,
         reasoning: std.ArrayList(u8) = .empty,
         saw_read_file: bool = false,
+        /// A chunk that could not be kept; the test reports it.
+        append_error: ?std.mem.Allocator.Error = null,
 
         fn contentChunk(raw: *anyopaque, chunk: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.content.appendSlice(std.testing.allocator, chunk) catch unreachable;
+            self.content.appendSlice(std.testing.allocator, chunk) catch |err| {
+                self.append_error = err;
+            };
         }
         fn reasoningChunk(raw: *anyopaque, chunk: []const u8) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.reasoning.appendSlice(std.testing.allocator, chunk) catch unreachable;
+            self.reasoning.appendSlice(std.testing.allocator, chunk) catch |err| {
+                self.append_error = err;
+            };
         }
         fn toolStart(raw: *anyopaque, _: []const u8, name: []const u8, _: ?[]const u8, _: ?[]const u8) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
@@ -746,6 +752,7 @@ test "OpenAI Codex SSE maps text reasoning tools and usage" {
         types.freeToolCallSlice(std.testing.allocator, @constCast(completion.tool_calls));
         if (completion.provider_state_json) |value| std.testing.allocator.free(@constCast(value));
     }
+    if (capture.append_error) |err| return err;
     try std.testing.expectEqualStrings("hello", capture.content.items);
     try std.testing.expectEqualStrings("thinking", capture.reasoning.items);
     try std.testing.expect(capture.saw_read_file);

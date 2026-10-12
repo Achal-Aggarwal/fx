@@ -29,8 +29,8 @@ pub const DiscoverError = error{ OutOfMemory, InvalidGitFile };
 /// git, a `.git` file that is not a valid `gitdir:` pointer is an error, and a
 /// `.git` directory that is not a git directory is skipped.
 pub fn discover(arena: Allocator, start: []const u8) DiscoverError!?Layout {
-    std.debug.assert(std.fs.path.isAbsolute(start));
-    const normalized = try std.fs.path.resolve(arena, &.{start});
+    std.debug.assert(std.Io.Dir.path.isAbsolute(start));
+    const normalized = try std.Io.Dir.path.resolveAlloc(arena, &.{start});
     var candidate: []const u8 = normalized;
     while (true) {
         if (try layoutAt(arena, candidate)) |found| {
@@ -47,7 +47,7 @@ pub fn discover(arena: Allocator, start: []const u8) DiscoverError!?Layout {
                 .prefix = prefix,
             };
         }
-        const parent = std.fs.path.dirname(candidate) orelse return null;
+        const parent = std.Io.Dir.path.dirname(candidate) orelse return null;
         if (std.mem.eql(u8, parent, candidate)) return null;
         candidate = parent;
     }
@@ -65,7 +65,7 @@ pub fn hasOwnRepository(arena: Allocator, dir: []const u8) Allocator.Error!bool 
 }
 
 fn layoutAt(arena: Allocator, dir: []const u8) DiscoverError!?Layout {
-    const dot_git = try std.fs.path.join(arena, &.{ dir, ".git" });
+    const dot_git = try std.Io.Dir.path.join(arena, &.{ dir, ".git" });
     const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), dot_git, .{ .follow_symlinks = true }) catch return null;
     switch (stat.kind) {
         .directory => {
@@ -92,7 +92,7 @@ fn readGitFile(arena: Allocator, dir: []const u8, dot_git: []const u8) Allocator
     if (!std.mem.startsWith(u8, content, prefix)) return null;
     const raw = std.mem.trimEnd(u8, content[prefix.len..], " \t\r\n");
     if (raw.len == 0) return null;
-    return try std.fs.path.resolve(arena, &.{ dir, raw });
+    return try std.Io.Dir.path.resolveAlloc(arena, &.{ dir, raw });
 }
 
 const GitDirs = struct { git_dir: []const u8, common_dir: []const u8 };
@@ -115,13 +115,13 @@ fn gitDirs(arena: Allocator, git_dir: []const u8) Allocator.Error!?GitDirs {
         .content => |bytes| blk: {
             const raw = std.mem.trimEnd(u8, bytes, " \t\r\n");
             if (raw.len == 0) return null;
-            break :blk try std.fs.path.resolve(arena, &.{ git_dir, raw });
+            break :blk try std.Io.Dir.path.resolveAlloc(arena, &.{ git_dir, raw });
         },
         .missing => git_dir,
         .unavailable => return null,
     };
     for ([_][]const u8{ "objects", "refs" }) |name| {
-        const path = try std.fs.path.join(arena, &.{ common_dir, name });
+        const path = try std.Io.Dir.path.join(arena, &.{ common_dir, name });
         const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = true }) catch return null;
         if (stat.kind != .directory) return null;
     }
@@ -151,7 +151,7 @@ fn hexPrefix(content: []const u8, len: usize) bool {
 /// Returns the branch `HEAD` points at (`refs/heads/<name>`), or null when
 /// detached or unreadable. Memory belongs to `arena`.
 pub fn currentBranch(arena: Allocator, layout: Layout) Allocator.Error!?[]const u8 {
-    const head_path = try std.fs.path.join(arena, &.{ layout.git_dir, "HEAD" });
+    const head_path = try std.Io.Dir.path.join(arena, &.{ layout.git_dir, "HEAD" });
     const content = switch (try bounded_read.readAbsolute(arena, head_path, max_metadata_bytes)) {
         .content => |bytes| bytes,
         .missing, .unavailable => return null,
@@ -163,16 +163,16 @@ pub fn currentBranch(arena: Allocator, layout: Layout) Allocator.Error!?[]const 
 }
 
 fn writeTestFile(dir: std.Io.Dir, path: []const u8, content: []const u8) !void {
-    if (std.fs.path.dirname(path)) |parent| try dir.createDirPath(std.testing.io, parent);
+    if (std.Io.Dir.path.dirname(path)) |parent| try dir.createDirPath(std.testing.io, parent);
     try dir.writeFile(std.testing.io, .{ .sub_path = path, .data = content });
 }
 
 fn makeTestRepo(dir: std.Io.Dir, git_dir: []const u8) !void {
-    const head = try std.fs.path.join(std.testing.allocator, &.{ git_dir, "HEAD" });
+    const head = try std.Io.Dir.path.join(std.testing.allocator, &.{ git_dir, "HEAD" });
     defer std.testing.allocator.free(head);
     try writeTestFile(dir, head, "ref: refs/heads/main\n");
     for ([_][]const u8{ "objects", "refs" }) |name| {
-        const path = try std.fs.path.join(std.testing.allocator, &.{ git_dir, name });
+        const path = try std.Io.Dir.path.join(std.testing.allocator, &.{ git_dir, name });
         defer std.testing.allocator.free(path);
         try dir.createDirPath(std.testing.io, path);
     }
@@ -188,15 +188,15 @@ test "layout discovery finds the innermost repository and the workspace prefix" 
     try tmp.dir.createDirPath(std.testing.io, "repo/a/b");
     const root = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
 
-    const start = try std.fs.path.join(arena, &.{ root, "repo/a/b" });
+    const start = try std.Io.Dir.path.join(arena, &.{ root, "repo/a/b" });
     const found = (try discover(arena, start)).?;
-    try std.testing.expectEqualStrings(try std.fs.path.join(arena, &.{ root, "repo" }), found.worktree_root);
-    try std.testing.expectEqualStrings(try std.fs.path.join(arena, &.{ root, "repo/.git" }), found.git_dir);
+    try std.testing.expectEqualStrings(try std.Io.Dir.path.join(arena, &.{ root, "repo" }), found.worktree_root);
+    try std.testing.expectEqualStrings(try std.Io.Dir.path.join(arena, &.{ root, "repo/.git" }), found.git_dir);
     try std.testing.expectEqualStrings(found.git_dir, found.common_dir);
     try std.testing.expectEqualStrings("a/b", found.prefix);
     try std.testing.expectEqualStrings("main", (try currentBranch(arena, found)).?);
 
-    const at_root = (try discover(arena, try std.fs.path.join(arena, &.{ root, "repo/" }))).?;
+    const at_root = (try discover(arena, try std.Io.Dir.path.join(arena, &.{ root, "repo/" }))).?;
     try std.testing.expectEqualStrings("", at_root.prefix);
 }
 
@@ -212,10 +212,10 @@ test "layout discovery follows gitdir files and commondir for linked worktrees" 
     try writeTestFile(tmp.dir, "wt/.git", "gitdir: ../main/.git/worktrees/wt\n");
     const root = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
 
-    const found = (try discover(arena, try std.fs.path.join(arena, &.{ root, "wt" }))).?;
-    try std.testing.expectEqualStrings(try std.fs.path.join(arena, &.{ root, "wt" }), found.worktree_root);
-    try std.testing.expectEqualStrings(try std.fs.path.join(arena, &.{ root, "main/.git/worktrees/wt" }), found.git_dir);
-    try std.testing.expectEqualStrings(try std.fs.path.join(arena, &.{ root, "main/.git" }), found.common_dir);
+    const found = (try discover(arena, try std.Io.Dir.path.join(arena, &.{ root, "wt" }))).?;
+    try std.testing.expectEqualStrings(try std.Io.Dir.path.join(arena, &.{ root, "wt" }), found.worktree_root);
+    try std.testing.expectEqualStrings(try std.Io.Dir.path.join(arena, &.{ root, "main/.git/worktrees/wt" }), found.git_dir);
+    try std.testing.expectEqualStrings(try std.Io.Dir.path.join(arena, &.{ root, "main/.git" }), found.common_dir);
     try std.testing.expectEqualStrings("feature/x", (try currentBranch(arena, found)).?);
 }
 
@@ -232,14 +232,14 @@ test "layout discovery rejects bad gitdir files and skips non-git .git directori
     try tmp.dir.createDirPath(std.testing.io, "plain/sub");
     const root = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
 
-    try std.testing.expectError(error.InvalidGitFile, discover(arena, try std.fs.path.join(arena, &.{ root, "bad" })));
-    try std.testing.expectError(error.InvalidGitFile, discover(arena, try std.fs.path.join(arena, &.{ root, "dangling" })));
-    const outer = (try discover(arena, try std.fs.path.join(arena, &.{ root, "outer/inner" }))).?;
-    try std.testing.expectEqualStrings(try std.fs.path.join(arena, &.{ root, "outer" }), outer.worktree_root);
+    try std.testing.expectError(error.InvalidGitFile, discover(arena, try std.Io.Dir.path.join(arena, &.{ root, "bad" })));
+    try std.testing.expectError(error.InvalidGitFile, discover(arena, try std.Io.Dir.path.join(arena, &.{ root, "dangling" })));
+    const outer = (try discover(arena, try std.Io.Dir.path.join(arena, &.{ root, "outer/inner" }))).?;
+    try std.testing.expectEqualStrings(try std.Io.Dir.path.join(arena, &.{ root, "outer" }), outer.worktree_root);
     try std.testing.expectEqualStrings("inner", outer.prefix);
     // The test directory may itself sit inside a checkout, so only require
     // that discovery does not stop inside it.
-    if (try discover(arena, try std.fs.path.join(arena, &.{ root, "plain/sub" }))) |enclosing| {
+    if (try discover(arena, try std.Io.Dir.path.join(arena, &.{ root, "plain/sub" }))) |enclosing| {
         try std.testing.expect(!std.mem.startsWith(u8, enclosing.worktree_root, root));
     }
 }
@@ -269,7 +269,7 @@ test "layout discovery accepts exactly the git directories git accepts" {
         .{ .start = "outer/spaced", .worktree = "outer/spaced" },
     };
     for (cases) |case| {
-        const found = (try discover(arena, try std.fs.path.join(arena, &.{ root, case.start }))).?;
-        try std.testing.expectEqualStrings(try std.fs.path.join(arena, &.{ root, case.worktree }), found.worktree_root);
+        const found = (try discover(arena, try std.Io.Dir.path.join(arena, &.{ root, case.start }))).?;
+        try std.testing.expectEqualStrings(try std.Io.Dir.path.join(arena, &.{ root, case.worktree }), found.worktree_root);
     }
 }

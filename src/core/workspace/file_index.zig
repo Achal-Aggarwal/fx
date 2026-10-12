@@ -7,6 +7,7 @@
 //! impossible subsequence matches before scoring.
 
 const std = @import("std");
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const file_picker_path = @import("../input/file_picker_path.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const display_width = @import("../shared/display_width.zig");
@@ -127,7 +128,7 @@ const Generation = struct {
     /// A release store publishes the terminal outcome after all generation
     /// writes. The main thread performs an acquire load before deciding
     /// whether joining and adoption are permitted.
-    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(GenerationState.loading)),
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@backingInt(GenerationState.loading)),
 
     fn create(alloc: Allocator, id: usize) !*Generation {
         const generation = try alloc.create(Generation);
@@ -141,11 +142,11 @@ const Generation = struct {
     }
 
     fn currentState(self: *const Generation) GenerationState {
-        return @enumFromInt(self.state.load(.acquire));
+        return @fromBackingInt(@intCast(self.state.load(.acquire)));
     }
 
     fn finish(self: *Generation, state: GenerationState) void {
-        self.state.store(@intFromEnum(state), .release);
+        self.state.store(@backingInt(state), .release);
     }
 
     fn count(self: *const Generation) usize {
@@ -522,7 +523,7 @@ pub const FileIndex = struct {
     pub fn isCurrentCandidateKind(self: *const FileIndex, path: []const u8, expected_kind: CandidateKind) bool {
         const current_roots = if (self.pending_scope) |pending| pending.roots else self.roots;
         if (!text_utils.isTerminalSafe(path) or current_roots.len == 0) return false;
-        const root_path, const relative = if (std.fs.path.isAbsolute(path)) resolved: {
+        const root_path, const relative = if (std.Io.Dir.path.isAbsolute(path)) resolved: {
             for (current_roots) |root| {
                 if (!pathing.pathInside(root, path)) continue;
                 const rel = pathing.workspaceRelativePath(std.heap.c_allocator, root, path) catch return false;
@@ -530,7 +531,7 @@ pub const FileIndex = struct {
             }
             return false;
         } else .{ current_roots[0], path };
-        defer if (std.fs.path.isAbsolute(path)) std.heap.c_allocator.free(relative);
+        defer if (std.Io.Dir.path.isAbsolute(path)) std.heap.c_allocator.free(relative);
         var root = std.Io.Dir.openDirAbsolute(io_mod.getIo(), root_path, .{}) catch return false;
         defer root.close(io_mod.getIo());
         const stat = root.statFile(io_mod.getIo(), relative, .{ .follow_symlinks = false }) catch return false;
@@ -863,7 +864,7 @@ fn loadGeneration(
 /// config, so a listing built under one config is never reused under another.
 pub fn snapshotPath(alloc: Allocator, roots: []const []const u8) Allocator.Error!?[]const u8 {
     const home = io_mod.getenv("HOME") orelse return null;
-    if (!std.fs.path.isAbsolute(home)) return null;
+    if (!std.Io.Dir.path.isAbsolute(home)) return null;
     var config_environment: [indexer.config_environment_names.len]?[]const u8 = undefined;
     for (indexer.config_environment_names, &config_environment) |name, *value| value.* = io_mod.getenv(name);
     return try snapshotPathIn(alloc, home, roots, &config_environment);
@@ -887,7 +888,7 @@ fn snapshotPathIn(
     var sum: [sha256_digest_len]u8 = undefined;
     digest.final(&sum);
     const hex = std.fmt.bytesToHex(sum, .lower);
-    return std.fmt.allocPrint(alloc, "{s}/.fx/file-index/{s}.idx", .{ home, &hex });
+    return alloc.print("{s}/.fx/file-index/{s}.idx", .{ home, &hex });
 }
 
 /// The trees for the available roots of a scope, in root order. Trees reused
@@ -1095,7 +1096,7 @@ fn appendDiscoveredCandidate(
     relative: []const u8,
     kind: CandidateKind,
 ) !bool {
-    const absolute = try std.fs.path.resolve(alloc, &.{ root_path, relative });
+    const absolute = try std.Io.Dir.path.resolveAlloc(alloc, &.{ root_path, relative });
     if (!pathing.pathInside(root_path, absolute)) return false;
 
     const display = if (root_index == 0) relative else absolute;
@@ -1142,7 +1143,7 @@ fn acceptedSafeCandidate(candidate: Candidate) ?Candidate {
     if (candidate.path.len == 0) return null;
     if (candidate.path.len > max_path_len) return null;
     if (!file_picker_path.isRepresentable(candidate.path)) return null;
-    if (candidate.kind == .directory and std.fs.path.isSep(candidate.path[candidate.path.len - 1])) return null;
+    if (candidate.kind == .directory and std.Io.Dir.path.isSep(candidate.path[candidate.path.len - 1])) return null;
     return candidate;
 }
 
@@ -1190,7 +1191,7 @@ fn foldUtf8Into(bytes: []const u8, out: []u21) ?[]const u21 {
         const sequence_len = std.unicode.utf8ByteSequenceLength(bytes[byte_index]) catch return null;
         const end = byte_index + sequence_len;
         if (end > bytes.len) return null;
-        const codepoint = std.unicode.utf8Decode(bytes[byte_index..end]) catch return null;
+        const codepoint = display_width.decodeUtf8Sequence(bytes[byte_index..end]) catch return null;
         out[scalar_index] = unicode_simple_fold.fold(codepoint);
         scalar_index += 1;
         byte_index = end;
@@ -1240,7 +1241,7 @@ fn decodeFoldedPath(
         const sequence_len = std.unicode.utf8ByteSequenceLength(path[byte_index]) catch return null;
         const end = byte_index + sequence_len;
         if (end > path.len or scalar_index >= scratch.scalars.len) return null;
-        const codepoint = std.unicode.utf8Decode(path[byte_index..end]) catch return null;
+        const codepoint = display_width.decodeUtf8Sequence(path[byte_index..end]) catch return null;
         scratch.byte_offsets[scalar_index] = std.math.cast(u16, byte_index) orelse return null;
         scratch.scalars[scalar_index] = unicode_simple_fold.fold(codepoint);
         scalar_index += 1;
@@ -1505,7 +1506,7 @@ fn matchScore(exact_fit: bool, basename_fit: bool, facts: SubsequenceFacts) Matc
 fn isMatchBoundary(path: []const u8, byte_index: usize) bool {
     if (byte_index == 0) return true;
     const previous = path[byte_index - 1];
-    if (std.fs.path.isSep(previous) or previous == '-' or previous == '_' or previous == '.' or previous == ' ') return true;
+    if (std.Io.Dir.path.isSep(previous) or previous == '-' or previous == '_' or previous == '.' or previous == ' ') return true;
     if (byte_index >= path.len) return false;
     const current = path[byte_index];
     return previous >= 'a' and previous <= 'z' and current >= 'A' and current <= 'Z';
@@ -1781,7 +1782,7 @@ test "buildFromRaw precomputes a-z char masks" {
 }
 
 test "countAndSize applies the same filters as the fill pass" {
-    const long_path = "a" ** (max_path_len + 1);
+    const long_path = text_utils.repeat("a", max_path_len + 1);
     const raw = "ok.zig\n" ++ long_path ++ "\n\nother.md\n";
     const totals = countAndSize(.{ .file_raw = raw });
     // "ok.zig" + "" (empty) + long_path (too long) + "other.md" -> 2 kept.
@@ -1822,7 +1823,7 @@ test "buildFromCandidates handles empty and rejected typed candidates" {
     try empty.buildFromCandidates(alloc, &.{});
     try std.testing.expectEqual(@as(usize, 0), empty.count());
 
-    const long_path = "a" ** (max_path_len + 1);
+    const long_path = text_utils.repeat("a", max_path_len + 1);
     const candidates = [_]Candidate{
         .{ .path = "src/", .kind = .directory },
         .{ .path = "escape-\x1b[2J", .kind = .directory },
@@ -1859,7 +1860,7 @@ test "typed candidate publication exposes matching immutable kinds" {
     const generation = index.active_generation.?;
     index.active_generation = null;
     index.loading_generation = generation;
-    generation.state.store(@intFromEnum(GenerationState.loading), .release);
+    generation.state.store(@backingInt(GenerationState.loading), .release);
     generation.ready_count.store(2, .release);
     try std.testing.expectEqual(@as(usize, 2), index.count());
     try std.testing.expectEqual(CandidateKind.directory, index.kindAt(0));
@@ -1888,7 +1889,7 @@ test "typed candidate cap is shared across files and directories" {
     for (candidates, 0..) |*candidate, index| {
         const slot = path_storage[index * path_stride ..][0..path_stride];
         candidate.* = .{
-            .path = try std.fmt.bufPrint(slot, "candidate-{d:0>6}", .{index}),
+            .path = try std.mem.print(slot, "candidate-{d:0>6}", .{index}),
             .kind = if (index % 2 == 0) .file else .directory,
         };
     }
@@ -1909,7 +1910,7 @@ test "tree candidates keep a sorted directory at the exact shared cap" {
     const entries = try arena.alloc(indexer.Entry, max_indexed_files + 1);
     entries[0] = .{ .path = "a-empty-directory", .kind = .directory };
     for (entries[1..], 0..) |*entry, index| {
-        entry.* = .{ .path = try std.fmt.allocPrint(arena, "z-file-{d:0>6}", .{index}), .kind = .file };
+        entry.* = .{ .path = try arena.print("z-file-{d:0>6}", .{index}), .kind = .file };
     }
     const tree: indexer.Tree = .{
         .root = "/workspace",
@@ -2559,7 +2560,7 @@ test "search returns partial results while ready_count is below total" {
     const generation = index.active_generation.?;
     index.active_generation = null;
     index.loading_generation = generation;
-    generation.state.store(@intFromEnum(GenerationState.loading), .release);
+    generation.state.store(@backingInt(GenerationState.loading), .release);
     generation.ready_count.store(2, .release);
     try std.testing.expectEqual(@as(usize, 2), index.count());
 
@@ -2567,7 +2568,7 @@ test "search returns partial results while ready_count is below total" {
     const results = try search.run(&index, "main");
     try std.testing.expectEqual(@as(usize, 2), results.len);
     for (results) |result| {
-        try std.testing.expect(std.mem.indexOf(u8, result.path, "main") != null);
+        try std.testing.expect(std.mem.find(u8, result.path, "main") != null);
     }
 
     generation.ready_count.store(4, .release);
@@ -2610,7 +2611,7 @@ test "search caps ranked results at 64 even with larger output" {
         try std.testing.expect(ptr + results[i].path.len <= paths_end);
 
         var expected_buf: [32]u8 = undefined;
-        const expected = try std.fmt.bufPrint(&expected_buf, "src/match-{d:0>3}.zig", .{i});
+        const expected = try std.mem.print(&expected_buf, "src/match-{d:0>3}.zig", .{i});
         try std.testing.expectEqualStrings(expected, results[i].path);
         try std.testing.expectEqual(CandidateKind.file, results[i].kind);
         try expectValidSearchSpans(results[i]);
@@ -2622,8 +2623,8 @@ test "search rejects queries longer than max_path_len" {
     var index = FileIndex{};
     defer index.deinit(alloc);
 
-    const path = "a" ** max_path_len;
-    const query = ("a" ** max_path_len) ++ "b";
+    const path = text_utils.repeat("a", max_path_len);
+    const query = text_utils.repeat("a", max_path_len) ++ "b";
     try index.buildFromRaw(alloc, path);
 
     var search: TestSearchBuffer(1) = .{};
@@ -2636,23 +2637,23 @@ test "persisted file index paints a stale preview and the real scan replaces it"
     // become git-authoritative, and a git failure would replace the walk.
     var random_suffix: [8]u8 = undefined;
     io_mod.getIo().random(&random_suffix);
-    const base = try std.fmt.allocPrint(alloc, "/tmp/fx-fileidx-{s}", .{std.fmt.bytesToHex(random_suffix, .lower)});
+    const base = try alloc.print("/tmp/fx-fileidx-{s}", .{std.fmt.bytesToHex(random_suffix, .lower)});
     defer alloc.free(base);
     const zio = io_mod.getIo();
     var base_dir = try std.Io.Dir.openDirAbsolute(zio, "/", .{});
     defer base_dir.close(zio);
     const base_rel = std.mem.trimStart(u8, base, "/");
-    const home_rel = try std.fmt.allocPrint(alloc, "{s}/home", .{base_rel});
+    const home_rel = try alloc.print("{s}/home", .{base_rel});
     defer alloc.free(home_rel);
-    const work_rel = try std.fmt.allocPrint(alloc, "{s}/work", .{base_rel});
+    const work_rel = try alloc.print("{s}/work", .{base_rel});
     defer alloc.free(work_rel);
     try base_dir.createDirPath(zio, home_rel);
     defer base_dir.deleteTree(zio, base_rel) catch {};
     try base_dir.createDirPath(zio, work_rel);
 
-    const home_joined = try std.fs.path.join(alloc, &.{ base, "home" });
+    const home_joined = try std.Io.Dir.path.join(alloc, &.{ base, "home" });
     defer alloc.free(home_joined);
-    const work_joined = try std.fs.path.join(alloc, &.{ base, "work" });
+    const work_joined = try std.Io.Dir.path.join(alloc, &.{ base, "work" });
     defer alloc.free(work_joined);
     const home = try io_mod.realpathAlloc(alloc, home_joined);
     defer alloc.free(home);
@@ -2776,9 +2777,9 @@ test "scope discovery emits primary-relative and added-absolute paths in root or
     defer alloc.free(primary);
     const shared = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "shared");
     defer alloc.free(shared);
-    const shared_file = try std.fs.path.join(alloc, &.{ shared, "nested/lib.zig" });
+    const shared_file = try std.Io.Dir.path.join(alloc, &.{ shared, "nested/lib.zig" });
     defer alloc.free(shared_file);
-    const shared_directory = try std.fs.path.join(alloc, &.{ shared, "nested" });
+    const shared_directory = try std.Io.Dir.path.join(alloc, &.{ shared, "nested" });
     defer alloc.free(shared_directory);
     const roots = [_][]const u8{ primary, shared };
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -2800,7 +2801,7 @@ test "scope discovery emits primary-relative and added-absolute paths in root or
 }
 
 test "production scope admits tracked untracked hidden and direct directory candidates" {
-    if (comptime @import("builtin").os.tag == .windows or @import("builtin").os.tag == .wasi) return error.SkipZigTest;
+    if (comptime @import("builtin").target.os.tag == .windows or @import("builtin").target.os.tag == .wasi) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2829,11 +2830,11 @@ test "production scope admits tracked untracked hidden and direct directory cand
     }
     for (0..40) |index| {
         var path_storage: [64]u8 = undefined;
-        const path = try std.fmt.bufPrint(&path_storage, "root/z-file-{d:0>2}.txt", .{index});
+        const path = try std.mem.print(&path_storage, "root/z-file-{d:0>2}.txt", .{index});
         var file = try tmp.dir.createFile(io_mod.getIo(), path, .{ .truncate = true });
         file.close(io_mod.getIo());
     }
-    if (comptime @import("builtin").os.tag != .windows) {
+    if (comptime @import("builtin").target.os.tag != .windows) {
         try tmp.dir.symLink(std.testing.io, "nested", "root/linked-dir", .{ .is_directory = true });
     }
 
@@ -2888,7 +2889,7 @@ test "scope discovery deduplicates overlapping roots and tolerates one failed ro
     defer alloc.free(primary);
     const nested = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "primary/nested");
     defer alloc.free(nested);
-    const missing = try std.fs.path.join(alloc, &.{ primary, "missing" });
+    const missing = try std.Io.Dir.path.join(alloc, &.{ primary, "missing" });
     defer alloc.free(missing);
     const roots = [_][]const u8{ primary, nested, missing };
     var arena_state = std.heap.ArenaAllocator.init(alloc);
@@ -2950,7 +2951,7 @@ test "typed current candidate validation rejects missing and changed kinds" {
 }
 
 test "typed current candidate validation keeps symlinks as file references" {
-    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    if (comptime @import("builtin").target.os.tag == .windows) return error.SkipZigTest;
 
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2989,7 +2990,7 @@ test "current candidate rejects an added-root selection after scope removal" {
     defer alloc.free(primary);
     const shared = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "shared");
     defer alloc.free(shared);
-    const shared_file = try std.fs.path.join(alloc, &.{ shared, "item.txt" });
+    const shared_file = try std.Io.Dir.path.join(alloc, &.{ shared, "item.txt" });
     defer alloc.free(shared_file);
     const entries = [_]workspace_access.Entry{.{
         .path = @constCast(shared),
@@ -3132,7 +3133,7 @@ test "current candidate uses pending scope while refresh is coalesced" {
     defer alloc.free(primary);
     const shared = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "shared");
     defer alloc.free(shared);
-    const shared_file = try std.fs.path.join(alloc, &.{ shared, "item.txt" });
+    const shared_file = try std.Io.Dir.path.join(alloc, &.{ shared, "item.txt" });
     defer alloc.free(shared_file);
 
     var index = FileIndex{};
@@ -3191,7 +3192,7 @@ fn checkBuildFromCandidatesAllocationFailures(alloc: Allocator) !void {
 
 test "file-only builder frees partial buffers across allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkBuildFromRawAllocationFailures,
         .{},
     );
@@ -3199,14 +3200,14 @@ test "file-only builder frees partial buffers across allocation failures" {
 
 test "typed builder frees dedupe state and partial buffers across allocation failures" {
     try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
+        testing_allocator.no_resize,
         checkBuildFromCandidatesAllocationFailures,
         .{},
     );
 }
 
 test "kind buffer allocation failure retains the existing index" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var index = FileIndex{};
     defer index.deinit(alloc);
     try index.buildFromRaw(alloc, "existing.txt\x00");
@@ -3223,12 +3224,12 @@ test "kind buffer allocation failure retains the existing index" {
 }
 
 test "refresh traces snapshot allocation failures and retains roots" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const trace_path = try std.fs.path.join(alloc, &.{ root, "trace.log" });
+    const trace_path = try std.Io.Dir.path.join(alloc, &.{ root, "trace.log" });
     defer alloc.free(trace_path);
 
     debug_trace.resetForTest();
@@ -3397,7 +3398,7 @@ test "failed replacement retains active results count and render facts" {
 }
 
 test "replacement generation allocation failure retains active results" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var index = FileIndex{};
     defer index.deinit(alloc);
     try index.buildFromRaw(alloc, "stable.txt\x00");
@@ -3414,7 +3415,7 @@ test "replacement generation allocation failure retains active results" {
 }
 
 test "initial allocation failure reports failure and a later load retries" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     {
@@ -3666,7 +3667,7 @@ test "file picker readable revision captures one prefix and survives equal count
 }
 
 test "file picker pending scope coalesces epochs through A B A and failed refresh" {
-    const alloc = std.testing.allocator;
+    const alloc = testing_allocator.no_resize;
     var index: FileIndex = .{};
     defer index.deinit(alloc);
     try index.buildFromRaw(alloc, "stable.txt\x00");

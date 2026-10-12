@@ -199,7 +199,7 @@ test "a followed source stamps the file its link points at" {
     tmp.dir.symLink(std.testing.io, "target", "link", .{}) catch return error.SkipZigTest;
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const link = try std.fs.path.join(alloc, &.{ root, "link" });
+    const link = try std.Io.Dir.path.join(alloc, &.{ root, "link" });
     defer alloc.free(link);
 
     const start = nowNs();

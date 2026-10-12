@@ -23,7 +23,7 @@ pub fn readAt(alloc: Allocator, dir: std.Io.Dir, sub_path: []const u8, max_bytes
 
 /// Reads an absolute `path`.
 pub fn readAbsolute(alloc: Allocator, path: []const u8, max_bytes: usize) Allocator.Error!Outcome {
-    if (!std.fs.path.isAbsolute(path)) return .{ .unavailable = "relative_path" };
+    if (!std.Io.Dir.path.isAbsolute(path)) return .{ .unavailable = "relative_path" };
     return readAt(alloc, std.Io.Dir.cwd(), path, max_bytes);
 }
 
@@ -32,7 +32,7 @@ pub fn readAbsolute(alloc: Allocator, path: []const u8, max_bytes: usize) Alloca
 /// link these files. The target must still be a regular file within the cap.
 /// Paths a repository names use `readAbsolute`.
 pub fn readUserAbsolute(alloc: Allocator, path: []const u8, max_bytes: usize) Allocator.Error!Outcome {
-    if (!std.fs.path.isAbsolute(path)) return .{ .unavailable = "relative_path" };
+    if (!std.Io.Dir.path.isAbsolute(path)) return .{ .unavailable = "relative_path" };
     return readWith(alloc, std.Io.Dir.cwd(), path, max_bytes, .follow);
 }
 
@@ -88,7 +88,7 @@ test "user reads follow a final symlink to a regular file and still refuse the r
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
 
-    const linked = try std.fs.path.join(alloc, &.{ root, "linked" });
+    const linked = try std.Io.Dir.path.join(alloc, &.{ root, "linked" });
     defer alloc.free(linked);
     const followed = try readUserAbsolute(alloc, linked, 16);
     defer alloc.free(followed.content);
@@ -96,18 +96,18 @@ test "user reads follow a final symlink to a regular file and still refuse the r
     // A repository-named path still refuses the same link.
     try std.testing.expect(try readAbsolute(alloc, linked, 16) == .unavailable);
 
-    const linked_dir = try std.fs.path.join(alloc, &.{ root, "linked-dir" });
+    const linked_dir = try std.Io.Dir.path.join(alloc, &.{ root, "linked-dir" });
     defer alloc.free(linked_dir);
     try std.testing.expect(try readUserAbsolute(alloc, linked_dir, 16) == .unavailable);
     try std.testing.expectEqualStrings("too_large", (try readUserAbsolute(alloc, linked, 2)).unavailable);
     try std.testing.expect(try readUserAbsolute(alloc, "relative", 16) == .unavailable);
 
     // A link to a FIFO is refused without waiting for a writer.
-    const fifo = try std.fs.path.joinZ(alloc, &.{ root, "fifo" });
+    const fifo = try std.Io.Dir.path.joinZ(alloc, &.{ root, "fifo" });
     defer alloc.free(fifo);
     if (mkfifo(fifo, 0o600) != 0) return error.SkipZigTest;
     try tmp.dir.symLink(std.testing.io, "fifo", "linked-fifo", .{});
-    const linked_fifo = try std.fs.path.join(alloc, &.{ root, "linked-fifo" });
+    const linked_fifo = try std.Io.Dir.path.join(alloc, &.{ root, "linked-fifo" });
     defer alloc.free(linked_fifo);
     try std.testing.expect(try readUserAbsolute(alloc, linked_fifo, 16) == .unavailable);
 }

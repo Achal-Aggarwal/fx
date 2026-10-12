@@ -379,9 +379,9 @@ const Loader = struct {
     /// including file's directory otherwise. Null when it cannot expand.
     fn includePath(self: *Loader, raw: []const u8, config_path: []const u8) Allocator.Error!?[]const u8 {
         const expanded = try self.expandHome(raw) orelse return null;
-        if (std.fs.path.isAbsolute(expanded)) return expanded;
-        const dir = std.fs.path.dirname(config_path) orelse return null;
-        return try std.fs.path.join(self.arena, &.{ dir, expanded });
+        if (std.Io.Dir.path.isAbsolute(expanded)) return expanded;
+        const dir = std.Io.Dir.path.dirname(config_path) orelse return null;
+        return try std.Io.Dir.path.join(self.arena, &.{ dir, expanded });
     }
 
     fn expandHome(self: *Loader, raw: []const u8) Allocator.Error!?[]const u8 {
@@ -389,7 +389,7 @@ const Loader = struct {
         if (raw[0] != '~') return raw;
         if (!std.mem.startsWith(u8, raw, "~/")) return null;
         const home = self.context.home orelse return null;
-        return try std.fs.path.join(self.arena, &.{ home, raw[2..] });
+        return try std.Io.Dir.path.join(self.arena, &.{ home, raw[2..] });
     }
 
     fn conditionMatches(self: *Loader, condition: []const u8, config_path: []const u8) Allocator.Error!bool {
@@ -412,10 +412,10 @@ const Loader = struct {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return false,
             };
-            const dir = std.fs.path.dirname(real_config) orelse return false;
+            const dir = std.Io.Dir.path.dirname(real_config) orelse return false;
             pattern = try std.mem.concat(self.arena, u8, &.{ dir, pattern[1..] });
             literal_len = dir.len + 1;
-        } else if (!std.fs.path.isAbsolute(pattern)) {
+        } else if (!std.Io.Dir.path.isAbsolute(pattern)) {
             pattern = try std.mem.concat(self.arena, u8, &.{ "**/", pattern });
         }
         if (std.mem.endsWith(u8, pattern, "/")) pattern = try std.mem.concat(self.arena, u8, &.{ pattern, "**" });
@@ -461,15 +461,15 @@ pub fn loadAll(arena: Allocator, context: *const Context) Allocator.Error!Loaded
         if (path.len > 0) try loader.readFile(path, .global, 0);
     } else {
         if (context.xdg_config_home) |xdg| {
-            try loader.readFile(try std.fs.path.join(arena, &.{ xdg, "git", "config" }), .global, 0);
+            try loader.readFile(try std.Io.Dir.path.join(arena, &.{ xdg, "git", "config" }), .global, 0);
         } else if (context.home) |home| {
-            try loader.readFile(try std.fs.path.join(arena, &.{ home, ".config", "git", "config" }), .global, 0);
+            try loader.readFile(try std.Io.Dir.path.join(arena, &.{ home, ".config", "git", "config" }), .global, 0);
         }
-        if (context.home) |home| try loader.readFile(try std.fs.path.join(arena, &.{ home, ".gitconfig" }), .global, 0);
+        if (context.home) |home| try loader.readFile(try std.Io.Dir.path.join(arena, &.{ home, ".gitconfig" }), .global, 0);
     }
     if (context.layout) |layout| {
         const local_start = loader.entries.items.len;
-        try loader.readFile(try std.fs.path.join(arena, &.{ layout.common_dir, "config" }), .local, 0);
+        try loader.readFile(try std.Io.Dir.path.join(arena, &.{ layout.common_dir, "config" }), .local, 0);
         var worktree_config = false;
         for (loader.entries.items[local_start..]) |loaded| {
             const entry = loaded.entry;
@@ -477,7 +477,7 @@ pub fn loadAll(arena: Allocator, context: *const Context) Allocator.Error!Loaded
                 worktree_config = parseBool(entry.value) orelse false;
             }
         }
-        if (worktree_config) try loader.readFile(try std.fs.path.join(arena, &.{ layout.git_dir, "config.worktree" }), .worktree, 0);
+        if (worktree_config) try loader.readFile(try std.Io.Dir.path.join(arena, &.{ layout.git_dir, "config.worktree" }), .worktree, 0);
     }
     return loader.result();
 }
@@ -488,8 +488,8 @@ pub fn loadAll(arena: Allocator, context: *const Context) Allocator.Error!Loaded
 pub fn loadRepositoryEveryInclude(arena: Allocator, context: *const Context) Allocator.Error!Loaded {
     var loader: Loader = .{ .arena = arena, .context = context, .mode = .every_include };
     if (context.layout) |layout| {
-        try loader.readFile(try std.fs.path.join(arena, &.{ layout.common_dir, "config" }), .local, 0);
-        try loader.readFile(try std.fs.path.join(arena, &.{ layout.git_dir, "config.worktree" }), .worktree, 0);
+        try loader.readFile(try std.Io.Dir.path.join(arena, &.{ layout.common_dir, "config" }), .local, 0);
+        try loader.readFile(try std.Io.Dir.path.join(arena, &.{ layout.git_dir, "config.worktree" }), .worktree, 0);
     }
     return loader.result();
 }
@@ -560,16 +560,16 @@ pub fn ignoreSettings(arena: Allocator, loaded: Loaded, context: *const Context)
         if (raw.len == 0) break :blk null;
         if (std.mem.startsWith(u8, raw, "~/")) {
             const home = context.home orelse break :blk null;
-            break :blk try std.fs.path.join(arena, &.{ home, raw[2..] });
+            break :blk try std.Io.Dir.path.join(arena, &.{ home, raw[2..] });
         }
-        if (std.fs.path.isAbsolute(raw)) break :blk raw;
+        if (std.Io.Dir.path.isAbsolute(raw)) break :blk raw;
         // git resolves a relative path from the worktree root, its cwd.
         const layout = context.layout orelse break :blk null;
-        break :blk try std.fs.path.join(arena, &.{ layout.worktree_root, raw });
+        break :blk try std.Io.Dir.path.join(arena, &.{ layout.worktree_root, raw });
     } else if (context.xdg_config_home) |xdg|
-        try std.fs.path.join(arena, &.{ xdg, "git", "ignore" })
+        try std.Io.Dir.path.join(arena, &.{ xdg, "git", "ignore" })
     else if (context.home) |home|
-        try std.fs.path.join(arena, &.{ home, ".config", "git", "ignore" })
+        try std.Io.Dir.path.join(arena, &.{ home, ".config", "git", "ignore" })
     else
         null;
 
@@ -644,7 +644,7 @@ test "config booleans follow git" {
 }
 
 fn writeTestFile(dir: std.Io.Dir, path: []const u8, content: []const u8) !void {
-    if (std.fs.path.dirname(path)) |parent| try dir.createDirPath(std.testing.io, parent);
+    if (std.Io.Dir.path.dirname(path)) |parent| try dir.createDirPath(std.testing.io, parent);
     try dir.writeFile(std.testing.io, .{ .sub_path = path, .data = content });
 }
 
@@ -656,15 +656,15 @@ const TestRepo = struct {
 /// Builds `home/` and a repository at `repo_path` inside `tmp`, and a context
 /// that reads only those files.
 fn testRepo(arena: Allocator, tmp: *std.testing.TmpDir, repo_path: []const u8, branch: []const u8) !TestRepo {
-    const head = try std.fmt.allocPrint(arena, "{s}/.git/HEAD", .{repo_path});
-    try writeTestFile(tmp.dir, head, try std.fmt.allocPrint(arena, "ref: refs/heads/{s}\n", .{branch}));
-    try tmp.dir.createDirPath(std.testing.io, try std.fmt.allocPrint(arena, "{s}/.git/objects", .{repo_path}));
-    try tmp.dir.createDirPath(std.testing.io, try std.fmt.allocPrint(arena, "{s}/.git/refs", .{repo_path}));
+    const head = try arena.print("{s}/.git/HEAD", .{repo_path});
+    try writeTestFile(tmp.dir, head, try arena.print("ref: refs/heads/{s}\n", .{branch}));
+    try tmp.dir.createDirPath(std.testing.io, try arena.print("{s}/.git/objects", .{repo_path}));
+    try tmp.dir.createDirPath(std.testing.io, try arena.print("{s}/.git/refs", .{repo_path}));
     try tmp.dir.createDirPath(std.testing.io, "home");
     const root = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
-    const layout = (try layout_mod.discover(arena, try std.fs.path.join(arena, &.{ root, repo_path }))).?;
+    const layout = (try layout_mod.discover(arena, try std.Io.Dir.path.join(arena, &.{ root, repo_path }))).?;
     var context = try Context.fromEnvironment(arena, layout);
-    context.home = try std.fs.path.join(arena, &.{ root, "home" });
+    context.home = try std.Io.Dir.path.join(arena, &.{ root, "home" });
     context.xdg_config_home = null;
     context.global_override = null;
     context.no_system = true;
@@ -688,7 +688,7 @@ test "config includes follow relative and home paths, skip missing files and sto
     const settings = try ignoreSettings(arena, loaded, &repo.context);
     // The last value wins in file order, after spliced-in includes.
     try std.testing.expect(!settings.ignore_case);
-    try std.testing.expectEqualStrings(try std.fs.path.join(arena, &.{ repo.root, "home/from-b" }), settings.excludes_file.?);
+    try std.testing.expectEqualStrings(try std.Io.Dir.path.join(arena, &.{ repo.root, "home/from-b" }), settings.excludes_file.?);
     try std.testing.expectEqual(@as(usize, 1), loaded.unavailable.len);
     try std.testing.expectEqualStrings("include_depth", loaded.unavailable[0].reason);
 }
@@ -702,7 +702,7 @@ test "config includeIf evaluates gitdir, gitdir/i and onbranch, and never hascon
     const matching = try testRepo(arena, &tmp, "work/one", "feat/x");
     const other = try testRepo(arena, &tmp, "play/two", "main");
     const root = matching.root;
-    const gitconfig = try std.fmt.allocPrint(arena,
+    const gitconfig = try arena.print(
         \\[includeIf "gitdir:{s}/work/"]
         \\path = work.inc
         \\[includeIf "gitdir/i:{s}/PLAY/"]
@@ -735,7 +735,7 @@ test "config includeIf evaluates gitdir, gitdir/i and onbranch, and never hascon
     no_repo.git_dir_real = null;
     no_repo.branch = null;
     const none = try ignoreSettings(arena, try loadAll(arena, &no_repo), &no_repo);
-    try std.testing.expectEqualStrings(try std.fs.path.join(arena, &.{ root, "home/.config/git/ignore" }), none.excludes_file.?);
+    try std.testing.expectEqualStrings(try std.Io.Dir.path.join(arena, &.{ root, "home/.config/git/ignore" }), none.excludes_file.?);
 }
 
 test "config gitdir patterns relative to the including file" {
@@ -748,7 +748,7 @@ test "config gitdir patterns relative to the including file" {
     try writeTestFile(tmp.dir, "home/.gitconfig", "[includeIf \"gitdir:./projects/\"]\npath = projects.inc\n");
     try writeTestFile(tmp.dir, "home/projects.inc", "[core]\nexcludesfile = relative/ignore\n");
     const settings = try ignoreSettings(arena, try loadAll(arena, &repo.context), &repo.context);
-    const expected = try std.fs.path.join(arena, &.{ repo.context.layout.?.worktree_root, "relative/ignore" });
+    const expected = try std.Io.Dir.path.join(arena, &.{ repo.context.layout.?.worktree_root, "relative/ignore" });
     try std.testing.expectEqualStrings(expected, settings.excludes_file.?);
 }
 
@@ -771,9 +771,9 @@ test "user config links are followed and repository config links are not" {
     try std.testing.expectEqual(@as(usize, 0), loaded.unavailable.len);
     const settings = try ignoreSettings(arena, loaded, &repo.context);
     try std.testing.expect(settings.ignore_case);
-    try std.testing.expectEqualStrings(try std.fs.path.join(arena, &.{ repo.root, "home/.gitignore_global" }), settings.excludes_file.?);
+    try std.testing.expectEqualStrings(try std.Io.Dir.path.join(arena, &.{ repo.root, "home/.gitignore_global" }), settings.excludes_file.?);
     try std.testing.expect(settings.excludes_file_follows_symlinks);
-    const home_prefix = try std.fs.path.join(arena, &.{ repo.root, "home/" });
+    const home_prefix = try std.Io.Dir.path.join(arena, &.{ repo.root, "home/" });
     for (loaded.paths) |read| {
         try std.testing.expectEqual(std.mem.startsWith(u8, read.path, home_prefix), read.follow_symlinks);
     }
