@@ -26,9 +26,12 @@ pub const State = struct {
     failed_at_ms: ?i64 = null,
 };
 
+/// Whether `n` ms have passed since `t`. A clock that now reads earlier than
+/// `t` was corrected backward; waiting for it to catch up would hold every
+/// fetch for as long as the correction, so that counts as passed.
 fn since(t: ?i64, n: i64, now_ms: i64) bool {
     const at = t orelse return true;
-    return now_ms - at >= n;
+    return now_ms < at or now_ms - at >= n;
 }
 
 fn floorClear(state: State, now_ms: i64) bool {
@@ -104,6 +107,15 @@ test "r needs the dashboard open and respects the floor" {
     try testing.expect(!due(.manual, false, .{}, t0));
     try testing.expect(due(.manual, true, .{}, t0));
     try testing.expect(!due(.manual, true, .{ .last_start_ms = t0 }, t0 + 30 * std.time.ms_per_s));
+}
+
+test "a clock corrected backward does not hold fetches until it catches up" {
+    const t0: i64 = 1_000_000;
+    const back = t0 - std.time.ms_per_hour;
+    try testing.expect(due(.open, false, .{ .last_start_ms = t0 }, back));
+    try testing.expect(due(.manual, true, .{ .failed_at_ms = t0 }, back));
+    try testing.expect(due(.timer, true, .{ .last_start_ms = t0 }, back));
+    try testing.expect(!due(.open, false, .{ .last_start_ms = back }, back + 1));
 }
 
 test "the timer fires every 15 minutes while open, never while closed" {

@@ -82,17 +82,41 @@ pub const Owned = struct {
     }
 };
 
-/// Combines what was stored with what a fetch returned. Each part keeps the
-/// newer of the two: today by fetch start, finished days by day, the budget
-/// by fetch start. The result borrows from both inputs.
-pub fn merge(stored: Entry, fetched: Entry) Entry {
-    return .{
-        .today = newer(Today, stored.today, fetched.today, todayKey),
-        .finished = newer(Finished, stored.finished, fetched.finished, finishedKey),
-        .budget = newer(Budget, stored.budget, fetched.budget, budgetKey),
-        .codex = mergeCodex(stored.codex, fetched.codex),
-        .grok = mergeGrok(stored.grok, fetched.grok),
+/// Combines what was stored with what a fetch returned, at wall time
+/// `now_ms`. Each part keeps the newer of the two: today by fetch start,
+/// finished days by day, the budget by fetch start. A stored part stamped
+/// after `now_ms` was written while the clock ran ahead, so it yields to the
+/// fetch; otherwise a backward clock correction would keep every later fetch
+/// out until the clock caught up. Finished days do not change during a day,
+/// so they count as ahead only when they are for a later day, and that holds
+/// for the fetch too: one that started before the clock was corrected back
+/// across midnight read them for a day that has not begun. The result
+/// borrows from both inputs.
+pub fn merge(stored: Entry, fetched: Entry, now_ms: i64) Entry {
+    const s: Entry = .{
+        .today = notAfter(Today, stored.today, now_ms),
+        .finished = finishedBy(stored.finished, now_ms),
+        .budget = notAfter(Budget, stored.budget, now_ms),
+        .codex = notAfter(Codex, stored.codex, now_ms),
+        .grok = notAfter(Grok, stored.grok, now_ms),
     };
+    return .{
+        .today = newer(Today, s.today, fetched.today, todayKey),
+        .finished = newer(Finished, s.finished, finishedBy(fetched.finished, now_ms), finishedKey),
+        .budget = newer(Budget, s.budget, fetched.budget, budgetKey),
+        .codex = mergeCodex(s.codex, fetched.codex),
+        .grok = mergeGrok(s.grok, fetched.grok),
+    };
+}
+
+fn finishedBy(part: ?Finished, now_ms: i64) ?Finished {
+    const f = part orelse return null;
+    return if (f.day > report.utcDay(now_ms)) null else f;
+}
+
+fn notAfter(comptime T: type, part: ?T, now_ms: i64) ?T {
+    const p = part orelse return null;
+    return if (p.at_ms > now_ms) null else p;
 }
 
 /// The newer billing; a fetch whose settings request failed keeps the
@@ -222,9 +246,22 @@ pub fn read(gpa: Allocator, io: Io, fx_dir: Io.Dir, identity: Identity) ?Owned {
     return decode(gpa, identity, bytes);
 }
 
-/// Merges `fetched` into the stored entry under the identity's lock and
-/// writes the result by rename. Returns the merged entry. Caller owns it.
-pub fn store(gpa: Allocator, io: Io, fx_dir: Io.Dir, identity: Identity, fetched: Entry) !Owned {
+/// `entry` copied into memory of its own, as `read` would return it. Fails
+/// when the reader would reject it. Caller owns the result.
+pub fn own(gpa: Allocator, identity: Identity, entry: Entry) !Owned {
+    if (!validEntry(entry)) return error.InvalidCache;
+    const bytes = try encode(gpa, identity, entry);
+    defer gpa.free(bytes);
+    return decode(gpa, identity, bytes) orelse error.InvalidCache;
+}
+
+/// Merges `fetched` into the stored entry under the identity's lock, at
+/// wall time `now_ms`, and writes the result by rename. `held` is the
+/// caller's own copy of the entry: it counts as well, so a process never
+/// stores less than it holds, even after the file was unreadable and a store
+/// started over from less. Never writes what `read` would reject, so a bad
+/// fetch leaves the file as it was. Returns the merged entry. Caller owns it.
+pub fn store(gpa: Allocator, io: Io, fx_dir: Io.Dir, identity: Identity, fetched: Entry, now_ms: i64, held: ?Entry) !Owned {
     fx_dir.createDir(io, dir_name, .fromMode(0o700)) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
@@ -242,7 +279,9 @@ pub fn store(gpa: Allocator, io: Io, fx_dir: Io.Dir, identity: Identity, fetched
 
     var stored = read(gpa, io, fx_dir, identity);
     defer if (stored) |*s| s.deinit();
-    const merged = merge(if (stored) |s| s.entry else .{}, fetched);
+    const base: Entry = if (stored) |s| (if (held) |h| merge(h, s.entry, now_ms) else s.entry) else held orelse .{};
+    const merged = merge(base, fetched, now_ms);
+    if (!validEntry(merged)) return error.InvalidCache;
 
     const bytes = try encode(gpa, identity, merged);
     defer gpa.free(bytes);
@@ -258,6 +297,8 @@ pub fn store(gpa: Allocator, io: Io, fx_dir: Io.Dir, identity: Identity, fetched
 // Tests
 
 const testing = std.testing;
+/// A wall clock on the day after the fixtures' day 5.
+const test_now: i64 = 6 * std.time.ms_per_day;
 
 fn oneRow(comptime cost: f64) []const report.ModelRow {
     return &.{.{ .model = "anthropic/claude-opus-5.5", .totals = .{ .request_count = 2, .total_cost = cost } }};
@@ -270,11 +311,11 @@ test "merge keeps the newer part of each half" {
         .budget = .{ .at_ms = 200, .value = .{ .limit = 100, .spent = 5, .period = .monthly } },
     };
     // An older fetch arrives late: nothing of it may replace newer data.
-    const late = merge(old, .{ .today = .{ .day = 10, .at_ms = 150, .models = oneRow(1) } });
+    const late = merge(old, .{ .today = .{ .day = 10, .at_ms = 150, .models = oneRow(1) } }, 11 * std.time.ms_per_day);
     try testing.expectEqual(@as(i64, 200), late.today.?.at_ms);
     try testing.expectEqual(@as(f64, 7), late.finished.?.days_7[0].totals.total_cost);
     // A newer fetch with only today keeps the stored finished days and budget.
-    const fresh = merge(old, .{ .today = .{ .day = 10, .at_ms = 300, .models = oneRow(3) } });
+    const fresh = merge(old, .{ .today = .{ .day = 10, .at_ms = 300, .models = oneRow(3) } }, 11 * std.time.ms_per_day);
     try testing.expectEqual(@as(f64, 3), fresh.today.?.models[0].totals.total_cost);
     try testing.expectEqual(@as(i64, 10), fresh.finished.?.day);
     try testing.expectEqual(@as(f64, 5), fresh.budget.?.value.spent);
@@ -318,15 +359,120 @@ test "store merges under the lock and never regresses today" {
     var first = try store(testing.allocator, io, tmp.dir, id, .{
         .today = .{ .day = 5, .at_ms = 500, .models = oneRow(5) },
         .finished = .{ .day = 5, .at_ms = 500, .days_7 = oneRow(7), .month = oneRow(30) },
-    });
+    }, test_now, null);
     first.deinit();
     var second = try store(testing.allocator, io, tmp.dir, id, .{
         .today = .{ .day = 5, .at_ms = 400, .models = oneRow(4) },
-    });
+    }, test_now, null);
     defer second.deinit();
     try testing.expectEqual(@as(i64, 500), second.entry.today.?.at_ms);
     try testing.expectEqual(@as(i64, 5), second.entry.finished.?.day);
     var again = read(testing.allocator, io, tmp.dir, id).?;
     defer again.deinit();
     try testing.expectEqual(@as(f64, 5), again.entry.today.?.models[0].totals.total_cost);
+}
+
+test "a part stored while the clock ran ahead yields to the next fetch" {
+    const day: i64 = 20737;
+    const at = day * std.time.ms_per_day + 3 * std.time.ms_per_hour;
+    const tomorrow = at + std.time.ms_per_day;
+    const ahead: Entry = .{
+        .today = .{ .day = day + 1, .at_ms = tomorrow, .models = oneRow(6) },
+        .finished = .{ .day = day + 1, .at_ms = tomorrow, .days_7 = oneRow(7), .month = oneRow(30) },
+        .budget = .{ .at_ms = tomorrow, .value = .{ .limit = 100, .spent = 60, .period = .monthly } },
+    };
+    const fetched: Entry = .{
+        .today = .{ .day = day, .at_ms = at, .models = oneRow(3) },
+        .finished = .{ .day = day, .at_ms = at, .days_7 = oneRow(70), .month = oneRow(300) },
+    };
+    // Corrected back a day: what was stored for tomorrow yields.
+    const corrected = merge(ahead, fetched, at + std.time.ms_per_min);
+    try testing.expectEqual(at, corrected.today.?.at_ms);
+    try testing.expectEqual(day, corrected.finished.?.day);
+    try testing.expect(corrected.budget == null);
+    // Once the clock passes it, the stored parts are simply newer.
+    const later = merge(ahead, fetched, tomorrow + std.time.ms_per_min);
+    try testing.expectEqual(tomorrow, later.today.?.at_ms);
+    try testing.expectEqual(day + 1, later.finished.?.day);
+    try testing.expectEqual(@as(f64, 60), later.budget.?.value.spent);
+    // A small correction within a day drops today but keeps the finished
+    // days, which do not change during the day.
+    const same_day: Entry = .{
+        .today = .{ .day = day, .at_ms = at + 10 * std.time.ms_per_min, .models = oneRow(4) },
+        .finished = .{ .day = day, .at_ms = at + 10 * std.time.ms_per_min, .days_7 = oneRow(7), .month = oneRow(30) },
+    };
+    const small = merge(same_day, .{ .today = .{ .day = day, .at_ms = at, .models = oneRow(3) } }, at + std.time.ms_per_min);
+    try testing.expectEqual(at, small.today.?.at_ms);
+    try testing.expect(small.finished != null);
+    try testing.expectEqual(@as(f64, 7), small.finished.?.days_7[0].totals.total_cost);
+    // A fetch that started tomorrow by the old clock keeps its finished days
+    // out; its today is stored and yields to the next fetch.
+    const straddling = merge(fetched, ahead, at + std.time.ms_per_min);
+    try testing.expectEqual(day, straddling.finished.?.day);
+    try testing.expectEqual(tomorrow, straddling.today.?.at_ms);
+}
+
+test "a store never keeps less than the caller holds" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const id = identityOf(.api_key, "k", "");
+    var first = try store(testing.allocator, io, tmp.dir, id, .{
+        .finished = .{ .day = 5, .at_ms = 500, .days_7 = oneRow(7), .month = oneRow(30) },
+    }, test_now, null);
+    defer first.deinit();
+    var name_buf: [80]u8 = undefined;
+    var path_buf: [128]u8 = undefined;
+    const path = try std.mem.print(&path_buf, "{s}/{s}", .{ dir_name, fileName(&name_buf, id, ".json") });
+    try tmp.dir.writeFile(io, .{ .sub_path = path, .data = "garbage" });
+    // The fetch skipped the finished days because the caller already had them.
+    var second = try store(testing.allocator, io, tmp.dir, id, .{
+        .today = .{ .day = 5, .at_ms = 600, .models = oneRow(4) },
+    }, test_now, first.entry);
+    defer second.deinit();
+    try testing.expect(second.entry.finished != null);
+    try testing.expectEqual(@as(i64, 5), second.entry.finished.?.day);
+    const read_back = read(testing.allocator, io, tmp.dir, id);
+    try testing.expect(read_back != null);
+    var kept = read_back.?;
+    defer kept.deinit();
+    try testing.expectEqual(@as(i64, 5), kept.entry.finished.?.day);
+    try testing.expectEqual(@as(i64, 600), kept.entry.today.?.at_ms);
+
+    // A readable file with less than the caller holds (a store that started
+    // over from an unreadable file, with yesterday's finished days) does not
+    // take the caller's finished days either.
+    const older = try encode(testing.allocator, id, .{
+        .finished = .{ .day = 4, .at_ms = 400, .days_7 = oneRow(1), .month = oneRow(1) },
+    });
+    defer testing.allocator.free(older);
+    try tmp.dir.writeFile(io, .{ .sub_path = path, .data = older });
+    var third = try store(testing.allocator, io, tmp.dir, id, .{
+        .today = .{ .day = 5, .at_ms = 700, .models = oneRow(5) },
+    }, test_now, second.entry);
+    defer third.deinit();
+    try testing.expect(third.entry.finished != null);
+    try testing.expectEqual(@as(i64, 5), third.entry.finished.?.day);
+}
+
+test "store never writes an entry its reader would reject" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = testing.io;
+    const id = identityOf(.api_key, "k", "");
+    var first = try store(testing.allocator, io, tmp.dir, id, .{
+        .finished = .{ .day = 5, .at_ms = 500, .days_7 = oneRow(7), .month = oneRow(30) },
+    }, test_now, null);
+    first.deinit();
+    const huge = [_]report.ModelRow{.{ .model = "m", .totals = .{ .request_count = 1, .total_cost = std.math.inf(f64) } }};
+    try testing.expectError(error.InvalidCache, store(testing.allocator, io, tmp.dir, id, .{
+        .today = .{ .day = 5, .at_ms = 600, .models = &huge },
+    }, test_now, null));
+    try testing.expectError(error.InvalidCache, own(testing.allocator, id, .{ .today = .{ .day = 5, .at_ms = 600, .models = &huge } }));
+    const read_back = read(testing.allocator, io, tmp.dir, id);
+    try testing.expect(read_back != null);
+    var kept = read_back.?;
+    defer kept.deinit();
+    try testing.expectEqual(@as(i64, 5), kept.entry.finished.?.day);
+    try testing.expect(kept.entry.today == null);
 }

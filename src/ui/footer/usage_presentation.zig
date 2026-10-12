@@ -7,6 +7,7 @@
 const std = @import("std");
 const usage = @import("../../usage/usage.zig");
 const display_width = @import("../../core/shared/display_width.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const row_text = @import("row_text.zig");
 const ui_render = @import("../render.zig");
 
@@ -360,11 +361,24 @@ fn appendCells(alloc: Allocator, row: *std.ArrayList(u8), cells: []const Cell, k
 }
 
 /// Model names and labels come from the network and the credential: keep
-/// them on one line and free of control bytes.
+/// them on one line, and show `?` for anything fx would escape on a terminal
+/// (control bytes, C1 controls, bidi and zero-width characters, invalid
+/// UTF-8). Cuts only between characters, so `buf` always holds whole ones.
 fn safeText(buf: []u8, text: []const u8) []const u8 {
-    const n = @min(buf.len, text.len);
-    for (text[0..n], 0..) |byte, i| buf[i] = if (byte < 0x20 or byte == 0x7f) '?' else byte;
-    return buf[0..n];
+    var in: usize = 0;
+    var out: usize = 0;
+    while (in < text.len) {
+        const len = std.unicode.utf8ByteSequenceLength(text[in]) catch 1;
+        const end = @min(in + len, text.len);
+        const piece = text[in..end];
+        const keep = piece.len == len and text_utils.isTerminalSafe(piece);
+        const n = if (keep) piece.len else 1;
+        if (out + n > buf.len) break;
+        if (keep) @memcpy(buf[out..][0..n], piece) else buf[out] = '?';
+        out += n;
+        in = end;
+    }
+    return buf[0..out];
 }
 
 // ---------------------------------------------------------------- heading
@@ -1946,6 +1960,31 @@ test "network text cannot inject terminal controls" {
     defer row.deinit(alloc);
     try testing.expect(std.mem.find(u8, row.items, "\x1b[2J") == null);
     try testing.expect(std.mem.find(u8, row.items, "evil/?[2Jmodel") != null);
+}
+
+test "network text cannot reorder or hide characters on the terminal" {
+    const alloc = testing.allocator;
+    const names = [_][]const u8{ "evil/\u{9b}31mred", "evil/\u{202e}edoc", "evil/\u{200b}hidden", "evil/\xff\xfebad" };
+    for (names) |name| {
+        const rows = [_]ModelRow{testRow(name, 1, 1, 1)};
+        var snapshot = try testSnapshot(.ready, false, &rows);
+        defer snapshot.deinit();
+        const p: Projection = .{ .active = true, .snapshot = &snapshot };
+        var row = try composeRow(alloc, p, @intCast(tableRows(p)), 40, 80);
+        defer row.deinit(alloc);
+        for ([_][]const u8{ "\u{9b}", "\u{202e}", "\u{200b}", "\xff", "\xfe" }) |raw| {
+            try testing.expect(std.mem.find(u8, row.items, raw) == null);
+        }
+        try testing.expect(std.mem.find(u8, row.items, "evil/?") != null);
+    }
+}
+
+test "safe text cuts only between characters" {
+    var three: [3]u8 = undefined;
+    try testing.expectEqualStrings("ab", safeText(&three, "ab\u{e9}"));
+    var four: [4]u8 = undefined;
+    try testing.expectEqualStrings("ab\u{e9}", safeText(&four, "ab\u{e9}"));
+    try testing.expectEqualStrings("a?b", safeText(&four, "a\u{202e}b"));
 }
 
 test "relative times" {

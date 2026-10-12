@@ -265,8 +265,11 @@ pub fn parseModelRows(gpa: Allocator, body: []const u8) ParseError!Rows {
             .tps_weighted = if (tps) |v| v * requests_f else 0,
             .tps_requests = if (tps != null) requests else 0,
         };
+        // Each number was finite, but a product or a sum can still overflow.
+        if (!totals.valid()) return error.InvalidResponse;
         if (findRow(rows.items, model)) |row| {
             row.totals.add(totals);
+            if (!row.totals.valid()) return error.InvalidResponse;
             continue;
         }
         if (rows.items.len == max_models) return error.InvalidResponse;
@@ -431,6 +434,9 @@ test "malformed reports are rejected instead of shown" {
         "{\"results\":[{\"model\":\"m\",\"total_cost\":-1}]}",
         "{\"results\":[{\"model\":\"m\",\"total_cost\":1,\"input_tokens\":-3}]}",
         "{\"results\":[{\"model\":\"\",\"total_cost\":1}]}",
+        // Finite numbers whose product or sum is not: the cache would refuse them.
+        "{\"results\":[{\"model\":\"m\",\"request_count\":100000000000000000,\"total_cost\":1,\"p90_ttft_ms\":1e300}]}",
+        "{\"results\":[{\"model\":\"m\",\"total_cost\":1.7e308},{\"model\":\"m\",\"total_cost\":1.7e308}]}",
     };
     for (bad) |body| try testing.expectError(error.InvalidResponse, parseModelRows(testing.allocator, body));
     var empty = try parseModelRows(testing.allocator, "{\"results\":[]}");

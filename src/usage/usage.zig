@@ -442,13 +442,37 @@ pub const Dashboard = struct {
     }
 
     /// Re-reads this sign-in's entry from the shared cache, which other fx
-    /// processes may have written since. The file only moves forward, so a
-    /// read never goes back; an unreadable file keeps what is in memory.
+    /// processes may have written since, keeping the newer of each part. The
+    /// file normally holds at least what is in memory, but after it was
+    /// unreadable a store may have started over from less. A missing or
+    /// unreadable file keeps what is in memory.
     fn reloadEntryLocked(self: *Dashboard) void {
         const s = self.session orelse return;
-        const fresh = self.readCache(s.identity) orelse return;
-        if (self.entry) |*e| e.deinit();
-        self.entry = fresh;
+        var fresh = self.readCache(s.identity) orelse return;
+        const current = if (self.entry) |*e| e else {
+            self.entry = fresh;
+            return;
+        };
+        const now = self.host.now_fn(self.host.ctx);
+        const merged = cache.own(self.gpa, s.identity, cache.merge(current.entry, fresh.entry, now)) catch {
+            current.deinit();
+            self.entry = fresh;
+            return;
+        };
+        fresh.deinit();
+        current.deinit();
+        self.entry = merged;
+    }
+
+    /// A copy of the entry the dashboard holds, when it is for `identity`.
+    /// Called by the worker; the copy outlives the lock.
+    fn ownedEntryFor(self: *Dashboard, identity: cache.Identity) ?cache.Owned {
+        self.mutex.lockUncancelable(self.io());
+        defer self.mutex.unlock(self.io());
+        const s = self.session orelse return null;
+        if (!std.mem.eql(u8, &s.identity, &identity)) return null;
+        const e = self.entry orelse return null;
+        return cache.own(self.gpa, identity, e.entry) catch null;
     }
 
     fn readCache(self: *Dashboard, identity: cache.Identity) ?cache.Owned {
@@ -611,10 +635,32 @@ fn fetchAll(dashboard: *Dashboard, job: *const Job) Outcome {
     defer run.deinit();
     const fetched = collect(&run) catch return run.stop;
 
-    var fx_dir = dashboard.openOrCreateFxDir() orelse return .{ .failed = .cache };
+    const now = dashboard.host.now_fn(dashboard.host.ctx);
+    // What the dashboard holds now counts too: the plan may have skipped
+    // parts it already had, and the file may hold less after it was unreadable.
+    var latest = dashboard.ownedEntryFor(job.identity);
+    defer if (latest) |*l| l.deinit();
+    const held: ?cache.Entry = if (latest) |l| l.entry else null;
+    var fx_dir = dashboard.openOrCreateFxDir() orelse return unsaved(dashboard, job, fetched, now, held);
     defer fx_dir.close(dashboard.io());
-    const stored = cache.store(dashboard.gpa, dashboard.io(), fx_dir, job.identity, fetched) catch return .{ .failed = .cache };
+    const stored = cache.store(dashboard.gpa, dashboard.io(), fx_dir, job.identity, fetched, now, held) catch |err| switch (err) {
+        // The fetch itself is unfit to keep.
+        error.InvalidCache => return .{ .failed = .cache },
+        else => return unsaved(dashboard, job, fetched, now, held),
+    };
     return .{ .stored = stored };
+}
+
+/// What a fetch shows when the cache cannot be written (a read-only or
+/// misplaced `~/.fx/usage-cache`): the fetch merged with whatever can still
+/// be read, or else with what the dashboard holds, kept in memory only.
+fn unsaved(dashboard: *Dashboard, job: *const Job, fetched: cache.Entry, now: i64, held: ?cache.Entry) Outcome {
+    var on_disk = dashboard.readCache(job.identity);
+    defer if (on_disk) |*d| d.deinit();
+    const base: cache.Entry = if (on_disk) |d| (if (held) |h| cache.merge(h, d.entry, now) else d.entry) else held orelse .{};
+    const merged = cache.merge(base, fetched, now);
+    const owned = cache.own(dashboard.gpa, job.identity, merged) catch return .{ .failed = .cache };
+    return .{ .stored = owned };
 }
 
 fn collect(run: *Run) error{Stop}!cache.Entry {
@@ -1254,4 +1300,130 @@ test "another sign-in never shows the previous one's numbers" {
     defer elsewhere.deinit();
     try testing.expectEqual(Status{ .unavailable = .unsupported_provider }, elsewhere.status);
     try testing.expectEqual(@as(usize, 0), elsewhere.of(.month).models.len);
+}
+
+test "a clock corrected backward does not freeze /usage" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    var gateway: FakeGateway = .{};
+    const real = gateway.now_ms;
+    var dashboard = Dashboard.init(testing.allocator, gateway.host(home));
+    defer dashboard.deinit();
+
+    // The clock ran a day ahead when this was fetched and stored.
+    gateway.now_ms = real + std.time.ms_per_day;
+    dashboard.open(api_key);
+    dashboard.waitForFetch();
+    dashboard.close();
+
+    // Corrected: reopening fetches at once, and the result is shown and kept.
+    gateway.now_ms = real;
+    const before = gateway.count;
+    dashboard.open(api_key);
+    dashboard.waitForFetch();
+    // Today plus the finished days, which were stored for tomorrow.
+    try testing.expectEqual(@as(usize, 3), gateway.count - before);
+    {
+        var shown = try dashboard.snapshot(testing.allocator);
+        defer shown.deinit();
+        try testing.expectEqual(Status.ready, shown.status);
+        try testing.expect(shown.of(.today).today_current);
+        try testing.expectEqual(real, shown.of(.today).fetched_at_ms.?);
+        try testing.expect(shown.of(.days_7).finished_current);
+    }
+
+    // The next refresh reads only today again.
+    gateway.now_ms = real + 2 * std.time.ms_per_min;
+    const again = gateway.count;
+    try testing.expect(dashboard.refresh());
+    dashboard.waitForFetch();
+    try testing.expectEqual(@as(usize, 1), gateway.count - again);
+}
+
+test "an unreadable cache file keeps the finished days on screen and in the file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    var gateway: FakeGateway = .{};
+    var dashboard = Dashboard.init(testing.allocator, gateway.host(home));
+    defer dashboard.deinit();
+
+    dashboard.open(api_key);
+    dashboard.waitForFetch();
+
+    // Something else (garbage, or another fx version's schema) replaces the file.
+    const identity = cache.identityOf(.api_key, api_key.subject, "");
+    var name_buf: [128]u8 = undefined;
+    const name = try std.mem.print(&name_buf, ".fx/{s}/{s}.json", .{ cache.dir_name, &identity });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = name, .data = "{\"schema_version\":3}" });
+
+    gateway.now_ms += 2 * std.time.ms_per_min;
+    const before = gateway.count;
+    try testing.expect(dashboard.refresh());
+    dashboard.waitForFetch();
+    // Only today is read; the finished days come from what the fetch was planned from.
+    try testing.expectEqual(@as(usize, 1), gateway.count - before);
+    {
+        var shown = try dashboard.snapshot(testing.allocator);
+        defer shown.deinit();
+        try testing.expect(shown.of(.days_7).finished_current);
+        try testing.expect(shown.of(.days_7).totals.total_cost > 40);
+    }
+    // The file has them again for every other fx process.
+    var other = Dashboard.init(testing.allocator, gateway.host(home));
+    defer other.deinit();
+    other.open(api_key);
+    var seen = try other.snapshot(testing.allocator);
+    defer seen.deinit();
+    try testing.expect(seen.of(.days_7).finished_current);
+}
+
+test "a cache that cannot be written still shows what was fetched" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    // `usage-cache` is a file, so nothing can be stored.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = ".fx/" ++ cache.dir_name, .data = "not a directory" });
+    var gateway: FakeGateway = .{};
+    var dashboard = Dashboard.init(testing.allocator, gateway.host(home));
+    defer dashboard.deinit();
+
+    dashboard.open(api_key);
+    dashboard.waitForFetch();
+    var shown = try dashboard.snapshot(testing.allocator);
+    defer shown.deinit();
+    try testing.expectEqual(Status.ready, shown.status);
+    try testing.expect(shown.of(.today).today_current);
+    try testing.expect(shown.of(.days_7).finished_current);
+}
+
+test "a dashboard never shows less than it had when the file goes back" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    var gateway: FakeGateway = .{};
+    var dashboard = Dashboard.init(testing.allocator, gateway.host(home));
+    defer dashboard.deinit();
+    dashboard.open(api_key);
+    dashboard.waitForFetch();
+
+    // A store that started over from an unreadable file left an older entry.
+    const identity = cache.identityOf(.api_key, api_key.subject, "");
+    const older = try cache.encode(testing.allocator, identity, .{
+        .today = .{ .day = report.utcDay(gateway.now_ms), .at_ms = gateway.now_ms - std.time.ms_per_hour, .models = &.{} },
+    });
+    defer testing.allocator.free(older);
+    var name_buf: [128]u8 = undefined;
+    const name = try std.mem.print(&name_buf, ".fx/{s}/{s}.json", .{ cache.dir_name, &identity });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = name, .data = older });
+
+    var shown = try dashboard.snapshot(testing.allocator);
+    defer shown.deinit();
+    try testing.expectEqual(gateway.now_ms, shown.of(.today).fetched_at_ms.?);
+    try testing.expect(shown.of(.days_7).finished_current);
 }
