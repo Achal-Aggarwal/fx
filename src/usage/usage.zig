@@ -320,6 +320,7 @@ pub const Dashboard = struct {
     pub fn snapshot(self: *Dashboard, gpa: Allocator) Allocator.Error!Snapshot {
         self.mutex.lockUncancelable(self.io());
         defer self.mutex.unlock(self.io());
+        self.reloadEntryLocked();
         const now = self.host.now_fn(self.host.ctx);
         const entry: ?cache.Entry = if (self.entry) |e| e.entry else null;
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -440,6 +441,16 @@ pub const Dashboard = struct {
         self.unavailable = reason;
     }
 
+    /// Re-reads this sign-in's entry from the shared cache, which other fx
+    /// processes may have written since. The file only moves forward, so a
+    /// read never goes back; an unreadable file keeps what is in memory.
+    fn reloadEntryLocked(self: *Dashboard) void {
+        const s = self.session orelse return;
+        const fresh = self.readCache(s.identity) orelse return;
+        if (self.entry) |*e| e.deinit();
+        self.entry = fresh;
+    }
+
     fn readCache(self: *Dashboard, identity: cache.Identity) ?cache.Owned {
         var fx_dir = self.openFxDir() orelse return null;
         defer fx_dir.close(self.io());
@@ -471,6 +482,8 @@ pub const Dashboard = struct {
         const s = self.session orelse return false;
         const now = self.host.now_fn(self.host.ctx);
         if (!policy.due(trigger, self.is_open, self.fetch_state, now)) return false;
+        // Another process may already hold today's finished days.
+        self.reloadEntryLocked();
         const finished_day: ?i64 = if (self.entry) |e| (if (e.entry.finished) |f| f.day else null) else null;
         const job = Job.init(self.gpa, s, policy.plan(s.scope, finished_day, now), now) catch return false;
         // The previous worker has finished (in_flight is false); reap it.
@@ -917,6 +930,65 @@ test "opening shows the cache at once and fills it from AI Gateway in the backgr
     other.waitForFetch();
     // It already has today's finished days: only today and the budget.
     try testing.expectEqual(@as(usize, 2), other_gateway.count);
+}
+
+test "a dashboard reads what another fx process stored since" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+
+    // The first process fetches on Oct 10, finished days included.
+    var first_gateway: FakeGateway = .{ .now_ms = 20736 * std.time.ms_per_day + 23 * std.time.ms_per_hour };
+    var first = Dashboard.init(testing.allocator, first_gateway.host(home));
+    defer first.deinit();
+    first.open(api_key);
+    first.waitForFetch();
+    try testing.expectEqual(@as(usize, 3), first_gateway.count);
+    first.close();
+
+    // On Oct 11 a second process stores today and today's finished days.
+    var second_gateway: FakeGateway = .{};
+    var second = Dashboard.init(testing.allocator, second_gateway.host(home));
+    defer second.deinit();
+    second.open(api_key);
+    second.waitForFetch();
+    try testing.expectEqual(@as(usize, 3), second_gateway.count);
+
+    // The first reopens and its own fetch fails: it shows the second's today.
+    first_gateway.now_ms = second_gateway.now_ms + 30 * std.time.ms_per_s;
+    first_gateway.status = 500;
+    first.open(api_key);
+    first.waitForFetch();
+    try testing.expectEqual(@as(usize, 4), first_gateway.count);
+    {
+        var shown = try first.snapshot(testing.allocator);
+        defer shown.deinit();
+        try testing.expectEqual(@as(?i64, second_gateway.now_ms), shown.of(.today).fetched_at_ms);
+    }
+
+    // While the first stays open, the second stores Oct 12: the first's
+    // next redraw shows it.
+    second_gateway.now_ms += std.time.ms_per_day;
+    try testing.expect(second.refresh());
+    second.waitForFetch();
+    first_gateway.now_ms = second_gateway.now_ms + 30 * std.time.ms_per_s;
+    first_gateway.status = 200;
+    {
+        var shown = try first.snapshot(testing.allocator);
+        defer shown.deinit();
+        try testing.expectEqual(@as(?i64, second_gateway.now_ms), shown.of(.today).fetched_at_ms);
+    }
+
+    // On Oct 13 the second stores the finished days first; the first's
+    // refresh then reads only today.
+    second_gateway.now_ms += std.time.ms_per_day;
+    try testing.expect(second.refresh());
+    second.waitForFetch();
+    first_gateway.now_ms = second_gateway.now_ms + 30 * std.time.ms_per_s;
+    try testing.expect(first.refresh());
+    first.waitForFetch();
+    try testing.expectEqual(@as(usize, 5), first_gateway.count);
 }
 
 test "a first fetch creates a private ~/.fx for its cache" {
