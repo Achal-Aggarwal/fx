@@ -9100,3 +9100,63 @@ test "command tool rows reclip to live width across lifecycle states" {
     try h.driveResize(200, 30, 4, true);
     try expectGridContains(&h, "Exited 1 " ++ command);
 }
+
+test "full transcript shows terminal session launch commands in full across widths" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 100, 30, 4);
+    defer h.deinit();
+
+    var input = InputRuntime{};
+    defer input.deinit(alloc);
+    var approval = approval_prompt.ApprovalPrompt{};
+    defer approval.deinit(alloc);
+    try h.shell.initViewport(&h.metrics, 1);
+
+    // `interact` has no command argument: the session's launch command is
+    // known only through the stored command display, and the status phrase
+    // was frozen at the compact activity bound.
+    const launch = "cd . && python3 - <<'PYEOF' import pathlib led = pathlib.Path(\"docs/workflows/ledger.md\"); " ++
+        "s = led.read_text() old = \"Fixed in draft (b226cd28e,\" assert old in s LAUNCH_COMMAND_TAIL";
+    const frozen = launch[0..100] ++ "...";
+    const id = types.ToolLifecycleId{ .turn_id = 1, .call_id = "observe-session" };
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .authoritative_started = .{
+        .id = id,
+        .reconciles_provisional_call_id = null,
+        .tool_name = "shell",
+        .activity_kind = .command,
+        .arguments_json = "{\"action\":\"interact\",\"session_id\":\"shell-922\"}",
+    } });
+    try h.shell.setToolCommandMetadata(alloc, id, launch, "Observed");
+    _ = try h.shell.applyToolLifecycle(alloc, .{ .terminal = .{
+        .id = id,
+        .outcome = .{ .kind = .completed, .summary = "Observed " ++ frozen },
+    } });
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+
+    // The main view still trails a row that does not fit.
+    try expectGridContains(&h, "Observed cd . && python3");
+    try expectGridNotContains(&h, "LAUNCH_COMMAND_TAIL");
+
+    // Ctrl+O shows the whole launch command at every width.
+    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .full));
+    h.frame_redraw = true;
+    try renderTestFooter(&h, &input, &approval, &h.frame_redraw);
+    try h.flush();
+    try expectGridContains(&h, "Observed cd . && python3");
+    try expectGridContains(&h, "LAUNCH_COMMAND_TAIL");
+    try expectGridContains(&h, "session_id: shell-922");
+    try expectGridNotContains(&h, "…");
+    try h.driveResize(60, 30, 4, true);
+    try expectGridContains(&h, "LAUNCH_COMMAND_TAIL");
+    try expectGridNotContains(&h, "…");
+    try h.driveResize(140, 30, 4, true);
+    try expectGridContains(&h, "LAUNCH_COMMAND_TAIL");
+
+    // Leaving Ctrl+O restores the trailing main view.
+    try std.testing.expect(try h.shell.setTranscriptPresentationDepth(alloc, .inline_mode));
+    try h.driveResize(100, 30, 4, true);
+    try expectGridContains(&h, "Observed cd . && python3");
+    try expectGridNotContains(&h, "LAUNCH_COMMAND_TAIL");
+}
