@@ -15,6 +15,8 @@ const durabilityKind = process.argv[2] || "memory";
 const { local } = durabilityKind === "local" ? await import("../durable/local.mjs") : {};
 // "world": the app's own World through world(); see app-world.mjs.
 const { appWorldAt, closeAppWorlds } = durabilityKind === "world" ? await import("./app-world.mjs") : {};
+// A World whose queue delivers as Vercel Queues does; see queue-world.mjs.
+const { queueWorldAt, closeQueueWorlds } = durabilityKind === "world" ? await import("./queue-world.mjs") : {};
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const dirs = [];
@@ -889,6 +891,52 @@ if (durabilityKind === "world") {
   });
 }
 
+if (durabilityKind === "world") {
+  for (const [how, name] of [
+    ["lapse", "a later delivery of the message whose delivery holds a session takes the session over at once"],
+    // Vercel runs a delivery whose function's process exited again, attempt and all.
+    ["rerun", "a delivery run again after its process died takes its session over at once"],
+  ]) test(name, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-core-redelivered-"));
+    dirs.push(dir);
+    // A lease that outlasts the test: only the redelivery can free the session.
+    const { durability, broker } = await queueWorldAt(dir, { leaseMs: 60_000, maxDurationMs: 600_000 });
+    const fenced = [];
+    const first = createAgent({ durability, onEvent: (event) => { if (event.type === "session.fenced") fenced.push(event); } });
+    const second = createAgent({ durability });
+    // Both take deliveries from the World, the first one first.
+    await first.newSessionId();
+    await second.newSessionId();
+    const held = holdStep("zeta-1");
+    const before = ran.length;
+    const session = first.session();
+    const turn = session.prompt("zeta", { messageId: "turn-z" });
+    await held.holding;
+    // The queue gives up on the first worker's process, which this one no
+    // longer runs as, and delivers the prompt's message again.
+    const holders = globalThis[Symbol.for("libfx.liveHolders")];
+    for (const holder of [...holders]) holders.delete(holder);
+    holds.delete("zeta-1");
+    const [message] = broker.held((input) => input.messageId === "turn-z");
+    assert.ok(message, "the prompt's message is still held");
+    const lapsed = Date.now();
+    broker[how](message);
+    const { text, result } = await textOf(turn);
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(text, "zeta-0 zeta-1 zeta-2");
+    assert.ok(Date.now() - lapsed < 5000, `the session was taken over ${Date.now() - lapsed} ms after its message came back, not when its lease ran out`);
+    assert.deepEqual(ran.slice(before), ["turn-z:0", "turn-z:1", "turn-z:2"], "the second worker continued the turn from its held step");
+    // The first worker's held step goes on, and its next write is refused.
+    held.release();
+    for (let waited = 0; fenced.length === 0 && waited < 5000; waited += 20) await sleep(20);
+    assert.equal(fenced.length, 1, "the replaced worker stopped at its next write");
+    const lines = await readLines(session.stream(0), 32);
+    assert.equal(lines.filter((line) => line.type === "turn_end").length, 1, "the turn ended once");
+    await first.close();
+    await second.close();
+  });
+}
+
 let failed = 0;
 for (const [name, fn] of tests) {
   const started = performance.now();
@@ -902,6 +950,7 @@ for (const [name, fn] of tests) {
   }
 }
 await closeAppWorlds?.();
+await closeQueueWorlds?.();
 for (const dir of dirs) await rm(dir, { recursive: true, force: true }).catch(() => {});
 console.log(`${tests.length - failed}/${tests.length} core tests passed (${durabilityKind})`);
 process.exit(failed ? 1 : 0);
