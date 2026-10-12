@@ -83,6 +83,7 @@ const AcpMethod = enum {
     libfx_new,
     libfx_steer,
     libfx_withdraw,
+    libfx_handoff,
     libfx_follow_up,
     libfx_snapshot,
     libfx_journal_open,
@@ -107,6 +108,7 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "libfx/new")) return .libfx_new;
         if (std.mem.eql(u8, method, "libfx/steer")) return .libfx_steer;
         if (std.mem.eql(u8, method, "libfx/withdraw")) return .libfx_withdraw;
+        if (std.mem.eql(u8, method, "libfx/handoff")) return .libfx_handoff;
         if (std.mem.eql(u8, method, "libfx/follow_up")) return .libfx_follow_up;
         if (std.mem.eql(u8, method, "libfx/snapshot")) return .libfx_snapshot;
         if (std.mem.eql(u8, method, "libfx/journal_open")) return .libfx_journal_open;
@@ -127,6 +129,7 @@ const AcpMethod = enum {
             .libfx_new,
             .libfx_steer,
             .libfx_withdraw,
+            .libfx_handoff,
             .libfx_follow_up,
             => false,
             .session_list,
@@ -145,7 +148,7 @@ const AcpMethod = enum {
 
     fn isLibfx(self: AcpMethod) bool {
         return switch (self) {
-            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer, .libfx_withdraw, .libfx_follow_up, .libfx_snapshot, .libfx_journal_open => true,
+            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer, .libfx_withdraw, .libfx_handoff, .libfx_follow_up, .libfx_snapshot, .libfx_journal_open => true,
             else => false,
         };
     }
@@ -1512,6 +1515,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
             .libfx_new => sessions.handleNewLibfxSession(state, alloc, msg),
             .libfx_steer => handleKernelSteer(state, alloc, msg),
             .libfx_withdraw => handleKernelWithdraw(state, alloc, msg),
+            .libfx_handoff => handleKernelHandoff(state, alloc, msg),
             .libfx_follow_up => handleKernelFollowUp(state, alloc, msg),
             .libfx_snapshot => handleKernelSnapshot(state, alloc, msg),
             .libfx_journal_open => handleKernelJournalOpen(state, alloc, msg),
@@ -1536,6 +1540,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .libfx_new => sessions.handleNewLibfxSession(state, alloc, msg),
         .libfx_steer => handleKernelSteer(state, alloc, msg),
         .libfx_withdraw => handleKernelWithdraw(state, alloc, msg),
+        .libfx_handoff => handleKernelHandoff(state, alloc, msg),
         .libfx_follow_up => handleKernelFollowUp(state, alloc, msg),
         .libfx_snapshot => handleKernelSnapshot(state, alloc, msg),
         .libfx_journal_open => handleKernelJournalOpen(state, alloc, msg),
@@ -1669,6 +1674,29 @@ fn handleKernelWithdraw(
         break :withdrawn true;
     };
     try state.writer.writeResponse(alloc, msg.id, if (withdrawn) "{\"result\":\"withdrawn\"}" else "{\"result\":\"already_placed\"}");
+}
+
+/// A libfx steer that cannot join the running turn, such as one with images,
+/// ends that turn at its next safe point so the host can run it next.
+fn handleKernelHandoff(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *const jsonrpc.Message,
+) !void {
+    var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid libfx handoff params",
+    });
+    defer parsed.deinit();
+    const active = activeLibfxSession(state, parsed.value) orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Unknown libfx session",
+        });
+    if (active.steering.requestHandoff(&active.cancel_flag)) {
+        debug_trace.logf("acp", "libfx handoff interrupts the streaming reply", .{});
+    }
+    try state.writer.writeResponse(alloc, msg.id, "null");
 }
 
 pub fn takeSteering(
@@ -2172,14 +2200,11 @@ fn handleKernelSteer(
             },
         });
     };
-    var update: std.Io.Writer.Allocating = .init(alloc);
-    defer update.deinit();
-    try update.writer.writeAll("{\"sessionId\":");
-    try writeJsonStr(active.session_id, &update.writer);
-    try update.writer.writeAll(",\"update\":");
-    try acp_types.writeUserMessageChunk(&update.writer, "libfx-steering", text.string);
-    try update.writer.writeByte('}');
-    try state.writer.writeNotification(alloc, "session/update", update.written());
+    // While the model streams a reply, the steer cuts it short, as in the fx
+    // CLI. The turn shows the steer when a boundary places it.
+    if (active.steering.claimInterrupt(&active.cancel_flag)) {
+        debug_trace.logf("acp", "libfx steer interrupts the streaming reply bytes={d}", .{text.string.len});
+    }
     try state.writer.writeResponse(alloc, msg.id, "null");
 }
 
@@ -2313,6 +2338,51 @@ fn promptWorkerMain(active: *ActivePrompt) void {
     publishPromptOutcome(active, outcome) catch {};
     if (finished_steering) |finished| publishSteeringOutcomes(active, outcome, finished) catch {};
     prompt_test_controls.pauseAfterTerminalWrite();
+}
+
+/// At a cancel boundary of a libfx turn: whether steering, not the user,
+/// cancelled it, and why. A steer's cancel is spent so the turn goes on.
+pub fn takeSteeringInterrupt(state: *ServerState) ?libfx_steering.Runtime.Interrupt {
+    const active = if (state.active_session) |*session| session else return null;
+    return active.steering.takeInterrupt(&active.cancel_flag);
+}
+
+/// Whether the running libfx turn ends at this boundary for a handoff.
+pub fn steeringHandoffPending(state: *ServerState) bool {
+    const active = if (state.active_session) |*session| session else return false;
+    return active.steering.handoffPending();
+}
+
+/// Records what the running libfx turn's current step does, which decides
+/// whether a queued steer interrupts it.
+pub fn noteSteeringPhase(state: *ServerState, step: u64, phase: libfx_steering.Phase) void {
+    const active = if (state.active_session) |*session| session else return;
+    if (active.steering.notePhase(step, phase, &active.cancel_flag)) {
+        debug_trace.logf("acp", "queued libfx steer interrupts the streaming reply step={d}", .{step});
+    }
+}
+
+/// Whether the `queued` steers a web host holds should interrupt the running
+/// libfx turn's streaming reply now; if so the turn's cancel flag is set.
+pub fn claimHostSteeringInterrupt(state: *ServerState, queued: usize) bool {
+    const active = if (state.active_session) |*session| session else return false;
+    return active.steering.claimHostInterrupt(queued, &active.cancel_flag);
+}
+
+/// A boundary of a libfx turn whose web host keeps the steering queue.
+pub fn noteSteeringBoundary(state: *ServerState) void {
+    const active = if (state.active_session) |*session| session else return;
+    active.steering.noteBoundary();
+}
+
+/// Records a libfx turn's tool call `call_id` starting or ending.
+pub fn noteSteeringTool(state: *ServerState, call_id: []const u8, started: bool) void {
+    const active = if (state.active_session) |*session| session else return;
+    if (started) {
+        active.steering.noteToolStarted(state.alloc, call_id);
+    } else {
+        active.steering.noteToolEnded(state.alloc, call_id);
+    }
 }
 
 fn publishPromptOutcome(active: *ActivePrompt, outcome: prompt_handler.TerminalOutcome) !void {
@@ -3101,7 +3171,9 @@ fn handleCancel(state: *ServerState, notify_client: bool) void {
     if (state.active_session) |*session| {
         debug_trace.eventf("interrupt", "cancel_requested", .{}, "source=acp active_tool_known=false", .{});
         session.cancel_flag.store(true, .seq_cst);
-        if (state.cfg.minimal_kernel) session.steering.close(state.alloc, "cancelled");
+        // A libfx turn keeps its queued steering until it ends, which hands
+        // back what never reached the model.
+        if (state.cfg.minimal_kernel) session.steering.cancelForUser(&session.cancel_flag);
     }
     cancelPendingOutbound(state, notify_client);
     clearPendingLegacyUrls(state);
@@ -4090,11 +4162,14 @@ test "ACP method parser classifies request dispatch methods" {
     try std.testing.expectEqual(AcpMethod.libfx_restore, AcpMethod.parse("libfx/restore"));
     try std.testing.expectEqual(AcpMethod.libfx_new, AcpMethod.parse("libfx/new"));
     try std.testing.expectEqual(AcpMethod.libfx_steer, AcpMethod.parse("libfx/steer"));
+    try std.testing.expectEqual(AcpMethod.libfx_handoff, AcpMethod.parse("libfx/handoff"));
     try std.testing.expectEqual(AcpMethod.unknown, AcpMethod.parse("workspace/unknown"));
     try std.testing.expect(AcpMethod.libfx_checkpoint.isLibfx());
     try std.testing.expect(AcpMethod.libfx_restore.isLibfx());
     try std.testing.expect(AcpMethod.libfx_new.isLibfx());
     try std.testing.expect(AcpMethod.libfx_steer.isLibfx());
+    try std.testing.expect(AcpMethod.libfx_handoff.isLibfx());
+    try std.testing.expect(!AcpMethod.libfx_handoff.waitsForActivePrompt());
     try std.testing.expect(!AcpMethod.session_new.isLibfx());
 }
 
