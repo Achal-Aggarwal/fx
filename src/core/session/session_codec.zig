@@ -580,6 +580,138 @@ pub const ImageBlobReader = struct {
     }
 };
 
+/// An image's name in a libfx host's store: the lowercase hex SHA-256 of its
+/// bytes, as `ImageAttachment.snapshot_sha256` holds it for an inline image.
+pub const image_name_len = 2 * Sha256.digest_length;
+pub const ImageName = [image_name_len]u8;
+
+/// `text` as an image name, or null when it is not 64 lowercase hex digits.
+pub fn imageName(text: []const u8) ?ImageName {
+    if (text.len != image_name_len) return null;
+    for (text) |char| switch (char) {
+        '0'...'9', 'a'...'f' => {},
+        else => return null,
+    };
+    return text[0..image_name_len].*;
+}
+
+pub fn imageNameOf(bytes: []const u8) ImageName {
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+/// The images a libfx host's store holds, by name.
+pub const StoredImages = struct {
+    names: std.array_hash_map.Auto(ImageName, void) = .empty,
+
+    pub fn deinit(self: *StoredImages, alloc: Allocator) void {
+        self.names.deinit(alloc);
+        self.* = undefined;
+    }
+
+    pub fn add(self: *StoredImages, alloc: Allocator, name: ImageName) Allocator.Error!void {
+        try self.names.put(alloc, name, {});
+    }
+
+    /// Whether `image` has bytes the store holds under its name.
+    pub fn holds(self: *const StoredImages, image: types.ImageAttachment) bool {
+        if (image.inline_data == null) return false;
+        const name = imageName(image.snapshot_sha256 orelse return false) orelse return false;
+        return self.names.contains(name);
+    }
+
+    /// Whether writing `user` names any image instead of writing its bytes.
+    pub fn namesAny(self: *const StoredImages, user: session.UserTurn) bool {
+        for (user.images) |image| if (self.holds(image)) return true;
+        return false;
+    }
+
+    pub fn namesAnyInTurn(self: *const StoredImages, turn: session.HistoryTurn) bool {
+        return switch (turn) {
+            .assistant => |entry| self.namesAny(entry.user),
+            .interrupted => |entry| self.namesAny(entry.user),
+            .compacted_summary => false,
+        };
+    }
+};
+
+/// Writes images the host stored as `inline_ref` names. Every other image
+/// keeps its bytes: in `blobs`, a libfx kernel checkpoint's blob section,
+/// when given, else inline.
+pub const ImageNames = struct {
+    stored: *const StoredImages,
+    blobs: ?ImageBlobs = null,
+};
+
+/// Images a libfx host staged from its store for an open, by name. Owns the
+/// bytes.
+pub const StagedImages = struct {
+    images: std.array_hash_map.Auto(ImageName, []u8) = .empty,
+    bytes: usize = 0,
+
+    pub fn deinit(self: *StagedImages, alloc: Allocator) void {
+        for (self.images.values()) |bytes| alloc.free(bytes);
+        self.images.deinit(alloc);
+        self.* = undefined;
+    }
+
+    /// Stages `bytes`, `alloc`-owned, as `name`. A staged image must be
+    /// exactly the bytes its name is the hash of. On success it owns `bytes`,
+    /// freeing them when it already holds the name; on error the caller
+    /// still owns them.
+    pub fn add(self: *StagedImages, alloc: Allocator, name: ImageName, bytes: []u8) error{ OutOfMemory, ImageNameMismatch }!void {
+        if (!std.mem.eql(u8, &imageNameOf(bytes), &name)) return error.ImageNameMismatch;
+        if (self.images.contains(name)) {
+            alloc.free(bytes);
+            return;
+        }
+        try self.images.put(alloc, name, bytes);
+        self.bytes += bytes.len;
+    }
+
+    pub fn clear(self: *StagedImages, alloc: Allocator) void {
+        for (self.images.values()) |bytes| alloc.free(bytes);
+        self.images.clearRetainingCapacity();
+        self.bytes = 0;
+    }
+};
+
+/// Resolves `inline_ref` names to staged bytes while a libfx journal or
+/// checkpoint is read. A name it cannot resolve is recorded in `missing` and
+/// parses as an image without bytes, so one read names every image an open
+/// needs; a caller that finds any missing discards what it read.
+pub const ImageResolver = struct {
+    alloc: Allocator,
+    staged: *const StagedImages,
+    missing: std.array_hash_map.Auto(ImageName, void) = .empty,
+    /// The names it resolved, which the store therefore holds.
+    resolved: std.array_hash_map.Auto(ImageName, void) = .empty,
+
+    pub fn deinit(self: *ImageResolver) void {
+        self.missing.deinit(self.alloc);
+        self.resolved.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    /// A copy of the bytes named `name`, owned by `alloc`, or null when none
+    /// were staged.
+    fn resolve(self: *ImageResolver, alloc: Allocator, name: ImageName) Allocator.Error!?[]u8 {
+        const bytes = self.staged.images.get(name) orelse {
+            try self.missing.put(self.alloc, name, {});
+            return null;
+        };
+        try self.resolved.put(self.alloc, name, {});
+        return try alloc.dupe(u8, bytes);
+    }
+};
+
+/// Where a parse finds image bytes kept outside the image object.
+pub const ImageSources = struct {
+    blobs: ?*ImageBlobReader = null,
+    names: ?*ImageResolver = null,
+};
+
 pub fn writeHistoryTurn(writer: *std.Io.Writer, turn: session.HistoryTurn) !void {
     return writeHistoryTurnTo(writer, turn, {});
 }
@@ -594,8 +726,15 @@ pub fn writeHistoryTurnWithImageBlobs(
     return writeHistoryTurnTo(writer, turn, image_blobs);
 }
 
-/// `image_blobs` is `void` to embed inline image bytes or `ImageBlobs` to
-/// collect them. The choice is comptime so durable writers keep their error set.
+/// Like `writeHistoryTurn`, but names the images `names.stored` holds
+/// instead of writing their bytes.
+pub fn writeHistoryTurnNamingImages(writer: *std.Io.Writer, turn: session.HistoryTurn, names: ImageNames) !void {
+    return writeHistoryTurnTo(writer, turn, names);
+}
+
+/// `image_blobs` is `void` to embed inline image bytes, `ImageBlobs` to
+/// collect them, or `ImageNames` to name stored ones. The choice is comptime
+/// so durable writers keep their error set.
 fn writeHistoryTurnTo(writer: *std.Io.Writer, turn: session.HistoryTurn, image_blobs: anytype) !void {
     switch (turn) {
         .compacted_summary => |entry| {
@@ -687,6 +826,16 @@ pub fn parseHistoryTurnWithImageBlobs(
     value: std.json.Value,
     image_blobs: ?*ImageBlobReader,
 ) !session.HistoryTurn {
+    return parseHistoryTurnWithImages(alloc, value, .{ .blobs = image_blobs });
+}
+
+/// Like `parseHistoryTurn`, but reads the image bytes a libfx journal or
+/// checkpoint keeps outside each image from `sources`.
+pub fn parseHistoryTurnWithImages(
+    alloc: Allocator,
+    value: std.json.Value,
+    sources: ImageSources,
+) !session.HistoryTurn {
     const kind = try requireString(try requireObject(value), "kind");
     if (std.mem.eql(u8, kind, "compacted_summary")) {
         const raw_object = try requireObject(value);
@@ -743,7 +892,7 @@ pub fn parseHistoryTurnWithImageBlobs(
     if (std.mem.eql(u8, kind, "assistant")) {
         const shape = try exactVariantObject(value, &.{ "kind", "user", "assistant", "execution" }, &.{ "kind", "user", "assistant", "execution", "provider_replay" });
         const object = shape.object;
-        const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat, image_blobs);
+        const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat, sources);
         errdefer session.freeUserTurn(alloc, user);
         const assistant = try parseRequiredDurableBytes(alloc, object, "assistant");
         errdefer mem_utils.free(alloc, assistant);
@@ -764,7 +913,7 @@ pub fn parseHistoryTurnWithImageBlobs(
             &.{ "kind", "user", "log_path", "expect_url", "url", "background_record_id", "assistant", "execution" },
         );
         const object = shape.object;
-        const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat, image_blobs);
+        const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat, sources);
         errdefer session.freeUserTurn(alloc, user);
         const legacy_assistant = if (shape.extended)
             try parseOptionalDurableBytes(alloc, object.get("assistant") orelse return error.InvalidSessionFormat)
@@ -807,7 +956,7 @@ pub fn parseHistoryTurnWithImageBlobs(
             has_terminal_reason,
             has_cancellation_origin,
         );
-        const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat, image_blobs);
+        const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat, sources);
         errdefer session.freeUserTurn(alloc, user);
         const assistant = try parseOptionalDurableBytes(alloc, object.get("assistant") orelse return error.InvalidSessionFormat);
         errdefer if (assistant) |owned| mem_utils.free(alloc, owned);
@@ -1092,12 +1241,22 @@ fn parsePermissionState(
 }
 
 pub fn writeRecoveryCheckpoint(writer: *std.Io.Writer, checkpoint: RecoveryCheckpoint) !void {
+    return writeRecoveryCheckpointTo(writer, checkpoint, {});
+}
+
+/// Like `writeRecoveryCheckpoint`, but names the images `names.stored` holds
+/// instead of writing their bytes.
+pub fn writeRecoveryCheckpointNamingImages(writer: *std.Io.Writer, checkpoint: RecoveryCheckpoint, names: ImageNames) !void {
+    return writeRecoveryCheckpointTo(writer, checkpoint, names);
+}
+
+fn writeRecoveryCheckpointTo(writer: *std.Io.Writer, checkpoint: RecoveryCheckpoint, image_mode: anytype) !void {
     if (checkpoint.disposition == .history_only) return error.InvalidDurableField;
     try writer.print("{{\"version\":{d},\"turn_id\":{d},\"user\":", .{
         checkpoint.version,
         checkpoint.turn_id,
     });
-    try writeUserTurn(writer, checkpoint.user, {});
+    try writeUserTurn(writer, checkpoint.user, image_mode);
     try writer.writeAll(",\"assistant_source\":");
     try writeDurableBytes(writer, checkpoint.assistant_source);
     try writer.writeAll(",\"execution\":");
@@ -1362,6 +1521,12 @@ fn decodeStateImpl(alloc: Allocator, source: *std.Io.Reader, limits: DecodeLimit
 }
 
 pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !RecoveryCheckpoint {
+    return parseRecoveryCheckpointWithImages(alloc, value, .{});
+}
+
+/// Like `parseRecoveryCheckpoint`, but reads the image bytes a libfx journal
+/// keeps outside each image from `sources`.
+pub fn parseRecoveryCheckpointWithImages(alloc: Allocator, value: std.json.Value, sources: ImageSources) !RecoveryCheckpoint {
     const raw_object = try requireObject(value);
     const version = try requireU64(raw_object, "version");
     const legacy_route = raw_object.contains("route_identity");
@@ -1400,7 +1565,7 @@ pub fn parseRecoveryCheckpoint(alloc: Allocator, value: std.json.Value) !Recover
             }),
         else => return error.InvalidDurableField,
     };
-    const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat, null);
+    const user = try parseUserTurn(alloc, object.get("user") orelse return error.InvalidSessionFormat, sources);
     errdefer session.freeUserTurn(alloc, user);
     const assistant_source = try parseDurableBytes(alloc, object.get("assistant_source") orelse return error.InvalidSessionFormat);
     errdefer alloc.free(assistant_source);
@@ -1560,10 +1725,15 @@ fn parseTurnAuthority(alloc: Allocator, value: std.json.Value) !TurnAuthority {
 }
 
 fn writeUserTurn(writer: *std.Io.Writer, user: session.UserTurn, image_blobs: anytype) !void {
-    const collect_blobs = comptime switch (@TypeOf(image_blobs)) {
-        void => false,
-        ImageBlobs => true,
-        else => @compileError("image_blobs must be void or ImageBlobs"),
+    const Mode = @TypeOf(image_blobs);
+    comptime switch (Mode) {
+        void, ImageBlobs, ImageNames => {},
+        else => @compileError("image_blobs must be void, ImageBlobs or ImageNames"),
+    };
+    const blobs: ?ImageBlobs = switch (Mode) {
+        ImageBlobs => image_blobs,
+        ImageNames => image_blobs.blobs,
+        else => null,
     };
     try writer.writeAll("{\"text\":");
     try writeDurableBytes(writer, user.text);
@@ -1579,11 +1749,15 @@ fn writeUserTurn(writer: *std.Io.Writer, user: session.UserTurn, image_blobs: an
         try writer.writeAll(",\"snapshot_sha256\":");
         try writeOptionalDurableBytes(writer, image.snapshot_sha256);
         // Inline image bytes appear only for sessions without a filesystem
-        // snapshot backend, so durable sessions keep their exact format.
+        // snapshot backend, so durable sessions keep their exact format. An
+        // image the host stored is named instead; its name is the digest.
         if (image.inline_data) |inline_data| {
-            if (collect_blobs) {
-                try writer.print(",\"inline_blob\":{d}", .{image_blobs.items.items.len});
-                try image_blobs.items.append(image_blobs.alloc, inline_data);
+            if (Mode == ImageNames and image_blobs.stored.holds(image)) {
+                try writer.writeAll(",\"inline_ref\":");
+                try writeJsonString(writer, image.snapshot_sha256.?);
+            } else if (blobs) |collected| {
+                try writer.print(",\"inline_blob\":{d}", .{collected.items.items.len});
+                try collected.items.append(collected.alloc, inline_data);
             } else {
                 try writer.writeAll(",\"inline_data\":");
                 try writeDurableBytes(writer, inline_data);
@@ -2010,7 +2184,7 @@ fn writeExecutionFileEvidence(
     try writer.writeByte('}');
 }
 
-fn parseUserTurn(alloc: Allocator, value: std.json.Value, image_blobs: ?*ImageBlobReader) !session.UserTurn {
+fn parseUserTurn(alloc: Allocator, value: std.json.Value, sources: ImageSources) !session.UserTurn {
     const source = try requireObject(value);
     const object = if (source.count() == 2)
         try exactObject(value, &.{ "text", "images" })
@@ -2052,7 +2226,8 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value, image_blobs: ?*ImageBl
             image.get("snapshot_sha256") orelse .null,
         );
         errdefer if (snapshot_sha256) |sha256_bytes| mem_utils.free(alloc, sha256_bytes);
-        const inline_data = try parseInlineImageBytes(alloc, image, image_blobs);
+        const inline_image = try parseInlineImageBytes(alloc, image, sources);
+        const inline_data = inline_image.bytes;
         errdefer if (inline_data) |inline_bytes| mem_utils.free(alloc, inline_bytes);
         const source_ref = if (image.get("source_ref")) |_| source: {
             const source_bytes = try requireString(image, "source_ref");
@@ -2060,7 +2235,14 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value, image_blobs: ?*ImageBl
             break :source try alloc.dupe(u8, source_bytes);
         } else null;
         errdefer if (source_ref) |source_bytes| alloc.free(source_bytes);
-        if (inline_data) |inline_bytes| {
+        if (inline_image.name) |name| {
+            // A named image is the host's stored copy of exactly the bytes
+            // its digest names; with none staged, `sources` records it.
+            if (snapshot_path != null) return error.InvalidSessionFormat;
+            const digest = snapshot_sha256 orelse return error.InvalidSessionFormat;
+            if (!std.mem.eql(u8, digest, &name)) return error.InvalidSessionFormat;
+            if (inline_data) |inline_bytes| try validateInlineImageBytes(inline_bytes, media_type);
+        } else if (inline_data) |inline_bytes| {
             // Inline images carry their own bytes: no snapshot file, but the
             // digest stays so request-time verification is unchanged.
             if (snapshot_path != null or snapshot_sha256 == null) return error.InvalidSessionFormat;
@@ -2080,19 +2262,35 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value, image_blobs: ?*ImageBl
     return .{ .text = text, .images = images, .work_id = work_id };
 }
 
-/// Reads an inline image's bytes from `inline_data` or, inside a libfx kernel
-/// checkpoint, from the raw blob named by `inline_blob`. Caller owns the result.
+/// An image's bytes as a parse found them, and its name when the object
+/// named it. A named image with no bytes was not staged.
+const InlineImage = struct {
+    bytes: ?[]u8 = null,
+    name: ?ImageName = null,
+};
+
+/// Reads an inline image's bytes from `inline_data`, from the raw blob of a
+/// libfx kernel checkpoint named by `inline_blob`, or from the host's staged
+/// copy named by `inline_ref`. Caller owns the bytes.
 fn parseInlineImageBytes(
     alloc: Allocator,
     image: std.json.ObjectMap,
-    image_blobs: ?*ImageBlobReader,
-) !?[]u8 {
+    sources: ImageSources,
+) !InlineImage {
+    if (image.get("inline_ref")) |ref_value| {
+        const resolver = sources.names orelse return error.InvalidSessionFormat;
+        if (image.get("inline_data") != null or image.get("inline_blob") != null or ref_value != .string) {
+            return error.InvalidSessionFormat;
+        }
+        const name = imageName(ref_value.string) orelse return error.InvalidSessionFormat;
+        return .{ .bytes = try resolver.resolve(alloc, name), .name = name };
+    }
     const blob_value = image.get("inline_blob") orelse
-        return parseOptionalDurableBytes(alloc, image.get("inline_data") orelse .null);
-    const blobs = image_blobs orelse return error.InvalidSessionFormat;
+        return .{ .bytes = try parseOptionalDurableBytes(alloc, image.get("inline_data") orelse .null) };
+    const blobs = sources.blobs orelse return error.InvalidSessionFormat;
     if (image.get("inline_data") != null or blob_value != .integer) return error.InvalidSessionFormat;
     const index = std.math.cast(usize, blob_value.integer) orelse return error.InvalidSessionFormat;
-    return try alloc.dupe(u8, try blobs.take(index));
+    return .{ .bytes = try alloc.dupe(u8, try blobs.take(index)) };
 }
 
 fn imageAttachmentObject(value: std.json.Value) !std.json.ObjectMap {
@@ -2112,6 +2310,7 @@ fn imageAttachmentObject(value: std.json.Value) !std.json.ObjectMap {
             std.mem.eql(u8, entry.key_ptr.*, "snapshot_sha256") or
             std.mem.eql(u8, entry.key_ptr.*, "inline_data") or
             std.mem.eql(u8, entry.key_ptr.*, "inline_blob") or
+            std.mem.eql(u8, entry.key_ptr.*, "inline_ref") or
             std.mem.eql(u8, entry.key_ptr.*, "source_ref"))
         {
             continue;
@@ -5576,13 +5775,13 @@ test "persisted image source refs reject malformed metadata and preserve the byt
     for (invalid) |value| {
         user_ref.* = value;
         tool_ref.* = value;
-        try std.testing.expectError(error.InvalidSessionFormat, parseUserTurn(alloc, user.value, null));
+        try std.testing.expectError(error.InvalidSessionFormat, parseUserTurn(alloc, user.value, .{}));
         try std.testing.expectError(error.InvalidSourceRef, parsePersistedToolImages(alloc, tools.value.array.items));
     }
     const boundary = text_utils.repeat("é", 256);
     user_ref.* = .{ .string = boundary };
     tool_ref.* = .{ .string = boundary };
-    const decoded_user = try parseUserTurn(alloc, user.value, null);
+    const decoded_user = try parseUserTurn(alloc, user.value, .{});
     defer session.freeUserTurn(alloc, decoded_user);
     const decoded_tools = try parsePersistedToolImages(alloc, tools.value.array.items);
     defer types.freeToolImages(alloc, decoded_tools);

@@ -97,8 +97,16 @@ pub const Journal = struct {
     /// The pending resume is a turn that yielded: it continues without being
     /// told it was interrupted.
     pending_resume_yielded: bool = false,
+    /// The host keeps an image store: events and snapshots name the images
+    /// in `stored_images` instead of holding their bytes.
+    image_store: bool = false,
+    /// The images the host's store holds: those it said it stored before it
+    /// sent their prompt, and those an open resolved from it. Owned by the
+    /// session's allocator.
+    stored_images: session_codec.StoredImages = .{},
 
     pub fn deinit(self: *Journal, alloc: Allocator) void {
+        self.stored_images.deinit(alloc);
         self.dropPendingResume(alloc);
         self.clearPlaced(alloc);
         self.placed_next.deinit(alloc);
@@ -262,7 +270,10 @@ pub const Journal = struct {
         try params.writer.writeAll("{\"sessionId\":");
         try jsonrpc.writeJsonStr(session_id, &params.writer);
         try params.writer.writeAll(",\"events\":[");
-        const next = try self.cursor.write(&params.writer, event);
+        const next = if (self.storedImages()) |stored|
+            try self.cursor.writeNamingImages(&params.writer, event, stored)
+        else
+            try self.cursor.write(&params.writer, event);
         try params.writer.writeAll("]}");
         try self.writer.writeNotification(alloc, "libfx/journal_append", params.written());
         self.cursor = next;
@@ -282,6 +293,34 @@ pub const Journal = struct {
                 .steer => self.steers_waiting += 1,
             },
             .tool_intent, .history_replaced, .input_withdrawn, .turn_yielded => {},
+        }
+    }
+
+    /// The images events and snapshots name, when the host keeps a store.
+    pub fn storedImages(self: *const Journal) ?*const session_codec.StoredImages {
+        return if (self.image_store) &self.stored_images else null;
+    }
+
+    /// Records the prompt images the host stored before it sent them:
+    /// `names[i]` is the name the host gave `images[i]`, and counts only when
+    /// it is that image's digest. A name that does not match leaves the image
+    /// inline.
+    pub fn noteStoredImages(
+        self: *Journal,
+        alloc: Allocator,
+        images: []const types.ImageAttachment,
+        names: []const ?session_codec.ImageName,
+    ) Allocator.Error!void {
+        if (!self.image_store) return;
+        std.debug.assert(images.len == names.len);
+        for (images, names) |image, claimed| {
+            const name = claimed orelse continue;
+            const digest = image.snapshot_sha256 orelse continue;
+            if (image.inline_data == null or !std.mem.eql(u8, digest, &name)) {
+                debug_trace.logf("session", "event=libfx_image_not_stored id={d} reason=name_mismatch", .{image.id});
+                continue;
+            }
+            try self.stored_images.add(alloc, name);
         }
     }
 
@@ -357,6 +396,10 @@ fn dupePendingInputs(alloc: Allocator, inputs: []const journal.PendingInput) All
 /// answered as possibly run, for the model to decide about unless the host
 /// has the resume run it again (`rerunCalls`); `session_alloc` owns it.
 /// With `inputs_durable`, the host stores every input before handing it in.
+/// Named images resolve through `images`, which holds what the host staged;
+/// when one is missing the session stays unopened and `error.ImagesMissing`
+/// leaves every missing name in `images.missing`. With `image_store` the
+/// journal names stored images from then on.
 pub fn open(
     alloc: Allocator,
     session_alloc: Allocator,
@@ -365,16 +408,18 @@ pub fn open(
     events_json: []const u8,
     snapshot: ?[]const u8,
     inputs_durable: bool,
+    images: *session_codec.ImageResolver,
+    image_store: bool,
 ) !struct { Journal, Opened } {
     if (!runtime.agent.fresh or runtime.agent.history.items.len != 0) return error.AgentNotFresh;
-    var base: journal.Base = .{};
+    var base: journal.Base = .{ .images = images };
     var decoded: ?checkpoint_codec.Decoded = null;
     defer if (decoded) |*value| value.deinit(alloc);
     var saved_meta: checkpoint_codec.Meta = .{};
     errdefer saved_meta.free(alloc);
     if (snapshot) |bytes| {
         const parsed = try journal.parseSnapshot(bytes);
-        decoded = checkpoint_codec.decode(alloc, parsed.checkpoint) catch |err| switch (err) {
+        decoded = checkpoint_codec.decodeWithImages(alloc, parsed.checkpoint, images) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.UnsupportedCheckpointVersion => return error.UnsupportedJournalVersion,
             else => return error.InvalidJournal,
@@ -385,10 +430,16 @@ pub fn open(
             .cursor = .{ .next_seq = parsed.seq + 1, .turn = parsed.turn },
             .last_turn_id = parsed.last_turn_id,
             .open_turn = parsed.open_turn,
+            .images = images,
         };
     }
     var folded = try journal.foldFrom(alloc, events_json, base);
     defer folded.deinit(alloc);
+    // A history missing an image is not the one saved: open none of it.
+    if (images.missing.count() > 0) {
+        debug_trace.logf("session", "event=libfx_journal_images_missing count={d}", .{images.missing.count()});
+        return error.ImagesMissing;
+    }
     if (folded.history.len > 0) try runtime.agent.restoreHistory(alloc, folded.history);
     if (decoded) |value| runtime.agent.turn_usage = value.usage;
     var state: Journal = .{
@@ -401,8 +452,11 @@ pub fn open(
         .last_turn_id = TurnId.of(folded.last_turn_id),
         .inputs_durable = inputs_durable,
         .steers_waiting = folded.pending_inputs.len,
+        .image_store = image_store,
     };
     errdefer state.deinit(session_alloc);
+    // An image the open resolved is in the store; one it read inline is not.
+    if (image_store) for (images.resolved.keys()) |name| try state.stored_images.add(session_alloc, name);
     const checkpoint = folded.open_turn orelse
         return .{ state, .{ .turns = folded.history.len, .resumable = false, .last_turn_id = state.last_turn_id, .checkpoint_meta = saved_meta } };
 

@@ -26,6 +26,8 @@ The SDK has two WebAssembly surfaces and one shared JavaScript host layer:
 | A durability over a World the app supplies; `local()` and `vercel()` are built on it | `sdk/durable/world.mjs` |
 | TypeScript declarations for every entry point | `sdk/types/`, checked by `sdk/tests/test-types.mjs` |
 | Checkpoint format, including the libfx version, tool set, and model each checkpoint records | `src/core/agent/runtime/checkpoint.zig` |
+| Images a session saves once, by name: naming in journal events and checkpoints, and the two-phase open | `src/core/session/session_codec.zig`, `src/acp/libfx_journal.zig`, and `src/acp/server.zig` |
+| A persistence's image store (`putImage`, `getImage`) and storing before sending | `sdk/fx-sdk.js`; a durable session's images are World streams in `sdk/durable.js` |
 | Commands required by CI | `.github/workflows/ci.yml` |
 
 Do not treat the demos or this file as the implementation contract. When prose and behavior disagree, establish the current behavior from code and focused tests before changing either.
@@ -51,6 +53,7 @@ Do not treat the demos or this file as the implementation contract. When prose a
 | Public export, option, event, or result shape | Update `sdk/types/` and run `node sdk/tests/test-types.mjs` after `npm ci --prefix sdk/node` |
 | `createFxAgent()`, ACP translation, core session persistence, streaming, or cancellation | Core build, core Node tests, and the browser test when browser behavior is involved |
 | Live Gateway request or model-catalog translation | Core tests plus the opt-in live smoke test when a credential is available |
+| How a session saves images: naming, the image store, staging at open | Core and terminal builds, `bun sdk/tests/test-journal.mjs native wasm` and `wasm native`, `test-checkpoint.mjs` both ways, the Zig tests of `checkpoint.zig` and `journal.zig`, then `sdk/tests/model/check.sh` and `bun sdk/tests/model/drive-images.mjs` with `--backend native` and `wasm`, which walks the graph of `ImageStore.tla`; change the spec with the code. For durable sessions, also the durable sessions row |
 | Terminal adapter, input encoding, resize, cleanup, config, or prompt history | Terminal build and the headless terminal suite |
 | Terminal session persistence or browser device login | Terminal build plus `sdk/tests/test-term-session-resume.mjs` or `sdk/tests/test-term-login.mjs` |
 | Browser workspace metadata, permissions, execution, limits, or cancellation | Terminal build plus `sdk/node/test-term-workspace.mjs` |
@@ -58,7 +61,7 @@ Do not treat the demos or this file as the implementation contract. When prose a
 | `encodeXtermKeyEvent()` or `xtermAdapter()` only | `sdk/node/test-xterm-adapter.mjs` |
 | Core debugger query behavior or automation state | `sdk/tests/test-core-browser.mjs` |
 | Terminal demo asset references, integrity, or cache policy | Package into a fresh temporary directory and inspect the generated HTML, manifest, and headers |
-| Durable sessions: leases, fencing, takeovers, tool reruns, the UI stream | `sdk/tests/test-durable-core.mjs` on memory, local, and world (the core with a scripted harness; world is an app-built World passed to `world()`), `sdk/tests/test-durable.mjs` on the same three, then `sdk/tests/model/check.sh` and `bun sdk/tests/model/drive.mjs send`, `lookup`, `cutoff` (deadline cut-offs up to their bound), and `leased` (a World without liveness, where each worker renews a short lease), which walk the real code along the TLC state graphs of `DurableSession.tla`; change the spec with the code. With a Vercel access token, also run both against Vercel's World: `test-durable.mjs vercel native` and `drive.mjs --durability vercel`, configured as `sdk/tests/vercel-storage.mjs` describes |
+| Durable sessions: leases, fencing, takeovers, tool reruns, the UI stream | `sdk/tests/test-durable-core.mjs` on memory, local, and world (the core with a scripted harness; world is an app-built World passed to `world()`), `sdk/tests/test-durable.mjs` on the same three, then `sdk/tests/model/check.sh` and `bun sdk/tests/model/drive.mjs send`, `lookup`, `cutoff` (deadline cut-offs up to their bound), and `leased` (a World without liveness, where each worker renews a short lease), which walk the real code along the TLC state graphs of `DurableSession.tla`; change the spec with the code. For how a session object takes prompts in (image bytes, files, their reads and image writes, cancels, and closing the agent), also run `bun sdk/tests/model/drive-intake.mjs` on memory and `--durability world`, which walks the graph of `PromptIntake.tla`. With a Vercel access token, also run both against Vercel's World: `test-durable.mjs vercel native` and `drive.mjs --durability vercel`, configured as `sdk/tests/vercel-storage.mjs` describes |
 | Supported public behavior or setup | Update `sdk/README.md` in the same change |
 
 Use Node.js 24 for SDK tests. CI relies on its JSPI implementation behind `--experimental-wasm-jspi`.

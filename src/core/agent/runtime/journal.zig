@@ -42,6 +42,10 @@ const compactor = @import("../../compactor/compactor.zig");
 const Allocator = std.mem.Allocator;
 
 pub const version: u8 = 1;
+/// An event that names an image the host stored (`inline_ref`) instead of
+/// holding its bytes. Only such an event is version 2, so an fx that reads
+/// only version 1 reports a newer journal instead of an invalid one.
+pub const naming_version: u8 = 2;
 /// The most event bytes one load accepts, and the most bytes one snapshot
 /// holds: each travels as one host attachment, and an attachment holds at
 /// most one kernel checkpoint. Longer sessions need snapshots.
@@ -112,8 +116,18 @@ pub const Cursor = struct {
 
     /// Writes `event` as one JSON object and returns the cursor after it.
     pub fn write(self: Cursor, writer: *std.Io.Writer, event: Event) !Cursor {
+        return self.writeWith(writer, event, null);
+    }
+
+    /// Like `write`, but names the images `stored` holds instead of writing
+    /// their bytes.
+    pub fn writeNamingImages(self: Cursor, writer: *std.Io.Writer, event: Event, stored: *const session_codec.StoredImages) !Cursor {
+        return self.writeWith(writer, event, stored);
+    }
+
+    fn writeWith(self: Cursor, writer: *std.Io.Writer, event: Event, stored: ?*const session_codec.StoredImages) !Cursor {
         try writer.print("{{\"v\":{d},\"seq\":{d},\"turn\":{d},\"type\":\"{s}\"", .{
-            version,
+            if (stored) |names| if (eventNamesImages(event, names)) naming_version else version else version,
             self.next_seq,
             self.turn,
             @tagName(event),
@@ -121,11 +135,17 @@ pub const Cursor = struct {
         switch (event) {
             .turn_committed => |turn| {
                 try writer.writeAll(",\"data\":");
-                try session_codec.writeHistoryTurn(writer, turn);
+                if (stored) |names|
+                    try session_codec.writeHistoryTurnNamingImages(writer, turn, .{ .stored = names })
+                else
+                    try session_codec.writeHistoryTurn(writer, turn);
             },
             .turn_progress => |progress| {
                 try writer.writeAll(",\"data\":");
-                try session_codec.writeRecoveryCheckpoint(writer, progress.checkpoint);
+                if (stored) |names|
+                    try session_codec.writeRecoveryCheckpointNamingImages(writer, progress.checkpoint, .{ .stored = names })
+                else
+                    try session_codec.writeRecoveryCheckpoint(writer, progress.checkpoint);
                 if (progress.placed.len > 0) {
                     try writer.writeAll(",\"inputs\":");
                     try std.json.Stringify.value(progress.placed, .{}, writer);
@@ -149,7 +169,10 @@ pub const Cursor = struct {
                 try writer.writeAll(",\"data\":[");
                 for (history, 0..) |turn, index| {
                     if (index > 0) try writer.writeByte(',');
-                    try session_codec.writeHistoryTurn(writer, turn);
+                    if (stored) |names|
+                        try session_codec.writeHistoryTurnNamingImages(writer, turn, .{ .stored = names })
+                    else
+                        try session_codec.writeHistoryTurn(writer, turn);
                 }
                 try writer.writeByte(']');
             },
@@ -171,6 +194,18 @@ pub const Cursor = struct {
     }
 };
 
+/// Whether writing `event` names any image `stored` holds.
+fn eventNamesImages(event: Event, stored: *const session_codec.StoredImages) bool {
+    return switch (event) {
+        .turn_committed => |turn| stored.namesAnyInTurn(turn),
+        .turn_progress => |progress| stored.namesAny(progress.checkpoint.user),
+        .history_replaced => |history| for (history) |turn| {
+            if (stored.namesAnyInTurn(turn)) break true;
+        } else false,
+        .tool_intent, .turn_progress_cleared, .input_accepted, .input_withdrawn, .turn_yielded => false,
+    };
+}
+
 /// A snapshot of a quiet prefix: `FXSN`, a version byte, the last `seq` it
 /// covers and the turn after it (each a little-endian u64), the id of the
 /// last turn (a length byte, zero for none, then its bytes), then a
@@ -182,6 +217,8 @@ pub const Cursor = struct {
 const snapshot_magic = "FXSN";
 const snapshot_version_quiet: u8 = 1;
 const snapshot_version: u8 = 2;
+/// Version 2's layout, with an open turn that names images the host stored.
+const snapshot_naming_version: u8 = 3;
 const snapshot_header_bytes = snapshot_magic.len + 1 + 8 + 8 + 1;
 
 pub const Snapshot = struct {
@@ -208,13 +245,43 @@ pub fn encodeSnapshot(
     open_turn: ?[]const u8,
     checkpoint: []const u8,
 ) error{ OutOfMemory, SnapshotTooLarge }![]u8 {
+    return encodeSnapshotWith(alloc, seq, turn, last_turn_id, open_turn, checkpoint, false);
+}
+
+/// Like `encodeSnapshot`, for an `open_turn` that `writeOpenTurnNamingImages`
+/// wrote naming at least one image.
+pub fn encodeSnapshotNamingImages(
+    alloc: Allocator,
+    seq: u64,
+    turn: u64,
+    last_turn_id: ?[]const u8,
+    open_turn: []const u8,
+    checkpoint: []const u8,
+) error{ OutOfMemory, SnapshotTooLarge }![]u8 {
+    return encodeSnapshotWith(alloc, seq, turn, last_turn_id, open_turn, checkpoint, true);
+}
+
+fn encodeSnapshotWith(
+    alloc: Allocator,
+    seq: u64,
+    turn: u64,
+    last_turn_id: ?[]const u8,
+    open_turn: ?[]const u8,
+    checkpoint: []const u8,
+    open_turn_names_images: bool,
+) error{ OutOfMemory, SnapshotTooLarge }![]u8 {
     const id = last_turn_id orelse "";
     std.debug.assert(id.len <= max_turn_id_bytes);
     const open_bytes: usize = if (open_turn) |open| 4 + open.len else 0;
     if (open_turn) |open| if (open.len > std.math.maxInt(u32)) return error.SnapshotTooLarge;
     const bytes = try alloc.alloc(u8, snapshot_header_bytes + id.len + open_bytes + checkpoint.len);
     @memcpy(bytes[0..snapshot_magic.len], snapshot_magic);
-    bytes[snapshot_magic.len] = if (open_turn == null) snapshot_version_quiet else snapshot_version;
+    bytes[snapshot_magic.len] = if (open_turn == null)
+        snapshot_version_quiet
+    else if (open_turn_names_images)
+        snapshot_naming_version
+    else
+        snapshot_version;
     std.mem.writeInt(u64, bytes[snapshot_magic.len + 1 ..][0..8], seq, .little);
     std.mem.writeInt(u64, bytes[snapshot_magic.len + 9 ..][0..8], turn, .little);
     bytes[snapshot_header_bytes - 1] = @intCast(id.len);
@@ -234,8 +301,9 @@ pub fn parseSnapshot(bytes: []const u8) LoadError!Snapshot {
         return error.InvalidJournal;
     }
     const found_version = bytes[snapshot_magic.len];
-    if (found_version > snapshot_version) return error.UnsupportedJournalVersion;
-    if (found_version != snapshot_version and found_version != snapshot_version_quiet) return error.InvalidJournal;
+    if (found_version > snapshot_naming_version) return error.UnsupportedJournalVersion;
+    if (found_version == 0) return error.InvalidJournal;
+    const has_open_turn = found_version != snapshot_version_quiet;
     const seq = std.mem.readInt(u64, bytes[snapshot_magic.len + 1 ..][0..8], .little);
     const turn = std.mem.readInt(u64, bytes[snapshot_magic.len + 9 ..][0..8], .little);
     if (seq == 0 or turn == 0 or seq > max_safe_position or turn > max_safe_position) return error.InvalidJournal;
@@ -243,7 +311,7 @@ pub fn parseSnapshot(bytes: []const u8) LoadError!Snapshot {
     if (id_len > max_turn_id_bytes or bytes.len - snapshot_header_bytes < id_len) return error.InvalidJournal;
     var at: usize = snapshot_header_bytes + id_len;
     var open_turn: ?[]const u8 = null;
-    if (found_version == snapshot_version) {
+    if (has_open_turn) {
         if (bytes.len - at < 4) return error.InvalidJournal;
         const open_len = std.mem.readInt(u32, bytes[at..][0..4], .little);
         at += 4;
@@ -263,6 +331,28 @@ pub fn parseSnapshot(bytes: []const u8) LoadError!Snapshot {
 /// Writes the turn that yielded, for a version 2 snapshot: its id, when the
 /// host gave one, and its progress as a `turn_progress` carries it.
 pub fn writeOpenTurn(writer: *std.Io.Writer, turn_id: ?[]const u8, progress: session_codec.RecoveryCheckpoint) !void {
+    return writeOpenTurnWith(writer, turn_id, progress, null);
+}
+
+/// Like `writeOpenTurn`, but names the images `stored` holds instead of
+/// writing their bytes. Returns whether it named any, which makes the
+/// snapshot version 3 (`encodeSnapshotNamingImages`).
+pub fn writeOpenTurnNamingImages(
+    writer: *std.Io.Writer,
+    turn_id: ?[]const u8,
+    progress: session_codec.RecoveryCheckpoint,
+    stored: *const session_codec.StoredImages,
+) !bool {
+    try writeOpenTurnWith(writer, turn_id, progress, stored);
+    return stored.namesAny(progress.user);
+}
+
+fn writeOpenTurnWith(
+    writer: *std.Io.Writer,
+    turn_id: ?[]const u8,
+    progress: session_codec.RecoveryCheckpoint,
+    stored: ?*const session_codec.StoredImages,
+) !void {
     try writer.writeByte('{');
     if (turn_id) |id| {
         std.debug.assert(id.len > 0 and id.len <= max_turn_id_bytes);
@@ -271,7 +361,10 @@ pub fn writeOpenTurn(writer: *std.Io.Writer, turn_id: ?[]const u8, progress: ses
         try writer.writeByte(',');
     }
     try writer.writeAll("\"progress\":");
-    try session_codec.writeRecoveryCheckpoint(writer, progress);
+    if (stored) |names|
+        try session_codec.writeRecoveryCheckpointNamingImages(writer, progress, .{ .stored = names })
+    else
+        try session_codec.writeRecoveryCheckpoint(writer, progress);
     try writer.writeByte('}');
 }
 
@@ -376,6 +469,10 @@ pub const Base = struct {
     last_turn_id: ?[]const u8 = null,
     /// The turn that yielded, as `writeOpenTurn` wrote it.
     open_turn: ?[]const u8 = null,
+    /// Resolves the images events name. Without it an event that names one
+    /// is invalid; a name it cannot resolve is recorded there, and the fold
+    /// is then only good for learning which images the host must stage.
+    images: ?*session_codec.ImageResolver = null,
 };
 
 /// Rebuilds a session from `events_json`, a JSON array of events in order.
@@ -433,7 +530,7 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
         if (event.kind != .turn_yielded) yielded = false;
         switch (event.kind) {
             .turn_committed => {
-                const turn = try parseTurn(alloc, event.data orelse return error.InvalidJournal);
+                const turn = try parseTurn(alloc, event.data orelse return error.InvalidJournal, base.images);
                 // The same rule the session applies when it commits the turn.
                 if (replacesHistory(turn)) {
                     for (history.items) |old| types.freeHistoryTurn(alloc, old);
@@ -516,7 +613,7 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
                     replacement.deinit(alloc);
                 }
                 try replacement.ensureTotalCapacity(alloc, data.array.items.len);
-                for (data.array.items) |item| replacement.appendAssumeCapacity(try parseTurn(alloc, item));
+                for (data.array.items) |item| replacement.appendAssumeCapacity(try parseTurn(alloc, item, base.images));
                 for (history.items) |turn| types.freeHistoryTurn(alloc, turn);
                 history.deinit(alloc);
                 history = replacement;
@@ -530,7 +627,7 @@ pub fn foldFrom(alloc: Allocator, events_json: []const u8, base: Base) LoadError
     }
 
     var open_turn: ?session_codec.RecoveryCheckpoint = null;
-    if (open) |data| open_turn = if (data == .null) return error.InvalidJournal else session_codec.parseRecoveryCheckpoint(alloc, data) catch |err| switch (err) {
+    if (open) |data| open_turn = if (data == .null) return error.InvalidJournal else session_codec.parseRecoveryCheckpointWithImages(alloc, data, .{ .names = base.images }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidJournal,
     };
@@ -646,8 +743,8 @@ fn envelope(value: std.json.Value, cursor: Cursor) LoadError!Envelope {
     if (value != .object) return error.InvalidJournal;
     const object = value.object;
     const event_version = try integerField(object, "v");
-    if (event_version > version) return error.UnsupportedJournalVersion;
-    if (event_version != version) return error.InvalidJournal;
+    if (event_version > naming_version) return error.UnsupportedJournalVersion;
+    if (event_version != version and event_version != naming_version) return error.InvalidJournal;
     if (try integerField(object, "seq") != cursor.next_seq) return error.OutOfOrderJournalEvent;
     if (try integerField(object, "turn") != cursor.turn) return error.OutOfOrderJournalEvent;
     const kind_value = object.get("type") orelse return error.InvalidJournal;
@@ -677,8 +774,8 @@ fn replacesHistory(turn: types.HistoryTurn) bool {
     };
 }
 
-fn parseTurn(alloc: Allocator, value: std.json.Value) LoadError!types.HistoryTurn {
-    return session_codec.parseHistoryTurn(alloc, value) catch |err| switch (err) {
+fn parseTurn(alloc: Allocator, value: std.json.Value, images: ?*session_codec.ImageResolver) LoadError!types.HistoryTurn {
+    return session_codec.parseHistoryTurnWithImages(alloc, value, .{ .names = images }) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         else => error.InvalidJournal,
     };
@@ -984,7 +1081,7 @@ test "a journal from a newer fx or with a malformed event is rejected" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(
         error.UnsupportedJournalVersion,
-        fold(alloc, "[{\"v\":2,\"seq\":1,\"turn\":1,\"type\":\"turn_progress_cleared\"}]"),
+        fold(alloc, "[{\"v\":3,\"seq\":1,\"turn\":1,\"type\":\"turn_progress_cleared\"}]"),
     );
     const malformed = [_][]const u8{
         "{}",
@@ -1363,7 +1460,7 @@ test "a snapshot that is not one, or comes from a newer fx, is refused" {
     try std.testing.expectError(error.InvalidJournal, parseSnapshot(zero));
     const newer = try encodeSnapshot(alloc, 3, 2, null, null, "");
     defer alloc.free(newer);
-    newer[snapshot_magic.len] = snapshot_version + 1;
+    newer[snapshot_magic.len] = snapshot_naming_version + 1;
     try std.testing.expectError(error.UnsupportedJournalVersion, parseSnapshot(newer));
 }
 
@@ -1404,4 +1501,142 @@ test "a turn's first progress names it, and the turn keeps that name until it en
     const wrong = try std.mem.concat(alloc, u8, &.{ named[0..at], "\"turnId\":7", named[at + "\"turnId\":\"x\"".len ..] });
     defer alloc.free(wrong);
     try std.testing.expectError(error.InvalidJournal, fold(alloc, wrong));
+}
+
+fn testImageUser(alloc: Allocator, png: []const u8) !types.UserTurn {
+    const name = session_codec.imageNameOf(png);
+    const images = try alloc.alloc(types.ImageAttachment, 1);
+    images[0] = .{
+        .id = 1,
+        .path = try alloc.dupe(u8, "inline://image-1"),
+        .media_type = try alloc.dupe(u8, "image/png"),
+        .snapshot_sha256 = try alloc.dupe(u8, &name),
+        .inline_data = try alloc.dupe(u8, png),
+    };
+    return .{ .text = try alloc.dupe(u8, "[Image #1]"), .images = images };
+}
+
+fn testImageTurn(alloc: Allocator, png: []const u8) !types.HistoryTurn {
+    return .{ .assistant = .{ .user = try testImageUser(alloc, png), .assistant = try alloc.dupe(u8, "seen") } };
+}
+
+test "a journal names the images the host stored and folds them back from its copies" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\njournal-named";
+    const name = session_codec.imageNameOf(png);
+    const turn = try testImageTurn(alloc, png);
+    defer types.freeHistoryTurn(alloc, turn);
+    var stored: session_codec.StoredImages = .{};
+    defer stored.deinit(alloc);
+    try stored.add(alloc, name);
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeByte('[');
+    _ = try (Cursor{}).writeNamingImages(&out.writer, .{ .turn_committed = turn }, &stored);
+    try out.writer.writeByte(']');
+    const events = out.written();
+    // The event names the image and holds none of its bytes.
+    try std.testing.expect(std.mem.startsWith(u8, events, "[{\"v\":2,"));
+    try std.testing.expect(std.mem.find(u8, events, "\"inline_ref\":\"" ++ name ++ "\"") != null);
+    try std.testing.expect(std.mem.find(u8, events, "journal-named") == null);
+    try std.testing.expect(std.mem.find(u8, events, "\"inline_data\"") == null);
+
+    try std.testing.expectError(error.InvalidJournal, fold(alloc, events));
+
+    var staged: session_codec.StagedImages = .{};
+    defer staged.deinit(alloc);
+    try staged.add(alloc, name, try alloc.dupe(u8, png));
+    var resolver: session_codec.ImageResolver = .{ .alloc = alloc, .staged = &staged };
+    defer resolver.deinit();
+    var folded = try foldFrom(alloc, events, .{ .images = &resolver });
+    defer folded.deinit(alloc);
+    try std.testing.expectEqualStrings(png, folded.history[0].assistant.user.images[0].inline_data.?);
+    try std.testing.expectEqual(@as(usize, 0), resolver.missing.count());
+    try std.testing.expect(resolver.resolved.contains(name));
+}
+
+test "an event that names no image is version 1, byte for byte" {
+    const alloc = std.testing.allocator;
+    const turn = try testImageTurn(alloc, "\x89PNG\r\n\x1a\nnot-stored");
+    defer types.freeHistoryTurn(alloc, turn);
+    var stored: session_codec.StoredImages = .{};
+    defer stored.deinit(alloc);
+    try stored.add(alloc, session_codec.imageNameOf("another image"));
+
+    var plain: std.Io.Writer.Allocating = .init(alloc);
+    defer plain.deinit();
+    _ = try (Cursor{}).write(&plain.writer, .{ .turn_committed = turn });
+    var named: std.Io.Writer.Allocating = .init(alloc);
+    defer named.deinit();
+    _ = try (Cursor{}).writeNamingImages(&named.writer, .{ .turn_committed = turn }, &stored);
+    try std.testing.expectEqualStrings(plain.written(), named.written());
+    try std.testing.expect(std.mem.startsWith(u8, named.written(), "{\"v\":1,"));
+}
+
+test "one fold names every image the host did not stage" {
+    const alloc = std.testing.allocator;
+    const first_png = "\x89PNG\r\n\x1a\nfirst-missing";
+    const second_png = "\x89PNG\r\n\x1a\nsecond-missing";
+    var stored: session_codec.StoredImages = .{};
+    defer stored.deinit(alloc);
+    try stored.add(alloc, session_codec.imageNameOf(first_png));
+    try stored.add(alloc, session_codec.imageNameOf(second_png));
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try out.writer.writeByte('[');
+    var cursor: Cursor = .{};
+    const first = try testImageTurn(alloc, first_png);
+    defer types.freeHistoryTurn(alloc, first);
+    cursor = try cursor.writeNamingImages(&out.writer, .{ .turn_committed = first }, &stored);
+    try out.writer.writeByte(',');
+    var progress = try testProgress(alloc, "");
+    defer progress.deinit(alloc);
+    types.freeUserTurn(alloc, progress.user);
+    progress.user = try testImageUser(alloc, second_png);
+    _ = try cursor.writeNamingImages(&out.writer, .{ .turn_progress = .{ .checkpoint = progress } }, &stored);
+    try out.writer.writeByte(']');
+
+    var staged: session_codec.StagedImages = .{};
+    defer staged.deinit(alloc);
+    var resolver: session_codec.ImageResolver = .{ .alloc = alloc, .staged = &staged };
+    defer resolver.deinit();
+    var folded = try foldFrom(alloc, out.written(), .{ .images = &resolver });
+    defer folded.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), resolver.missing.count());
+    try std.testing.expect(resolver.missing.contains(session_codec.imageNameOf(first_png)));
+    try std.testing.expect(resolver.missing.contains(session_codec.imageNameOf(second_png)));
+}
+
+test "a yielded snapshot names its open turn's stored images" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\nyielded-turn";
+    const name = session_codec.imageNameOf(png);
+    var stored: session_codec.StoredImages = .{};
+    defer stored.deinit(alloc);
+    try stored.add(alloc, name);
+    var progress = try testProgress(alloc, "");
+    defer progress.deinit(alloc);
+    types.freeUserTurn(alloc, progress.user);
+    progress.user = try testImageUser(alloc, png);
+
+    var open_out: std.Io.Writer.Allocating = .init(alloc);
+    defer open_out.deinit();
+    try std.testing.expect(try writeOpenTurnNamingImages(&open_out.writer, "turn-y", progress, &stored));
+    try std.testing.expect(std.mem.find(u8, open_out.written(), "yielded-turn") == null);
+    const snapshot = try encodeSnapshotNamingImages(alloc, 5, 2, null, open_out.written(), "");
+    defer alloc.free(snapshot);
+    try std.testing.expectEqual(snapshot_naming_version, snapshot[snapshot_magic.len]);
+    const parsed = try parseSnapshot(snapshot);
+
+    var staged: session_codec.StagedImages = .{};
+    defer staged.deinit(alloc);
+    try staged.add(alloc, name, try alloc.dupe(u8, png));
+    var resolver: session_codec.ImageResolver = .{ .alloc = alloc, .staged = &staged };
+    defer resolver.deinit();
+    var folded = try foldFrom(alloc, "[]", .{ .cursor = .{ .next_seq = 6, .turn = 2 }, .open_turn = parsed.open_turn, .images = &resolver });
+    defer folded.deinit(alloc);
+    try std.testing.expectEqualStrings(png, folded.open_turn.?.user.images[0].inline_data.?);
+    try std.testing.expect(folded.yielded);
 }

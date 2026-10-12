@@ -5,7 +5,7 @@
 //
 //   node sdk/tests/test-durable-core.mjs [memory|local|world]
 import { strict as assert } from "node:assert";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDurableAgentFactory, memory } from "../durable.js";
@@ -777,6 +777,380 @@ test("each prompt's turn runs with its session object's settings, resumed or not
   assert.throws(() => strict.session(undefined, { model: "nope" }), /^TypeError: no such model$/);
   await strict.close();
   await agent.close();
+});
+
+// A real 1x1 PNG, as a caller would send it.
+const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
+const pngBytes = Uint8Array.from(atob(png), (char) => char.charCodeAt(0));
+const image = { type: "image", data: png, mimeType: "image/png" };
+// A PNG Blob whose read takes `ms`, or fails with `error`.
+class SlowBlob extends Blob {
+  constructor({ ms = 0, error = null } = {}) {
+    super([pngBytes], { type: "image/png" });
+    this.ms = ms;
+    this.error = error;
+  }
+  async arrayBuffer() {
+    await sleep(this.ms);
+    if (this.error) throw this.error;
+    return super.arrayBuffer();
+  }
+}
+// An agent whose harness records each prompt input it is handed, and runs an
+// image prompt as the word "image"; with `refuseFirst`, its first prompt
+// throws, as a harness that cannot run a turn does.
+function recordingAgent(durability, { refuseFirst = false } = {}) {
+  const seen = [];
+  let refusals = refuseFirst ? 1 : 0;
+  const agent = createDurableAgentFactory({
+    harness: () => {
+      const base = scriptedHarness()();
+      return {
+        open: async (options) => {
+          const session = await base.open(options);
+          return {
+            ...session,
+            prompt: (input, opts) => {
+              seen.push(input);
+              if (refusals > 0) {
+                refusals -= 1;
+                throw new Error("the harness stopped");
+              }
+              return session.prompt(typeof input === "string" ? input : "image", opts);
+            },
+            get openTurn() { return session.openTurn; },
+          };
+        },
+      };
+    },
+    defaultDurability: async () => memory(),
+  })({ durability });
+  return { agent, seen };
+}
+const kinds = (seen) => seen.map((input) => (typeof input === "string" ? input : "image"));
+
+test("image bytes and files reach the harness as the base64 a caller would send", async () => {
+  const { agent, seen } = recordingAgent(await durabilityFor());
+  const session = agent.session();
+  const padded = new Uint8Array(pngBytes.length + 4);
+  padded.set(pngBytes, 2);
+  const reused = new Uint8Array(pngBytes);
+  const turn = session.prompt([
+    { type: "text", text: "look" },
+    { type: "image", data: new Uint8Array(pngBytes), mimeType: "image/png" },
+    { type: "image", data: new Uint8Array(pngBytes).buffer, mimeType: "image/png" },
+    { type: "image", data: new DataView(padded.buffer, 2, pngBytes.length), mimeType: "image/png" },
+    { type: "image", data: new Blob([pngBytes], { type: "image/png" }) },
+    { type: "image", data: new File([pngBytes], "shot.png", { type: "image/png" }), mimeType: "image/png", sourceRef: "uploads:shot" },
+    { type: "image", data: reused, mimeType: "image/png" },
+  ]);
+  // Its bytes were stored when prompt() returned, so the caller may reuse them.
+  reused.fill(0);
+  assert.equal((await turn.result).stopReason, "end_turn");
+  assert.deepEqual(seen, [[{ type: "text", text: "look" }, image, image, image, image, { ...image, sourceRef: "uploads:shot" }, image]]);
+  assert.equal((await session.prompt([{ type: "text", text: "look" }, image]).result).stopReason, "end_turn");
+  assert.deepEqual(seen[1], [{ type: "text", text: "look" }, image], "base64 passes as given");
+  await agent.close();
+});
+
+test("image data a durable prompt cannot store throws from prompt(), and nothing is queued", async () => {
+  const { agent, seen } = recordingAgent(await durabilityFor());
+  const session = agent.session();
+  const refused = [
+    [{ type: "image", data: 42, mimeType: "image/png" }, /^image prompt block 1 requires base64 data, bytes, or a Blob$/],
+    [{ type: "image", data: new Uint8Array(0), mimeType: "image/png" }, /requires base64 data, bytes, or a Blob/],
+    [{ type: "image", data: { size: 4, type: "image/png", arrayBuffer: async () => new ArrayBuffer(4) } }, /requires base64 data, bytes, or a Blob/],
+    [{ type: "image", data: new Uint8Array(pngBytes) }, /requires a mimeType/],
+    [{ type: "image", data: new Blob([pngBytes]) }, /requires a mimeType/],
+    [{ type: "image", data: new Blob([pngBytes], { type: "image/png" }), mimeType: "image/jpeg" }, /mimeType disagrees with Blob.type/],
+    [{ type: "image", data: new Blob([], { type: "image/png" }) }, /requires a non-empty Blob/],
+  ];
+  for (const [block, message] of refused) {
+    assert.throws(() => session.prompt([{ type: "text", text: "look" }, block]), (error) => error instanceof TypeError && message.test(error.message));
+  }
+  assert.equal((await session.prompt("after").result).stopReason, "end_turn");
+  assert.deepEqual(seen, ["after"]);
+  await agent.close();
+});
+
+test("a prompt reading a file is stored before the prompts made after it, and a failed read stores nothing", async () => {
+  const { agent, seen } = recordingAgent(await durabilityFor());
+  const session = agent.session();
+  const first = session.prompt([{ type: "image", data: new SlowBlob({ ms: 150 }) }]);
+  const second = session.prompt("second");
+  assert.deepEqual([(await first.result).stopReason, (await second.result).stopReason], ["end_turn", "end_turn"]);
+  assert.deepEqual(kinds(seen), ["image", "second"]);
+  const failing = session.prompt([{ type: "image", data: new SlowBlob({ error: new Error("unreadable") }) }]);
+  const after = session.prompt("after");
+  await assert.rejects(failing.accepted, /^Error: unreadable$/);
+  await assert.rejects(failing.result, /^Error: unreadable$/);
+  assert.equal((await after.result).stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["image", "second", "after"], "the failed read stored no turn, and the prompt behind it ran");
+  await agent.close();
+});
+
+test("a prompt's signal or the agent closing while its file is read keeps its turn from running", async () => {
+  const { agent, seen } = recordingAgent(await durabilityFor());
+  const session = agent.session();
+  const controller = new AbortController();
+  const cancelled = session.prompt([{ type: "image", data: new SlowBlob({ ms: 150 }) }], { signal: controller.signal });
+  await sleep(20);
+  controller.abort();
+  assert.equal((await cancelled.result).stopReason, "cancelled");
+  assert.equal((await session.prompt("after").result).stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["after"]);
+  const closing = session.prompt([{ type: "image", data: new SlowBlob({ ms: 150 }) }]);
+  await agent.close();
+  await assert.rejects(closing.accepted, /agent is closed/);
+  await assert.rejects(closing.result, /agent is closed/);
+  assert.deepEqual(kinds(seen), ["after"]);
+});
+
+test("an image prompt its first worker could not start runs from the log with the same base64, once", async () => {
+  const { agent, seen } = recordingAgent(await durabilityFor(), { refuseFirst: true });
+  const session = agent.session();
+  const file = () => ({ type: "image", data: new File([pngBytes], "shot.png", { type: "image/png" }), sourceRef: "uploads:shot" });
+  assert.equal((await session.prompt([file()], { messageId: "turn-img" }).result).stopReason, "end_turn");
+  assert.deepEqual(seen, [[{ ...image, sourceRef: "uploads:shot" }], [{ ...image, sourceRef: "uploads:shot" }]]);
+  const again = await agent.session(session.id).prompt([file()], { messageId: "turn-img" }).result;
+  assert.equal(again.repeated, true);
+  assert.equal(seen.length, 2, "the retry ran nothing");
+  await agent.close();
+});
+
+test("an image block is read once, so the log holds what was checked", async () => {
+  const { agent, seen } = recordingAgent(await durabilityFor());
+  const session = agent.session();
+  // Accessors that answer one way when checked and another way after.
+  let dataReads = 0;
+  let mimeReads = 0;
+  const blob = new Blob([pngBytes], { type: "image/png" });
+  const shifting = {
+    type: "image",
+    get data() { dataReads += 1; return dataReads === 1 ? blob : new Uint8Array([1, 2, 3]); },
+    sourceRef: "uploads:shifting",
+  };
+  const relabelled = {
+    type: "image",
+    data: new Uint8Array(pngBytes),
+    get mimeType() { mimeReads += 1; return mimeReads === 1 ? "image/png" : undefined; },
+  };
+  assert.equal((await session.prompt([{ type: "text", text: "look" }, shifting, relabelled]).result).stopReason, "end_turn");
+  assert.deepEqual(seen.at(-1), [{ type: "text", text: "look" }, { ...image, sourceRef: "uploads:shifting" }, image]);
+  assert.deepEqual([dataReads, mimeReads], [1, 1]);
+  // An Array subclass whose map() returns something else still stores its blocks.
+  class Remapped extends Array { map() { return "not the caller's blocks"; } }
+  const blocks = Remapped.from([{ type: "text", text: "remapped" }, { type: "image", data: new Uint8Array(pngBytes), mimeType: "image/png" }]);
+  assert.equal((await session.prompt(blocks).result).stopReason, "end_turn");
+  assert.deepEqual(seen.at(-1), [{ type: "text", text: "remapped" }, image]);
+  await agent.close();
+});
+
+const pngName = Buffer.from(await crypto.subtle.digest("SHA-256", pngBytes)).toString("hex");
+// Every image stream's name holds this: "_user_", then the base64url of the
+// namespace "libfx-image-".
+const imageStreamTag = `_user_${Buffer.from("libfx-image-").toString("base64url")}`;
+
+// The durability with a faulty image store: with `fault.lose`, every image
+// reads back as missing; with `fault.corrupt`, every image reads back with
+// its last byte changed; `fault.failWrites` fails that many image writes.
+// The test may change `fault` as it goes. A World's faults are in its
+// streams, under the code that names images.
+function faultyImages(durability, fault = {}) {
+  fault.failWrites ??= 0;
+  const refuse = () => {
+    fault.failWrites -= 1;
+    throw new Error("the store is full");
+  };
+  const flipped = (bytes) => {
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) return bytes;
+    const copy = bytes.slice();
+    copy[copy.length - 1] ^= 0xff;
+    return copy;
+  };
+  if (typeof durability.create === "function") {
+    return {
+      ...durability,
+      create() {
+        const backend = durability.create();
+        return {
+          ...backend,
+          async session(id) {
+            const log = await backend.session(id);
+            return {
+              ...log,
+              images: {
+                put: async (name, bytes) => (fault.failWrites > 0 ? refuse() : log.images.put(name, bytes)),
+                get: async (name) => {
+                  if (fault.lose) return undefined;
+                  const bytes = await log.images.get(name);
+                  return fault.corrupt ? flipped(bytes) : bytes;
+                },
+              },
+            };
+          },
+        };
+      },
+    };
+  }
+  const isImage = (name) => String(name).includes(imageStreamTag);
+  const bound = (target, value) => (typeof value === "function" ? value.bind(target) : value);
+  return {
+    ...durability,
+    async world() {
+      const world = await durability.world();
+      const streams = new Proxy(world.streams, {
+        get(target, prop) {
+          const value = Reflect.get(target, prop);
+          if (prop === "write") {
+            return async (runId, name, chunk) => (isImage(name) && fault.failWrites > 0 ? refuse() : value.call(target, runId, name, chunk));
+          }
+          if (prop === "getChunks") {
+            return async (runId, name, options) => {
+              if (fault.lose && isImage(name)) return { data: [], cursor: null, hasMore: false, done: false };
+              const result = await value.call(target, runId, name, options);
+              if (!fault.corrupt || !isImage(name) || !Array.isArray(result?.data)) return result;
+              return { ...result, data: result.data.map((chunk) => ({ ...chunk, data: flipped(chunk?.data) })) };
+            };
+          }
+          return bound(target, value);
+        },
+      });
+      return new Proxy(world, { get: (target, prop) => (prop === "streams" ? streams : bound(target, Reflect.get(target, prop))) });
+    },
+  };
+}
+
+// Every file under a World's folder, for checking what it stored. A lock or
+// temporary file gone by the time it is read is skipped.
+async function filesUnder(dir) {
+  const files = [];
+  for (const entry of await readdir(dir, { withFileTypes: true, recursive: true })) {
+    if (!entry.isFile()) continue;
+    try {
+      files.push(await readFile(join(entry.parentPath ?? entry.path, entry.name)));
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+  return files;
+}
+
+test("a durable prompt stores each image once in the session's image store, and the log only names it", async () => {
+  const durability = await durabilityFor();
+  const { agent, seen } = recordingAgent(durability);
+  const session = agent.session();
+  const turn = session.prompt([
+    { type: "text", text: "look" },
+    { type: "image", data: new Uint8Array(pngBytes), mimeType: "image/png" },
+    { type: "image", data: new File([pngBytes], "shot.png", { type: "image/png" }), sourceRef: "uploads:shot" },
+    image,
+  ]);
+  assert.equal((await turn.result).stopReason, "end_turn");
+  assert.deepEqual(seen, [[{ type: "text", text: "look" }, image, { ...image, sourceRef: "uploads:shot" }, image]]);
+  if (typeof durability.create === "function") {
+    const log = await durability.create().session(session.id);
+    const entries = (await log.readSince("0")).map(({ entry }) => entry);
+    assert.deepEqual(entries.find((entry) => entry.k === "input")?.input, [
+      { type: "text", text: "look" },
+      { type: "image", mimeType: "image/png", sha256: pngName },
+      { type: "image", mimeType: "image/png", sourceRef: "uploads:shot", sha256: pngName },
+      { type: "image", mimeType: "image/png", sha256: pngName },
+    ]);
+    assert.ok(!JSON.stringify(entries).includes(png), "no entry holds the image's base64");
+    assert.deepEqual(await log.images.get(pngName), pngBytes);
+  }
+  await agent.close();
+  if (typeof durability.create !== "function") {
+    // On disk: the image's bytes once, in its stream, and its base64 nowhere.
+    const files = await filesUnder(dirs.at(-1));
+    assert.ok(!files.some((bytes) => bytes.includes(Buffer.from(png))), "no file holds the image's base64");
+    assert.equal(files.filter((bytes) => bytes.includes(Buffer.from(pngBytes))).length, 1, "one file holds the image's bytes");
+  }
+});
+
+test("an image the session's store no longer holds fails its turn, naming it", async () => {
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), { lose: true }));
+  const session = agent.session();
+  const result = await session.prompt([{ type: "text", text: "look" }, image]).result;
+  assert.equal(result.stopReason, "error");
+  assert.match(result.error.message, new RegExp(`does not hold image ${pngName}`));
+  assert.deepEqual(seen, [], "the harness never ran it");
+  assert.equal((await session.prompt("after").result).stopReason, "end_turn");
+  await agent.close();
+});
+
+test("an image whose stored bytes changed fails its turn, naming it", async () => {
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), { corrupt: true }));
+  const session = agent.session();
+  const result = await session.prompt([{ type: "text", text: "look" }, image]).result;
+  assert.equal(result.stopReason, "error");
+  // A World's read skips bytes that don't match the name, so to it the image
+  // is missing; a store that returns them fails the check after the read.
+  assert.match(result.error.message, new RegExp(`(holds other bytes under|does not hold) image ${pngName}`));
+  assert.deepEqual(seen, [], "the harness never ran it");
+  assert.equal((await session.prompt("after").result).stopReason, "end_turn");
+  await agent.close();
+});
+
+test("a failed image write rejects the prompt before anything is stored", async () => {
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), { failWrites: 1 }));
+  const session = agent.session();
+  const refused = session.prompt([{ type: "text", text: "look" }, image], { messageId: "refused-img" });
+  await assert.rejects(refused.accepted, /the store is full/);
+  await assert.rejects(refused.result, /the store is full/);
+  assert.equal((await session.prompt([{ type: "text", text: "again" }, image]).result).stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["image"], "only the second prompt was stored and ran");
+  // The refused prompt was never stored, so its retry is a new turn.
+  const retried = await session.prompt([{ type: "text", text: "look" }, image], { messageId: "refused-img" }).result;
+  assert.equal(retried.stopReason, "end_turn");
+  assert.notEqual(retried.repeated, true);
+  assert.deepEqual(kinds(seen), ["image", "image"]);
+  await agent.close();
+});
+
+test("a retried image prompt the log already holds is answered without writing its images again", async () => {
+  const fault = {};
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), fault));
+  const session = agent.session();
+  assert.equal((await session.prompt([{ type: "text", text: "look" }, image], { messageId: "img-once" }).result).stopReason, "end_turn");
+  // From now on every image write fails, so a retry that wrote again would fail.
+  fault.failWrites = Infinity;
+  const again = await agent.session(session.id).prompt([{ type: "text", text: "look" }, image], { messageId: "img-once" }).result;
+  assert.equal(again.repeated, true);
+  assert.equal(again.stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["image"], "the retry ran nothing");
+  await agent.close();
+});
+
+test("base64 is the same with and without the runtime's own encoder and decoder", async () => {
+  const reference = (bytes) => btoa(String.fromCharCode(...bytes));
+  const inputs = [...Array.from({ length: 9 }, (_, n) => pngBytes.subarray(0, n + 1)), Uint8Array.from({ length: 3000 }, (_, i) => (i * 131) & 255)];
+  const run = async () => {
+    const { agent, seen } = recordingAgent(await durabilityFor());
+    const session = agent.session();
+    for (const bytes of inputs) assert.equal((await session.prompt([{ type: "image", data: bytes, mimeType: "image/png" }]).result).stopReason, "end_turn");
+    // Each turn's records went through the log as base64 and back.
+    const words = JSON.parse(decoder.decode(await session.checkpoint()));
+    await agent.close();
+    return { seen, words };
+  };
+  const native = await run();
+  const encode = Uint8Array.prototype.toBase64;
+  const decode = Uint8Array.fromBase64;
+  delete Uint8Array.prototype.toBase64;
+  delete Uint8Array.fromBase64;
+  let fallback;
+  try {
+    fallback = await run();
+  } finally {
+    if (encode) Uint8Array.prototype.toBase64 = encode;
+    if (decode) Uint8Array.fromBase64 = decode;
+  }
+  for (const result of [native, fallback]) {
+    assert.deepEqual(result.seen.map((input) => input[0].data), inputs.map(reference));
+    assert.equal(result.words.length, inputs.length * 3);
+  }
 });
 
 test("a worker lives only while a delivery runs it", async () => {

@@ -5,7 +5,7 @@
 //   node --experimental-wasm-jspi sdk/tests/test-durable.mjs [memory|local] [native|wasm]
 import { strict as assert } from "node:assert";
 import { spawn } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -94,7 +94,10 @@ const server = createServer((request, response) => {
   request.on("end", () => {
     if (request.method === "GET") {
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ object: "list", data: [{ id: "durable/model", type: "language" }] }));
+      response.end(JSON.stringify({ object: "list", data: [
+        { id: "durable/model", type: "language" },
+        { id: "durable/vision-model", type: "language", tags: ["tool-use", "vision", "file-input"] },
+      ] }));
       return;
     }
     const prompt = JSON.parse(body).prompt;
@@ -1092,6 +1095,74 @@ test("a prompt the engine refuses ends its own turn once, and the session goes o
   assert.equal(result.stopReason, "end_turn");
   assert.equal(text, "echo: hello again");
   await agent.close();
+});
+
+test("a durable prompt's image bytes and files reach the model as base64", async () => {
+  const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
+  const bytes = Uint8Array.from(atob(png), (char) => char.charCodeAt(0));
+  const agent = createFxAgent(agentOptions(await durabilityFor(), { model: "durable/vision-model" }));
+  const { text, result } = await collect(agent.session().prompt([
+    { type: "text", text: "look" },
+    { type: "image", data: bytes, mimeType: "image/png" },
+    { type: "image", data: new File([bytes], "shot.png", { type: "image/png" }) },
+  ]));
+  assert.equal(result.stopReason, "end_turn");
+  // The model hears each image's placeholder alongside its text.
+  assert.equal(text, "echo: look\n[Image #1]\n[Image #2]");
+  const files = chats.at(-1).prompt
+    .filter((message) => message.role === "user" && Array.isArray(message.content))
+    .flatMap((message) => message.content)
+    .filter((part) => part.type === "file");
+  const file = { type: "file", mediaType: "image/png", data: { type: "data", data: png } };
+  assert.deepEqual(files, [file, file]);
+  await agent.close();
+});
+
+test("a durable session saves each image once, and a new agent sends it again", async () => {
+  // A PNG header, then filler, so its bytes are easy to look for.
+  const header = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII="), (char) => char.charCodeAt(0));
+  const bytes = new Uint8Array(300_000);
+  bytes.set(header);
+  for (let index = header.length; index < bytes.length; index += 1) bytes[index] = (index * 31 + 7) & 255;
+  const base64 = Buffer.from(bytes).toString("base64");
+  const durability = await durabilityFor();
+  const first = createFxAgent(agentOptions(durability, { model: "durable/vision-model" }));
+  const session = first.session();
+  for (const text of ["look", "again"]) {
+    const { result } = await collect(session.prompt([{ type: "text", text }, { type: "image", data: bytes, mimeType: "image/png" }]));
+    assert.equal(result.stopReason, "end_turn");
+  }
+  if (durabilityKind === "memory") {
+    // Every entry, records and checkpoints decoded: names only.
+    const entries = (await (await durability.create().session(session.id)).readSince("0")).map(({ entry }) => entry);
+    const saved = entries.map((entry) => (entry.k === "record" || entry.k === "checkpoint" ? Buffer.from(entry.data, "base64") : Buffer.from(JSON.stringify(entry))));
+    assert.ok(entries.some((entry) => entry.k === "checkpoint"));
+    assert.ok(!saved.some((data) => data.includes(Buffer.from(base64.slice(1000, 1100))) || data.includes(Buffer.from(bytes.subarray(1000, 1064)))), "no entry holds the image");
+  }
+  await first.close();
+  if (durabilityKind !== "memory") {
+    const files = [];
+    for (const entry of await readdir(dirs.at(-1), { withFileTypes: true, recursive: true })) {
+      if (!entry.isFile()) continue;
+      try {
+        files.push(await readFile(join(entry.parentPath ?? entry.path, entry.name)));
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+    }
+    assert.ok(!files.some((data) => data.includes(Buffer.from(base64.slice(1000, 1100)))), "no file holds the image as base64");
+    assert.equal(files.filter((data) => data.includes(Buffer.from(bytes.subarray(1000, 1064)))).length, 1, "one file holds the image's bytes");
+  }
+
+  const second = createFxAgent(agentOptions(durabilityKind === "memory" ? durability : await durabilityFor({ dir: dirs.at(-1) }), { model: "durable/vision-model" }));
+  const { result } = await collect(second.session(session.id).prompt("and now"));
+  assert.equal(result.stopReason, "end_turn");
+  const files = chats.at(-1).prompt
+    .filter((message) => message.role === "user" && Array.isArray(message.content))
+    .flatMap((message) => message.content)
+    .filter((part) => part.type === "file");
+  assert.deepEqual(files.map((part) => part.data?.data), [base64, base64]);
+  await second.close();
 });
 
 test("the fx harness tells a refused turn from one whose core exited under it", async () => {

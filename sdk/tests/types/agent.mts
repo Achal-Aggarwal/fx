@@ -103,8 +103,15 @@ export async function sessionsAndTurns(agent: FxAgent): Promise<void> {
     { type: "image", mimeType: "image/png", sourceRef: "uploads:screenshot-1" },
     { type: "resource", resource: { uri: "repo://notes", text: "Notes" } },
   ]);
-  // @ts-expect-error a durable prompt carries image data as a base64 string
-  known.prompt([{ type: "image", data: new Uint8Array(4), mimeType: "image/png" }]);
+  // A durable prompt takes image bytes and files as an engine's prompt does.
+  known.prompt([
+    { type: "image", data: new Uint8Array(4), mimeType: "image/png" },
+    { type: "image", data: new ArrayBuffer(4), mimeType: "image/png" },
+    { type: "image", data: new Blob([], { type: "image/png" }) },
+    { type: "image", data: new File([], "screenshot.png", { type: "image/png" }), sourceRef: "uploads:screenshot-2" },
+  ]);
+  // @ts-expect-error raw bytes carry no type of their own, so they need a mimeType
+  known.prompt([{ type: "image", data: new Uint8Array(4) }]);
   // @ts-expect-error a durable prompt has no turnId; use messageId
   known.prompt("again", { turnId: "turn_1" });
 

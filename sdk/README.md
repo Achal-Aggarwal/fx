@@ -375,7 +375,7 @@ agent.session().prompt([
 ]);
 ```
 
-A session stores each prompt as JSON before it runs, so a session prompt takes image data as a base64 string. `createFxEngine()` also takes bytes, a `Blob` or a `File`. Each prompt takes up to 8 PNG, JPEG, GIF or WebP images, at most 3.75 MiB each and 6 MiB together. Pass `resizeImage` to downscale or convert prompt images before they're sent.
+Image data can be a base64 string, bytes, a `Blob` or a `File`. A session saves each image once, named by its SHA-256, before it stores the prompt, and the saved conversation refers to it by that name, so images don't count toward the 4 MiB a checkpoint holds. Each prompt takes up to 8 PNG, JPEG, GIF or WebP images, at most 3.75 MiB each and 6 MiB together. Pass `resizeImage` to downscale or convert prompt images before they're sent.
 
 ## Diagnostics
 
@@ -407,7 +407,7 @@ An engine differs from a session:
 - One prompt runs at a time, and breaking out of a turn's events cancels the turn.
 - The turn itself has `cancel()` and `steer()`.
 
-To have the engine record the conversation as it runs, pass a `persistence` store instead of a checkpoint. A new engine on the same store can then `resume()` a turn the last process left open. A store needs two methods and can add a third, and the bytes are opaque, so it never has to understand them:
+To have the engine record the conversation as it runs, pass a `persistence` store instead of a checkpoint. A new engine on the same store can then `resume()` a turn the last process left open. A store needs two methods and can add the others, and the bytes are opaque, so it never has to understand them:
 
 ```ts
 interface Persistence {
@@ -417,6 +417,8 @@ interface Persistence {
   }>;
   append(input: { expected: string | null; idempotencyKey: string; data: Uint8Array }): Promise<{ cursor: string }>;
   saveCheckpoint?(input: { through: string; data: Uint8Array }): Promise<void>;
+  putImage?(name: string, bytes: Uint8Array): Promise<void>;
+  getImage?(name: string): Promise<Uint8Array | undefined>;
 }
 
 interface JournalRecord {
@@ -426,6 +428,8 @@ interface JournalRecord {
 ```
 
 Reject an `append()` whose `expected` isn't the last stored cursor with `FxFencedError`, so two processes can't write the same conversation. `createMemoryPersistence()` is a reference store for tests. When a resumed turn left a tool call running, `resume({ onAmbiguous })` lets you return `"rerun"` to run it again under the same `executionId`.
+
+Add `putImage()` and `getImage()` together, and the store keeps each prompt image once, under the lowercase hex SHA-256 of its bytes. Records and checkpoints then hold only that name, so images don't count toward the 4 MiB a checkpoint or a journal load holds. `putImage()` runs before any record names the image, and may run again for a name the store already holds. A prompt whose image can't be stored is rejected with `FX_IMAGE_STORE_FAILED` before anything is recorded. `getImage()` returns `undefined` for a name it doesn't hold, and the engine then fails to open with `FX_JOURNAL_IMAGE_MISSING`, as it does for bytes that don't match their name. Without these methods, images stay inline as before.
 
 ## Runtimes
 

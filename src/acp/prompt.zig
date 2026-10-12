@@ -869,6 +869,7 @@ pub fn handlePrompt(
             // checkpoint, so no filesystem snapshot backend is needed.
             prompt_input.captureImagesInline(alloc) catch |err|
                 return promptInputFailure(err);
+            if (session.journal) |*journal| try prompt_input.noteStoredImages(state.alloc, journal);
         } else {
             if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
             var temporary_snapshot_dir: ?[]u8 = null;
@@ -1470,6 +1471,8 @@ const PendingPromptImage = struct {
     bytes: []u8,
     media_type: []u8,
     source_ref: ?[]u8 = null,
+    /// The name the host stored the bytes under before it sent them.
+    stored_name: ?session_codec.ImageName = null,
 
     fn deinit(self: *PendingPromptImage, alloc: Allocator) void {
         alloc.free(self.bytes);
@@ -1564,6 +1567,15 @@ const ParsedPromptInput = struct {
             captured += 1;
         }
         self.images = images;
+    }
+
+    /// Tells `journal` which captured images the host stored before it sent
+    /// them, so its events name them. `captureImagesInline` keeps the order.
+    fn noteStoredImages(self: *const ParsedPromptInput, session_alloc: Allocator, journal: *libfx_journal.Journal) Allocator.Error!void {
+        std.debug.assert(self.images.len == self.pending_images.len);
+        for (self.images, self.pending_images) |image, pending| {
+            try journal.noteStoredImages(session_alloc, &.{image}, &.{pending.stored_name});
+        }
     }
 
     fn retainImageSnapshots(self: *ParsedPromptInput) void {
@@ -1748,6 +1760,11 @@ fn parsePromptInputWithFirstImageId(
                 break :bytes try alloc.alloc(u8, 0);
             };
             errdefer alloc.free(decoded);
+            // A host with an image store names the bytes it stored first.
+            const stored_name: ?session_codec.ImageName = if (acp_types.fxMetaField(block.object, "stored")) |value| name: {
+                if (value != .string or decoded.len == 0) return error.InvalidPromptImage;
+                break :name session_codec.imageName(value.string) orelse return error.InvalidPromptImage;
+            } else null;
 
             const image_id = std.math.add(usize, first_image_id, pending_images.items.len) catch
                 return error.ImageIdOverflow;
@@ -1766,6 +1783,7 @@ fn parsePromptInputWithFirstImageId(
                 .bytes = decoded,
                 .media_type = media_type,
                 .source_ref = source_ref,
+                .stored_name = stored_name,
             });
         } else if (std.mem.eql(u8, block_type.string, "resource")) {
             if (block.object.get("resource")) |resource| {

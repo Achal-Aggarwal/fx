@@ -376,6 +376,10 @@ jobs:
           bun sdk/tests/model/drive.mjs lookup --walks 20 --seed 9 --durability world
           bun sdk/tests/model/drive.mjs cutoff --walks 20 --seed 5
           bun sdk/tests/model/drive.mjs leased --walks 40 --seed 12
+          bun sdk/tests/model/drive-intake.mjs --walks 60 --seed 1
+          bun sdk/tests/model/drive-intake.mjs --walks 30 --seed 2 --durability world
+          bun sdk/tests/model/drive-images.mjs --walks 40 --seed 1
+          bun sdk/tests/model/drive-images.mjs --walks 20 --seed 2 --backend wasm
 
       - name: Test libfx on a World
         run: |

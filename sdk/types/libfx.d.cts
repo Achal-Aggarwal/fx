@@ -114,13 +114,11 @@ export type FxPromptBlock = FxTextBlock | FxImageBlock | FxResourceBlock;
 /** Prompt input: a string, or text, image, and resource blocks. */
 export type FxPromptInput = string | readonly FxPromptBlock[];
 
-/** An image block in a durable session's prompt: base64 data, or only a `sourceRef`. */
-export type FxSessionImageBlock =
-  | { type: "image"; data: string; mimeType: string; sourceRef?: string }
-  | { type: "image"; data?: undefined; mimeType: string; sourceRef: string };
+/** An image block in a durable session's prompt: the same forms an engine's prompt takes. */
+export type FxSessionImageBlock = FxImageBlock;
 
-/** A durable session's prompt input. Image data must be a base64 string, because the prompt is stored as JSON before it runs. */
-export type FxSessionPromptInput = string | readonly (FxTextBlock | FxSessionImageBlock | FxResourceBlock)[];
+/** A durable session's prompt input. libfx stores image data as base64 before the turn runs, reading a `Blob` or `File` first. */
+export type FxSessionPromptInput = FxPromptInput;
 
 /** Steering or follow-up input: a string or text blocks. */
 export type FxSteeringInput = string | readonly FxTextBlock[];
@@ -265,6 +263,8 @@ export type FxEngineEvent = FxEventBase & (
   | { type: "journal.error"; error: string }
   | { type: "checkpoint.save"; through: string; bytes: number }
   | { type: "checkpoint.error"; error: string; message: string }
+  /** The core refused a checkpoint: the session is past a checkpoint's bounds, and its journal keeps growing until compaction brings it back. */
+  | { type: "checkpoint.skipped"; reason: "too_large" | "too_many_turns" | "invalid" }
   /** A checkpoint saved under a different libfx version, tool set, or model still loaded. */
   | { type: "checkpoint.mismatch"; sessionId: string; changed: Array<keyof FxCheckpointMeta>; saved: unknown; current: FxCheckpointMeta }
   | { type: "output.backpressure"; bufferedBytes: number; bufferedEvents: number }
@@ -351,16 +351,28 @@ export interface Persistence {
   append(input: { expected: string | null; idempotencyKey: string; data: Uint8Array }): Promise<{ cursor: string }>;
   /** Stores a checkpoint covering the records through `through`. */
   saveCheckpoint?(input: { through: string; data: Uint8Array }): Promise<void>;
+  /**
+   * Stores a prompt image once, under its name: the lowercase hex SHA-256 of `bytes`. Called before
+   * the prompt is sent, so it must be durable when it resolves; storing a name it already holds
+   * must succeed. With `getImage`, records and checkpoints name images instead of holding them.
+   */
+  putImage?(name: string, bytes: Uint8Array): Promise<void>;
+  /** The bytes stored under `name`, or `undefined` when the store does not hold it. */
+  getImage?(name: string): Promise<FxBytes | undefined>;
 }
 
 /** The persistence store `createMemoryPersistence()` returns. */
 export interface MemoryPersistence extends Persistence {
   /** The stored records, oldest first. */
   readonly records: Array<JournalRecord & { idempotencyKey: string }>;
+  /** The stored prompt images, by name. */
+  readonly images: Map<string, Uint8Array>;
   /** The latest checkpoint, or null. */
   readonly checkpoint: { through: string; data: Uint8Array } | null;
   load(): Promise<{ checkpoint?: { data: Uint8Array; through: string }; journal: JournalRecord[] }>;
   saveCheckpoint(input: { through: string; data: Uint8Array }): Promise<void>;
+  putImage(name: string, bytes: Uint8Array): Promise<void>;
+  getImage(name: string): Promise<Uint8Array | undefined>;
 }
 
 /** Another writer took over the session after this agent loaded it. Its `code` is `FX_FENCED`. */
@@ -628,7 +640,7 @@ export type FxSessionTurnEvent = FxTurnEvent & { epoch?: number };
 
 /** A view of one durable turn. Dropping it cancels nothing; call `session.cancel()` to stop the turn. */
 export interface FxTurnView<Result> {
-  /** Resolves once the prompt is stored, or at once for a prompt whose signal had already aborted. */
+  /** Resolves once the prompt is stored, or at once for a prompt whose signal had already aborted. Rejects when it cannot be stored, as when its `Blob` or `File` cannot be read. */
   readonly accepted: Promise<FxAccepted>;
   /** Resolves when the turn ends. */
   readonly result: Promise<Result>;

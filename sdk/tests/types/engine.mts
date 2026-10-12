@@ -171,6 +171,32 @@ export async function persistence(): Promise<void> {
 
   await createFxEngine({ apiKey, persistence: new SessionStore() });
 
+  // A store that keeps each prompt image once, by name.
+  const images = new Map<string, Uint8Array>();
+  const imageStore: Persistence = {
+    load: async () => ({}),
+    append: async () => ({ cursor: "1" }),
+    putImage: async (name: string, bytes: Uint8Array) => { images.set(name, bytes.slice()); },
+    getImage: async (name: string) => images.get(name),
+  };
+  await createFxEngine({ apiKey, persistence: imageStore });
+  const stored: Map<string, Uint8Array> = memoryStore.images;
+  const kept: Uint8Array | undefined = await memoryStore.getImage([...stored.keys()][0] ?? "");
+  console.log(kept?.byteLength);
+  // @ts-expect-error an image's bytes are bytes
+  const wrongStore: Persistence = { load: async () => ({}), append: async () => ({ cursor: "1" }), putImage: async (_name: string, _bytes: string) => {} };
+  console.log(wrongStore);
+  await createFxEngine({
+    apiKey,
+    persistence: memoryStore,
+    onEvent: (event) => {
+      if (event.type === "checkpoint.skipped") {
+        const reason: "too_large" | "too_many_turns" | "invalid" = event.reason;
+        console.log(reason);
+      }
+    },
+  });
+
   const checkpoint = await agent.checkpoint();
   // @ts-expect-error persistence cannot be combined with checkpoint
   await createFxEngine({ apiKey, persistence: memoryStore, checkpoint });
