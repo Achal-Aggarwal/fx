@@ -4,6 +4,7 @@ const build_checkpoint = @import("build_checkpoint.zig");
 const debug_trace = @import("../../core/shared/debug_trace.zig");
 const display_width = @import("../../core/shared/display_width.zig");
 const shared_theme = @import("../../core/shared/theme.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const types = @import("../../core/shared/types.zig");
 const command_output_content = @import("../../core/tooling/command_output_content.zig");
 const assistant_wrap = @import("assistant_wrap.zig");
@@ -898,6 +899,79 @@ fn formatFullToolStatus(alloc: Allocator, text: []const u8, cols: u16) ![]u8 {
         if (line.hard_break and start == text.len) try out.append(alloc, '\n');
     }
     return out.toOwnedSlice(alloc);
+}
+
+/// Word-wraps one expanded tool row for the full transcript without dropping
+/// any of its text. Each continuation row starts with `continuation_prefix`
+/// in the default style, then reopens the attributes and foreground color
+/// active at the wrap point. The reopen comes from tracked state, so output
+/// stays linear in the row length; styles the shared SGR state does not
+/// track, such as backgrounds, are not reopened. A prefix that leaves no room
+/// for content is omitted, and a wide character that cannot fit leaves a `?`
+/// marker. The caller owns the result.
+pub fn wrapFullToolStatus(
+    alloc: Allocator,
+    text: []const u8,
+    cols: u16,
+    continuation_prefix: []const u8,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    if (cols == 0 or text.len == 0) return out.toOwnedSlice(alloc);
+
+    const prefix_width = display_width.visibleWidthIgnoringAnsi(continuation_prefix);
+    const prefix = if (prefix_width < cols) continuation_prefix else "";
+    var style: assistant_pacer.SgrState = .{};
+    var styled = false;
+    var start: usize = 0;
+    var continuation = false;
+    while (start < text.len) {
+        const indent: usize = if (continuation and prefix.len > 0) prefix_width else 0;
+        const line = scanToolStatusLine(text, start, @as(usize, cols) - indent);
+        if (continuation) {
+            try out.append(alloc, '\n');
+            if (styled) try out.appendSlice(alloc, "\x1b[0m");
+            try out.appendSlice(alloc, prefix);
+            if (style.isActive()) {
+                var reopen: [64]u8 = undefined;
+                try out.appendSlice(alloc, reopen[0..style.writeOpens(reopen[0..])]);
+            }
+        }
+        try out.appendSlice(alloc, text[start..line.end]);
+        if (line.omitted_rune) try out.append(alloc, '?');
+
+        const next = if (line.next > start)
+            line.next
+        else if (line.end > start)
+            line.end
+        else blk: {
+            try out.append(alloc, '?');
+            break :blk start + display_width.displayUnitAt(text, start).byte_len;
+        };
+        if (trackToolStatusStyle(&style, text[start..next])) styled = true;
+        start = next;
+        continuation = true;
+
+        if (line.hard_break and start == text.len) try out.append(alloc, '\n');
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Folds every SGR sequence in `text` into `style`. Returns whether any was
+/// present.
+fn trackToolStatusStyle(style: *assistant_pacer.SgrState, text: []const u8) bool {
+    var styled = false;
+    var index: usize = 0;
+    while (std.mem.findScalarPos(u8, text, index, 0x1b)) |escape| {
+        const end = display_width.ansiSequenceEnd(text, escape);
+        const sequence = text[escape..end];
+        if (sequence.len > 2 and sequence[1] == '[' and sequence[sequence.len - 1] == 'm') {
+            styled = true;
+            style.apply(sequence);
+        }
+        index = @max(end, escape + 1);
+    }
+    return styled;
 }
 
 /// Renders a table as a boxed grid whose cells wrap onto extra lines when the
@@ -3797,6 +3871,74 @@ test "full tool status reasserts ANSI before wrapped command continuations" {
         try std.testing.expect(grid.cellAt(1, command_col).?.style.fg.eql(.{ .indexed = 245 }));
     }
     try std.testing.expect(continuation_rows >= 2);
+}
+
+test "full tool status paints its continuation prefix unstyled before replaying styles" {
+    const alloc = std.testing.allocator;
+    const source = "├ Ran \x1b[38;5;250m'every word of this quoted argument stays visible'\x1b[39m";
+    const out = try wrapFullToolStatus(alloc, source, 20, "│ ");
+    defer alloc.free(out);
+
+    var row_count: u16 = 0;
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |line| : (row_count += 1) {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= 20);
+    }
+    try std.testing.expect(row_count >= 3);
+    try std.testing.expect(std.mem.find(u8, out, "…") == null);
+
+    var grid = try vt_emulator.Grid.init(alloc, 20, row_count);
+    defer grid.deinit();
+    try grid.feed(out);
+    var row: u16 = 2;
+    while (row <= row_count) : (row += 1) {
+        const rail = grid.cellAt(row, 1).?;
+        try std.testing.expectEqual(@as(u21, '│'), rail.codepoint);
+        try std.testing.expect(rail.style.fg.eql(.default));
+        try std.testing.expect(grid.cellAt(row, 3).?.style.fg.eql(.{ .indexed = 250 }));
+    }
+    var last: std.ArrayList(u8) = .empty;
+    defer last.deinit(alloc);
+    try grid.rowTextTrimmed(row_count, &last);
+    try std.testing.expect(std.mem.endsWith(u8, last.items, "visible'"));
+}
+
+test "full tool status drops a continuation prefix that leaves no room" {
+    const alloc = std.testing.allocator;
+    const out = try wrapFullToolStatus(alloc, "abcdef", 2, "│ ");
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("ab\ncd\nef", out);
+}
+
+test "full tool status reopens a bounded style on every continuation row" {
+    const alloc = std.testing.allocator;
+    // A long highlighted command: replaying every earlier sequence on each
+    // row would grow quadratically with its length.
+    const source = "├ Ran " ++ text_utils.repeat("\x1b[38;5;250m'quoted token'\x1b[39m ", 400);
+    const out = try wrapFullToolStatus(alloc, source, 20, "│ ");
+    defer alloc.free(out);
+
+    const rows = std.mem.count(u8, out, "\n") + 1;
+    try std.testing.expect(rows > 100);
+    try std.testing.expect(out.len <= source.len + rows * 32);
+
+    var grid = try vt_emulator.Grid.init(alloc, 20, @intCast(rows));
+    defer grid.deinit();
+    try grid.feed(out);
+    var row: u16 = 2;
+    while (row <= rows) : (row += 1) {
+        const rail = grid.cellAt(row, 1).?;
+        try std.testing.expectEqual(@as(u21, '│'), rail.codepoint);
+        try std.testing.expect(rail.style.fg.eql(.default));
+        try std.testing.expect(grid.cellAt(row, 3).?.style.fg.eql(.{ .indexed = 250 }));
+    }
+}
+
+test "full tool status marks a wide character that cannot fit" {
+    const alloc = std.testing.allocator;
+    const out = try wrapFullToolStatus(alloc, "日本", 1, "");
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("?\n?", out);
 }
 
 test "tool status preview honors explicit newlines and terminal width" {
