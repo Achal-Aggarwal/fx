@@ -29,7 +29,8 @@ pub const Kind = tree_mod.Kind;
 pub const Entry = tree_mod.Entry;
 
 pub const Options = struct {
-    /// D7: at most this many entries are returned.
+    /// D7: at most this many files are returned. Folder rows do not count;
+    /// the collection limit (`collect_factor`) bounds them.
     candidate_cap: usize = 100_000,
     max_path_bytes: usize = 2048,
     /// Folder and file names skipped outside repositories and below an
@@ -258,8 +259,8 @@ pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*std.at
     try assemble(arena, listings, rules.repository, &entries);
     std.mem.sortUnstable(Entry, entries.items, {}, entryLessThan);
     var cap_reached = false;
-    if (entries.items.len > options.candidate_cap) {
-        entries.shrinkRetainingCapacity(options.candidate_cap);
+    if (capCut(entries.items, options.candidate_cap)) |len| {
+        entries.shrinkRetainingCapacity(len);
         cap_reached = true;
     }
     if (shared.limit_reached.load(.acquire)) cap_reached = true;
@@ -598,6 +599,39 @@ fn entryLessThan(_: void, a: Entry, b: Entry) bool {
     };
 }
 
+/// Length of the sorted prefix that holds the first `cap` files, or null when
+/// `entries` has no more than `cap` files. Folder rows do not count (D7).
+fn capCut(entries: []const Entry, cap: usize) ?usize {
+    var files: usize = 0;
+    for (entries, 0..) |entry, index| {
+        if (entry.kind != .file) continue;
+        if (files == cap) return index;
+        files += 1;
+    }
+    return null;
+}
+
+fn testFileCount(entries: []const Entry) usize {
+    var files: usize = 0;
+    for (entries) |entry| files += @intFromBool(entry.kind == .file);
+    return files;
+}
+
+test "the cap counts files and keeps the folder rows before the next file" {
+    const entries = [_]Entry{
+        .{ .path = "a", .kind = .directory },
+        .{ .path = "a/1", .kind = .file },
+        .{ .path = "b", .kind = .directory },
+        .{ .path = "b/2", .kind = .file },
+        .{ .path = "c", .kind = .directory },
+    };
+    try std.testing.expectEqual(@as(?usize, 1), capCut(&entries, 0));
+    try std.testing.expectEqual(@as(?usize, 3), capCut(&entries, 1));
+    try std.testing.expectEqual(@as(?usize, null), capCut(&entries, 2));
+    try std.testing.expectEqual(@as(?usize, null), capCut(&entries, 3));
+    try std.testing.expectEqual(@as(?usize, null), capCut(entries[4..], 0));
+}
+
 const TestTree = struct {
     tmp: std.testing.TmpDir,
     root: []const u8,
@@ -774,18 +808,27 @@ test "scan caps, skips overlong paths, cancels and is the same with one worker o
         try std.testing.expect(entryLessThan({}, earlier, later));
     }
 
-    // Within the collection limit the cap keeps the sorted prefix.
-    var capped = try scan(std.testing.allocator, root, .{ .candidate_cap = 200 }, null);
+    // The cap counts files only: 180 files and 240 folder rows fit a cap of
+    // 180, though the entries outnumber it.
+    var exact = try scan(std.testing.allocator, root, .{ .candidate_cap = 180 }, null);
+    defer exact.deinit();
+    try std.testing.expect(!exact.tree.incomplete and !exact.tree.cap_reached);
+    try std.testing.expectEqual(serial.tree.entries.len, exact.tree.entries.len);
+    // Within the collection limit the cap keeps the sorted prefix that holds
+    // the first files, ending just before the next file.
+    var capped = try scan(std.testing.allocator, root, .{ .candidate_cap = 120 }, null);
     defer capped.deinit();
     // Below it the walk read everything, so only the cap was reached.
     try std.testing.expect(!capped.tree.incomplete and capped.tree.cap_reached);
-    try std.testing.expectEqual(@as(usize, 200), capped.tree.entries.len);
-    for (capped.tree.entries, serial.tree.entries[0..200]) |a, b| try std.testing.expectEqualStrings(b.path, a.path);
+    try std.testing.expectEqual(@as(usize, 120), testFileCount(capped.tree.entries));
+    const kept = capped.tree.entries.len;
+    for (capped.tree.entries, serial.tree.entries[0..kept]) |a, b| try std.testing.expectEqualStrings(b.path, a.path);
+    try std.testing.expectEqual(Kind.file, serial.tree.entries[kept].kind);
     // Past it, reading stops early: still capped, sorted and incomplete.
     var tiny = try scan(std.testing.allocator, root, .{ .candidate_cap = 10 }, null);
     defer tiny.deinit();
     try std.testing.expect(tiny.tree.incomplete and tiny.tree.cap_reached);
-    try std.testing.expectEqual(@as(usize, 10), tiny.tree.entries.len);
+    try std.testing.expect(testFileCount(tiny.tree.entries) <= 10);
     for (tiny.tree.entries[1..], tiny.tree.entries[0 .. tiny.tree.entries.len - 1]) |later, earlier| try std.testing.expect(entryLessThan({}, earlier, later));
 
     var short = try scan(std.testing.allocator, root, .{ .max_path_bytes = 6 }, null);

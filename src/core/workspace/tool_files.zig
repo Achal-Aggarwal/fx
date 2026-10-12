@@ -1,7 +1,9 @@
 //! Files under a search root for `glob_files` and `grep_files`, listed by the
-//! native indexer and current at the time of the call. A search of the whole
-//! workspace reuses the saved `@`-completion snapshot when every folder and
-//! rule file it depended on is unchanged; any other search scans its root.
+//! native indexer and current at the time of the call. A search of the
+//! workspace or of an ordinary folder in it reuses the saved `@`-completion
+//! snapshot when the folders and rule files it depended on are unchanged; a
+//! folder search never reuses a snapshot cut at the candidate cap. Any other
+//! search scans its root.
 //! Nothing here saves a snapshot, so searches outside the workspace leave no
 //! trace under `~/.fx/file-index/`.
 
@@ -80,13 +82,24 @@ fn subtreeFromSnapshot(tree: *const indexer.Tree, subtree: []const u8) bool {
     return false;
 }
 
+/// Whether the cap lets `tree` answer a search of `subtree`. A tree cut at
+/// the cap holds only the sorted prefix with its first files: a folder past
+/// the cut lost its files, and another cap would cut elsewhere. Only a search
+/// of the whole workspace with the same cap gets that list from a new scan.
+fn capAllowsReuse(tree: *const indexer.Tree, subtree: []const u8, candidate_cap: usize) bool {
+    var files: usize = 0;
+    for (tree.entries) |entry| files += @intFromBool(entry.kind == .file);
+    if (files > candidate_cap) return false;
+    return !tree.cap_reached or (subtree.len == 0 and files == candidate_cap);
+}
+
 fn listFromSnapshot(alloc: Allocator, arena: Allocator, workspace_root: []const u8, subtree: []const u8, options: Options) Allocator.Error!?Listing {
     const roots = [_][]const u8{workspace_root};
     const path = (try file_index.snapshotPath(arena, &roots)) orelse return null;
     var snapshot = (try indexer.loadSnapshot(alloc, path, &roots)) orelse return null;
     defer snapshot.deinit();
     const tree = &snapshot.trees[0];
-    if (tree.entries.len > options.candidate_cap) return null;
+    if (!capAllowsReuse(tree, subtree, options.candidate_cap)) return null;
     if (!subtreeFromSnapshot(tree, subtree)) return null;
     if (!indexer.isCurrent(tree, workspace_root, options.skipped_names, if (subtree.len == 0) null else subtree)) return null;
     debug_trace.logf("core", "tool files reused snapshot entries={d} subtree_bytes={d}", .{ tree.entries.len, subtree.len });
@@ -216,4 +229,24 @@ test "subfolder searches reuse the workspace tree only for ordinary folders" {
     try std.testing.expectEqualStrings("", relativeInside("/w", "/w").?);
     try std.testing.expect(relativeInside("/w", "/workspace") == null);
     try std.testing.expect(relativeInside("/w", "/other") == null);
+}
+
+test "a tree cut at the cap answers only a whole-workspace search with the same cap" {
+    const entries = [_]indexer.Entry{
+        .{ .path = "src", .kind = .directory },
+        .{ .path = "src/a.zig", .kind = .file },
+        .{ .path = "src/b.zig", .kind = .file },
+        .{ .path = "tools", .kind = .directory },
+    };
+    var tree: indexer.Tree = .{ .root = "/w", .root_inode = 1, .scan_started_ns = 0, .repository = true, .incomplete = false, .cap_reached = false, .skipped_overlong = 0, .skipped_names = &.{}, .entries = &entries, .folders = &.{}, .sources = &.{} };
+    // Folder rows do not count: two files fit a cap of two.
+    try std.testing.expect(capAllowsReuse(&tree, "", 2));
+    try std.testing.expect(capAllowsReuse(&tree, "src", 2));
+    try std.testing.expect(!capAllowsReuse(&tree, "", 1));
+
+    tree.cap_reached = true;
+    try std.testing.expect(capAllowsReuse(&tree, "", 2));
+    try std.testing.expect(!capAllowsReuse(&tree, "", 3));
+    try std.testing.expect(!capAllowsReuse(&tree, "src", 2));
+    try std.testing.expect(!capAllowsReuse(&tree, "tools", 2));
 }
