@@ -68,7 +68,7 @@ fn commandLine(arena: Allocator, command: []const u8, args: []const []const u8) 
     for (0..args.len + 1) |k| {
         const word = if (k == 0) command else args[k - 1];
         if (k > 0) try out.append(arena, ' ');
-        const plain = word.len > 0 and std.mem.indexOfAny(u8, word, " \t\n'\"$`\\") == null;
+        const plain = word.len > 0 and std.mem.findAny(u8, word, " \t\n'\"$`\\") == null;
         if (plain) {
             try out.appendSlice(arena, word);
             continue;
@@ -124,7 +124,7 @@ pub fn resolve(
         // token exchange asks for the same; MCP-v2 takes it only if it is
         // the server's own.
         if (s.bridge and auth.resource == null) if (s.url) |url| {
-            auth.resource = try std.fmt.allocPrint(arena, "{s}/", .{origin(url)});
+            auth.resource = try arena.print("{s}/", .{origin(url)});
         };
         if (saved) |lookup| if (s.url) |url| {
             auth.saved = try lookup.get(lookup.context, arena, s.name, url);
@@ -183,7 +183,7 @@ fn transportFor(
             }
             if (c.bearer_token_env) |variable| {
                 const token = inherited.get(variable) orelse return missing(arena, s, variable);
-                try headers.append(arena, .{ .name = "Authorization", .value = try std.fmt.allocPrint(arena, "Bearer {s}", .{token}) });
+                try headers.append(arena, .{ .name = "Authorization", .value = try arena.print("Bearer {s}", .{token}) });
             }
             return .{ .http = .{ .url = s.url orelse return null, .headers = headers.items } };
         },

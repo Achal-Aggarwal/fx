@@ -102,12 +102,12 @@ fn writeAttachmentNotice(writer: *std.Io.Writer, image: types.ImageAttachment) s
 }
 
 fn toolImagesNotice(arena: Allocator, count: usize, handle: ?[]const u8) Allocator.Error![]u8 {
-    const subject = if (count == 1) "1 image" else try std.fmt.allocPrint(arena, "{d} images", .{count});
+    const subject = if (count == 1) "1 image" else try arena.print("{d} images", .{count});
     if (handle) |value| {
         const object = if (count == 1) "it" else "them";
-        return std.fmt.allocPrint(arena, "[{s} from this result not sent to keep the request under the provider's size limit. Use read_tool_result with handle {s} to load {s} again.]\n", .{ subject, value, object });
+        return arena.print("[{s} from this result not sent to keep the request under the provider's size limit. Use read_tool_result with handle {s} to load {s} again.]\n", .{ subject, value, object });
     }
-    return std.fmt.allocPrint(arena, "[{s} from this result not sent to keep the request under the provider's size limit.]\n", .{subject});
+    return arena.print("[{s} from this result not sent to keep the request under the provider's size limit.]\n", .{subject});
 }
 
 fn prependNotice(arena: Allocator, notice: []const u8, content: []const u8, limit: usize) Allocator.Error![]u8 {
