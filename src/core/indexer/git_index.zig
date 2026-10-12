@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const bounded_read = @import("bounded_read.zig");
+const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -23,6 +24,8 @@ pub const Entry = struct {
 pub const Index = struct {
     /// In index order (sorted by path). Unmerged paths appear once.
     entries: []const Entry,
+    /// The file's bytes when `read` loaded them, which entry paths may borrow.
+    data: []const u8 = &.{},
 };
 
 pub const Outcome = union(enum) {
@@ -35,14 +38,27 @@ pub const Outcome = union(enum) {
 
 pub const HashFormat = enum { sha1, sha256 };
 
-/// Reads the index at the absolute `path`. Memory belongs to `arena`.
-pub fn read(arena: Allocator, path: []const u8, hash: HashFormat) Allocator.Error!Outcome {
-    const data = switch (try bounded_read.readAbsolute(arena, path, max_index_bytes)) {
+/// Reads the index at the absolute `path`. The file's bytes come from
+/// `data_alloc` and are returned as `Index.data`, which the entries may
+/// borrow; the caller frees it once it is done with the entries. Everything
+/// else belongs to `arena`.
+pub fn read(arena: Allocator, data_alloc: Allocator, path: []const u8, hash: HashFormat) Allocator.Error!Outcome {
+    const data = switch (try bounded_read.readAbsolute(data_alloc, path, max_index_bytes)) {
         .content => |bytes| bytes,
         .missing => return .missing,
         .unavailable => |reason| return .{ .unavailable = reason },
     };
-    return parse(arena, data, hash);
+    const outcome = parse(arena, data, hash) catch |err| {
+        data_alloc.free(data);
+        return err;
+    };
+    switch (outcome) {
+        .index => |index| return .{ .index = .{ .entries = index.entries, .data = data } },
+        .missing, .unavailable => {
+            data_alloc.free(data);
+            return outcome;
+        },
+    }
 }
 
 const Reader = struct {
@@ -243,6 +259,32 @@ test "index reader handles versions 2 to 4, both hash formats, gitlinks and unme
             try expectPaths(try parse(arena, data, hash), &expected, &.{"mod"});
         }
     }
+}
+
+test "read leaves the index bytes to the caller and frees them when the index is unusable" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const good = try buildForTest(arena, 2, .sha1, &.{.{ .path = "a.txt" }}, "");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "good", .data = good });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad", .data = "not an index" });
+    const root = try io_mod.dirRealpathAlloc(arena, tmp.dir, ".");
+
+    // The entries borrow `data`, which stays the caller's to free.
+    const outcome = try read(arena, alloc, try std.Io.Dir.path.join(arena, &.{ root, "good" }), .sha1);
+    const index = switch (outcome) {
+        .index => |value| value,
+        else => return error.TestExpectedIndex,
+    };
+    defer alloc.free(index.data);
+    try expectPaths(outcome, &.{"a.txt"}, &.{});
+    try std.testing.expectEqual(good.len, index.data.len);
+
+    // An unusable index frees its bytes before returning.
+    try std.testing.expect(try read(arena, alloc, try std.Io.Dir.path.join(arena, &.{ root, "bad" }), .sha1) == .unavailable);
 }
 
 test "index reader rejects truncated, hostile and unsupported indexes" {

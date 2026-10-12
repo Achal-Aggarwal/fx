@@ -69,6 +69,10 @@ const Rules = struct {
     tracked_files: std.StringHashMapUnmanaged(void) = .empty,
     tracked_dirs: std.StringHashMapUnmanaged(void) = .empty,
     gitlinks: std.StringHashMapUnmanaged(void) = .empty,
+    /// The index file's bytes, which the three sets above borrow. Owned by
+    /// the scan's allocator rather than an arena, since a large index would
+    /// otherwise grow every later arena block.
+    index_bytes: []const u8 = &.{},
     skipped_names: []const []const u8,
     max_path_bytes: usize,
     /// Files the rules read or looked for, stamped once the walk ends.
@@ -198,6 +202,11 @@ pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*std.at
     var result_arena = std.heap.ArenaAllocator.init(alloc);
     errdefer result_arena.deinit();
     const arena = result_arena.allocator();
+    // The rules, the listings and their bookkeeping matter only while
+    // scanning; the tree keeps just what it returns.
+    var scratch_arena = std.heap.ArenaAllocator.init(alloc);
+    defer scratch_arena.deinit();
+    const scratch = scratch_arena.allocator();
     if (!std.Io.Dir.path.isAbsolute(root)) return error.RootUnavailable;
     const io = io_mod.getIo();
     var root_dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch return error.RootUnavailable;
@@ -211,9 +220,10 @@ pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*std.at
         .skipped_names = options.skipped_names,
         .max_path_bytes = options.max_path_bytes,
     };
+    defer alloc.free(rules.index_bytes);
     var incomplete = false;
     var root_lists: []const *const ignore.PatternList = &.{};
-    if (try repositoryRules(arena, root, &rules, &incomplete)) |lists| root_lists = lists;
+    if (try repositoryRules(scratch, alloc, root, &rules, &incomplete)) |lists| root_lists = lists;
 
     var shared: Shared = .{
         .alloc = alloc,
@@ -238,7 +248,10 @@ pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*std.at
     const workers = try alloc.alloc(Worker, worker_count);
     defer alloc.free(workers);
     for (workers) |*worker| worker.* = .{ .arena = std.heap.ArenaAllocator.init(alloc) };
-    defer for (workers) |*worker| worker.arena.deinit();
+    defer for (workers) |*worker| {
+        worker.listings.deinit(alloc);
+        worker.arena.deinit();
+    };
 
     runMain(&shared, workers);
     if (shared.failure) |err| return err;
@@ -246,7 +259,7 @@ pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*std.at
 
     var listing_count: usize = 0;
     for (workers) |*worker| listing_count += worker.listings.items.len;
-    const listings = try arena.alloc(*const Listing, listing_count);
+    const listings = try scratch.alloc(*const Listing, listing_count);
     var cursor: usize = 0;
     for (workers) |*worker| {
         for (worker.listings.items) |*listing| {
@@ -256,7 +269,7 @@ pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*std.at
     }
 
     var entries: std.ArrayList(Entry) = .empty;
-    try assemble(arena, listings, rules.repository, &entries);
+    try assemble(arena, scratch, listings, rules.repository, &entries);
     std.mem.sortUnstable(Entry, entries.items, {}, entryLessThan);
     var cap_reached = false;
     if (capCut(entries.items, options.candidate_cap)) |len| {
@@ -267,20 +280,24 @@ pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*std.at
     incomplete = incomplete or shared.limit_reached.load(.acquire) or shared.incomplete.load(.acquire);
 
     var folders: std.ArrayList(tree_mod.FolderStamp) = .empty;
+    try folders.ensureTotalCapacityPrecise(arena, listings.len);
     for (listings) |listing| {
         const stamp = listing.stamp orelse continue;
-        try folders.append(arena, .{ .rel = try arena.dupe(u8, stamp.rel), .inode = stamp.inode, .mtime_ns = stamp.mtime_ns, .ctime_ns = stamp.ctime_ns, .reusable = stamp.reusable, .boundary = listing.boundary, .excluded = listing.excluded });
-        if (listing.ignore_file) |path| try rules.sources.append(arena, .{ .path = try arena.dupe(u8, path), .identity_only = false });
+        folders.appendAssumeCapacity(.{ .rel = try arena.dupe(u8, stamp.rel), .inode = stamp.inode, .mtime_ns = stamp.mtime_ns, .ctime_ns = stamp.ctime_ns, .reusable = stamp.reusable, .boundary = listing.boundary, .excluded = listing.excluded });
+        if (listing.ignore_file) |path| try rules.sources.append(scratch, .{ .path = path, .identity_only = false });
     }
     const stamps = try arena.alloc(tree_mod.SourceStamp, rules.sources.items.len);
-    for (rules.sources.items, stamps) |request, *stamp| stamp.* = tree_mod.sourceStamp(request.path, request.identity_only, request.follow_symlinks, scan_started_ns);
+    for (rules.sources.items, stamps) |request, *stamp| stamp.* = tree_mod.sourceStamp(try arena.dupe(u8, request.path), request.identity_only, request.follow_symlinks, scan_started_ns);
     const skipped_names = try arena.alloc([]const u8, options.skipped_names.len);
     for (options.skipped_names, skipped_names) |name, *copy| copy.* = try arena.dupe(u8, name);
 
+    // Every allocation comes before `result_arena` is copied into the result:
+    // a block the arena adds after the copy would be missing from it and leak.
+    const root_copy = try arena.dupe(u8, root);
     return .{
         .arena = result_arena,
         .tree = .{
-            .root = try arena.dupe(u8, root),
+            .root = root_copy,
             .root_inode = @intCast(root_stat.inode),
             .scan_started_ns = scan_started_ns,
             .repository = rules.repository,
@@ -297,7 +314,8 @@ pub fn scan(alloc: Allocator, root: []const u8, options: Options, stop: ?*std.at
 
 /// Fills in repository rules when `root` is inside a repository and is not
 /// itself ignored, and returns the ignore lists that apply above the root.
-fn repositoryRules(arena: Allocator, root: []const u8, rules: *Rules, incomplete: *bool) Allocator.Error!?[]const *const ignore.PatternList {
+/// The index's bytes come from `index_alloc` and are left in `rules`.
+fn repositoryRules(arena: Allocator, index_alloc: Allocator, root: []const u8, rules: *Rules, incomplete: *bool) Allocator.Error!?[]const *const ignore.PatternList {
     const maybe_found = layout_mod.discover(arena, root) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidGitFile => blk: {
@@ -344,9 +362,8 @@ fn repositoryRules(arena: Allocator, root: []const u8, rules: *Rules, incomplete
                 continue;
             };
             defer dir.close(io_mod.getIo());
-            const base = if (rule_dir.len == 0) "" else try arena.print("{s}/", .{rule_dir});
             try rules.sources.append(arena, .{ .path = try std.Io.Dir.path.join(arena, &.{ absolute, ".gitignore" }), .identity_only = false });
-            switch (try sources.loadDirectory(arena, dir, base)) {
+            switch (try sources.loadDirectory(arena, dir, rule_dir)) {
                 .list => |list| try lists.append(arena, list),
                 .absent => {},
                 .unavailable => incomplete.* = true,
@@ -364,24 +381,27 @@ fn repositoryRules(arena: Allocator, root: []const u8, rules: *Rules, incomplete
     rules.prefix = found.prefix;
     const index_path = try std.Io.Dir.path.join(arena, &.{ found.git_dir, "index" });
     const hash: git_index.HashFormat = if (settings.object_format == .sha256) .sha256 else .sha1;
-    switch (try git_index.read(arena, index_path, hash)) {
+    switch (try git_index.read(arena, index_alloc, index_path, hash)) {
         .missing => {},
         .unavailable => |reason| {
             debug_trace.logf("indexer", "scan index unavailable reason={s} root={s}", .{ reason, root });
             incomplete.* = true;
         },
-        .index => |index| for (index.entries) |entry| {
-            if (entry.gitlink) {
-                try rules.gitlinks.put(arena, entry.path, {});
-            } else {
-                try rules.tracked_files.put(arena, entry.path, {});
-            }
-            var slash = std.mem.findScalarLast(u8, entry.path, '/');
-            while (slash) |end| {
-                const parent = entry.path[0..end];
-                const slot = try rules.tracked_dirs.getOrPut(arena, parent);
-                if (slot.found_existing) break;
-                slash = std.mem.findScalarLast(u8, parent, '/');
+        .index => |index| {
+            rules.index_bytes = index.data;
+            for (index.entries) |entry| {
+                if (entry.gitlink) {
+                    try rules.gitlinks.put(arena, entry.path, {});
+                } else {
+                    try rules.tracked_files.put(arena, entry.path, {});
+                }
+                var slash = std.mem.findScalarLast(u8, entry.path, '/');
+                while (slash) |end| {
+                    const parent = entry.path[0..end];
+                    const slot = try rules.tracked_dirs.getOrPut(arena, parent);
+                    if (slot.found_existing) break;
+                    slash = std.mem.findScalarLast(u8, parent, '/');
+                }
             }
         },
     }
@@ -423,7 +443,7 @@ fn listDirectory(shared: *Shared, worker: *Worker, job: Job, children: *std.Arra
     const io = io_mod.getIo();
     const rules = shared.rules;
     var listing: Listing = .{ .rel = job.rel, .tracked = job.tracked, .excluded = job.excluded };
-    defer worker.listings.append(arena, listing) catch shared.fail(error.OutOfMemory);
+    defer worker.listings.append(shared.alloc, listing) catch shared.fail(error.OutOfMemory);
     if (shared.canceled()) return error.Canceled;
     if (shared.limit_reached.load(.acquire)) return;
 
@@ -441,8 +461,7 @@ fn listDirectory(shared: *Shared, worker: *Worker, job: Job, children: *std.Arra
     // Below an excluded folder everything is excluded, as in git, which stops
     // reading `.gitignore` files there.
     if (!job.excluded) {
-        const base = if (job.rule_path.len == 0) "" else try arena.print("{s}/", .{job.rule_path});
-        const loaded = try sources.loadDirectory(arena, dir, base);
+        const loaded = try sources.loadDirectory(arena, dir, job.rule_path);
         if (loaded != .absent) listing.ignore_file = try std.Io.Dir.path.join(arena, &.{ shared.root_abs, job.rel, ".gitignore" });
         switch (loaded) {
             .list => |list| {
@@ -459,6 +478,8 @@ fn listDirectory(shared: *Shared, worker: *Worker, job: Job, children: *std.Arra
         }
     }
 
+    // At and below the repository root the rule path is the same string.
+    const shares_rule_path = !rules.repository or std.mem.eql(u8, job.rule_path, job.rel);
     var files: std.ArrayList([]const u8) = .empty;
     var child_entries: std.ArrayList(Child) = .empty;
     var saw_dot_git = false;
@@ -478,7 +499,7 @@ fn listDirectory(shared: *Shared, worker: *Worker, job: Job, children: *std.Arra
         if (!rules.repository and rules.skipped(entry.name)) continue;
 
         const rel = try joinPath(arena, job.rel, entry.name);
-        const rule_path = if (rules.repository) try joinPath(arena, job.rule_path, entry.name) else rel;
+        const rule_path = if (shares_rule_path) rel else try joinPath(arena, job.rule_path, entry.name);
         // A path over the limit is not listed, but it still exists and is not
         // ignored, so its folder stays visible.
         const overlong = rel.len > rules.max_path_bytes;
@@ -545,24 +566,25 @@ fn excludedPath(lists: []const *const ignore.PatternList, path: []const u8, is_d
 
 fn joinPath(arena: Allocator, parent: []const u8, name: []const u8) Allocator.Error![]const u8 {
     if (parent.len == 0) return arena.dupe(u8, name);
-    return arena.print("{s}/{s}", .{ parent, name });
+    return std.mem.concat(arena, u8, &.{ parent, "/", name });
 }
 
 /// Applies git's folder rules bottom-up and gathers the visible entries.
-fn assemble(arena: Allocator, listings: []const *const Listing, repository: bool, out: *std.ArrayList(Entry)) Allocator.Error!void {
+/// `out` and its paths use `arena`; the bookkeeping uses `scratch`.
+fn assemble(arena: Allocator, scratch: Allocator, listings: []const *const Listing, repository: bool, out: *std.ArrayList(Entry)) Allocator.Error!void {
     var by_path: std.StringHashMapUnmanaged(usize) = .empty;
-    try by_path.ensureTotalCapacity(arena, @intCast(listings.len));
+    try by_path.ensureTotalCapacity(scratch, @intCast(listings.len));
     for (listings, 0..) |listing, index| by_path.putAssumeCapacity(listing.rel, index);
 
     // Deeper folders first, so each folder sees its children's visibility.
-    const order = try arena.alloc(usize, listings.len);
+    const order = try scratch.alloc(usize, listings.len);
     for (order, 0..) |*slot, index| slot.* = index;
     std.mem.sortUnstable(usize, order, listings, struct {
         fn deeper(items: []const *const Listing, a: usize, b: usize) bool {
             return std.mem.count(u8, items[a].rel, "/") > std.mem.count(u8, items[b].rel, "/");
         }
     }.deeper);
-    const visible = try arena.alloc(bool, listings.len);
+    const visible = try scratch.alloc(bool, listings.len);
     for (order) |index| {
         const listing = listings[index];
         visible[index] = if (!repository or listing.tracked or listing.boundary or !listing.has_entries) true else blk: {
@@ -578,17 +600,29 @@ fn assemble(arena: Allocator, listings: []const *const Listing, repository: bool
         };
     }
 
+    // Reserve exactly once: growing the list inside the arena would leave every
+    // smaller copy behind.
+    var count: usize = 0;
     for (listings, 0..) |listing, index| {
         if (!visible[index]) continue;
-        for (listing.files) |path| try out.append(arena, .{ .path = try arena.dupe(u8, path), .kind = .file });
+        count += listing.files.len;
+        for (listing.children) |child| count += @intFromBool(childShown(child, &by_path, visible));
+    }
+    try out.ensureTotalCapacityPrecise(arena, out.items.len + count);
+    for (listings, 0..) |listing, index| {
+        if (!visible[index]) continue;
+        for (listing.files) |path| out.appendAssumeCapacity(.{ .path = try arena.dupe(u8, path), .kind = .file });
         for (listing.children) |child| {
-            const shown = switch (child.state) {
-                .boundary => true,
-                .entered => if (by_path.get(child.rel)) |child_index| visible[child_index] else true,
-            };
-            if (shown) try out.append(arena, .{ .path = try arena.dupe(u8, child.rel), .kind = .directory });
+            if (childShown(child, &by_path, visible)) out.appendAssumeCapacity(.{ .path = try arena.dupe(u8, child.rel), .kind = .directory });
         }
     }
+}
+
+fn childShown(child: Child, by_path: *const std.StringHashMapUnmanaged(usize), visible: []const bool) bool {
+    return switch (child.state) {
+        .boundary => true,
+        .entered => if (by_path.get(child.rel)) |child_index| visible[child_index] else true,
+    };
 }
 
 fn entryLessThan(_: void, a: Entry, b: Entry) bool {

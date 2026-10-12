@@ -223,7 +223,10 @@ const SearchOutcome = union(enum) {
 fn callWithOps(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput, ops: CallOps) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const input = erased.as(Input);
 
-    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    // The scan and the per-call work use the scratch allocator, so each search
+    // returns its memory when it ends; only the result body comes from
+    // `ctx.allocator`.
+    var arena_state = std.heap.ArenaAllocator.init(ctx.scratch_allocator);
     defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
 
@@ -272,10 +275,10 @@ fn searchGrepRoot(
 ) tool_dispatch.DispatchError!SearchOutcome {
     return switch (root_stat.kind) {
         .directory => switch (input.mode) {
-            .count => .{ .count = ops.count_directory(ctx.allocator, arena, ctx.workspace_root, absolute_root, input.pattern, input.case_insensitive, ctx.ignored_list_entries, include_pattern) catch |err| {
+            .count => .{ .count = ops.count_directory(ctx.scratch_allocator, arena, ctx.workspace_root, absolute_root, input.pattern, input.case_insensitive, ctx.ignored_list_entries, include_pattern) catch |err| {
                 return searchFailure(ctx.allocator, absolute_root, "walk grep search root", err);
             } },
-            .matches, .files_with_matches => .{ .matches = ops.collect_directory(ctx.allocator, arena, ctx.workspace_root, absolute_root, input.pattern, input.case_insensitive, ctx.ignored_list_entries, include_pattern) catch |err| {
+            .matches, .files_with_matches => .{ .matches = ops.collect_directory(ctx.scratch_allocator, arena, ctx.workspace_root, absolute_root, input.pattern, input.case_insensitive, ctx.ignored_list_entries, include_pattern) catch |err| {
                 return searchFailure(ctx.allocator, absolute_root, "walk grep search root", err);
             } },
         },
@@ -667,6 +670,7 @@ fn dispatchGrepFilesRaw(alloc: Allocator, workspace_root: []const u8, args_json:
     const registry = tool_dispatch.Registry{ .tools = &.{grep_files_dispatch_tool} };
     return tool_dispatch.dispatchToolCall(.{
         .allocator = alloc,
+        .scratch_allocator = alloc,
         .permission_mode = .auto,
         .workspace_root = workspace_root,
     }, registry, .{
@@ -674,6 +678,41 @@ fn dispatchGrepFilesRaw(alloc: Allocator, workspace_root: []const u8, args_json:
         .name = "grep_files",
         .arguments_json = args_json,
     });
+}
+
+test "grep_files keeps only its result in the turn's allocator" {
+    // fx passes the turn's arena as `allocator`, so a scan left there stays
+    // until the turn ends and every search adds another.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try workspaceRoot(alloc, tmp);
+    defer alloc.free(workspace);
+    try tmp.dir.createDirPath(io_mod.getIo(), "many");
+    for (0..2050) |i| {
+        var name_buf: [64]u8 = undefined;
+        const name = try std.mem.print(&name_buf, "many/file-{d:0>4}.txt", .{i});
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = if (i == 1) "needle\n" else "x\n" });
+    }
+    const args = try grepArgsJson(alloc, "needle", null, null, null, null, null);
+    defer alloc.free(args);
+
+    var turn_state = std.heap.ArenaAllocator.init(alloc);
+    defer turn_state.deinit();
+    const registry = tool_dispatch.Registry{ .tools = &.{grep_files_dispatch_tool} };
+    for (0..2) |_| {
+        const before = turn_state.queryCapacity();
+        const result = try tool_dispatch.dispatchToolCall(.{
+            .allocator = turn_state.allocator(),
+            .scratch_allocator = alloc,
+            .permission_mode = .auto,
+            .workspace_root = workspace,
+        }, registry, .{ .id = "call_1", .name = "grep_files", .arguments_json = args });
+        try std.testing.expectEqual(.success, result.status);
+        try std.testing.expect(std.mem.find(u8, result.body, "many/file-0001.txt") != null);
+        // Searching 2,050 files takes far more than this; the result does not.
+        try std.testing.expect(turn_state.queryCapacity() - before < 64 * 1024);
+    }
 }
 
 fn writeTempFile(alloc: Allocator, tmp: *std.testing.TmpDir, sub_path: []const u8, content: []const u8) ![]u8 {
@@ -728,7 +767,7 @@ fn grepFilesFailureWithOps(
     };
     defer input.deinit(alloc);
 
-    const result = try callWithOps(.{ .allocator = alloc, .workspace_root = workspace_root }, .{ .ptr = &input, .deinit_fn = noopInputDeinit }, ops);
+    const result = try callWithOps(.{ .allocator = alloc, .scratch_allocator = alloc, .workspace_root = workspace_root }, .{ .ptr = &input, .deinit_fn = noopInputDeinit }, ops);
     switch (result) {
         .rich => return error.TestUnexpectedRichResult,
         .failure => |body| return body,

@@ -97,7 +97,10 @@ pub fn call(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput)
 fn callWithWorkspaceOptions(ctx: tool_dispatch.DispatchContext, erased: tool_dispatch.ToolInput, list_options: tool_files.Options) tool_dispatch.DispatchError!tool_dispatch.ToolResult {
     const input = erased.as(Input);
 
-    var arena_state = std.heap.ArenaAllocator.init(ctx.allocator);
+    // The scan and the per-call work use the scratch allocator, so each search
+    // returns its memory when it ends; only the result body comes from
+    // `ctx.allocator`.
+    var arena_state = std.heap.ArenaAllocator.init(ctx.scratch_allocator);
     defer mem_utils.deinit_arena(arena_state);
     const arena = arena_state.allocator();
 
@@ -145,7 +148,7 @@ fn callWithWorkspaceOptions(ctx: tool_dispatch.DispatchContext, erased: tool_dis
     options.include_hidden = options.include_hidden or shouldIncludeHidden(root_relative, input.pattern);
 
     if (root.is_directory) {
-        const listing = tool_files.list(ctx.allocator, arena, ctx.workspace_root, root.absolute, options) catch |err| switch (err) {
+        const listing = tool_files.list(ctx.scratch_allocator, arena, ctx.workspace_root, root.absolute, options) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.FileNotFound => return .{ .failure = try ctx.allocator.print("Unable to discover glob candidates: {s} ({s})", .{ root.absolute, @errorName(err) }) },
         };
@@ -401,6 +404,7 @@ fn dispatchGlobFilesRaw(alloc: Allocator, workspace_root: []const u8, args_json:
     const registry = tool_dispatch.Registry{ .tools = &.{glob_files_dispatch_tool} };
     return tool_dispatch.dispatchToolCall(.{
         .allocator = alloc,
+        .scratch_allocator = alloc,
         .permission_mode = .auto,
         .workspace_root = workspace_root,
     }, registry, .{
@@ -516,7 +520,7 @@ test "glob_files reports overlong patterns during matching" {
     };
     defer input.deinit(alloc);
 
-    const result = try call(.{ .allocator = alloc, .workspace_root = workspace }, .{ .ptr = &input, .deinit_fn = noopInputDeinit });
+    const result = try call(.{ .allocator = alloc, .scratch_allocator = alloc, .workspace_root = workspace }, .{ .ptr = &input, .deinit_fn = noopInputDeinit });
     defer result.deinit(alloc);
     const expected = try alloc.print("glob_files field \"pattern\" must be at most {d} bytes", .{glob_pattern.max_pattern_bytes});
     defer alloc.free(expected);
@@ -734,6 +738,7 @@ test "glob_files path narrowing applies before candidate cap" {
     const erased = tool_dispatch.ToolInput{ .ptr = &input, .deinit_fn = noopInputDeinit };
     var result = try callWithWorkspaceOptions(.{
         .allocator = alloc,
+        .scratch_allocator = alloc,
         .permission_mode = .auto,
         .workspace_root = workspace,
         .max_list_entries = 10,
@@ -770,6 +775,7 @@ test "glob_files extracts static base before candidate cap" {
     const erased = tool_dispatch.ToolInput{ .ptr = &input, .deinit_fn = noopInputDeinit };
     var result = try callWithWorkspaceOptions(.{
         .allocator = alloc,
+        .scratch_allocator = alloc,
         .permission_mode = .auto,
         .workspace_root = workspace,
         .max_list_entries = 10,
@@ -837,6 +843,36 @@ test "glob_files finds match beyond former traversal cap" {
     try std.testing.expectEqual(.success, result.status);
     try std.testing.expect(std.mem.find(u8, result.body, "zzzz/target.zig") != null);
     try std.testing.expect(std.mem.find(u8, result.body, "traversal cap") == null);
+}
+
+test "glob_files keeps only its result in the turn's allocator" {
+    // fx passes the turn's arena as `allocator`, so a scan left there stays
+    // until the turn ends and every search adds another.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    try createNumberedFiles(&tmp, 2050);
+    const args = try globArgsJson(alloc, "**/file-0001.txt", null);
+    defer alloc.free(args);
+
+    var turn_state = std.heap.ArenaAllocator.init(alloc);
+    defer turn_state.deinit();
+    const registry = tool_dispatch.Registry{ .tools = &.{glob_files_dispatch_tool} };
+    for (0..2) |_| {
+        const before = turn_state.queryCapacity();
+        const result = try tool_dispatch.dispatchToolCall(.{
+            .allocator = turn_state.allocator(),
+            .scratch_allocator = alloc,
+            .permission_mode = .auto,
+            .workspace_root = workspace,
+        }, registry, .{ .id = "call_1", .name = "glob_files", .arguments_json = args });
+        try std.testing.expectEqual(.success, result.status);
+        try std.testing.expect(std.mem.find(u8, result.body, "many/file-0001.txt") != null);
+        // Listing 2,050 files takes far more than this; the result does not.
+        try std.testing.expect(turn_state.queryCapacity() - before < 64 * 1024);
+    }
 }
 
 test "glob_files distinguishes candidate cap from output cap" {

@@ -106,20 +106,32 @@ fn listFromSnapshot(alloc: Allocator, arena: Allocator, workspace_root: []const 
     return try collect(arena, tree, subtree, options);
 }
 
+/// The path of a file entry relative to `subtree`, or null when the entry is
+/// not a file or is outside the subtree.
+fn subtreePath(entry: indexer.Entry, subtree: []const u8) ?[]const u8 {
+    if (entry.kind != .file) return null;
+    if (subtree.len == 0) return entry.path;
+    if (entry.path.len <= subtree.len + 1 or !std.mem.startsWith(u8, entry.path, subtree) or entry.path[subtree.len] != '/') return null;
+    return entry.path[subtree.len + 1 ..];
+}
+
 fn collect(arena: Allocator, tree: *const indexer.Tree, subtree: []const u8, options: Options) Allocator.Error!Listing {
     const keep_hidden = options.include_hidden or (options.include_hidden_in_repository and tree.repository);
-    var files: std.ArrayList([]const u8) = .empty;
+    // Reserve once for every file in the subtree, so the list never grows.
+    // Only the cheap checks run here; hidden paths are left out while filling.
+    var upper: usize = 0;
+    for (tree.entries) |entry| upper += @intFromBool(subtreePath(entry, subtree) != null);
+    const files = try arena.alloc([]const u8, upper);
+    var count: usize = 0;
     for (tree.entries) |entry| {
-        if (entry.kind != .file) continue;
-        const path = if (subtree.len == 0) entry.path else blk: {
-            if (entry.path.len <= subtree.len + 1 or !std.mem.startsWith(u8, entry.path, subtree) or entry.path[subtree.len] != '/') continue;
-            break :blk entry.path[subtree.len + 1 ..];
-        };
+        const path = subtreePath(entry, subtree) orelse continue;
         if (!keep_hidden and pathContainsHiddenDirectoryComponent(path)) continue;
-        try files.append(arena, try arena.dupe(u8, path));
+        files[count] = try arena.dupe(u8, path);
+        count += 1;
     }
     return .{
-        .files = try files.toOwnedSlice(arena),
+        // The unused tail belongs to the arena like the rest of the listing.
+        .files = files[0..count],
         .candidate_cap = options.candidate_cap,
         .incomplete = tree.incomplete or tree.cap_reached,
         .cap_reached = tree.cap_reached,

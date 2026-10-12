@@ -4,6 +4,7 @@
 //! truncated, so a caller never acts on a partial file.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const io_mod = @import("../shared/io.zig");
 
 const Allocator = std.mem.Allocator;
@@ -48,6 +49,8 @@ fn readWith(
         else => .{ .unavailable = @errorName(err) },
     };
     defer file.close(io_mod.getIo());
+    if (try readSized(alloc, file, max_bytes)) |outcome| return outcome;
+    // The file grew after the stat, or reports no size: read it as a stream.
     // The reader reports a stream that fills its limit as too long, so allow
     // one extra byte to accept a file of exactly `max_bytes`.
     const data = io_mod.readFileToEnd(alloc, &file, max_bytes +| 1) catch |err| return switch (err) {
@@ -56,6 +59,28 @@ fn readWith(
         else => .{ .unavailable = @errorName(err) },
     };
     return .{ .content = data };
+}
+
+/// Reads the whole file into a buffer sized from its stat, so a small file
+/// does not claim a stream reader's growth buffer. Returns null when the file
+/// holds more than its stat said, which the caller reads as a stream.
+fn readSized(alloc: Allocator, file: std.Io.File, max_bytes: usize) Allocator.Error!?Outcome {
+    const io = io_mod.getIo();
+    const stat = file.stat(io) catch |err| return .{ .unavailable = @errorName(err) };
+    if (stat.size > max_bytes) return .{ .unavailable = "too_large" };
+    // `stat.size <= max_bytes`, so it fits in a usize.
+    const size: usize = @intCast(stat.size);
+    // One byte past the size shows whether the file grew since the stat.
+    const buffer = try alloc.alloc(u8, size + 1);
+    const read = file.readPositionalAll(io, buffer, 0) catch |err| {
+        alloc.free(buffer);
+        return .{ .unavailable = @errorName(err) };
+    };
+    if (read > size) {
+        alloc.free(buffer);
+        return null;
+    }
+    return .{ .content = try alloc.realloc(buffer, read) };
 }
 
 test "bounded reads return content, missing, oversize and non-regular outcomes" {
@@ -75,6 +100,33 @@ test "bounded reads return content, missing, oversize and non-regular outcomes" 
     tmp.dir.symLink(std.testing.io, "small", "link", .{}) catch return error.SkipZigTest;
     try std.testing.expect(try readAt(alloc, tmp.dir, "link", 16) == .unavailable);
     try std.testing.expect(try readAbsolute(alloc, "relative", 16) == .unavailable);
+}
+
+test "bounded reads allocate the file's size, not a stream buffer" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "small", .data = "0123456789" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "empty", .data = "" });
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = counting.allocator();
+
+    const small = try readAt(alloc, tmp.dir, "small", 1024 * 1024);
+    defer alloc.free(small.content);
+    try std.testing.expectEqualStrings("0123456789", small.content);
+    try std.testing.expect(counting.allocated_bytes <= 64);
+
+    const empty = try readAt(alloc, tmp.dir, "empty", 1024 * 1024);
+    defer alloc.free(empty.content);
+    try std.testing.expectEqual(@as(usize, 0), empty.content.len);
+}
+
+test "bounded reads stream a regular file whose stat reports no size" {
+    // Linux reports 0 bytes for the regular files under /proc.
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const status = try readUserAbsolute(alloc, "/proc/self/status", 1024 * 1024);
+    defer alloc.free(status.content);
+    try std.testing.expect(std.mem.startsWith(u8, status.content, "Name:"));
 }
 
 test "user reads follow a final symlink to a regular file and still refuse the rest" {

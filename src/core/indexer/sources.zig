@@ -66,11 +66,14 @@ pub const DirectoryList = union(enum) {
 };
 
 /// Loads `.gitignore` from the open directory `dir`, whose path relative to
-/// the worktree root is `base` (empty, or ending in `/`). A symlinked
-/// `.gitignore` is not followed, as in git. Memory belongs to `arena`.
-pub fn loadDirectory(arena: Allocator, dir: std.Io.Dir, base: []const u8) Allocator.Error!DirectoryList {
+/// the worktree root is `rule_dir` (empty at the root, no trailing `/`). A
+/// symlinked `.gitignore` is not followed, as in git. Memory belongs to
+/// `arena`.
+pub fn loadDirectory(arena: Allocator, dir: std.Io.Dir, rule_dir: []const u8) Allocator.Error!DirectoryList {
     return switch (try bounded_read.readAt(arena, dir, ".gitignore", ignore.max_pattern_file_bytes)) {
         .content => |content| blk: {
+            // Built only here, since most folders have no `.gitignore`.
+            const base = if (rule_dir.len == 0) "" else try std.mem.concat(arena, u8, &.{ rule_dir, "/" });
             const list = try arena.create(ignore.PatternList);
             list.* = try ignore.PatternList.parse(arena, base, content);
             break :blk .{ .list = list };
@@ -142,7 +145,7 @@ test "directory .gitignore loads with its base and refuses symlinks" {
     try tmp.dir.createDirPath(std.testing.io, "linked");
     var sub = try tmp.dir.openDir(std.testing.io, "sub", .{});
     defer sub.close(std.testing.io);
-    const loaded = try loadDirectory(arena, sub, "sub/");
+    const loaded = try loadDirectory(arena, sub, "sub");
     const lists = [_]*const ignore.PatternList{loaded.list};
     try std.testing.expectEqual(ignore.Decision.excluded, ignore.decide(&lists, "sub/local", false, false));
     try std.testing.expectEqual(ignore.Decision.none, ignore.decide(&lists, "local", false, false));
@@ -151,5 +154,5 @@ test "directory .gitignore loads with its base and refuses symlinks" {
     var linked = try tmp.dir.openDir(std.testing.io, "linked", .{});
     defer linked.close(std.testing.io);
     linked.symLink(std.testing.io, "../target", ".gitignore", .{}) catch return error.SkipZigTest;
-    try std.testing.expect(try loadDirectory(arena, linked, "linked/") == .unavailable);
+    try std.testing.expect(try loadDirectory(arena, linked, "linked") == .unavailable);
 }

@@ -969,7 +969,7 @@ fn candidatesFromTrees(
         for (tree.entries) |entry| {
             if (isStopRequested(stop_requested)) return error.Canceled;
             if (candidates.items.len >= max_indexed_files) return candidates.toOwnedSlice(arena);
-            if (hasGitComponent(entry.path)) continue;
+            if (!isPlainRelativePath(entry.path)) continue;
             if (!text_utils.isTerminalSafe(entry.path)) {
                 debug_trace.logf("core", "file index omitted unsafe candidate bytes={d} kind={s}", .{ entry.path.len, @tagName(entry.kind) });
                 continue;
@@ -1020,14 +1020,6 @@ fn isPlainRelativePath(path: []const u8) bool {
         if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..") or std.mem.eql(u8, part, ".git")) return false;
     }
     return true;
-}
-
-fn hasGitComponent(path: []const u8) bool {
-    var parts = std.mem.splitScalar(u8, path, '/');
-    while (parts.next()) |part| {
-        if (std.mem.eql(u8, part, ".git")) return true;
-    }
-    return false;
 }
 
 /// Publishes the loader's terminal outcome only after its caller has released
@@ -1930,6 +1922,42 @@ test "tree candidates keep a sorted directory at the exact shared cap" {
     try std.testing.expectEqual(max_indexed_files, candidates.len);
     try std.testing.expectEqual(CandidateKind.directory, candidates[0].kind);
     try std.testing.expectEqualStrings("z-file-099998", candidates[max_indexed_files - 1].path);
+}
+
+test "added-root candidates drop the same paths as primary-root ones" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const primary = [_]indexer.Entry{.{ .path = "main.zig", .kind = .file }};
+    // Only a damaged snapshot holds such paths; a scan never produces them.
+    const added = [_]indexer.Entry{
+        .{ .path = ".git/config", .kind = .file },
+        .{ .path = "a/../../outside", .kind = .file },
+        .{ .path = "a//b", .kind = .file },
+        .{ .path = "./a", .kind = .file },
+        .{ .path = "ok.txt", .kind = .file },
+    };
+    var trees: [2]indexer.Tree = undefined;
+    for (&trees, [_][]const u8{ "/workspace", "/extra" }, [_][]const indexer.Entry{ &primary, &added }) |*tree, root, entries| {
+        tree.* = .{
+            .root = root,
+            .root_inode = 1,
+            .scan_started_ns = 0,
+            .repository = true,
+            .incomplete = false,
+            .cap_reached = false,
+            .skipped_overlong = 0,
+            .skipped_names = &.{},
+            .entries = entries,
+            .folders = &.{},
+            .sources = &.{},
+        };
+    }
+    var stop_requested = std.atomic.Value(bool).init(false);
+    const candidates = try candidatesFromTrees(arena, &.{ "/workspace", "/extra" }, &trees, &stop_requested);
+    try std.testing.expectEqual(@as(usize, 2), candidates.len);
+    try std.testing.expectEqualStrings("main.zig", candidates[0].path);
+    try std.testing.expectEqualStrings("/extra/ok.txt", candidates[1].path);
 }
 
 test "primary tree candidates keep plain paths and drop git, escaping and unsafe ones" {
@@ -2863,7 +2891,7 @@ test "production scope admits tracked untracked hidden and direct directory cand
     try std.testing.expect(!containsCandidate(candidates, "ignored-dir", .directory));
     try std.testing.expect(containsCandidate(candidates, "empty-dir", .directory));
     for (candidates) |candidate| {
-        try std.testing.expect(!hasGitComponent(candidate.path));
+        try std.testing.expect(isPlainRelativePath(candidate.path));
     }
 
     var index = FileIndex{};
