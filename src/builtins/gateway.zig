@@ -2381,7 +2381,13 @@ fn fetchModelCatalogResponse(
         gateway_client.fetchGatewayJson(alloc, api_key, gateway_team, model_catalog_url);
 }
 
-fn modelCatalogTeamPath(
+/// The catalog follows the same team contract as `/v1/credits`: it rejects an
+/// fx login unless the request names the team in a `teamId` query value, and
+/// the `x-vercel-ai-gateway-team` header does not satisfy it. Other
+/// credentials carry their team in that header. Every catalog transport builds
+/// its request from this function and `modelCatalogHeaderTeam` so they agree.
+/// Returns a caller-owned path, or null when `path` is used unchanged.
+pub fn modelCatalogTeamPath(
     alloc: Allocator,
     path: []const u8,
     access: credentials.CatalogAccess,
@@ -2392,9 +2398,40 @@ fn modelCatalogTeamPath(
     return try alloc.print("{s}?teamId={s}", .{ path, team });
 }
 
-fn modelCatalogHeaderTeam(access: credentials.CatalogAccess) ?[]const u8 {
+/// Returns the `x-vercel-ai-gateway-team` value for a catalog request, borrowed
+/// from `access`, or null for an fx login, whose team travels in the query.
+pub fn modelCatalogHeaderTeam(access: credentials.CatalogAccess) ?[]const u8 {
     if (access.credentialSource() == .fx_login) return null;
     return access.teamContext();
+}
+
+test "model catalog names an fx login team in the query and other teams in the header" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        access: credentials.CatalogAccess,
+        path: ?[]const u8,
+        header: ?[]const u8,
+    }{
+        .{ .access = credentials.catalogAccessForCredential(.fx_login, "login-token", "team_123"), .path = models_path ++ "?teamId=team_123", .header = null },
+        .{ .access = credentials.catalogAccessForCredential(.fx_login, "login-token", "team a/../b"), .path = null, .header = null },
+        .{ .access = credentials.catalogAccessForCredential(.fx_login, "login-token", null), .path = null, .header = null },
+        .{ .access = credentials.catalogAccessForCredential(.ai_gateway_api_key, "api-key", "team_123"), .path = null, .header = "team_123" },
+        .{ .access = credentials.catalogAccessForCredential(.ai_gateway_api_key, "api-key", null), .path = null, .header = null },
+    };
+    for (cases) |case| {
+        const path = try modelCatalogTeamPath(alloc, models_path, case.access);
+        defer if (path) |owned| alloc.free(owned);
+        if (case.path) |want| {
+            try std.testing.expectEqualStrings(want, path orelse return error.TestExpectedTeamPath);
+        } else {
+            try std.testing.expect(path == null);
+        }
+        if (case.header) |want| {
+            try std.testing.expectEqualStrings(want, modelCatalogHeaderTeam(case.access) orelse return error.TestExpectedHeaderTeam);
+        } else {
+            try std.testing.expect(modelCatalogHeaderTeam(case.access) == null);
+        }
+    }
 }
 
 fn catalogRequestFailure(err: anyerror) model_catalog.Failure {
