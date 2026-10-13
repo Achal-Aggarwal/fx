@@ -1840,8 +1840,10 @@ async function turnEndIn(log, messageId, count) {
 const retryEndWaitMs = 30_000;
 
 // One turn as its viewer sees it: the session stream from `from` on, its
-// events only, until its end. `start` queues the turn and returns the
-// stream; a resume learns its turn from the first one the stream shows.
+// events only, until its end. `start` queues the turn at once and returns
+// the stream; a resume learns its turn from the first one the stream shows.
+// The stream is read only once something reads the view, its events,
+// `readable` or `result`, so a prompt nobody follows holds no read open.
 function turnView({ messageId, resumeRequest = null, start }) {
   // A retried turn reports the outcome of the turn its id already ran.
   let repeated = false;
@@ -1863,9 +1865,17 @@ function turnView({ messageId, resumeRequest = null, start }) {
     } else settle.resolve(repeated ? { ...value, repeated: true } : value);
     wake();
   };
-  void (async () => {
+  const started = start();
+  void started.catch(() => {});
+  let following = false;
+  const follow = () => {
+    if (following) return;
+    following = true;
+    void read();
+  };
+  const read = async () => {
     try {
-      const { log, from, settled, attaching, endWithinMs, unsure } = await start();
+      const { log, from, settled, attaching, endWithinMs, unsure } = await started;
       // A turn whose end this view finds after its own start may be the
       // message's first run, so only an end found before it is a repeat.
       repeated = settled?.repeated === true || (endWithinMs !== undefined && !unsure);
@@ -1926,7 +1936,7 @@ function turnView({ messageId, resumeRequest = null, start }) {
     } catch (error) {
       finish(null, error);
     }
-  })();
+  };
   async function* iterate(raw) {
     for (let index = 0; ; index += 1) {
       while (index >= events.length) {
@@ -1946,11 +1956,18 @@ function turnView({ messageId, resumeRequest = null, start }) {
   }
   return {
     get messageId() { return id; },
-    result,
+    get result() {
+      follow();
+      return result;
+    },
     // Dropping a turn cancels nothing; `session.cancel()` does.
-    [Symbol.asyncIterator]() { return iterate(false); },
+    [Symbol.asyncIterator]() {
+      follow();
+      return iterate(false);
+    },
     // Each line is one event with the cursor `stream()` resumes after it.
     get readable() {
+      follow();
       const iterator = iterate(true);
       return new ReadableStream({
         async pull(controller) {

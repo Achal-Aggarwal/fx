@@ -638,7 +638,7 @@ export interface FxIdleResult {
 /** A turn event as a durable session delivers it, with the lease epoch of the worker that wrote it. */
 export type FxSessionTurnEvent = FxTurnEvent & { epoch?: number };
 
-/** A view of one durable turn. Dropping it cancels nothing; call `session.cancel()` to stop the turn. */
+/** A view of one durable turn. It reads the session stream only once its events, `readable` or `result` are used. Dropping it cancels nothing; call `session.cancel()` to stop the turn. */
 export interface FxTurnView<Result> {
   /** Resolves once the prompt is stored, or at once for a prompt whose signal had already aborted. Rejects when it cannot be stored, as when its `Blob` or `File` cannot be read. */
   readonly accepted: Promise<FxAccepted>;
