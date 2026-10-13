@@ -118,7 +118,10 @@ done
 # OpenExact: an open that drops an image the store lost runs on a history
 # that is not the one saved. RetryLands breaks NoDanglingRef: a retry stores
 # nothing, so a log that kept its input would name an image never stored.
-for pair in SendBeforeStore:NoDanglingRef NameUnstored:NoDanglingRef DropMissing:OpenExact RetryLands:NoDanglingRef; do
+# KeepAll breaks WindowHeld: a core that keeps every image outgrows the
+# window an open can stage. NeedAll breaks FailsOnlyOnLossInWindow: an open
+# that stages every named image fails on one the window had dropped.
+for pair in SendBeforeStore:NoDanglingRef NameUnstored:NoDanglingRef DropMissing:OpenExact RetryLands:NoDanglingRef KeepAll:WindowHeld NeedAll:FailsOnlyOnLossInWindow; do
     witness="${pair%%:*}" invariant="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -workers auto -cleanup -metadir "$work/images-$witness" \
         -config "ImageStore-$witness.cfg" ImageStore.tla 2>&1 | grep -q -F "Invariant $invariant is violated"; then

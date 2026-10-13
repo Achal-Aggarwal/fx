@@ -220,6 +220,9 @@ export function normalizeAgentOptions(value) {
 // public surface.
 export const engineInternals = Symbol.for("libfx.engineInternals");
 export const journalMarksWanted = Symbol.for("libfx.journalMarks");
+// `{ images, bytes }`: a smaller image window than the core's, the newest
+// images a session with an image store keeps, so tests can reach its edge.
+const imageWindowLimits = Symbol.for("libfx.imageWindow");
 // Marks an error the core answered a request with, as opposed to one from a
 // core that stopped answering.
 export const coreAnswered = Symbol.for("libfx.coreAnswered");
@@ -2865,6 +2868,7 @@ export async function createFxEngine(options = {}) {
           sessionId,
           ...(options.inputsDurable === true ? { inputsDurable: true } : {}),
           ...(imageStore ? { imageStore: true } : {}),
+          ...(imageStore && options[imageWindowLimits] ? { imageWindow: options[imageWindowLimits] } : {}),
         };
         // One call: attaching again would drop the first attachment.
         const attachments = [];

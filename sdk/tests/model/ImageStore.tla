@@ -22,6 +22,14 @@
 (* retry's input lands too, naming an image the store may never have got   *)
 (* (ImageStore-RetryLands.cfg).                                            *)
 (*                                                                         *)
+(* The session keeps only its newest Window images. When a turn starts,    *)
+(* the core drops each image older than the window: it keeps the name and  *)
+(* gives up the bytes, and a checkpoint saves it by name alone. An open    *)
+(* stages only the named images inside the window. With LiveWindow = FALSE *)
+(* the core keeps every image (ImageStore-KeepAll.cfg); with WindowAtOpen  *)
+(* = FALSE an open stages every named image, so one the store lost outside *)
+(* the window fails it (ImageStore-NeedAll.cfg).                           *)
+(*                                                                         *)
 (* The core may crash, losing what it held and the image writes in flight. *)
 (* It opens again in two phases: it names the images it needs, the host    *)
 (* stages each from its store, then the core opens. An image the store     *)
@@ -45,12 +53,16 @@ CONSTANTS
     MarkOnlyStored, \* whether the core names only images it knows are stored
     FailOnMissing,  \* whether an open that misses an image fails
     MaxRetries,     \* bound on retries of prompts the log holds
-    DropRepeats     \* whether the log drops a retried prompt's input
+    DropRepeats,    \* whether the log drops a retried prompt's input
+    Window,         \* the newest images the session keeps
+    LiveWindow,     \* whether the core drops images older than the window
+    WindowAtOpen    \* whether an open stages only the window's images
 
 ASSUME N \in Nat /\ MaxFaults \in Nat /\ MaxCrashes \in Nat /\ MaxLoss \in Nat
 ASSUME Old \in BOOLEAN /\ Durable \in BOOLEAN /\ StoreFirst \in BOOLEAN
 ASSUME MarkOnlyStored \in BOOLEAN /\ FailOnMissing \in BOOLEAN
 ASSUME MaxRetries \in Nat /\ DropRepeats \in BOOLEAN
+ASSUME Window \in Nat \ {0} /\ LiveWindow \in BOOLEAN /\ WindowAtOpen \in BOOLEAN
 ASSUME "o" \notin Imgs
 
 Prompts == 1..N
@@ -67,9 +79,9 @@ VARIABLES
     putting,   \* the prompts whose image write is in flight
     store,     \* the images the host's store holds
     lostImgs,  \* the images the store lost
-    saved,     \* the saved history: each turn's image, named or inline
+    saved,     \* the saved history: each turn's image, named, inline or dropped
     inputs,    \* with Durable: the prompts the log holds, in the order they landed
-    mem,       \* the core's history while it runs: each image, and whether it is known stored
+    mem,       \* the core's history while it runs: each image, whether it is known stored, and whether it was dropped
     up,        \* the core: open, down, opening, or failed to open
     staged,    \* the images staged for the open in progress
     dirty,     \* whether records landed since the last checkpoint
@@ -88,9 +100,9 @@ TypeOK ==
     /\ putting \subseteq Prompts
     /\ store \subseteq AllImgs
     /\ lostImgs \subseteq AllImgs
-    /\ saved \in Seq([i : AllImgs, ref : BOOLEAN])
+    /\ saved \in Seq([i : AllImgs, ref : BOOLEAN, dropped : BOOLEAN])
     /\ inputs \in Seq(Prompts)
-    /\ mem \in Seq([i : AllImgs, stored : BOOLEAN])
+    /\ mem \in Seq([i : AllImgs, stored : BOOLEAN, dropped : BOOLEAN])
     /\ up \in CoreStates
     /\ staged \subseteq AllImgs
     /\ dirty \in BOOLEAN
@@ -106,7 +118,7 @@ Init ==
     /\ putting = {}
     /\ store = {}
     /\ lostImgs = {}
-    /\ saved = IF Old THEN << [i |-> OldImg, ref |-> FALSE] >> ELSE << >>
+    /\ saved = IF Old THEN << [i |-> OldImg, ref |-> FALSE, dropped |-> FALSE] >> ELSE << >>
     /\ inputs = << >>
     /\ mem = << >>
     /\ up = "down"
@@ -120,6 +132,15 @@ Init ==
 
 \* The images the saved history names.
 Named == {saved[k].i : k \in {j \in 1..Len(saved) : saved[j].ref}}
+\* Whether image k of a history of n is one of the newest Window.
+InWindow(k, n) == k + Window > n
+\* The named images an open stages: those inside the window.
+Needed == {saved[k].i : k \in {j \in 1..Len(saved) : saved[j].ref /\ (InWindow(j, Len(saved)) \/ ~WindowAtOpen)}}
+\* A core history whose images older than the window are dropped: each
+\* keeps its name, and the core no longer counts it as stored.
+Windowed(s) ==
+    IF ~LiveWindow THEN s
+    ELSE [k \in 1..Len(s) |-> IF InWindow(k, Len(s)) THEN s[k] ELSE [i |-> s[k].i, stored |-> FALSE, dropped |-> TRUE]]
 Images(s) == [k \in 1..Len(s) |-> s[k].i]
 Running == \E p \in Prompts : ph[p] \in {"sent", "started"}
 Queued(p) == \E k \in 1..Len(inputs) : inputs[k] = p
@@ -199,12 +220,13 @@ Take(p) ==
     /\ act' = << "Take", p >>
     /\ UNCHANGED <<made, img, putting, store, lostImgs, saved, inputs, mem, up, staged, dirty, faults, crashes, retries, repeats>>
 
-\* The turn's first record lands, naming the image the host stored.
+\* The turn's first record lands, naming the image the host stored. The
+\* new image is the newest; the core drops any older than the window.
 TurnStart(p) ==
     /\ ph[p] = "sent"
     /\ up = "open"
-    /\ mem' = Append(mem, [i |-> img[p], stored |-> TRUE])
-    /\ saved' = Append(saved, [i |-> img[p], ref |-> TRUE])
+    /\ mem' = Windowed(Append(mem, [i |-> img[p], stored |-> TRUE, dropped |-> FALSE]))
+    /\ saved' = Append(saved, [i |-> img[p], ref |-> TRUE, dropped |-> FALSE])
     /\ dirty' = TRUE
     /\ ph' = Set(ph, p, "started")
     /\ act' = << "TurnStart", p >>
@@ -219,12 +241,16 @@ TurnEnd(p) ==
     /\ act' = << "TurnEnd", p >>
     /\ UNCHANGED <<made, img, putting, store, lostImgs, saved, inputs, mem, up, staged, faults, crashes, retries, repeats>>
 
-\* A checkpoint between turns writes the history again from the core.
+\* A checkpoint between turns writes the history again from the core. A
+\* dropped image is saved by its name alone, neither named nor inline.
 Checkpoint ==
     /\ up = "open"
     /\ dirty
     /\ ~Running
-    /\ saved' = [k \in 1..Len(mem) |-> [i |-> mem[k].i, ref |-> mem[k].stored \/ ~MarkOnlyStored]]
+    /\ saved' = [k \in 1..Len(mem) |->
+                   [i |-> mem[k].i,
+                    ref |-> ~mem[k].dropped /\ (mem[k].stored \/ ~MarkOnlyStored),
+                    dropped |-> mem[k].dropped]]
     /\ dirty' = FALSE
     /\ act' = << "Checkpoint" >>
     /\ UNCHANGED <<made, img, ph, putting, store, lostImgs, inputs, mem, up, staged, faults, crashes, retries, repeats>>
@@ -256,33 +282,37 @@ OpenBegin ==
     /\ act' = << "OpenBegin" >>
     /\ UNCHANGED <<made, img, ph, putting, store, lostImgs, saved, inputs, mem, dirty, faults, crashes, retries, repeats>>
 
-\* The host stages one named image from its store.
+\* The host stages one image the open needs from its store.
 Stage(i) ==
     /\ up = "opening"
-    /\ i \in Named \ staged
+    /\ i \in Needed \ staged
     /\ i \in store
     /\ staged' = staged \cup {i}
     /\ act' = << "Stage", i >>
     /\ UNCHANGED <<made, img, ph, putting, store, lostImgs, saved, inputs, mem, up, dirty, faults, crashes, retries, repeats>>
 
-\* A named image the store does not hold fails the open.
+\* An image the open needs that the store does not hold fails the open.
 OpenMissing ==
     /\ up = "opening"
     /\ FailOnMissing
-    /\ \E i \in Named \ staged : i \notin store
+    /\ \E i \in Needed \ staged : i \notin store
     /\ up' = "failed"
     /\ act' = << "OpenMissing" >>
     /\ UNCHANGED <<made, img, ph, putting, store, lostImgs, saved, inputs, mem, staged, dirty, faults, crashes, retries, repeats>>
 
-\* Opening, second phase: every named image is staged, and the core holds
-\* the saved history again. With FailOnMissing = FALSE an image the store
-\* lost is dropped.
+\* Opening, second phase: every image the open needs is staged, and the
+\* core holds the saved history again; a named image outside the window
+\* stays dropped, unread. With FailOnMissing = FALSE an image the store lost
+\* is left out.
 OpenOk ==
     /\ up = "opening"
-    /\ \/ Named \subseteq staged
-       \/ ~FailOnMissing /\ \A i \in Named \ staged : i \notin store
-    /\ LET kept == SelectSeq(saved, LAMBDA e : ~e.ref \/ e.i \in staged)
-       IN mem' = [k \in 1..Len(kept) |-> [i |-> kept[k].i, stored |-> kept[k].ref]]
+    /\ \/ Needed \subseteq staged
+       \/ ~FailOnMissing /\ \A i \in Needed \ staged : i \notin store
+    /\ LET marked == [k \in 1..Len(saved) |->
+                        [saved[k] EXCEPT !.dropped = @ \/ (saved[k].ref /\ saved[k].i \notin staged /\ ~InWindow(k, Len(saved)))]]
+           kept == SelectSeq(marked, LAMBDA e : e.dropped \/ ~e.ref \/ e.i \in staged)
+       IN mem' = Windowed([k \in 1..Len(kept) |->
+                             [i |-> kept[k].i, stored |-> kept[k].ref /\ ~kept[k].dropped, dropped |-> kept[k].dropped]])
     /\ up' = "open"
     /\ staged' = {}
     /\ act' = << "OpenOk" >>
@@ -367,7 +397,7 @@ NoDanglingRef ==
         /\ repeats \subseteq store
 
 \* Only the image an older libfx saved inline is ever saved inline.
-OneCopy == \A k \in 1..Len(saved) : ~saved[k].ref => saved[k].i = OldImg
+OneCopy == \A k \in 1..Len(saved) : ~saved[k].ref /\ ~saved[k].dropped => saved[k].i = OldImg
 
 \* An open core holds exactly the saved history's images, in order.
 OpenExact == up = "open" => Images(mem) = Images(saved)
@@ -378,5 +408,14 @@ KnownStoredIsStored ==
 
 \* An open fails only when the store lost an image.
 FailsOnlyOnLoss == up = "failed" => lostImgs # {}
+
+\* An open fails only when the store lost an image the window keeps.
+FailsOnlyOnLossInWindow ==
+    up = "failed" =>
+        \E k \in 1..Len(saved) : saved[k].ref /\ InWindow(k, Len(saved)) /\ saved[k].i \in lostImgs
+
+\* An open core keeps exactly its newest Window images: each older one is
+\* dropped, keeping its name.
+WindowHeld == up = "open" => \A k \in 1..Len(mem) : mem[k].dropped = ~InWindow(k, Len(mem))
 
 =============================================================================

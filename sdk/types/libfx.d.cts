@@ -387,7 +387,10 @@ export interface Persistence {
    * must succeed. With `getImage`, records and checkpoints name images instead of holding them.
    */
   putImage?(name: string, bytes: Uint8Array): Promise<void>;
-  /** The bytes stored under `name`, or `undefined` when the store does not hold it. */
+  /**
+   * The bytes stored under `name`, or `undefined` when the store does not hold it. An open asks
+   * only for the images the session keeps, its newest 4,096 or 512 MiB.
+   */
   getImage?(name: string): Promise<FxBytes | undefined>;
   /** Set to receive each record's `marks`, for a store that tracks turns and accepted inputs without reading records. */
   marks?: boolean;

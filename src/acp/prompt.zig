@@ -869,7 +869,12 @@ pub fn handlePrompt(
             // checkpoint, so no filesystem snapshot backend is needed.
             prompt_input.captureImagesInline(alloc) catch |err|
                 return promptInputFailure(err);
-            if (session.journal) |*journal| try prompt_input.noteStoredImages(state.alloc, journal);
+            if (session.journal) |*journal| {
+                try prompt_input.noteStoredImages(state.alloc, journal);
+                // The prompt's images are the newest; older ones past the
+                // session's window give up their bytes.
+                try journal.dropOutsideWindow(alloc, state.alloc, state.alloc, session.session_rt.agent.history.items, prompt_input.images);
+            }
         } else {
             if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
             var temporary_snapshot_dir: ?[]u8 = null;

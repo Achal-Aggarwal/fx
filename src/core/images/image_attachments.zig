@@ -848,6 +848,37 @@ pub fn attachmentEncodedBytes(attachment: types.ImageAttachment) ?usize {
     return image_data.encodedImageBytes(size);
 }
 
+/// Leaves the images the session dropped out of a request, each with a note
+/// in its place, so no later projection or provider sees an image without
+/// bytes. Returns `messages` itself when none were dropped, otherwise a copy
+/// allocated in `arena`. History is not modified.
+pub fn withholdDroppedImages(arena: std.mem.Allocator, messages: []const types.ChatMessage) ![]const types.ChatMessage {
+    var result: ?[]types.ChatMessage = null;
+    for (messages, 0..) |message, index| {
+        var dropped: usize = 0;
+        for (message.images) |image| {
+            if (image.droppedFromSession()) dropped += 1;
+        }
+        if (dropped == 0) continue;
+        const projected = result orelse try arena.dupe(types.ChatMessage, messages);
+        result = projected;
+        const kept = try arena.alloc(types.ImageAttachment, message.images.len - dropped);
+        var notice: std.Io.Writer.Allocating = .init(arena);
+        var next: usize = 0;
+        for (message.images) |image| {
+            if (image.droppedFromSession()) {
+                notice.writer.print("[Image #{d} is no longer in this session, which keeps only its newest images.]\n", .{image.id}) catch return error.OutOfMemory;
+            } else {
+                kept[next] = image;
+                next += 1;
+            }
+        }
+        projected[index].images = kept;
+        projected[index].content = try std.mem.concat(arena, u8, &.{ notice.written(), message.content orelse "" });
+    }
+    return result orelse messages;
+}
+
 fn writeWithheldAttachmentNotice(
     writer: *std.Io.Writer,
     attachment: types.ImageAttachment,
@@ -3056,6 +3087,28 @@ test "capture keeps a byte-oversized original for request recovery" {
     try std.testing.expectEqualStrings("image/jpeg", attachment.media_type);
     try std.testing.expectEqualSlices(u8, source, verified.bytes);
     try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
+}
+
+test "requests leave out images the session dropped, each with a note" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const digest = text_utils.repeat("a", 64);
+    const images = [_]types.ImageAttachment{
+        .{ .id = 1, .path = @constCast("inline://image-1"), .media_type = @constCast("image/png"), .snapshot_sha256 = @constCast(digest) },
+        .{ .id = 2, .path = @constCast("inline://image-2"), .media_type = @constCast("image/png"), .snapshot_sha256 = @constCast(digest), .inline_data = @constCast("png") },
+    };
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = "[Image #1] [Image #2]", .images = &images },
+        .{ .role = .assistant, .content = "ok" },
+    };
+    const projected = try withholdDroppedImages(arena, &messages);
+    try std.testing.expectEqual(@as(usize, 1), projected[0].images.len);
+    try std.testing.expectEqual(@as(usize, 2), projected[0].images[0].id);
+    try std.testing.expectEqualStrings("[Image #1 is no longer in this session, which keeps only its newest images.]\n[Image #1] [Image #2]", projected[0].content.?);
+    // A request without dropped images passes through untouched.
+    const kept = [_]types.ChatMessage{.{ .role = .user, .content = "[Image #2]", .images = images[1..] }};
+    try std.testing.expect((try withholdDroppedImages(arena, &kept)).ptr == (&kept).ptr);
 }
 
 test "requests leave out attachments over the model pixel limit and name their saved file" {

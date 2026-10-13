@@ -384,7 +384,7 @@ agent.session().prompt([
 ]);
 ```
 
-Image data can be a base64 string, bytes, a `Blob` or a `File`. A session saves each image once, named by its SHA-256, before it stores the prompt, and the saved conversation refers to it by that name, so images don't count toward the 4 MiB the session's own checkpoints hold. A checkpoint you take with `checkpoint()` carries the images' bytes, within its 4 MiB. libfx never deletes a saved image; it lasts as long as the session's storage. Each prompt takes up to 8 PNG, JPEG, GIF or WebP images, at most 3.75 MiB each and 6 MiB together. Pass `resizeImage` to downscale or convert prompt images before they're sent.
+Image data can be a base64 string, bytes, a `Blob` or a `File`. A session saves each image once, named by its SHA-256, before it stores the prompt, and the saved conversation refers to it by that name, so images don't count toward the 4 MiB the session's own checkpoints hold. A session keeps its newest 4,096 images, up to 512 MiB of them; an older image leaves the conversation, and the model sees a note in its place. A checkpoint you take with `checkpoint()` carries the images' bytes, within its 4 MiB. libfx never deletes a saved image; it lasts as long as the session's storage. Each prompt takes up to 8 PNG, JPEG, GIF or WebP images, at most 3.75 MiB each and 6 MiB together. Pass `resizeImage` to downscale or convert prompt images before they're sent.
 
 ## Diagnostics
 
@@ -446,7 +446,7 @@ The engine sends one `append()` at a time, and everything that happens while one
 
 A journal or `checkpoint` from a newer libfx fails with `FxJournalVersionError`. `createMemoryPersistence()` is a reference store for tests.
 
-Add `putImage()` and `getImage()` together, and the store keeps each prompt image once, under the lowercase hex SHA-256 of its bytes. Records and checkpoints then hold only that name, so images don't count toward the 4 MiB a checkpoint or a journal load holds. `putImage()` runs before any record names the image, and may run again for a name the store already holds. A prompt whose image can't be stored is rejected with `FX_IMAGE_STORE_FAILED` before anything is recorded. `getImage()` returns `undefined` for a name it doesn't hold, and the engine then fails to open with `FX_JOURNAL_IMAGE_MISSING`, as it does for bytes that don't match their name. Without these methods, images stay inline as before.
+Add `putImage()` and `getImage()` together, and the store keeps each prompt image once, under the lowercase hex SHA-256 of its bytes. Records and checkpoints then hold only that name, so images don't count toward the 4 MiB a checkpoint or a journal load holds. `putImage()` runs before any record names the image, and may run again for a name the store already holds. A prompt whose image can't be stored is rejected with `FX_IMAGE_STORE_FAILED` before anything is recorded. `getImage()` returns `undefined` for a name it doesn't hold, and the engine then fails to open with `FX_JOURNAL_IMAGE_MISSING`, as it does for bytes that don't match their name. An open reads only the images the session still keeps, its newest 4,096 or 512 MiB, so an older image the store lost doesn't fail it. Without these methods, images stay inline as before.
 
 ## Runtimes
 

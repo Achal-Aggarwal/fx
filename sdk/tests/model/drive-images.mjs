@@ -42,6 +42,9 @@ const addon = resolve(here, "../../../zig-out/lib/libfx.node");
 const wasm = backend === "wasm" ? await readFile(resolve(here, "../../../zig-out/bin/fx-core.wasm")) : undefined;
 const quietMs = 150;
 const stepTimeoutMs = 10_000;
+// The model's window, which every engine the walk opens keeps too.
+const windowImages = Number(/^\s*Window = (\d+)$/m.exec(await readFile(resolve(here, "ImageStore-drive.cfg"), "utf8"))[1]);
+const imageWindow = Symbol.for("libfx.imageWindow");
 const decoder = new TextDecoder();
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 const deferred = () => {
@@ -185,6 +188,7 @@ async function harness(n) {
     fetch: fetchFor(current),
     persistence,
     checkpointAfterBytes: 0,
+    [imageWindow]: { images: windowImages },
   });
 
   // The session an older libfx saved: its image inline, in a record and in a
@@ -326,7 +330,8 @@ const view = (state) => JSON.stringify({
   ph: state.ph,
   up: state.up,
   store: [...state.store].sort(),
-  held: state.up === "open" && state.ph.includes("started") ? state.mem.map((entry) => entry.i) : null,
+  // A model request carries the images the core keeps; a dropped one is a note.
+  held: state.up === "open" && state.ph.includes("started") ? state.mem.filter((entry) => !entry.dropped).map((entry) => entry.i) : null,
 });
 const { steps, covered, totalEdges } = await walkGraph({
   graph,

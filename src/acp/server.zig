@@ -1953,6 +1953,10 @@ fn handleKernelJournalOpen(
             .message = "Invalid libfx journal params",
         }),
     } else false;
+    const window = imageWindowParam(parsed.value.object.get("imageWindow")) orelse return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid libfx journal params",
+    });
     var images: session_codec.ImageResolver = .{ .alloc = alloc, .staged = &active.staged_images };
     defer images.deinit();
     const journal, const opened = libfx_journal.open(
@@ -1965,6 +1969,7 @@ fn handleKernelJournalOpen(
         inputs_durable,
         &images,
         image_store,
+        window,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         // The host stages them from its store, then opens again.
@@ -2061,9 +2066,36 @@ fn writeImagesNeeded(state: *ServerState, alloc: Allocator, id: ?jsonrpc.Request
     try state.writer.writeResponse(alloc, id, response.written());
 }
 
-/// The most images, and image bytes, a host may stage for one open.
-const max_staged_images: usize = 4096;
-const max_staged_image_bytes: usize = 512 * 1024 * 1024;
+/// The most images, and image bytes, a host may stage for one open: those of
+/// the largest image window, the newest images a session keeps.
+const max_staged_images = (session_codec.ImageWindow{}).max_images;
+const max_staged_image_bytes = (session_codec.ImageWindow{}).max_bytes;
+
+/// The image window an open asks for, `{images, bytes}`, each at most the
+/// default: a host may keep fewer images, never more than an open stages.
+/// Null when the value is not one.
+fn imageWindowParam(value: ?std.json.Value) ?session_codec.ImageWindow {
+    const defaults: session_codec.ImageWindow = .{};
+    const object = switch (value orelse return defaults) {
+        .object => |object| object,
+        else => return null,
+    };
+    var window = defaults;
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        const limit = switch (entry.value_ptr.*) {
+            .integer => |integer| std.math.cast(usize, integer) orelse return null,
+            else => return null,
+        };
+        if (limit == 0) return null;
+        if (std.mem.eql(u8, entry.key_ptr.*, "images")) {
+            window.max_images = @min(limit, defaults.max_images);
+        } else if (std.mem.eql(u8, entry.key_ptr.*, "bytes")) {
+            window.max_bytes = @min(limit, defaults.max_bytes);
+        } else return null;
+    }
+    return window;
+}
 
 /// Stages images from the host's store for the journal the session opens
 /// next. `images` is `[{name, attachment}]`; each attachment holds the bytes

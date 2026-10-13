@@ -621,9 +621,10 @@ pub const StoredImages = struct {
         return self.names.contains(name);
     }
 
-    /// Whether writing `user` names any image instead of writing its bytes.
+    /// Whether writing `user` names any image instead of writing its bytes:
+    /// one the store holds, or one the session dropped.
     pub fn namesAny(self: *const StoredImages, user: session.UserTurn) bool {
-        for (user.images) |image| if (self.holds(image)) return true;
+        for (user.images) |image| if (self.holds(image) or image.droppedFromSession()) return true;
         return false;
     }
 
@@ -633,6 +634,44 @@ pub const StoredImages = struct {
             .interrupted => |entry| self.namesAny(entry.user),
             .compacted_summary => false,
         };
+    }
+};
+
+/// Whether `turn` holds an image the session dropped, which only a format
+/// that names images can write.
+pub fn dropsAnyInTurn(turn: session.HistoryTurn) bool {
+    const user = switch (turn) {
+        .assistant => |entry| entry.user,
+        .interrupted => |entry| entry.user,
+        .compacted_summary => return false,
+    };
+    for (user.images) |image| if (image.droppedFromSession()) return true;
+    return false;
+}
+
+/// The images a libfx session with an image store keeps: its newest, at most
+/// `max_images` of them holding at most `max_bytes`, which is the most one
+/// open stages from the host's store. Older images leave the session and keep
+/// only their names, so a session never grows past what it can reopen.
+pub const ImageWindow = struct {
+    max_images: usize = 4096,
+    max_bytes: usize = 512 * 1024 * 1024,
+
+    /// How many of the oldest images leave the window. `sizes` holds each
+    /// image's bytes, oldest first, or null for one that already left, which
+    /// keeps it and every older one out. Once an image does not fit, it and
+    /// every older one leave.
+    pub fn oldestOutside(self: ImageWindow, sizes: []const ?usize) usize {
+        var kept: usize = 0;
+        var bytes: usize = 0;
+        var start = sizes.len;
+        while (start > 0) : (start -= 1) {
+            const size = sizes[start - 1] orelse break;
+            if (kept == self.max_images or size > self.max_bytes - bytes) break;
+            kept += 1;
+            bytes += size;
+        }
+        return start;
     }
 };
 
@@ -678,13 +717,14 @@ pub const StagedImages = struct {
 };
 
 /// Resolves `inline_ref` names to staged bytes while a libfx journal or
-/// checkpoint is read. A name it cannot resolve is recorded in `missing` and
-/// parses as an image without bytes, so one read names every image an open
-/// needs; a caller that finds any missing discards what it read.
+/// checkpoint is read. A name it cannot resolve is recorded in `missing` with
+/// the size its record gives, and parses as an image without bytes, so one
+/// read names every image an open needs; a caller that needs any of them
+/// discards what it read.
 pub const ImageResolver = struct {
     alloc: Allocator,
     staged: *const StagedImages,
-    missing: std.array_hash_map.Auto(ImageName, void) = .empty,
+    missing: std.array_hash_map.Auto(ImageName, usize) = .empty,
     /// The names it resolved, which the store therefore holds.
     resolved: std.array_hash_map.Auto(ImageName, void) = .empty,
 
@@ -695,10 +735,10 @@ pub const ImageResolver = struct {
     }
 
     /// A copy of the bytes named `name`, owned by `alloc`, or null when none
-    /// were staged.
-    fn resolve(self: *ImageResolver, alloc: Allocator, name: ImageName) Allocator.Error!?[]u8 {
+    /// were staged. `size` is the image's size as its record gives it.
+    fn resolve(self: *ImageResolver, alloc: Allocator, name: ImageName, size: usize) Allocator.Error!?[]u8 {
         const bytes = self.staged.images.get(name) orelse {
-            try self.missing.put(self.alloc, name, {});
+            try self.missing.put(self.alloc, name, size);
             return null;
         };
         try self.resolved.put(self.alloc, name, {});
@@ -1774,11 +1814,13 @@ fn writeUserTurn(writer: *std.Io.Writer, user: session.UserTurn, image_blobs: an
         try writeOptionalDurableBytes(writer, image.snapshot_sha256);
         // Inline image bytes appear only for sessions without a filesystem
         // snapshot backend, so durable sessions keep their exact format. An
-        // image the host stored is named instead; its name is the digest.
+        // image the host stored is named instead; its name is the digest,
+        // and its size lets an open choose the images it keeps unread.
         if (image.inline_data) |inline_data| {
             if (Mode == ImageNames and image_blobs.stored.holds(image)) {
                 try writer.writeAll(",\"inline_ref\":");
                 try writeJsonString(writer, image.snapshot_sha256.?);
+                try writer.print(",\"inline_size\":{d}", .{inline_data.len});
             } else if (blobs) |collected| {
                 try writer.print(",\"inline_blob\":{d}", .{collected.items.items.len});
                 try collected.items.append(collected.alloc, inline_data);
@@ -1786,6 +1828,9 @@ fn writeUserTurn(writer: *std.Io.Writer, user: session.UserTurn, image_blobs: an
                 try writer.writeAll(",\"inline_data\":");
                 try writeDurableBytes(writer, inline_data);
             }
+        } else if (image.droppedFromSession()) {
+            // An image the session dropped keeps only its digest.
+            try writer.writeAll(",\"dropped\":true");
         }
         if (image.source_ref) |source_ref| {
             if (!image_data.validSourceRef(source_ref)) return error.InvalidSessionFormat;
@@ -2360,7 +2405,15 @@ fn parseUserTurn(alloc: Allocator, value: std.json.Value, sources: ImageSources)
             break :source try alloc.dupe(u8, source_bytes);
         } else null;
         errdefer if (source_ref) |source_bytes| alloc.free(source_bytes);
-        if (inline_image.name) |name| {
+        const dropped = if (image.get("dropped")) |dropped_value| switch (dropped_value) {
+            .bool => |flag| if (flag) true else return error.InvalidSessionFormat,
+            else => return error.InvalidSessionFormat,
+        } else false;
+        if (dropped) {
+            // An image the session dropped keeps only the digest naming it.
+            if (inline_image.name != null or inline_data != null or snapshot_path != null) return error.InvalidSessionFormat;
+            _ = imageName(snapshot_sha256 orelse return error.InvalidSessionFormat) orelse return error.InvalidSessionFormat;
+        } else if (inline_image.name) |name| {
             // A named image is the host's stored copy of exactly the bytes
             // its digest names; with none staged, `sources` records it.
             if (snapshot_path != null) return error.InvalidSessionFormat;
@@ -2408,8 +2461,16 @@ fn parseInlineImageBytes(
             return error.InvalidSessionFormat;
         }
         const name = imageName(ref_value.string) orelse return error.InvalidSessionFormat;
-        return .{ .bytes = try resolver.resolve(alloc, name), .name = name };
+        const size = try requireUsize(image, "inline_size");
+        if (size == 0 or size > image_attachments.max_image_bytes) return error.InvalidSessionFormat;
+        const bytes = try resolver.resolve(alloc, name, size);
+        if (bytes) |staged| if (staged.len != size) {
+            alloc.free(staged);
+            return error.InvalidSessionFormat;
+        };
+        return .{ .bytes = bytes, .name = name };
     }
+    if (image.get("inline_size") != null) return error.InvalidSessionFormat;
     const blob_value = image.get("inline_blob") orelse
         return .{ .bytes = try parseOptionalDurableBytes(alloc, image.get("inline_data") orelse .null) };
     const blobs = sources.blobs orelse return error.InvalidSessionFormat;
@@ -2436,6 +2497,8 @@ fn imageAttachmentObject(value: std.json.Value) !std.json.ObjectMap {
             std.mem.eql(u8, entry.key_ptr.*, "inline_data") or
             std.mem.eql(u8, entry.key_ptr.*, "inline_blob") or
             std.mem.eql(u8, entry.key_ptr.*, "inline_ref") or
+            std.mem.eql(u8, entry.key_ptr.*, "inline_size") or
+            std.mem.eql(u8, entry.key_ptr.*, "dropped") or
             std.mem.eql(u8, entry.key_ptr.*, "source_ref"))
         {
             continue;
@@ -5349,6 +5412,42 @@ test "inline image bytes round trip through the history turn codec" {
         try std.testing.expect(decoded.assistant.user.images[0].inline_data.?.ptr != images[0].inline_data.?.ptr);
         try std.testing.expect(decoded.assistant.user.images[0].source_ref.?.ptr != images[0].source_ref.?.ptr);
         try std.testing.expect(reader.consumedAll());
+    }
+}
+
+test "the image window keeps the newest images that fit, and drops every older one" {
+    const window: ImageWindow = .{ .max_images = 3, .max_bytes = 100 };
+    try std.testing.expectEqual(@as(usize, 0), window.oldestOutside(&.{}));
+    try std.testing.expectEqual(@as(usize, 0), window.oldestOutside(&.{ 10, 20, 30 }));
+    // Three images at most: the oldest of four leaves.
+    try std.testing.expectEqual(@as(usize, 1), window.oldestOutside(&.{ 10, 20, 30, 40 }));
+    // 100 bytes at most: 60 does not fit beside 40 and 30, so it and the
+    // 5 before it leave, though 5 alone would fit.
+    try std.testing.expectEqual(@as(usize, 2), window.oldestOutside(&.{ 5, 60, 30, 40 }));
+    // An image already dropped keeps every older one out.
+    try std.testing.expectEqual(@as(usize, 2), window.oldestOutside(&.{ 10, null, 30, 40 }));
+    // An image larger than the whole window leaves too.
+    try std.testing.expectEqual(@as(usize, 1), window.oldestOutside(&.{101}));
+}
+
+test "a dropped image parses only as a name without bytes" {
+    const alloc = std.testing.allocator;
+    const digest = "\"" ++ text_utils.repeat("a", image_name_len) ++ "\"";
+    const prefix = "{\"text\":\"[Image #1]\",\"images\":[{\"id\":1,\"path\":\"inline://image-1\",\"media_type\":\"image/png\",\"snapshot_path\":null,\"snapshot_sha256\":";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, prefix ++ digest ++ ",\"dropped\":true}]}", .{});
+    defer parsed.deinit();
+    const user = try parseUserTurn(alloc, parsed.value, .{});
+    defer types.freeUserTurn(alloc, user);
+    try std.testing.expect(user.images[0].droppedFromSession());
+    for ([_][]const u8{
+        prefix ++ digest ++ ",\"dropped\":false}]}",
+        prefix ++ "\"not-a-digest\",\"dropped\":true}]}",
+        prefix ++ "null,\"dropped\":true}]}",
+        prefix ++ digest ++ ",\"dropped\":true,\"inline_data\":\"iVBORw0KGgo=\"}]}",
+    }) |json| {
+        var invalid = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.InvalidSessionFormat, parseUserTurn(alloc, invalid.value, .{}));
     }
 }
 

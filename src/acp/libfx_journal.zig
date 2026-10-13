@@ -100,6 +100,9 @@ pub const Journal = struct {
     /// The host keeps an image store: events and snapshots name the images
     /// in `stored_images` instead of holding their bytes.
     image_store: bool = false,
+    /// The newest images the session keeps when the host keeps a store;
+    /// older ones keep only their names (`dropOutsideWindow`).
+    image_window: session_codec.ImageWindow = .{},
     /// The images the host's store holds: those it said it stored before it
     /// sent their prompt, and those an open resolved from it. Owned by the
     /// session's allocator.
@@ -368,6 +371,39 @@ pub const Journal = struct {
         try self.stored_images.add(alloc, name);
     }
 
+    /// Keeps the session within its image window when the host keeps a
+    /// store: each image older than the window loses its bytes and keeps its
+    /// name, in `history` (owned by `history_alloc`) and in the pending
+    /// resume (owned by `session_alloc`). `newest`, a prompt's images, are
+    /// newer than both; they count toward the window but stay.
+    pub fn dropOutsideWindow(
+        self: *Journal,
+        alloc: Allocator,
+        history_alloc: Allocator,
+        session_alloc: Allocator,
+        history: []types.HistoryTurn,
+        newest: []const types.ImageAttachment,
+    ) Allocator.Error!void {
+        if (!self.image_store) return;
+        var held: std.ArrayList(*types.ImageAttachment) = .empty;
+        defer held.deinit(alloc);
+        var sizes: std.ArrayList(?usize) = .empty;
+        defer sizes.deinit(alloc);
+        for (history) |*turn| if (userOf(turn)) |user| try collectWindowImages(alloc, &held, &sizes, user.images);
+        const in_history = held.items.len;
+        if (self.pending_resume) |*pending| try collectWindowImages(alloc, &held, &sizes, pending.user.images);
+        for (newest) |image| if (image.inline_data) |bytes| try sizes.append(alloc, bytes.len);
+        const outside = @min(self.image_window.oldestOutside(sizes.items), held.items.len);
+        var dropped: usize = 0;
+        for (held.items[0..outside], 0..) |image, index| {
+            const bytes = image.inline_data orelse continue;
+            (if (index < in_history) history_alloc else session_alloc).free(bytes);
+            image.inline_data = null;
+            dropped += 1;
+        }
+        if (dropped > 0) debug_trace.logf("session", "event=libfx_images_dropped count={d} reason=image_window max_images={d} max_bytes={d}", .{ dropped, self.image_window.max_images, self.image_window.max_bytes });
+    }
+
     /// Records that a call of the running batch finished, with what the
     /// model sees of it. Nothing waits for it to be stored: a crash before
     /// the next progress answers the call with it instead of with "may have
@@ -443,6 +479,85 @@ fn dupePendingInputs(alloc: Allocator, inputs: []const journal.PendingInput) All
     return owned;
 }
 
+fn userOf(turn: *types.HistoryTurn) ?*types.UserTurn {
+    return switch (turn.*) {
+        .assistant => |*entry| &entry.user,
+        .interrupted => |*entry| &entry.user,
+        .compacted_summary => null,
+    };
+}
+
+/// Appends each image of `images` the image window counts, oldest first,
+/// with its size, or null for one the session dropped. An image with neither
+/// bytes nor a name, which only a host reference describes, holds nothing.
+fn collectWindowImages(
+    alloc: Allocator,
+    held: *std.ArrayList(*types.ImageAttachment),
+    sizes: *std.ArrayList(?usize),
+    images: []types.ImageAttachment,
+) Allocator.Error!void {
+    for (images) |*image| {
+        const size: ?usize = if (image.inline_data) |bytes| bytes.len else if (image.droppedFromSession()) null else continue;
+        try held.append(alloc, image);
+        try sizes.append(alloc, size);
+    }
+}
+
+/// Leaves in `images.missing` only the names of images the window keeps, so
+/// the host stages none the session would drop. An open reads each named
+/// image it has not staged as one without bytes: with the size its record
+/// gives when `images.missing` holds its name, else as one already dropped.
+fn keepNeededImages(
+    alloc: Allocator,
+    images: *session_codec.ImageResolver,
+    history: []const types.HistoryTurn,
+    open_user: ?types.UserTurn,
+    window: session_codec.ImageWindow,
+) Allocator.Error!void {
+    var sizes: std.ArrayList(?usize) = .empty;
+    defer sizes.deinit(alloc);
+    var names: std.ArrayList(?session_codec.ImageName) = .empty;
+    defer names.deinit(alloc);
+    for (history) |turn| {
+        const user = switch (turn) {
+            .assistant => |entry| entry.user,
+            .interrupted => |entry| entry.user,
+            .compacted_summary => continue,
+        };
+        try countOpenedImages(alloc, &sizes, &names, user.images, &images.missing);
+    }
+    if (open_user) |user| try countOpenedImages(alloc, &sizes, &names, user.images, &images.missing);
+    const outside = window.oldestOutside(sizes.items);
+    var needed: std.array_hash_map.Auto(session_codec.ImageName, usize) = .empty;
+    errdefer needed.deinit(images.alloc);
+    for (names.items[outside..], sizes.items[outside..]) |name, size| {
+        if (name) |value| try needed.put(images.alloc, value, size.?);
+    }
+    if (outside > 0) debug_trace.logf("session", "event=libfx_image_window_open outside={d} needed={d}", .{ outside, needed.count() });
+    images.missing.deinit(images.alloc);
+    images.missing = needed;
+}
+
+fn countOpenedImages(
+    alloc: Allocator,
+    sizes: *std.ArrayList(?usize),
+    names: *std.ArrayList(?session_codec.ImageName),
+    user_images: []const types.ImageAttachment,
+    missing: *const std.array_hash_map.Auto(session_codec.ImageName, usize),
+) Allocator.Error!void {
+    for (user_images) |image| {
+        if (image.inline_data) |bytes| {
+            try sizes.append(alloc, bytes.len);
+            try names.append(alloc, null);
+        } else if (image.droppedFromSession()) {
+            const name = session_codec.imageName(image.snapshot_sha256.?);
+            const size = if (name) |value| missing.get(value) else null;
+            try sizes.append(alloc, size);
+            try names.append(alloc, if (size != null) name else null);
+        }
+    }
+}
+
 /// Rebuilds a fresh session from the host's events, after `snapshot` when
 /// the host stored one, and starts its journal after them. A turn a crash
 /// left open becomes the pending resume, with every call it left running
@@ -452,7 +567,8 @@ fn dupePendingInputs(alloc: Allocator, inputs: []const journal.PendingInput) All
 /// Named images resolve through `images`, which holds what the host staged;
 /// when one is missing the session stays unopened and `error.ImagesMissing`
 /// leaves every missing name in `images.missing`. With `image_store` the
-/// journal names stored images from then on.
+/// journal names stored images from then on, and the session keeps only the
+/// newest images `window` holds: an older one is neither needed nor kept.
 pub fn open(
     alloc: Allocator,
     session_alloc: Allocator,
@@ -463,6 +579,7 @@ pub fn open(
     inputs_durable: bool,
     images: *session_codec.ImageResolver,
     image_store: bool,
+    window: session_codec.ImageWindow,
 ) !struct { Journal, Opened } {
     if (!runtime.agent.fresh or runtime.agent.history.items.len != 0) return error.AgentNotFresh;
     var base: journal.Base = .{ .images = images };
@@ -488,7 +605,10 @@ pub fn open(
     }
     var folded = try journal.foldFrom(alloc, events_json, base);
     defer folded.deinit(alloc);
-    // A history missing an image is not the one saved: open none of it.
+    if (image_store and images.missing.count() > 0) {
+        try keepNeededImages(alloc, images, folded.history, if (folded.open_turn) |turn| turn.user else null, window);
+    }
+    // A history missing an image it keeps is not the one saved: open none.
     if (images.missing.count() > 0) {
         debug_trace.logf("session", "event=libfx_journal_images_missing count={d}", .{images.missing.count()});
         return error.ImagesMissing;
@@ -506,12 +626,15 @@ pub fn open(
         .inputs_durable = inputs_durable,
         .steers_waiting = folded.pending_inputs.len,
         .image_store = image_store,
+        .image_window = window,
     };
     errdefer state.deinit(session_alloc);
     // An image the open resolved is in the store; one it read inline is not.
     if (image_store) for (images.resolved.keys()) |name| try state.stored_images.add(session_alloc, name);
-    const checkpoint = folded.open_turn orelse
+    const checkpoint = folded.open_turn orelse {
+        try state.dropOutsideWindow(alloc, alloc, session_alloc, runtime.agent.history.items, &.{});
         return .{ state, .{ .turns = folded.history.len, .resumable = false, .last_turn_id = state.last_turn_id, .checkpoint_meta = saved_meta } };
+    };
 
     debug_trace.logf("session", "event=libfx_journal_open_turn turn={d} running_calls={d} finished_calls={d} resolved=pending_resume", .{ folded.cursor.turn, folded.running_calls.len, folded.finished.len });
     var scratch = std.heap.ArenaAllocator.init(alloc);
@@ -525,6 +648,7 @@ pub fn open(
     state.pending_resume_ambiguous = try unfinishedCalls(session_alloc, folded.running_calls, folded.finished);
     state.pending_resume_yielded = folded.yielded;
     state.pending_inputs = try dupePendingInputs(session_alloc, folded.pending_inputs);
+    try state.dropOutsideWindow(alloc, alloc, session_alloc, runtime.agent.history.items, &.{});
     return .{ state, .{
         .turns = folded.history.len,
         .resumable = true,

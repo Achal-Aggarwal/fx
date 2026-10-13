@@ -1434,6 +1434,44 @@ test("an image turn that crashed after a delta reopens with its image", async ()
   assert.equal(toolResults(requests[0]).length, 1, "the step came back from the delta");
 });
 
+// A smaller image window than the core's, so a test reaches its edge.
+const imageWindow = Symbol.for("libfx.imageWindow");
+const droppedNote = /\[Image #1 is no longer in this session, which keeps only its newest images\.\]/;
+
+for (const [label, limits] of [["images", { images: 2 }], ["bytes", { bytes: 2 * 40_000 }]]) {
+  test(`a session keeps its newest images within its window of ${label}, and an older one leaves as a note`, async () => {
+    const store = createMemoryPersistence();
+    const pictures = [pngOf(40_000, 11), pngOf(40_000, 12), pngOf(40_000, 13)];
+    const window = { [imageWindow]: limits };
+    const source = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: store, checkpointAfterBytes: 0, ...window }));
+    for (const [index, picture] of pictures.entries()) {
+      await run(source, [{ type: "text", text: `look ${index}` }, imageBlock(picture)]);
+    }
+    // The third prompt pushed the first image out: its request carries the
+    // two newest, and a note where the first was.
+    assert.deepEqual(requestImages(requests.at(-1)), [base64Of(pictures[1]), base64Of(pictures[2])]);
+    assert.match(JSON.stringify(requests.at(-1)), droppedNote);
+    await source.close();
+    assert.ok(savedData(store).some((data) => Buffer.from(data).includes("\"dropped\":true")), "the checkpoint keeps the first image's name alone");
+
+    // A store that lost the first image still opens the session, which reads
+    // only the images its window keeps.
+    store.images.delete(await nameOf(pictures[0]));
+    const read = [];
+    const getImage = store.getImage.bind(store);
+    store.getImage = async (name) => {
+      read.push(name);
+      return getImage(name);
+    };
+    const target = await createFxEngine(options(targetBackend, undefined, { ...visionCatalog, persistence: store, ...window }));
+    await run(target, "and now?");
+    await target.close();
+    assert.deepEqual(read.sort(), [await nameOf(pictures[1]), await nameOf(pictures[2])].sort());
+    assert.deepEqual(requestImages(requests.at(-1)), [base64Of(pictures[1]), base64Of(pictures[2])]);
+    assert.match(JSON.stringify(requests.at(-1)), droppedNote);
+  });
+}
+
 test("a failed image write fails the prompt before it is sent", async () => {
   const store = createMemoryPersistence();
   store.putImage = async () => { throw new Error("disk full"); };

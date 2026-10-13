@@ -138,6 +138,8 @@ fn encodeWith(
     for (history, 0..) |turn, index| {
         if (index > 0) json.writer.writeByte(',') catch return error.OutOfMemory;
         const first_new_blob = blobs.items.len;
+        // An image the session dropped is written by name even here.
+        names_images = names_images or session_codec.dropsAnyInTurn(turn);
         const written = if (stored) |names| named: {
             names_images = names_images or names.namesAnyInTurn(turn);
             break :named session_codec.writeHistoryTurnNamingImages(&json.writer, turn, .{ .stored = names, .blobs = image_blobs });
@@ -656,6 +658,54 @@ test "kernel checkpoint names stored images and keeps the bytes of the rest" {
     try std.testing.expectEqualStrings(kept_png, decoded.history[1].assistant.user.images[0].inline_data.?);
     try std.testing.expectEqual(@as(usize, 0), resolver.missing.count());
     try std.testing.expect(resolver.resolved.contains(stored_image.digest_hex));
+}
+
+test "kernel checkpoint names a stored image with its size" {
+    const alloc = std.testing.allocator;
+    const png = "\x89PNG\r\n\x1a\nsized-in-host";
+    var fixture: TestImageHistory = undefined;
+    fixture.init(png);
+    var stored: session_codec.StoredImages = .{};
+    defer stored.deinit(alloc);
+    try stored.add(alloc, fixture.digest_hex);
+    const bytes = try encodeNamingImages(alloc, &fixture.history, .{}, .{}, &stored);
+    defer alloc.free(bytes);
+    try std.testing.expect(std.mem.find(u8, bytes, std.fmt.comptimePrint("\"inline_size\":{d}", .{png.len})) != null);
+
+    // A staged image whose size is not the one recorded is refused.
+    const sized = "\"inline_size\":";
+    const resized = try alloc.dupe(u8, bytes);
+    defer alloc.free(resized);
+    const at = std.mem.find(u8, resized, sized).? + sized.len;
+    resized[at] += 1;
+    resealForTest(resized);
+    var staged: session_codec.StagedImages = .{};
+    defer staged.deinit(alloc);
+    try staged.add(alloc, fixture.digest_hex, try alloc.dupe(u8, png));
+    var resolver: session_codec.ImageResolver = .{ .alloc = alloc, .staged = &staged };
+    defer resolver.deinit();
+    try std.testing.expectError(error.InvalidCheckpoint, decodeWithImages(alloc, resized, &resolver));
+}
+
+test "kernel checkpoint keeps a dropped image's name alone, at the naming version" {
+    const alloc = std.testing.allocator;
+    var fixture: TestImageHistory = undefined;
+    fixture.init("\x89PNG\r\n\x1a\ndropped-from-the-session");
+    fixture.images[0].inline_data = null;
+    try std.testing.expect(fixture.images[0].droppedFromSession());
+
+    // Even where no image is named, a dropped one needs the naming version.
+    const bytes = try encode(alloc, &fixture.history, .{}, .{});
+    defer alloc.free(bytes);
+    try std.testing.expectEqual(naming_version, std.mem.readInt(u16, bytes[4..6], .little));
+    try std.testing.expect(std.mem.find(u8, bytes, "\"dropped\":true") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "\"inline_ref\"") == null);
+
+    var decoded = try decode(alloc, bytes);
+    defer decoded.deinit(alloc);
+    const image = decoded.history[0].assistant.user.images[0];
+    try std.testing.expect(image.droppedFromSession());
+    try std.testing.expectEqualStrings(&fixture.digest_hex, image.snapshot_sha256.?);
 }
 
 test "kernel checkpoint naming no stored image stays version 2, byte for byte" {
