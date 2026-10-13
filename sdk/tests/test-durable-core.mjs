@@ -882,6 +882,48 @@ if (durabilityKind === "queue") {
       await agent.close();
     }
   });
+
+  test("an image prompt run in the request reads its image from the store, and every queued copy only names it", async () => {
+    const internals = (agent) => agent[Symbol.for("libfx.durableInternals")];
+    for (const maxDurationMs of [60_000, 300]) {
+      const dir = await mkdtemp(join(tmpdir(), "libfx-in-request-image-"));
+      dirs.push(dir);
+      const waited = [];
+      const { durability, broker } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs, reserveMs: 100, waitUntil: (work) => waited.push(work) });
+      const { agent, seen } = recordingAgent(durability);
+      const session = agent.session();
+      // With the short deadline, a step outlasts the request.
+      if (maxDurationMs < 1000) {
+        const slow = holdStep("image-1");
+        void slow.holding.then(() => setTimeout(slow.release, 600));
+      }
+      const messageId = `turn-image-${maxDurationMs}`;
+      const turn = session.prompt([{ type: "text", text: "look" }, { type: "image", data: new Uint8Array(pngBytes), mimeType: "image/png" }], { messageId });
+      assert.equal((await turn.result).stopReason, "end_turn");
+      assert.equal(waited.length, 1, "the request ran the turn");
+      assert.deepEqual(seen, [[{ type: "text", text: "look" }, image]], "with the image's bytes, read once");
+      const sent = broker.sent.filter((message) => message.payload?.input?.messageId === messageId);
+      assert.equal(sent[0].attempt, 0, "the backstop waited");
+      if (maxDurationMs < 1000) assert.ok(sent.length > 1, "a turn longer than the request went on in a fresh message");
+      for (const message of sent) {
+        const payload = JSON.stringify(message.payload);
+        assert.ok(payload.includes(pngName) && !payload.includes(png), "a queued copy names the image and holds none of it");
+      }
+      await waited[0];
+      for (let tries = 0; internals(agent).liveWorkers() > 0; tries += 1) {
+        assert.ok(tries < 200, "the request's worker never let go");
+        await sleep(10);
+      }
+      // The backstop, delivered at last, runs nothing.
+      broker.lapse(sent[0]);
+      for (let tries = 0; broker.held(() => true).some((message) => message.id === sent[0].id); tries += 1) {
+        assert.ok(tries < 200, "the backstop was never acknowledged");
+        await sleep(10);
+      }
+      assert.equal(seen.length, 1, "the backstop ran nothing");
+      await agent.close();
+    }
+  });
 }
 
 test("a reconnect reads the stream from its cursor's line, not its start", async () => {

@@ -1183,6 +1183,10 @@ const errorSummary = (error) => ({ name: error?.name ?? "Error", message: String
 // The harness contract: a fenced write rejects with this code.
 const isFenced = (error) => error?.code === "FX_FENCED";
 
+// Whether the log already holds the input of message `messageId` of `type`:
+// still waiting, or taken by a turn. Pure.
+const logHolds = (state, type, messageId) => state.inputKeys.has(`${type}:${messageId}`) || state.consumed.has(messageId);
+
 // What a queue message adds to its session's log: a restored agent's first
 // checkpoint and the message's input, a prompt with its caller's context and
 // its session object's settings.
@@ -1193,8 +1197,7 @@ function messageEntries(state, message) {
     entries.push({ k: "checkpoint", through: null, data: message.seed });
   }
   const key = `${message.type}:${message.messageId}`;
-  const known = state.inputKeys.has(key) || state.consumed.has(message.messageId);
-  if ((message.type === "prompt" || message.type === "steer" || message.type === "cancel") && !known) {
+  if ((message.type === "prompt" || message.type === "steer" || message.type === "cancel") && !logHolds(state, message.type, message.messageId)) {
     entries.push({
       k: "input",
       key,
@@ -2400,11 +2403,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
               const log = await created.session(sessionId);
               // A retry of a prompt the log already holds is answered from
               // the log: its images are named, not written again.
-              let known = false;
-              if (retried) {
-                const state = foldSessionLog(await log.read());
-                known = state.inputKeys.has(`prompt:${messageId}`) || state.consumed.has(messageId);
-              }
+              const known = retried && logHolds(foldSessionLog(await log.read()), "prompt", messageId);
               read = await storePromptImages(known ? null : log.images, read);
             }
             // An agent closed meanwhile stores nothing more.

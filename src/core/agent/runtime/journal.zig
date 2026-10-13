@@ -138,8 +138,10 @@ pub const Event = union(EventType) {
     turn_yielded,
     tool_result: ToolResult,
 
-    /// The version `Cursor.write` gives the event.
-    fn eventVersion(self: Event) u8 {
+    /// The version `Cursor.write` gives the event: `naming_version` when it
+    /// names an image `stored` holds.
+    fn eventVersion(self: Event, stored: ?*const session_codec.StoredImages) u8 {
+        if (stored) |names| if (eventNamesImages(self, names)) return naming_version;
         return switch (self) {
             .tool_result => delta_version,
             .turn_progress => |progress| if (progress.delta != null) delta_version else plain_version,
@@ -173,7 +175,7 @@ pub const Cursor = struct {
 
     fn writeWith(self: Cursor, writer: *std.Io.Writer, event: Event, stored: ?*const session_codec.StoredImages) !Cursor {
         try writer.print("{{\"v\":{d},\"seq\":{d},\"turn\":{d},\"type\":\"{s}\"", .{
-            if (stored) |names| if (eventNamesImages(event, names)) naming_version else event.eventVersion() else event.eventVersion(),
+            event.eventVersion(stored),
             self.next_seq,
             self.turn,
             @tagName(event),

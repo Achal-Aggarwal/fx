@@ -65,7 +65,9 @@ function persisted(journal) {
 // Any other prompt is answered with its own text.
 const bulkySteps = 24;
 function framesFor(prompt) {
-  const text = lastUserText(prompt);
+  // An image prompt's text ends with a marker per image, which the scripts
+  // below ignore.
+  const text = lastUserText(prompt).replace(/(\n\[Image #\d+\])+$/u, "");
   // "keep using the tool" asks for a lookup until three results are in, so an
   // agent that ignored a fence would keep calling it.
   if (text === "keep using the tool") {
@@ -1399,6 +1401,37 @@ test("a persistence without an image store keeps writing images inline", async (
   for (const event of journal.events) assert.equal(event.v, event.base !== undefined || event.type === "tool_result" ? 2 : 1);
   assert.ok(JSON.stringify(journal.events).includes(base64Of(image)));
   assert.ok(!JSON.stringify(journal.events).includes("inline_ref"));
+});
+
+test("an image turn that crashed after a delta reopens with its image", async () => {
+  // The turn's first progress names the image. The one after the tool step
+  // extends it and leaves out the user's turn, so a crash right after that
+  // one brings the image back from the first.
+  const image = pngOf(50_000, 8);
+  const images = new Map();
+  const withImages = (persistence) => ({
+    ...persistence,
+    putImage: async (name, bytes) => { images.set(name, new Uint8Array(bytes)); },
+    getImage: async (name) => images.get(name),
+  });
+  const journal = eventJournal();
+  const source = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: withImages(persisted(journal)) }));
+  assert.equal((await run(source, [{ type: "text", text: "use the tool" }, imageBlock(image)])).text, "tool said beta");
+  await source.close();
+  const progress = journal.events.filter((event) => event.type === "turn_progress");
+  assert.equal(progress[0].v, 3, "the first progress names the image");
+  const stepped = progress.find((event) => event.steps === 1);
+  assert.ok(stepped?.base !== undefined && stepped.v === 2, "the progress after the tool extends it");
+  assert.ok(!JSON.stringify(stepped).includes("inline_ref"), "and names no image");
+  const survived = journal.events.slice(0, journal.events.indexOf(stepped) + 1);
+  const resumed = await createFxEngine(options(targetBackend, undefined, { ...visionCatalog, persistence: withImages(persisted(eventJournal(survived))) }));
+  requests.length = 0;
+  const turn = resumed.resume();
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  await resumed.close();
+  assert.deepEqual(requestImages(requests[0]), [base64Of(image)], "the image came back from the first progress");
+  assert.equal(toolResults(requests[0]).length, 1, "the step came back from the delta");
 });
 
 test("a failed image write fails the prompt before it is sent", async () => {

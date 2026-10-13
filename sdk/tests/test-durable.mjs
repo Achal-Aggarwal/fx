@@ -1254,10 +1254,9 @@ test("a durable session saves each image once, and a new agent sends it again", 
   const durability = await durabilityFor();
   const first = createFxAgent(agentOptions(durability, { model: "durable/vision-model" }));
   const session = first.session();
-  // Records that only name the image stay small, and a durable session saves
-  // a checkpoint once its records pass 64 KiB, so the second prompt's text
-  // passes that: the turn's end saves one, which must name the images too.
-  for (const text of ["look", `again${" and again".repeat(8000)}`]) {
+  // Records that only name the image stay small, so the second prompt is
+  // `bulky`: its turn's end saves a checkpoint, which must name the images too.
+  for (const text of ["look", bulky]) {
     const { result } = await collect(session.prompt([{ type: "text", text }, { type: "image", data: bytes, mimeType: "image/png" }]));
     assert.equal(result.stopReason, "end_turn");
   }
