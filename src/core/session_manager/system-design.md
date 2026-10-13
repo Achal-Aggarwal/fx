@@ -672,7 +672,7 @@ Settled in the 2026-09-27 scope lock:
   sync. Revised on 2026-09-27.
   **Why:** power loss is rare, and stronger syncing is not worth its cost.
   This is the simplest and fastest option, 0.12 ms per turn against the v1
-  replay's 3.4 ms in the Zig benchmark (the first Python prototype measured
+  replay's 3.4 ms in the Zig benchmark (an earlier prototype measured
   0.13 ms and 7.1 ms), with v1's guarantee against fx and OS crashes.
   **Alternative:** `F_FULLFSYNC` at durability points (power-loss safe on
   macOS, about 4 ms per turn), or a background full sync after a plain
@@ -776,8 +776,8 @@ Settled in the 2026-09-27 pre-wiring API check:
   of line 1 and of the newest line (0 before the first turn), and the index
   records the same `updated_ms` instead of the clock at the index write.
   **Why:** ACP's load and usage recovery need both on resume
-  (`src/acp/sessions.zig` lines 669 to 679,
-  `src/core/session/usage_recovery.zig` lines 89 to 107), and a converted
+  (`src/acp/sessions.zig` lines 669 to 679, and fx's usage recovery, since
+  removed), and a converted
   session keeps its original times in the list rather than the conversion
   time. **Alternative:** the adapter looks the session up in `list`.
 - **D21 Decision:** a host may end a turn with `reason: failed` as well as
@@ -1228,8 +1228,8 @@ Settled for the converter (2026-10-06):
   should not take its space twice. **Alternative:** keep the v1 copy
   until the converter is removed, or delete only from `fx sessions
   convert`.
-- **D61 Decision (2026-10-07, on the converter design's open
-  questions):** sessions in v1's older formats (schema 3 and legacy, about
+- **D61 Decision (2026-10-07, on questions left open when the converter
+  was designed):** sessions in v1's older formats (schema 3 and legacy, about
   82% of a real profile) convert too, through v1's older reader; a slow
   one shows the slow notice. So do v1 folders an old release left
   world-readable (0755), which today's v1 refuses: others could only read
@@ -1246,7 +1246,7 @@ Settled for the converter (2026-10-06):
   content; a v1 child id opened directly answers SessionNotFound, as v2
   does; the sweep runs under the family's locks, so two processes
   converting one family serialize, and `V1Conversion.tla` models two
-  converters. **Why:** the converter design left these open. **Alternative:** refuse the older formats,
+  converters. **Why:** these were left open when the converter was designed. **Alternative:** refuse the older formats,
   or keep `fx session` v2 only.
 - **D62 Decision (2026-10-07, after converting a clone of a
   real profile: 13,970 families converted, 13 unreadable):** a conversion

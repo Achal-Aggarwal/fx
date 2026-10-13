@@ -4,7 +4,7 @@
     check_conversion.py --request REQUEST.json --report DIR
     check_conversion.py --selftest
 
-REQUEST is written by the Bun driver: {"version": 1, "ids": {"root": ID,
+REQUEST records a real run: {"version": 1, "ids": {"root": ID,
 "child": ID or null, "fresh": [ID, ...]}, "observations": [...]}, one
 observation per real step, as V1ConversionTrace.tla describes. The verdict
 is printed as JSON and kept in DIR with TLC's log and its generated inputs:
