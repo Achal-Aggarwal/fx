@@ -250,7 +250,7 @@ fx does not use declarations that Zig 0.17 deprecates. They still compile, so ch
 
 ## Testing (TypeScript)
 
-Two test suites live under `tests/`, both using Bun.
+Two test suites live under `tests/`, both using Bun. `tests/AGENTS.md` says where each kind of test belongs, how to wire a new E2E file into CI, and how code comments cite tests and specs.
 
 Set `FX_SOUND=0` when you run either suite locally, for example `cd tests/e2e && FX_SOUND=0 bun test cli.test.ts`. On macOS, sound playback during a test run can overload the machine and crash it. The variable doesn't cover `notifications.test.ts`, which clears it, or the "TUI user-profile output preserves compact scrollback across slash commands" test in `tui-command-permissions.test.ts`, which sends `/sound on`. Leave those to CI. On Linux, fx rings the terminal bell instead of playing a sound, so they run safely there. The full `bun test` run below includes both, and `bun test tui-*.test.ts` includes the `/sound on` test, so on macOS pass test files by name.
 
@@ -278,14 +278,9 @@ TUI tests use tmux to drive the interactive terminal. They require `tmux` to be 
 
 ## TLA+ Models
 
-Every TLA+ spec, its TLC checker, the Bun drivers that walk real code along a spec, and the session manager's design record live in `tests/tla/`, and nowhere else. `tests/tla/README.md` lists the requirements and commands.
+Every TLA+ spec, its TLC checker, the Bun drivers that walk real code along a spec, and the session manager's design record live in `tests/tla/`, and nowhere else. `tests/AGENTS.md` describes the layout and how to add a model, and `tests/tla/README.md` lists the commands. Session decision numbers such as `D44` are defined in `tests/tla/session_manager/system-design.md`.
 
-* `tests/tla/session_manager/`: the session manager's specs, mutants, and trace checkers, plus `system-design.md`, which defines the `D1` to `D62` decision numbers that session code cites
-* `tests/tla/indexer/`: the indexer refresh model; `check.sh` requires each config's expected verdict
-* `tests/tla/sdk/`: the libfx durable session, agent routing, and steering specs
-* `tests/tla/drivers/`: the Bun drivers that walk the real SDK code along the `sdk/` specs' state graphs; CI runs them with the SDK specs in the `SDK (Bun + N-API/WASM)` job
-
-Code comments cite a spec by its path, such as `tests/tla/session_manager/Wiring.tla`. When a change alters behavior that a spec models, update the spec in the same change and run its checker.
+Code comments cite a spec by its repository-relative path and the property it checks, such as `tests/tla/session_manager/Wiring.tla` `ParentOutlivesChildren`, and never cite a file outside the repository. When a change alters behavior that a spec models, update the spec in the same change and run its checker.
 
 ## Pull Request Classification
 
