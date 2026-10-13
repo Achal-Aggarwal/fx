@@ -2112,8 +2112,6 @@ async function materializePromptImages(blocks, isCancelled, resizeImage) {
       bytes: image.bytes,
       ...(block.sourceRef === undefined ? {} : { sourceRef: block.sourceRef }),
     };
-    // A file's bytes, or what resizeImage made, are checked once there are some.
-    checkImageBytesType(image.bytes, image.mimeType, index);
     if (image.bytes.byteLength > maxPromptImageBytes && image.sourceRef !== undefined) {
       image = omitReferencedImageData([image])[0];
     }
@@ -2130,6 +2128,11 @@ async function materializePromptImages(blocks, isCancelled, resizeImage) {
   }
   if (promptFrameSize(prepared) > maxPromptFrameBytes) prepared = omitReferencedImageData(prepared);
   checkPromptFrameSize(prepared, true);
+  // A file's bytes, or what resizeImage made, are checked once there are
+  // some, after the size limits.
+  prepared.forEach((image, index) => {
+    if (image.type === "image" && image.bytes !== undefined) checkImageBytesType(image.bytes, image.mimeType, index);
+  });
   return prepared;
 }
 
