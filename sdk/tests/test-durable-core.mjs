@@ -1383,6 +1383,9 @@ if (durabilityKind === "queue") {
     const durability = world(instance, { name: "route", queueDurable: true });
     const support = createTaggedAgent({ durability, name: "support", tag: "support" });
     const coding = createTaggedAgent({ durability, name: "coding", tag: "coding" });
+    // An agent on another durability of the same kind, as an app that gives
+    // one agent vercel() and another vercel({ leaseMs }) has.
+    const ops = createTaggedAgent({ durability: world(instance, { name: "route", queueDurable: true }), name: "ops", tag: "ops" });
     let attempt = 0;
     const post = (route, { queueName, payload }) => {
       attempt += 1;
@@ -1391,14 +1394,18 @@ if (durabilityKind === "queue") {
     };
     const ours = support.session();
     const theirs = coding.session();
+    const opsSession = ops.session();
     const first = ours.prompt("alpha");
     const second = theirs.prompt("beta");
-    await Promise.all([first.accepted, second.accepted]);
+    const fourth = opsSession.prompt("delta");
+    await Promise.all([first.accepted, second.accepted, fourth.accepted]);
     const shared = wakeHandler();
-    // Both messages reach the one route, whichever agent sent them.
+    // Every message reaches the one route, whichever agent sent it.
     for (const message of sent.splice(0)) assert.equal((await post(shared, message)).status, 200);
     assert.equal((await textOf(first)).text, "alpha-0 alpha-1 alpha-2");
     assert.equal((await textOf(second)).text, "beta-0 beta-1 beta-2");
+    assert.equal((await textOf(fourth)).text, "delta-0 delta-1 delta-2");
+    assert.deepEqual(openersOf(opsSession.id), ["ops"]);
     // An agent's own route delivers to the agent a message names, too.
     const third = ours.prompt("gamma");
     await third.accepted;
@@ -1414,6 +1421,7 @@ if (durabilityKind === "queue") {
     assert.deepEqual(await refused.json(), { code: "FX_NO_AGENT", agent: "ghost" });
     await support.close();
     await coding.close();
+    await ops.close();
     assert.equal((await post(shared, message)).status, 503, "with no agent left, the route says so");
     await stored.close();
   });

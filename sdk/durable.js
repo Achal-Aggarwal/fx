@@ -604,22 +604,32 @@ function noAgentNamed(name) {
 // copy of this module in the process.
 const agentsByName = (globalThis[Symbol.for("libfx.durableAgents")] ??= new Map());
 
-// The backend of an agent named `name` in this process on `durability`, the
-// agent's copies in turn, or null. Agents share sessions only through the
-// durability they were created with, so one on another holds other sessions.
-async function agentSharing(name, durability) {
+// The World backend of an agent named `name` in this process whose
+// durability `matches`, the agent's copies in turn, or null.
+async function agentNamed(name, matches) {
   const group = agentsByName.get(name);
   if (!group) return null;
   const { members } = group;
   const first = group.turn++;
   for (let index = 0; index < members.length; index += 1) {
     const member = members[(first + index) % members.length];
-    if ((await member.durability()) !== durability) continue;
+    if (!matches(await member.durability())) continue;
     const created = await member.open();
     if (typeof created.deliverHere === "function") return created;
   }
   return null;
 }
+
+// Agents share sessions through the durability they were created with, so
+// one on another durability can hold other sessions.
+const agentSharing = (name, durability) => agentNamed(name, (other) => other === durability);
+
+// A route takes its deployment's deliveries, which every route durability
+// of the same kind in the process shares, such as each `vercel()` an app
+// creates: the agent a message names on this durability, or on another of
+// that kind.
+const agentOnRoute = async (name, durability) => (await agentSharing(name, durability)) ??
+  agentNamed(name, (other) => other !== durability && other.name === durability.name && typeof other.world === "function" && other.create === undefined);
 
 /**
  * The request handler a deployment mounts for queue deliveries, for every
@@ -677,7 +687,7 @@ function createWorldBackend(world, durability) {
   // message names, whichever agent's route it is.
   const queueHandler = world.createQueueHandler(queuePrefix, async (message, meta) => {
     const named = agentOf(message?.input);
-    const agent = await agentSharing(named, durability);
+    const agent = await agentOnRoute(named, durability);
     if (!agent) throw noAgentNamed(named);
     return agent.deliverHere(message, meta);
   });
