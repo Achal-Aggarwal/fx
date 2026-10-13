@@ -1856,10 +1856,12 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .usage, "usage", err, rest);
                 return .handled_failure;
             };
-            const home = deps.getenv(deps.env_ctx, "HOME") orelse {
+            // A relative $HOME counts as unset, as everywhere else in fx.
+            const home = deps.getenv(deps.env_ctx, "HOME") orelse "";
+            if (!std.Io.Dir.path.isAbsolute(home)) {
                 try writeUsageCommandFailure(alloc, deps, error.HomeNotSet, opts.format);
                 return .handled_failure;
-            };
+            }
             var startup = (if (cfg.auth_mode == .host_managed)
                 deps.load_startup_state_with_auth_mode(
                     alloc,

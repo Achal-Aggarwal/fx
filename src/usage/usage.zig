@@ -491,8 +491,15 @@ pub const Dashboard = struct {
         return cache.read(self.gpa, self.io(), fx_dir, identity);
     }
 
+    /// The home directory, if the host gave an absolute one. An empty or
+    /// relative `$HOME` counts as none, as everywhere else in fx.
+    fn openHome(self: *Dashboard) ?Io.Dir {
+        if (!Io.Dir.path.isAbsolute(self.host.home)) return null;
+        return Io.Dir.openDirAbsolute(self.io(), self.host.home, .{}) catch null;
+    }
+
     fn openFxDir(self: *Dashboard) ?Io.Dir {
-        var home = Io.Dir.openDirAbsolute(self.io(), self.host.home, .{}) catch return null;
+        var home = self.openHome() orelse return null;
         defer home.close(self.io());
         return home.openDir(self.io(), ".fx", .{}) catch null;
     }
@@ -500,7 +507,7 @@ pub const Dashboard = struct {
     /// `~/.fx`, created private when missing: `fx usage` with only an API
     /// key may run before anything else made it.
     fn openOrCreateFxDir(self: *Dashboard) ?Io.Dir {
-        var home = Io.Dir.openDirAbsolute(self.io(), self.host.home, .{}) catch return null;
+        var home = self.openHome() orelse return null;
         defer home.close(self.io());
         home.createDir(self.io(), ".fx", .fromMode(0o700)) catch |err| switch (err) {
             error.PathAlreadyExists => {},
@@ -1515,4 +1522,17 @@ test "a sign-in that arrives during another's fetch gets its fetch when that one
     dashboard.tick();
     dashboard.waitForFetch();
     try testing.expectEqual(fetched, gateway.count);
+}
+
+test "an empty or relative home is no home, and a fetch still shows" {
+    for ([_][]const u8{ "", "relative/home" }) |home| {
+        var gateway: FakeGateway = .{};
+        var dashboard = Dashboard.init(testing.allocator, gateway.host(home));
+        defer dashboard.deinit();
+        dashboard.open(api_key);
+        dashboard.waitForFetch();
+        var shown = try dashboard.snapshot(testing.allocator);
+        defer shown.deinit();
+        try testing.expectEqual(@as(?i64, gateway.now_ms), shown.of(.today).fetched_at_ms);
+    }
 }

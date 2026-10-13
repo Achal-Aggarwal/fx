@@ -651,7 +651,7 @@ const App = struct {
         );
         app.usage_dashboard = usage.Dashboard.init(
             std.heap.c_allocator,
-            usage_host.host(io_mod.getenv("HOME") orelse ""),
+            usage_host.host(io_mod.homeDir() orelse ""),
         );
         app_session_runtime.Persistence.initInto(&app.session_persistence);
         InputRuntime.initInto(&app.input_runtime);
