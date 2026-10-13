@@ -2,7 +2,7 @@
 // AgentRouting.tla, and checks after every step that the code is where the
 // model allows.
 //
-//   bun tests/tla/sdk/drive-agents.mjs [send|consume] [--walks N] [--depth N] [--seed S]
+//   bun tests/tla/drivers/drive-agents.mjs [send|consume] [--walks N] [--depth N] [--seed S]
 //
 // Two processes, p1 and p2, are two worker threads (agent-process.mjs), each
 // with a module instance and a globalThis of its own: p1 has the agents S
@@ -45,7 +45,7 @@ const random = () => {
 const pick = (items) => items[Math.floor(random() * items.length)];
 
 const here = fileURLToPath(new URL(".", import.meta.url));
-const graph = await loadGraph(resolve(here, "graphs", `agents-${mode}.dot`));
+const graph = await loadGraph(resolve(here, "../sdk/graphs", `agents-${mode}.dot`));
 const hosts = { p1: ["S", "C"], p2: ["S"] };
 
 // The queue the processes share: every message, until a step delivers it.

@@ -31,7 +31,7 @@
 (* Each rule has a constant. Setting one to FALSE gives the behavior libfx *)
 (* had before this model, and each witness config shows the property that *)
 (* rule protects then fails. `act` names each step so that                 *)
-(* tests/tla/sdk/drive-steer.mjs can drive the real code along any path    *)
+(* tests/tla/drivers/drive-steer.mjs can drive the real code along any path*)
 (* of the state graph and compare every state.                             *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets

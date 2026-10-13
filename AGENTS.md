@@ -282,7 +282,8 @@ Every TLA+ spec, its TLC checker, the Bun drivers that walk real code along a sp
 
 * `tests/tla/session_manager/`: the session manager's specs, mutants, and trace checkers, plus `system-design.md`, which defines the `D1` to `D62` decision numbers that session code cites
 * `tests/tla/indexer/`: the indexer refresh model; `check.sh` requires each config's expected verdict
-* `tests/tla/sdk/`: the libfx durable session and agent routing specs and their Bun drivers, which CI runs in the `SDK (Bun + N-API/WASM)` job
+* `tests/tla/sdk/`: the libfx durable session, agent routing, and steering specs
+* `tests/tla/drivers/`: the Bun drivers that walk the real SDK code along the `sdk/` specs' state graphs; CI runs them with the SDK specs in the `SDK (Bun + N-API/WASM)` job
 
 Code comments cite a spec by its path, such as `tests/tla/session_manager/Wiring.tla`. When a change alters behavior that a spec models, update the spec in the same change and run its checker.
 

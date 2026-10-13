@@ -3,7 +3,7 @@
 // WebAssembly, along paths of the TLC state graph of DurableSession.tla, and
 // checks after every step that the code is in a state the model allows.
 //
-//   bun tests/tla/sdk/drive.mjs [send|lookup|write|cutoff|leased|queue] [--walks N] [--seed S] [--backend native|wasm]
+//   bun tests/tla/drivers/drive.mjs [send|lookup|write|cutoff|leased|queue] [--walks N] [--seed S] [--backend native|wasm]
 //     [--durability local|world|vercel]
 //
 // The lookup and cutoff graphs run a lookup, which starts before its intent
@@ -32,7 +32,8 @@
 // session in Vercel's World (see sdk/tests/vercel-storage.mjs for what it
 // needs) instead of files.
 //
-// `./check.sh` model-checks the spec and writes graphs/<graph>.dot; the cutoff
+// `tests/tla/sdk/check.sh` model-checks the spec and writes its
+// graphs/<graph>.dot; the cutoff
 // graph runs lookup with more claims and no freezes, so a step can be cut off
 // at the deadline until the bound stops running it. Each walk
 // starts two agents, A and B, on one local() World directory. Every model
@@ -493,7 +494,7 @@ const random = () => {
   return seed / 2147483648;
 };
 
-const graph = await loadGraph(resolve(here, "graphs", `${graphName}.dot`));
+const graph = await loadGraph(resolve(here, "../sdk/graphs", `${graphName}.dot`));
 const covered = new Set();
 const totalEdges = [...graph.next.values()].reduce((sum, targets) => sum + targets.size, 0);
 let steps = 0;

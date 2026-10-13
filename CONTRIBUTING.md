@@ -114,7 +114,7 @@ python3 benchmarks/first_frame.py --binary /tmp/fx-before --binary ./zig-out/bin
 
 ### Check a TLA+ model
 
-`tests/tla/` holds TLA+ models of the session manager, the workspace indexer, and libfx durable sessions. CI runs the libfx model; run the matching checker yourself when you change behavior that one of the others describes. You need Java and `tla2tools.jar`, and `tests/tla/README.md` covers setup.
+`tests/tla/` holds TLA+ models of the session manager, the workspace indexer, and libfx durable sessions and steering. CI runs the libfx model; run the matching checker yourself when you change behavior that one of the others describes. You need Java and `tla2tools.jar`, and `tests/tla/README.md` covers setup.
 
 ```bash
 tests/tla/session_manager/check.sh SessionLog

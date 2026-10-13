@@ -1,6 +1,7 @@
 #!/bin/sh
 # Model-checks DurableSession.tla with TLC, confirms each witness is
-# violated, and writes the state graphs drive.mjs walks against the code.
+# violated, and writes the state graphs ../drivers/drive.mjs walks against
+# the code.
 #
 # Needs Java 11+ and tla2tools.jar:
 #   brew install openjdk
@@ -8,12 +9,13 @@
 #   curl -fL -o ~/.local/share/tla/tla2tools.jar \
 #     https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
 #
-# Then drive the code along the graphs:
-#   bun drive.mjs send && bun drive.mjs lookup && bun drive.mjs write && bun drive.mjs cutoff
-#   bun drive.mjs leased   # the Heartbeat graph, on a World without liveness
-#   bun drive.mjs queue    # the QueueHeld graph, on a World whose queue shows it
-#   bun drive-agents.mjs send && bun drive-agents.mjs consume   # AgentRouting
-#   bun drive-steer.mjs ideal && bun drive-steer.mjs faults
+# Then drive the code along the graphs with the drivers in ../drivers/:
+#   bun ../drivers/drive.mjs send && bun ../drivers/drive.mjs lookup
+#   bun ../drivers/drive.mjs write && bun ../drivers/drive.mjs cutoff
+#   bun ../drivers/drive.mjs leased   # the Heartbeat graph, on a World without liveness
+#   bun ../drivers/drive.mjs queue    # the QueueHeld graph, on a World whose queue shows it
+#   bun ../drivers/drive-agents.mjs send && bun ../drivers/drive-agents.mjs consume   # AgentRouting
+#   bun ../drivers/drive-steer.mjs ideal && bun ../drivers/drive-steer.mjs faults   # DurableSteer
 set -eu
 cd "$(dirname "$0")"
 
@@ -93,7 +95,7 @@ for pair in NoInterrupt:NoSteerWaitsOnReply NoHandBack:NothingLost \
 done
 
 # AgentRouting.tla: which agent runs a session's turns when an app has
-# several. Its graphs are what drive-agents.mjs walks: inputs stored when
+# several. Its graphs are what ../drivers/drive-agents.mjs walks: inputs stored when
 # sent (memory, local) and when delivered (Vercel), with process p2 lacking
 # one agent. Drains is checked under fairness, a simulation runs a larger
 # config, and each witness breaks RunsOnOwner: NoNames is routing without

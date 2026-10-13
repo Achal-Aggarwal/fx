@@ -66,7 +66,7 @@
 (*                                                                         *)
 (* `act` names each step and its worker, so a driver can replay any path   *)
 (* of the state graph against the real code and compare every state:       *)
-(* tests/tla/sdk/drive.mjs.                                                *)
+(* tests/tla/drivers/drive.mjs.                                            *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences
 

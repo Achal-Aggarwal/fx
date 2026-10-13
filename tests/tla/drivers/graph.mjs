@@ -1,4 +1,4 @@
-// The state graphs check.sh has TLC write, as the model drivers read them.
+// The state graphs tests/tla/sdk/check.sh has TLC write, as the drivers read them.
 import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 

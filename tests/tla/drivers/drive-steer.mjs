@@ -3,10 +3,11 @@
 // WebAssembly, along paths of the TLC state graph of DurableSteer.tla, and
 // checks after every step that the code is in a state the model allows.
 //
-//   bun tests/tla/sdk/drive-steer.mjs [ideal|faults] [--walks N] [--seed S]
+//   bun tests/tla/drivers/drive-steer.mjs [ideal|faults] [--walks N] [--seed S]
 //     [--backend native|wasm] [--durability local|world] [--verbose]
 //
-// `./check.sh` model-checks the spec and writes graphs/steer-<graph>.dot. The
+// `tests/tla/sdk/check.sh` model-checks the spec and writes its
+// graphs/steer-<graph>.dot. The
 // ideal graph has no faults; the faults graph adds cancels, deadline handoffs
 // and client retries.
 //
@@ -352,7 +353,7 @@ const random = () => {
   return seed / 2147483648;
 };
 
-const graph = await loadGraph(resolve(here, "graphs", `steer-${graphName}.dot`));
+const graph = await loadGraph(resolve(here, "../sdk/graphs", `steer-${graphName}.dot`));
 const covered = new Set();
 const totalEdges = [...graph.next.values()].reduce((sum, targets) => sum + targets.size, 0);
 let steps = 0;
