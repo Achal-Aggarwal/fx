@@ -3976,7 +3976,7 @@ fn saveSessionPermissionMode(state: *ServerState, alloc: Allocator, mode: types.
     if (comptime !host_target.is_wasm) {
         if (state.cfg.minimal_kernel) return;
         const label = permissions.permissionModeLabel(mode);
-        const home = state.cfg.home_override orelse io_mod.getenv("HOME") orelse {
+        const home = state.cfg.home_override orelse io_mod.homeDir() orelse {
             debug_trace.logf("acp", "permission_mode_save_failed mode={s} err=HomeNotSet", .{label});
             return;
         };

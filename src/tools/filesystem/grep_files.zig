@@ -1087,7 +1087,7 @@ test "grep_files single-file search returns matching lines" {
     try std.testing.expectEqualStrings("[grep] 1 matches for needle\n - single.txt:2: needle here\n", result.body);
 }
 
-test "grep_files single-file include applies to basename" {
+test "grep_files single-file include matches the base name or the workspace path" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1101,7 +1101,14 @@ test "grep_files single-file include applies to basename" {
     try std.testing.expectEqual(.success, basename_match.status);
     try std.testing.expectEqualStrings("[grep] 1 matches for needle\n - src/single.zig:1: needle\n", basename_match.body);
 
-    var path_pattern_miss = try dispatchGrepFiles(alloc, workspace, "needle", file_path, "src/*.zig", null, null, null);
+    // A pattern with a slash matches the path relative to the workspace, as in
+    // a search of the whole workspace.
+    var path_pattern_match = try dispatchGrepFiles(alloc, workspace, "needle", file_path, "src/*.zig", null, null, null);
+    defer path_pattern_match.deinit(alloc);
+    try std.testing.expectEqual(.success, path_pattern_match.status);
+    try std.testing.expectEqualStrings("[grep] 1 matches for needle\n - src/single.zig:1: needle\n", path_pattern_match.body);
+
+    var path_pattern_miss = try dispatchGrepFiles(alloc, workspace, "needle", file_path, "lib/*.zig", null, null, null);
     defer path_pattern_miss.deinit(alloc);
     try std.testing.expectEqual(.success, path_pattern_miss.status);
     try std.testing.expectEqualStrings("[grep] no matches for needle\n", path_pattern_miss.body);
