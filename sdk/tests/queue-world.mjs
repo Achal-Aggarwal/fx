@@ -104,13 +104,72 @@ function createBroker({ retryMs }) {
   };
 }
 
-/** The durability, a World at `dir` with that queue passed to world(), and its broker. */
-export async function queueWorldAt(dir, { retryMs = 20, ...options } = {}) {
+// The in-band writer fence `@workflow/world` defines, for a world-local
+// without it: a count per run of the in-band writes it took, reported with
+// each listing, read before it, and a refusal, before anything is written,
+// of an in-band write that expects another count. A world-local with its own
+// fence keeps it. Either way it keeps what each create was asked, for tests.
+// `settleMs` holds an accepted write's count back that long after its event
+// is published, as world-local's count on disk lags its event.
+function withInBandFence(stored, { settleMs = 0 } = {}) {
+  const own = stored.capabilities?.inBandFence === true;
+  const counts = new Map();
+  const seqs = new Map();
+  const locks = new Map();
+  const creates = [];
+  const slotOf = (event) => Number(/^[a-z]+_(\d{26})$/.exec(String(event?.eventId ?? ""))?.[1] ?? 0);
+  const noteSeq = (runId, event) => seqs.set(runId, Math.max(seqs.get(runId) ?? 0, slotOf(event)));
+  const locked = (runId, fn) => {
+    const run = (locks.get(runId) ?? Promise.resolve()).then(fn);
+    locks.set(runId, run.catch(() => {}));
+    return run;
+  };
+  const create = async (runId, data, params) => {
+    creates.push({ runId, data, params });
+    if (own) return stored.events.create(runId, data, params);
+    if (!params?.inBand || data?.eventType === "run_created") {
+      const result = await stored.events.create(runId, data, params);
+      noteSeq(runId, result.event);
+      return result;
+    }
+    return locked(runId, async () => {
+      const current = counts.get(runId) ?? 1;
+      if (params.expectedSeqInBand !== current) {
+        throw Object.assign(new Error(`In-band write on run ${runId} expected seqInBand ${params.expectedSeqInBand}, but the run is at ${current}.`), { name: "InBandSupersededError", status: 412, code: "in-band-superseded", seqInBand: current });
+      }
+      const result = await stored.events.create(runId, data, params);
+      noteSeq(runId, result.event);
+      if (settleMs > 0) await new Promise((resolve) => setTimeout(resolve, settleMs));
+      const allocated = result.event ? 1 : 0;
+      counts.set(runId, current + allocated);
+      return { ...result, allocated };
+    });
+  };
+  const list = async (params) => {
+    if (own) return stored.events.list(params);
+    const snapshot = { seq: seqs.get(params.runId) ?? 0, seqInBand: counts.get(params.runId) ?? 1 };
+    return { ...(await stored.events.list(params)), snapshot };
+  };
+  return {
+    events: { ...stored.events, create, list },
+    capabilities: { ...stored.capabilities, inBandFence: true },
+    creates,
+  };
+}
+
+/**
+ * The durability, a World at `dir` with that queue passed to world(), and its
+ * broker. With `inBandFence`, `true` or `{ settleMs }`, the World has the
+ * in-band writer fence, and `fence.creates` holds what each create was asked.
+ */
+export async function queueWorldAt(dir, { retryMs = 20, inBandFence = false, ...options } = {}) {
   const stored = createWorld({ dataDir: dir, recoverActiveRuns: false });
   await stored.start();
   const broker = createBroker({ retryMs });
+  const fence = inBandFence ? withInBandFence(stored, inBandFence === true ? {} : inBandFence) : null;
   const instance = {
     ...stored,
+    ...(fence ? { events: fence.events, capabilities: fence.capabilities } : {}),
     queue: broker.queue,
     createQueueHandler: broker.createQueueHandler,
     registerHandler: broker.registerHandler,
@@ -122,7 +181,9 @@ export async function queueWorldAt(dir, { retryMs = 20, ...options } = {}) {
   opened.push(instance);
   // The broker keeps its messages in memory, so a message dies with the
   // process and prompt() stores each prompt before it sends it.
-  return { durability: world(instance, { name: "queue", pollMs: 250, queueDurable: false, ...options }), broker };
+  // Every delivery comes from the queue unless a test asks for prompts to run
+  // in the request that sent them.
+  return { durability: world(instance, { name: "queue", pollMs: 250, queueDurable: false, runInRequest: false, ...options }), broker, fence };
 }
 
 export async function closeQueueWorlds() {
