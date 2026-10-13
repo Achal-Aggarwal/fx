@@ -33,8 +33,9 @@ const max_output_bytes = 8 * 1024 * 1024;
 const max_output_message_bytes = 64 * 1024 * 1024;
 const max_fetch_request_bytes = 8 * 1024 * 1024;
 /// The largest request body a provider sends over the fetch bridge: its
-/// budget less room for the request's method, URL, and headers.
-const max_bridge_request_body_bytes = max_fetch_request_bytes - 64 * 1024;
+/// budget less room for the request's method, URL, and headers, which hold
+/// at most the URL and API key this addon accepts and the other headers.
+const max_bridge_request_body_bytes = max_fetch_request_bytes - (max_url_bytes + max_api_key_bytes + 64 * 1024);
 
 /// `provider` with its requests fit to the fetch bridge, so they leave out
 /// their oldest images instead of failing.

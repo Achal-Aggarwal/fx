@@ -54,7 +54,7 @@ try {
       if (requests === 3) {
         // The bridge carries at most 8 MiB, so this request left out the
         // older image instead of failing, with a note, and kept the newer.
-        assert.ok(init.body.length <= 8 * 1024 * 1024 - 64 * 1024);
+        assert.ok(init.body.length <= 8 * 1024 * 1024 - 144 * 1024);
         const body = Buffer.from(init.body).toString("utf8");
         assert.equal(body.split(data).length - 1, 1, "only the newer image stays");
         assert.match(body, /not sent to keep the request under the provider's size limit/);
@@ -92,6 +92,9 @@ try {
   // oldest images leave the request, which reaches host fetch within it.
   assert.equal((await agent.prompt("x".repeat(2 * 1024 * 1024)).result).stopReason, "end_turn");
   assert.equal(requests, 3);
+  // A request past the bridge even without its images stays bounded.
+  await assert.rejects(agent.prompt("z".repeat(6.5 * 1024 * 1024)).result, /HostStreamBackpressure/);
+  assert.equal(requests, 3, "an oversized request must not reach host fetch");
   console.log("native image framing passed: accepted images survive base64 framing; requests past the bridge leave out their oldest images");
 } finally {
   clearTimeout(timer);
