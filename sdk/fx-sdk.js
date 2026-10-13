@@ -36,7 +36,9 @@ const maxUnreadEvents = 256;
 // Prompt images travel as raw bytes beside the ACP frame and are base64
 // encoded only in the model request. An image may use 5 MiB of encoded
 // request data, and a prompt's images 8 MiB, so the raw limits are 3/4 of that.
-// The kernel still validates content and media type.
+// The kernel still validates content and media type. An open stages one
+// prompt's images past a session's image window, so `max_prompt_images` and
+// `max_prompt_images_bytes` in src/acp/server.zig must match the prompt limits.
 const maxPromptImages = 8;
 const maxPromptImageDataBytes = 5 * 1024 * 1024;
 const maxPromptImagesDataBytes = 8 * 1024 * 1024;
