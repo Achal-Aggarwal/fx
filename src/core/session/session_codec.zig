@@ -642,9 +642,10 @@ pub fn turnNamesImages(turn: session.HistoryTurn, stored: ?*const StoredImages) 
 }
 
 /// The images a libfx session with an image store keeps: its newest, at most
-/// `max_images` of them holding at most `max_bytes`, which is the most one
-/// open stages from the host's store. Older images leave the session and keep
-/// only their names, so a session never grows past what it can reopen.
+/// `max_images` of them holding at most `max_bytes`. An open stages these from
+/// the host's store, with the open turn's, which the window leaves out. Older
+/// images leave the session and keep only their names, so a session never
+/// grows past what it can reopen.
 pub const ImageWindow = struct {
     max_images: usize = 4096,
     max_bytes: usize = 512 * 1024 * 1024,

@@ -389,9 +389,9 @@ pub const Journal = struct {
         var sizes: std.ArrayList(?usize) = .empty;
         defer sizes.deinit(alloc);
         for (history) |*turn| if (userOf(turn)) |user| for (user.images) |*image| {
-            if (try countSize(alloc, &sizes, windowSize(image.*, null))) try held.append(alloc, image);
+            if (try countSize(alloc, &sizes, windowSize(image.*))) try held.append(alloc, image);
         };
-        const outside = @min(self.image_window.oldestOutside(sizes.items), held.items.len);
+        const outside = self.image_window.oldestOutside(sizes.items);
         var dropped: usize = 0;
         for (held.items[0..outside]) |image| {
             const bytes = image.inline_data orelse continue;
@@ -489,8 +489,8 @@ const MissingImages = std.array_hash_map.Auto(session_codec.ImageName, usize);
 
 /// What the image window counts for one image.
 const WindowSize = union(enum) {
-    /// Its bytes: those it holds, or for a named image an open has yet to
-    /// stage, the size its record gives.
+    /// Its bytes: those it holds, or for an image an open has yet to stage,
+    /// the size its record gives (`unstaged`).
     bytes: usize,
     /// One the session dropped, which keeps every older image out.
     dropped,
@@ -499,14 +499,21 @@ const WindowSize = union(enum) {
     none,
 };
 
-/// What the window counts for `image`. An open reads a named image it has
-/// not staged as one without bytes, which `missing` names with its size.
-fn windowSize(image: types.ImageAttachment, missing: ?*const MissingImages) WindowSize {
+/// What the window counts for `image`, as the session holds it.
+fn windowSize(image: types.ImageAttachment) WindowSize {
     if (image.inline_data) |bytes| return .{ .bytes = bytes.len };
-    if (!image.droppedFromSession()) return .none;
-    const map = missing orelse return .dropped;
-    const name = session_codec.imageName(image.snapshot_sha256.?) orelse return .dropped;
-    return if (map.get(name)) |size| .{ .bytes = size } else .dropped;
+    return if (image.droppedFromSession()) .dropped else .none;
+}
+
+/// An image an open has yet to stage, with the size its record gives.
+const Unstaged = struct { name: session_codec.ImageName, size: usize };
+
+/// The name and size of `image` when it is one an open has yet to stage: it
+/// reads such an image as one without bytes, which `missing` names.
+fn unstaged(image: types.ImageAttachment, missing: *const MissingImages) ?Unstaged {
+    if (!image.droppedFromSession()) return null;
+    const name = session_codec.imageName(image.snapshot_sha256.?) orelse return null;
+    return .{ .name = name, .size = missing.get(name) orelse return null };
 }
 
 /// Appends what the window counts for one image to `sizes`, oldest first,
@@ -550,9 +557,7 @@ fn keepNeededImages(
         if (name) |value| try needed.put(images.alloc, value, size.?);
     }
     if (open_user) |user| for (user.images) |image| {
-        if (!image.droppedFromSession()) continue;
-        const name = session_codec.imageName(image.snapshot_sha256.?) orelse continue;
-        if (images.missing.get(name)) |size| try needed.put(images.alloc, name, size);
+        if (unstaged(image, &images.missing)) |found| try needed.put(images.alloc, found.name, found.size);
     };
     if (outside > 0) debug_trace.logf("session", "event=libfx_image_window_open outside={d} needed={d}", .{ outside, needed.count() });
     images.missing.deinit(images.alloc);
@@ -569,9 +574,9 @@ fn countOpenedImages(
     missing: *const MissingImages,
 ) Allocator.Error!void {
     for (user_images) |image| {
-        const size = windowSize(image, missing);
-        if (!try countSize(alloc, sizes, size)) continue;
-        try names.append(alloc, if (image.inline_data == null and size == .bytes) session_codec.imageName(image.snapshot_sha256.?) else null);
+        const pending = unstaged(image, missing);
+        if (!try countSize(alloc, sizes, if (pending) |found| .{ .bytes = found.size } else windowSize(image))) continue;
+        try names.append(alloc, if (pending) |found| found.name else null);
     }
 }
 

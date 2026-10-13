@@ -1493,6 +1493,48 @@ test("a turn that fails before it enters the history drops no image", async () =
   await agent.close();
 });
 
+test("a turn that crashed with a full image window reopens with all of its images", async () => {
+  // An open stages the whole window and the open turn's images, which the
+  // window leaves out: one prompt's, up to 8 of them.
+  const tiny = (n) => {
+    const bytes = pngOf(80, 0);
+    new DataView(bytes.buffer).setUint32(70, n);
+    return bytes;
+  };
+  let made = 0;
+  const prompt = (text) => [{ type: "text", text }, ...Array.from({ length: 8 }, () => imageBlock(tiny(made++)))];
+  const images = new Map();
+  const withImages = (persistence) => ({
+    ...persistence,
+    putImage: async (name, bytes) => { images.set(name, new Uint8Array(bytes)); },
+    getImage: async (name) => images.get(name),
+  });
+  const journal = eventJournal();
+  const source = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: withImages(persisted(journal)) }));
+  for (let turn = 0; turn < 4096 / 8; turn += 1) await run(source, prompt(`look ${turn}`));
+  const open = prompt("use the tool");
+  assert.equal((await run(source, open)).text, "tool said beta");
+  await source.close();
+  assert.equal(images.size, 4096 + 8);
+  // A crash after the last turn's tool step leaves it open, with the window
+  // full of the turns before it.
+  const stepped = journal.events.findLast((event) => event.type === "turn_progress" && event.steps === 1);
+  const survived = journal.events.slice(0, journal.events.indexOf(stepped) + 1);
+  const read = new Set();
+  const resumed = await createFxEngine(options(targetBackend, undefined, {
+    ...visionCatalog,
+    persistence: { ...withImages(persisted(eventJournal(survived))), getImage: async (name) => { read.add(name); return images.get(name); } },
+  }));
+  requests.length = 0;
+  const turn = resumed.resume();
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  await resumed.close();
+  assert.equal(read.size, 4096 + 8, "the open read the window and the open turn's images");
+  const sent = requestImages(requests[0]);
+  for (const block of open.slice(1)) assert.ok(sent.includes(base64Of(block.data)), "the open turn kept its images");
+});
+
 test("a failed image write fails the prompt before it is sent", async () => {
   const store = createMemoryPersistence();
   store.putImage = async () => { throw new Error("disk full"); };
