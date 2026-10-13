@@ -22,13 +22,14 @@
 (* retry's input lands too, naming an image the store may never have got   *)
 (* (ImageStore-RetryLands.cfg).                                            *)
 (*                                                                         *)
-(* The session keeps only its newest Window images. When a turn starts,    *)
-(* the core drops each image older than the window: it keeps the name and  *)
-(* gives up the bytes, and a checkpoint saves it by name alone. An open    *)
-(* stages only the named images inside the window. With LiveWindow = FALSE *)
-(* the core keeps every image (ImageStore-KeepAll.cfg); with WindowAtOpen  *)
-(* = FALSE an open stages every named image, so one the store lost outside *)
-(* the window fails it (ImageStore-NeedAll.cfg).                           *)
+(* The session keeps only its newest Window images. When a turn enters the *)
+(* history, the core drops each image older than the window: it keeps the  *)
+(* name and gives up the bytes, and a checkpoint saves it by name alone.   *)
+(* An open counts the history alone, as that turn's end did, and stages    *)
+(* the named images inside the window and the open turn's. With LiveWindow *)
+(* = FALSE the core keeps every image (ImageStore-KeepAll.cfg); with       *)
+(* WindowAtOpen = FALSE an open stages every named image, so one the store *)
+(* lost outside the window fails it (ImageStore-NeedAll.cfg).              *)
 (*                                                                         *)
 (* The core may crash, losing what it held and the image writes in flight. *)
 (* It opens again in two phases: it names the images it needs, the host    *)
@@ -134,8 +135,13 @@ Init ==
 Named == {saved[k].i : k \in {j \in 1..Len(saved) : saved[j].ref}}
 \* Whether image k of a history of n is one of the newest Window.
 InWindow(k, n) == k + Window > n
-\* The named images an open stages: those inside the window.
-Needed == {saved[k].i : k \in {j \in 1..Len(saved) : saved[j].ref /\ (InWindow(j, Len(saved)) \/ ~WindowAtOpen)}}
+\* A turn has started and not ended: its image is the last saved, and it has
+\* not entered the history the window counts.
+OpenTurn == \E p \in Prompts : ph[p] = "started"
+Counted == IF OpenTurn THEN Len(saved) - 1 ELSE Len(saved)
+\* The named images an open stages: those inside the window, and the open
+\* turn's, which is past every counted one.
+Needed == {saved[k].i : k \in {j \in 1..Len(saved) : saved[j].ref /\ (InWindow(j, Counted) \/ ~WindowAtOpen)}}
 \* A core history whose images older than the window are dropped: each
 \* keeps its name, and the core no longer counts it as stored.
 Windowed(s) ==
@@ -220,26 +226,27 @@ Take(p) ==
     /\ act' = << "Take", p >>
     /\ UNCHANGED <<made, img, putting, store, lostImgs, saved, inputs, mem, up, staged, dirty, faults, crashes, retries, repeats>>
 
-\* The turn's first record lands, naming the image the host stored. The
-\* new image is the newest; the core drops any older than the window.
+\* The turn's first record lands, naming the image the host stored.
 TurnStart(p) ==
     /\ ph[p] = "sent"
     /\ up = "open"
-    /\ mem' = Windowed(Append(mem, [i |-> img[p], stored |-> TRUE, dropped |-> FALSE]))
+    /\ mem' = Append(mem, [i |-> img[p], stored |-> TRUE, dropped |-> FALSE])
     /\ saved' = Append(saved, [i |-> img[p], ref |-> TRUE, dropped |-> FALSE])
     /\ dirty' = TRUE
     /\ ph' = Set(ph, p, "started")
     /\ act' = << "TurnStart", p >>
     /\ UNCHANGED <<made, img, putting, store, lostImgs, inputs, up, staged, faults, crashes, retries, repeats>>
 
-\* The model answers and the turn ends.
+\* The model answers and the turn enters the history. Its image is the
+\* newest; the core drops any older than the window.
 TurnEnd(p) ==
     /\ ph[p] = "started"
     /\ up = "open"
+    /\ mem' = Windowed(mem)
     /\ ph' = Set(ph, p, "ended")
     /\ dirty' = TRUE
     /\ act' = << "TurnEnd", p >>
-    /\ UNCHANGED <<made, img, putting, store, lostImgs, saved, inputs, mem, up, staged, faults, crashes, retries, repeats>>
+    /\ UNCHANGED <<made, img, putting, store, lostImgs, saved, inputs, up, staged, faults, crashes, retries, repeats>>
 
 \* A checkpoint between turns writes the history again from the core. A
 \* dropped image is saved by its name alone, neither named nor inline.
@@ -309,10 +316,10 @@ OpenOk ==
     /\ \/ Needed \subseteq staged
        \/ ~FailOnMissing /\ \A i \in Needed \ staged : i \notin store
     /\ LET marked == [k \in 1..Len(saved) |->
-                        [saved[k] EXCEPT !.dropped = @ \/ (saved[k].ref /\ saved[k].i \notin staged /\ ~InWindow(k, Len(saved)))]]
-           kept == SelectSeq(marked, LAMBDA e : e.dropped \/ ~e.ref \/ e.i \in staged)
-       IN mem' = Windowed([k \in 1..Len(kept) |->
-                             [i |-> kept[k].i, stored |-> kept[k].ref /\ ~kept[k].dropped, dropped |-> kept[k].dropped]])
+                        [saved[k] EXCEPT !.dropped = @ \/ (saved[k].ref /\ saved[k].i \notin staged /\ ~InWindow(k, Counted))]]
+           Kept(s) == SelectSeq(s, LAMBDA e : e.dropped \/ ~e.ref \/ e.i \in staged)
+           AsCore(s) == [k \in 1..Len(s) |-> [i |-> s[k].i, stored |-> s[k].ref /\ ~s[k].dropped, dropped |-> s[k].dropped]]
+       IN mem' = Windowed(AsCore(Kept(SubSeq(marked, 1, Counted)))) \o AsCore(Kept(SubSeq(marked, Counted + 1, Len(saved))))
     /\ up' = "open"
     /\ staged' = {}
     /\ act' = << "OpenOk" >>
@@ -412,10 +419,12 @@ FailsOnlyOnLoss == up = "failed" => lostImgs # {}
 \* An open fails only when the store lost an image the window keeps.
 FailsOnlyOnLossInWindow ==
     up = "failed" =>
-        \E k \in 1..Len(saved) : saved[k].ref /\ InWindow(k, Len(saved)) /\ saved[k].i \in lostImgs
+        \E k \in 1..Len(saved) : saved[k].ref /\ InWindow(k, Counted) /\ saved[k].i \in lostImgs
 
-\* An open core keeps exactly its newest Window images: each older one is
-\* dropped, keeping its name.
-WindowHeld == up = "open" => \A k \in 1..Len(mem) : mem[k].dropped = ~InWindow(k, Len(mem))
+\* An open core keeps exactly its newest Window images between turns: each
+\* older one is dropped, keeping its name. A running turn's image joins the
+\* window once the turn enters the history.
+WindowHeld ==
+    (up = "open" /\ ~OpenTurn) => \A k \in 1..Len(mem) : mem[k].dropped = ~InWindow(k, Len(mem))
 
 =============================================================================

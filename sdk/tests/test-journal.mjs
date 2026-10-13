@@ -64,10 +64,13 @@ function persisted(journal) {
 // "gather everything" calls bulky bulkySteps times, one call per response.
 // Any other prompt is answered with its own text.
 const bulkySteps = 24;
+// An image prompt's text ends with a marker per image, which the scripts
+// ignore.
+function scriptText(prompt) {
+  return lastUserText(prompt).replace(/(\n\[Image #\d+\])+$/u, "");
+}
 function framesFor(prompt) {
-  // An image prompt's text ends with a marker per image, which the scripts
-  // below ignore.
-  const text = lastUserText(prompt).replace(/(\n\[Image #\d+\])+$/u, "");
+  const text = scriptText(prompt);
   // "keep using the tool" asks for a lookup until three results are in, so an
   // agent that ignored a fence would keep calling it.
   if (text === "keep using the tool") {
@@ -141,7 +144,7 @@ const server = createServer((request, response) => {
     Object.defineProperty(prompt, "toolChoice", { value: toolChoice?.type ?? null });
     requests.push(prompt);
     sessionHeaders.push([request.headers["x-session-id"], request.headers["x-session-affinity"]]);
-    if (lastUserText(prompt) === "fail please") {
+    if (scriptText(prompt) === "fail please") {
       response.writeHead(400, { "content-type": "application/json" });
       response.end(JSON.stringify({ error: { message: "refused for the test", type: "invalid_request_error" } }));
       return;
@@ -1447,8 +1450,11 @@ for (const [label, limits] of [["images", { images: 2 }], ["bytes", { bytes: 2 *
     for (const [index, picture] of pictures.entries()) {
       await run(source, [{ type: "text", text: `look ${index}` }, imageBlock(picture)]);
     }
-    // The third prompt pushed the first image out: its request carries the
-    // two newest, and a note where the first was.
+    // The third turn's request still carries every image; once it entered the
+    // history, its image pushed the first out, and the next request carries
+    // the two newest and a note where the first was.
+    assert.deepEqual(requestImages(requests.at(-1)), pictures.map(base64Of));
+    await run(source, "and then?");
     assert.deepEqual(requestImages(requests.at(-1)), [base64Of(pictures[1]), base64Of(pictures[2])]);
     assert.match(JSON.stringify(requests.at(-1)), droppedNote);
     await source.close();
@@ -1471,6 +1477,21 @@ for (const [label, limits] of [["images", { images: 2 }], ["bytes", { bytes: 2 *
     assert.match(JSON.stringify(requests.at(-1)), droppedNote);
   });
 }
+
+test("a turn that fails before it enters the history drops no image", async () => {
+  const store = createMemoryPersistence();
+  const pictures = [pngOf(40_000, 21), pngOf(40_000, 22), pngOf(40_000, 23)];
+  const agent = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: store, [imageWindow]: { images: 2 } }));
+  await run(agent, [{ type: "text", text: "look 0" }, imageBlock(pictures[0])]);
+  await run(agent, [{ type: "text", text: "look 1" }, imageBlock(pictures[1])]);
+  const failed = await run(agent, [{ type: "text", text: "fail please" }, imageBlock(pictures[2])]);
+  assert.notEqual(failed.result.stopReason, "end_turn");
+  // The failed turn is not in the history, so the window still holds both.
+  await run(agent, "and then?");
+  assert.deepEqual(requestImages(requests.at(-1)), [base64Of(pictures[0]), base64Of(pictures[1])]);
+  assert.doesNotMatch(JSON.stringify(requests.at(-1)), /no longer in this session/);
+  await agent.close();
+});
 
 test("a failed image write fails the prompt before it is sent", async () => {
   const store = createMemoryPersistence();

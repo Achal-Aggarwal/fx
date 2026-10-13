@@ -36,8 +36,9 @@
 //! such as a compaction during the turn. Events that use `base` or are a
 //! `tool_result` are version 2; every other event stays version 1, so an fx
 //! that reads only version 1 still loads a journal without them.
-//! An event that names a stored image instead of holding its bytes is
-//! version 3, so an fx that reads only up to version 2 refuses it as newer.
+//! An event that names an image instead of holding its bytes, one the host
+//! stored or one the session dropped, is version 3, so an fx that reads only
+//! up to version 2 refuses it as newer.
 //!
 //! A `turn_progress` event lists the inputs its model request carries for
 //! the first time in `inputs`, so placement is stored with the text it
@@ -60,9 +61,10 @@ pub const version: u8 = 3;
 const plain_version: u8 = 1;
 /// The version of a `tool_result` and of a progress that extends another.
 const delta_version: u8 = 2;
-/// The version of an event that names an image the host stored
-/// (`inline_ref`) instead of holding its bytes, so an fx that reads only up
-/// to version 2 reports a newer journal instead of an invalid one.
+/// The version of an event that names an image instead of holding its
+/// bytes, one the host stored (`inline_ref`) or one the session dropped, so an
+/// fx that reads only up to version 2 reports a newer journal instead of an
+/// invalid one.
 const naming_version: u8 = 3;
 /// The most event bytes one load accepts, and the most bytes one snapshot
 /// holds: each travels as one host attachment, and an attachment holds at
@@ -281,7 +283,8 @@ fn eventNamesImages(event: Event, stored: ?*const session_codec.StoredImages) bo
 const snapshot_magic = "FXSN";
 const snapshot_version_quiet: u8 = 1;
 const snapshot_version: u8 = 2;
-/// Version 2's layout, with an open turn that names images the host stored.
+/// Version 2's layout, with an open turn that names images: ones the host
+/// stored, or ones the session dropped.
 const snapshot_naming_version: u8 = 3;
 const snapshot_header_bytes = snapshot_magic.len + 1 + 8 + 8 + 1;
 
@@ -312,8 +315,8 @@ pub fn encodeSnapshot(
     return encodeSnapshotWith(alloc, seq, turn, last_turn_id, open_turn, checkpoint, false);
 }
 
-/// Like `encodeSnapshot`, for an `open_turn` that `writeOpenTurnNamingImages`
-/// wrote naming at least one image.
+/// Like `encodeSnapshot`, for an `open_turn` that names at least one image
+/// (`session_codec.namesImages`).
 pub fn encodeSnapshotNamingImages(
     alloc: Allocator,
     seq: u64,

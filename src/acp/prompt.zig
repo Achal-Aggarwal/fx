@@ -1002,9 +1002,6 @@ pub fn handlePrompt(
     if (session.journal) |*journal| {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
-        // The turn starts with the prompt's images as the newest: older ones
-        // past the session's window give up their bytes.
-        if (prompt_input.images.len > 0) try journal.dropOutsideWindow(alloc, state.alloc, session.session_rt.agent.history.items, prompt_input.images);
         // A host that stores inputs first already holds the prompt.
         journal.barrier_next_progress = !journal.inputs_durable;
         journal.startYieldClock(prompt_input.yield_at_ms);
@@ -2881,6 +2878,7 @@ fn persistAcpHistoryTurn(
         session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
         prepared_owned = false;
         if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
+        try keepImageWindow(alloc, session);
         if (session.wasm_state != null) try sessions.commitWasmSessionLocked(alloc, session);
         return;
     }
@@ -2900,6 +2898,7 @@ fn persistAcpHistoryTurn(
         session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
         prepared_owned = false;
         if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
+        try keepImageWindow(alloc, session);
         return;
     };
     try writable.prepareHistoryTurnForCommit(alloc, &prepared);
@@ -2921,6 +2920,15 @@ fn persistAcpHistoryTurn(
     session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
     prepared_owned = false;
     if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
+}
+
+/// Keeps a libfx session within its image window once a turn enters its
+/// history (owned by `alloc`): its images are the newest, and older ones past
+/// the window give up their bytes. A turn that fails before it is recorded
+/// drops nothing, so a reopen keeps the same images.
+fn keepImageWindow(alloc: Allocator, session: *server.ActiveSessionState) Allocator.Error!void {
+    const journal = if (session.journal) |*value| value else return;
+    try journal.dropOutsideWindow(alloc, alloc, session.session_rt.agent.history.items);
 }
 
 fn commitContextCompaction(
