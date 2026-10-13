@@ -53,6 +53,14 @@ export type WorldOptions = {
    * deadline renews its lease all the same. Default false.
    */
   queueLeases?: boolean;
+  /**
+   * With `queueLeases`: a prompt runs in the request that took it when no worker holds the session, and the queue keeps
+   * the prompt as a backstop it delivers only after that request's deadline. The request's lease names the backstop, so
+   * if the request died, the backstop takes the session over. Default true with `queueLeases`.
+   */
+  runInRequest?: boolean;
+  /** Keeps the request alive until `work`, a turn it runs after its response, settles, such as Vercel's `waitUntil` or Next's `after()`. */
+  waitUntil?(work: Promise<void>): void;
   /** Without liveness, how long a lease lasts after its worker took or last renewed it; renewed every third of that. At least 1000. Default 15000. */
   leaseMs?: number;
   /** Each delivery stops `reserveMs` before `maxDurationMs`, or before the World's `getRuntimeDeadline()`. No limit by default. */

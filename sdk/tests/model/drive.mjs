@@ -3,8 +3,16 @@
 // WebAssembly, along paths of the TLC state graph of DurableSession.tla, and
 // checks after every step that the code is in a state the model allows.
 //
-//   bun sdk/tests/model/drive.mjs [send|lookup|cutoff|leased|queue] [--walks N] [--seed S] [--backend native|wasm]
+//   bun sdk/tests/model/drive.mjs [send|lookup|write|cutoff|leased|queue] [--walks N] [--seed S] [--backend native|wasm]
 //     [--durability local|world|vercel]
+//
+// The lookup and cutoff graphs run a lookup, which starts before its intent
+// is stored: the driver holds that intent's record, so the call runs while
+// its intent is on its way, until the model's Intent step lets it land. The
+// write graph runs an idempotent tool that writes, and the send graph a tool
+// with effects; both wait for their intent. Each model response names a new
+// call id, as a model's does, and the driver counts the execution ids the
+// tool ran under.
 //
 // The leased graph is the send graph with Heartbeat: its agents keep the
 // session in a World that cannot tell whether a holder runs, so each renews
@@ -49,8 +57,11 @@ const option = (name, fallback) => {
   const index = args.indexOf(`--${name}`);
   return index >= 0 ? args[index + 1] : fallback;
 };
-const graphName = args.find((arg) => ["send", "lookup", "cutoff", "leased", "queue"].includes(arg)) ?? "send";
+const graphName = args.find((arg) => ["send", "lookup", "write", "cutoff", "leased", "queue"].includes(arg)) ?? "send";
 const tool = graphName === "cutoff" ? "lookup" : graphName === "leased" || graphName === "queue" ? "send" : graphName;
+// The tool as the host declares it, and whether its calls run ahead.
+const toolFlags = { lookup: { idempotent: true }, write: { idempotent: true, writes: true }, send: { idempotent: false } }[tool];
+const runsAhead = tool === "lookup";
 const walks = Number(option("walks", 40));
 const backend = option("backend", "native");
 const leased = graphName === "leased";
@@ -103,7 +114,7 @@ const shownEpochs = (lines) => {
 // leased World, whether a lease stands too: a woken worker's renewal may or
 // may not have landed, and only the lease tells those states apart.
 const view = (state) => JSON.stringify({
-  pc: state.pc, frozen: state.frozen, runs: state.runs, ui: shownEpochs(state.ui), ...(leased ? { live: state.live ?? state.lease.live } : {}),
+  pc: state.pc, frozen: state.frozen, runs: state.runs, ids: state.ids, ui: shownEpochs(state.ui), ...(leased ? { live: state.live ?? state.lease.live } : {}),
 });
 const sameAct = (a, b) => a.name === b.name && a.w === b.w;
 
@@ -132,6 +143,17 @@ const until = async (check, ms = stepTimeoutMs) => {
   return true;
 };
 const sleep = (ms) => new Promise((resolveWait) => setTimeout(resolveWait, ms));
+
+// The ids of the calls a session-log record announces, from its stored
+// journal events.
+const intentCallIds = (entry) => {
+  try {
+    const { events } = JSON.parse(Buffer.from(entry.data, "base64").toString("utf8"));
+    return events.filter((event) => event?.type === "tool_intent").flatMap((event) => event.data.map((call) => call.id));
+  } catch {
+    return [];
+  }
+};
 
 // The queue as the driver runs it: a message the code asks to have delivered
 // again later, as a backstop, is not, so nothing runs that the driver did not
@@ -173,6 +195,14 @@ async function harness() {
   const brokers = {};
   const lapsed = { A: null, B: null };
   let runs = 0;
+  // The execution ids the tool ran under, and the call ids whose first
+  // intent was seen: a rerun announces its call again, and that record is
+  // not held.
+  const executions = new Set();
+  const announced = new Set();
+  let modelCalls = 0;
+  // Each agent's events, for a failure.
+  const events = [];
   let sessionId = null;
   const remove = (list, entry) => {
     const index = list.indexOf(entry);
@@ -186,6 +216,13 @@ async function harness() {
     if (queueWorld) brokers[w] = queueWorld.broker;
     const stored = leased ? leasedWorld(dir) : durabilityKind === "world" ? await appWorldAt(dir) : remote ? vercelStorage({ dir }) : queueWorld ? queueWorld.durability : local({ dir });
     const [durability, held] = holdWrites(withoutBackstops(stored), (entry) => {
+      // The first intent of a call that runs ahead waits for the Intent step.
+      if (entry.k === "record") {
+        if (!runsAhead) return false;
+        const fresh = intentCallIds(entry).filter((id) => !announced.has(id));
+        for (const id of fresh) announced.add(id);
+        return fresh.length > 0;
+      }
       if (entry.k !== "lease") return false;
       if (!claims.has(entry.holder)) {
         claims.add(entry.holder);
@@ -216,11 +253,12 @@ async function harness() {
       },
       tools: [{
         name: tool,
-        description: tool === "send" ? "Sends an invoice" : "Looks up a key",
-        ...(tool === "lookup" ? { idempotent: true } : {}),
+        description: { send: "Sends an invoice", write: "Saves a key", lookup: "Looks up a key" }[tool],
+        ...toolFlags,
         inputSchema: { type: "object", properties: { key: { type: "string" } } },
-        execute: (input, { signal }) => {
+        execute: (input, { signal, executionId }) => {
           runs += 1;
+          executions.add(executionId);
           return new Promise((resolveCall, rejectCall) => {
             const entry = { w, end: () => { remove(calls, entry); resolveCall(`value of ${input.key}`); } };
             calls.push(entry);
@@ -229,7 +267,10 @@ async function harness() {
         },
       }],
       durability,
-      onEvent: (event) => { if (event.type === "session.fenced") fenced[w] += 1; },
+      onEvent: (event) => {
+        if (event.type === "session.fenced") fenced[w] += 1;
+        if (!/^(acp|transport)\./.test(event.type)) events.push(`${w}:${event.type}${event.error ? `:${JSON.stringify(event.error)}` : ""}`);
+      },
     });
   }
 
@@ -256,15 +297,16 @@ async function harness() {
   }
 
   // Where each worker is, by what it waits on. A worker whose claim is held
-  // may already wait on its first model request.
+  // may already wait on its first model request; one whose call's intent is
+  // held runs that call ahead of it.
   const position = (w, lines) => {
-    if (writes[w].held.some((entry) => !renewals[w].includes(entry))) return "early";
+    if (writes[w].held.some((entry) => entry.k === "lease" && !renewals[w].includes(entry))) return "early";
     if (claimed[w] === null) return "none";
     if (fenced[w] > claimed[w].fenced) return "stopped";
     if (lines.some((line) => line.type === "turn_end" && line.epoch === claimed[w].epoch)) return "done";
     const request = requests.find((entry) => entry.w === w);
     if (request) return request.kind;
-    if (calls.some((entry) => entry.w === w)) return "tool";
+    if (calls.some((entry) => entry.w === w)) return writes[w].held.some((entry) => entry.k === "record") ? "ahead" : "tool";
     return "busy";
   };
   const waiting = (w) => requests.some((entry) => entry.w === w) || calls.some((entry) => entry.w === w);
@@ -302,6 +344,7 @@ async function harness() {
       pc: Object.fromEntries(Workers.map((w) => [w, position(w, lines)])),
       frozen: { ...frozen },
       runs,
+      ids: executions.size,
       ui: lines.filter((line) => modeledLines.has(line.type)).map((line) => line.epoch ?? 0),
       ...(leased ? { live: sessionId ? await agents.A[durableInternals].leaseStands(sessionId) : false } : {}),
     };
@@ -334,10 +377,15 @@ async function harness() {
       // w's claim lands, and the log says whether it counted. One that did
       // goes on with the turn; a refused one leaves w to read the log again,
       // and to claim again or let the message go.
-      const holder = writes[w].held.at(-1).holder;
+      const holder = writes[w].held.filter((entry) => entry.k === "lease").at(-1).holder;
       const before = new Set(liveHolders);
       await writes[w].releaseHeld();
-      if ((await agents[w][durableInternals].lastLease(sessionId))?.holder === holder) {
+      // A lease the World's in-band fence refused only because a count was
+      // still settling goes out again, so the claim has settled once w holds
+      // the session, holds a new write, or has let the session go.
+      const holds = async () => (await agents[w][durableInternals].lastLease(sessionId))?.holder === holder;
+      await until(async () => (await holds()) || writes[w].held.length > 0 || agents[w][durableInternals].liveWorkers() === 0);
+      if (await holds()) {
         claimed[w] = { fenced: fenced[w], epoch: expectedEpoch };
         await until(() => waiting(w) || stopped());
       } else {
@@ -348,11 +396,19 @@ async function harness() {
     } else if (name === "Model1" || name === "Model2") {
       const request = requests.find((entry) => entry.w === w);
       assert.ok(request, `${w} has a model request to answer`);
+      // A response that calls the tool names a new call id, as a model's does.
       request.answer(name === "Model1"
-        ? [{ type: "tool-call", toolCallId: "call-1", toolName: tool, input: { key: "alpha" } }, finish("tool-calls")]
+        ? [{ type: "tool-call", toolCallId: `call-${(modelCalls += 1)}`, toolName: tool, input: { key: "alpha" } }, finish("tool-calls")]
         : [{ type: "text-delta", id: "answer", delta: "done" }, finish("stop")]);
       if (name === "Model1") await until(() => calls.some((entry) => entry.w === w) || stopped());
       else await until(async () => stopped() || (await streamLines()).some((line) => line.type === "turn_end" && line.epoch === claimed[w].epoch));
+    } else if (name === "Intent") {
+      // The intent of w's call that ran ahead lands. Where w still heads the
+      // chain its call goes on; where it was replaced the write is refused,
+      // and w stops.
+      await writes[w].releaseHeld();
+      const head = (await agents[w][durableInternals].lastLease(sessionId))?.holder;
+      if (!holders[w].includes(head)) await until(() => stopped());
     } else if (name === "ToolEnd") {
       const call = calls.find((entry) => entry.w === w);
       assert.ok(call, `${w} has a tool call to end`);
@@ -418,7 +474,18 @@ async function harness() {
     await rm(dir, { recursive: true, force: true });
   }
 
-  return { perform, observe, close };
+  // What the stream holds and what each worker waits on, for a failure.
+  async function describe() {
+    const lines = await streamLines();
+    return [
+      `  stream: ${lines.map((line) => `${line.type}:e${line.epoch ?? 0}${line.toolCallId ? `:${line.toolCallId}` : ""}`).join(" ")}`,
+      ...lines.filter((line) => line.type === "turn_end").map((line) => `  ${JSON.stringify(line).slice(0, 400)}`),
+      `  waiting: requests ${JSON.stringify(requests.map((entry) => `${entry.w}:${entry.kind}`))}, calls ${JSON.stringify(calls.map((entry) => entry.w))}, held ${JSON.stringify(Object.fromEntries(Workers.map((w) => [w, writes[w].held.map((entry) => entry.k)])))}, fenced ${JSON.stringify(fenced)}`,
+      `  events: ${events.slice(-30).join(" ")}`,
+    ].join("\n");
+  }
+
+  return { perform, observe, close, describe };
 }
 
 // ---------------------------------------------------------------------------
@@ -469,30 +536,44 @@ for (let walk = 1; walk <= walks; walk += 1) {
         : undefined;
       if (verbose) console.log(`walk ${walk}: ${act.name}(${act.w})`);
       await code.perform(act, expectedEpoch);
-      const seen = JSON.stringify(await code.observe());
-      if (verbose) console.log(`  shows ${seen}`);
       path.push(`${act.name}(${act.w})`);
       steps += 1;
-      const next = new Set();
+      // The states the step can reach, and the edges to each.
       const allowed = new Set();
+      const reached = new Map();
       for (const from of current) {
         for (const to of successors(from).filter((id) => sameAct(actOf(id), act))) {
           const ends = graph.states.get(to).pc[act.w] === "announce"
             ? successors(to).filter((id) => sameAct(actOf(id), { name: "Announce", w: act.w })).map((id) => [to, id])
             : [[null, to]];
           for (const [middle, end] of ends) {
-            allowed.add(view(graph.states.get(end)));
-            if (view(graph.states.get(end)) !== seen) continue;
-            next.add(end);
-            covered.add(`${from}>${middle ?? end}`);
-            if (middle) covered.add(`${middle}>${end}`);
+            const shown = view(graph.states.get(end));
+            allowed.add(shown);
+            if (!reached.has(shown)) reached.set(shown, []);
+            reached.get(shown).push({ from, middle, end });
           }
         }
+      }
+      // A step's UI line is written after the step's other effects, and lines
+      // are only ever appended: a view that matches no state yet is looked at
+      // again for a while, and one that never does fails.
+      let seen = JSON.stringify(await code.observe());
+      for (let look = 0; !reached.has(seen) && look < 10; look += 1) {
+        await sleep(100);
+        seen = JSON.stringify(await code.observe());
+      }
+      if (verbose) console.log(`  shows ${seen}`);
+      const next = new Set();
+      for (const { from, middle, end } of reached.get(seen) ?? []) {
+        next.add(end);
+        covered.add(`${from}>${middle ?? end}`);
+        if (middle) covered.add(`${middle}>${end}`);
       }
       if (next.size === 0) {
         console.error(`FAIL walk ${walk} after ${path.join(" ")}`);
         console.error(`  the code shows   ${seen}`);
         for (const view of allowed) console.error(`  the model allows ${view}`);
+        console.error(await code.describe());
         process.exitCode = 1;
         break;
       }
