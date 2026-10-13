@@ -1354,10 +1354,15 @@ test("a store keeps each prompt image once, and records and checkpoints only nam
   for (const data of savedData(store)) {
     assert.ok(!holdsImage(data, first) && !holdsImage(data, second), "saved data holds no image bytes");
   }
-  // Events that name an image are version 2; the text-only turn's stay version 1.
-  const versions = storedEvents(store).map((event) => [JSON.stringify(event).includes("inline_ref"), event.v]);
+  // Events that name an image are version 3. A progress that extends another
+  // (`base`) is version 2 and leaves out the user's turn, so it names none;
+  // every other event stays version 1.
+  const versions = storedEvents(store).map((event) => [JSON.stringify(event).includes("inline_ref"), event.v, event.base !== undefined || event.type === "tool_result"]);
   assert.ok(versions.some(([named]) => named), "some events name images");
-  for (const [named, version] of versions) assert.equal(version, named ? 2 : 1);
+  for (const [named, version, delta] of versions) {
+    assert.ok(!(named && delta), "a delta names no image");
+    assert.equal(version, named ? 3 : delta ? 2 : 1);
+  }
   assert.ok(versions.some(([named]) => !named), "the text-only turn's events name none");
 
   const target = await createFxEngine(options(targetBackend, undefined, { ...visionCatalog, persistence: store }));
@@ -1389,7 +1394,9 @@ test("a persistence without an image store keeps writing images inline", async (
   const agent = await createFxEngine(options(sourceBackend, journal, visionCatalog));
   await run(agent, [{ type: "text", text: "inline" }, imageBlock(image)]);
   await agent.close();
-  assert.ok(journal.events.every((event) => event.v === 1));
+  // No event is the version that names stored images; a progress that
+  // extends another is version 2, every other event version 1.
+  for (const event of journal.events) assert.equal(event.v, event.base !== undefined || event.type === "tool_result" ? 2 : 1);
   assert.ok(JSON.stringify(journal.events).includes(base64Of(image)));
   assert.ok(!JSON.stringify(journal.events).includes("inline_ref"));
 });
