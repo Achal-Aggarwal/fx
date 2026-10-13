@@ -582,7 +582,7 @@ pub const ImageBlobReader = struct {
 
 /// An image's name in a libfx host's store: the lowercase hex SHA-256 of its
 /// bytes, as `ImageAttachment.snapshot_sha256` holds it for an inline image.
-pub const image_name_len = 2 * Sha256.digest_length;
+const image_name_len = 2 * Sha256.digest_length;
 pub const ImageName = [image_name_len]u8;
 
 /// `text` as an image name, or null when it is not 64 lowercase hex digits.
@@ -639,7 +639,7 @@ pub const StoredImages = struct {
 /// Writes images the host stored as `inline_ref` names. Every other image
 /// keeps its bytes: in `blobs`, a libfx kernel checkpoint's blob section,
 /// when given, else inline.
-pub const ImageNames = struct {
+const ImageNames = struct {
     stored: *const StoredImages,
     blobs: ?ImageBlobs = null,
 };

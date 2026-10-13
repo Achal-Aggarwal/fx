@@ -184,13 +184,12 @@ function promptInputForLog(input, { named = false } = {}) {
   return { input: blocks, blobs, images };
 }
 
-// Reads each Blob `promptInputForLog` left in a prompt's input: as base64,
-// or with `named` as bytes for `storePromptImages`.
-function readPromptBlobs(input, { named = false } = {}) {
+// Reads each Blob `promptInputForLog` left in a prompt's input, as bytes for
+// `storePromptImages`.
+function readPromptBlobs(input) {
   return Promise.all(input.map(async (block) => {
     if (blobSize(block?.data) === null) return block;
-    const bytes = new Uint8Array(await block.data.arrayBuffer());
-    return { ...block, data: named ? bytes : toBase64(bytes) };
+    return { ...block, data: new Uint8Array(await block.data.arrayBuffer()) };
   }));
 }
 
@@ -916,6 +915,9 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
         images: {
           async put(name, bytes) {
             if (storedImages.has(name)) return;
+            // Refused here, before the prompt is stored, rather than by every
+            // worker that reads the image back.
+            if (typeof world.streams.getChunks !== "function") throw new TypeError("a World needs streams.getChunks() to keep a session's images");
             await ensureRun();
             const stream = imageStreamOf(runId, name);
             let present = false;
@@ -1379,6 +1381,8 @@ class SessionWorker {
     const ui = uiWriter(log, (error) => agent.emit("ui.error", { sessionId: this.sessionId, error: error?.name ?? "Error" }), lease.epoch);
     // When the lease runs out, as this worker last renewed it.
     let leaseExpiresAt = lease.expiresAt;
+    // An image read that threw while the engine opened.
+    let imageReadFailed = null;
     const store = {
       load: async () => ({
         ...(state.checkpoint?.data ? { checkpoint: { through: state.checkpoint.through ?? "0", data: fromBase64(state.checkpoint.data) } } : {}),
@@ -1390,7 +1394,15 @@ class SessionWorker {
       // The engine stores each prompt image before it sends it; a prompt
       // from the log names images already here.
       putImage: (name, bytes) => log.images.put(name, bytes),
-      getImage: (name) => log.images.get(name),
+      getImage: async (name) => {
+        try {
+          return await log.images.get(name);
+        } catch (error) {
+          // The store failed to answer, which says nothing of the image.
+          imageReadFailed = error;
+          throw error;
+        }
+      },
       saveCheckpoint: async ({ through, data }) => {
         // What a fold that starts at this checkpoint would otherwise miss:
         // inputs before it that no turn took, the ids it ran, the turn a
@@ -1475,6 +1487,10 @@ class SessionWorker {
         harnessRun = runOf(state.openTurn ?? state.pending[0]);
         harness = await agent.openHarness(this.sessionId, store, harnessRun, ready);
       } catch (error) {
+        // The image store failed to answer while the engine read the
+        // session's images: as when the log can't be read, the delivery
+        // fails and its message runs again; nothing failed the turn.
+        if (imageReadFailed) throw imageReadFailed;
         // A harness that cannot start fails the turn waiting on it, once:
         // the open turn, or after it failed, the next prompt.
         const waiting = state.openTurn && !state.openFailed ? state.openTurn.id : state.pending[0]?.messageId;
@@ -2099,8 +2115,8 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
         await created.queue.send(full, { idempotencyKey: `${sessionId}:${message.type}:${message.messageId}` });
         seeded = true;
       };
-      // Settles once the latest prompt from this session object with a Blob
-      // to read is stored or has failed; null while none reads one. Each
+      // Settles once the latest prompt from this session object with images
+      // to read or store is stored or has failed; null while none has. Each
       // later prompt waits for it, so they are stored in the order made.
       let reading = null;
       // `ready`, when given, resolves the input once it can be stored; only a
@@ -2199,7 +2215,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
           const before = reading;
           const ready = before || stored.blobs || stored.images ? async () => {
             await before;
-            let read = stored.blobs ? await readPromptBlobs(stored.input, { named }) : stored.input;
+            let read = stored.blobs ? await readPromptBlobs(stored.input) : stored.input;
             if (stored.images) {
               const { created, id: sessionId } = await resolved;
               const log = await created.session(sessionId);

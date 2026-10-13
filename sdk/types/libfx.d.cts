@@ -117,7 +117,7 @@ export type FxPromptInput = string | readonly FxPromptBlock[];
 /** An image block in a durable session's prompt: the same forms an engine's prompt takes. */
 export type FxSessionImageBlock = FxImageBlock;
 
-/** A durable session's prompt input. libfx stores image data as base64 before the turn runs, reading a `Blob` or `File` first. */
+/** A durable session's prompt input. Before the prompt is stored, libfx reads each `Blob` or `File` and saves each image once in the session's image store, which the stored prompt names. */
 export type FxSessionPromptInput = FxPromptInput;
 
 /** Steering or follow-up input: a string or text blocks. */

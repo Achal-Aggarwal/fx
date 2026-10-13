@@ -1099,6 +1099,29 @@ test("an image whose stored bytes changed fails its turn, naming it", async () =
   await agent.close();
 });
 
+test("a World whose streams lack getChunks refuses an image prompt before storing it, and text still runs", async () => {
+  const durability = await durabilityFor();
+  // memory() keeps images itself; the others keep them in World streams.
+  if (typeof durability.world !== "function") return;
+  const bound = (target, value) => (typeof value === "function" ? value.bind(target) : value);
+  const withoutGetChunks = {
+    ...durability,
+    async world() {
+      const world = await durability.world();
+      const streams = new Proxy(world.streams, { get: (target, prop) => (prop === "getChunks" ? undefined : bound(target, Reflect.get(target, prop))) });
+      return new Proxy(world, { get: (target, prop) => (prop === "streams" ? streams : bound(target, Reflect.get(target, prop))) });
+    },
+  };
+  const { agent, seen } = recordingAgent(withoutGetChunks);
+  const session = agent.session();
+  const refused = session.prompt([{ type: "text", text: "look" }, image]);
+  await assert.rejects(refused.accepted, (error) => error.code === "FX_IMAGE_STORE_FAILED" && /getChunks/.test(error.cause?.message));
+  await assert.rejects(refused.result);
+  assert.equal((await session.prompt("text only").result).stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["text only"]);
+  await agent.close();
+});
+
 test("a failed image write rejects the prompt before anything is stored", async () => {
   const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), { failWrites: 1 }));
   const session = agent.session();

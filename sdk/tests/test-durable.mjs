@@ -1129,6 +1129,57 @@ test("a durable prompt's image bytes and files reach the model as base64", async
   await agent.close();
 });
 
+test("an image read that fails while the engine opens runs the turn again instead of failing it", async () => {
+  const base = await durabilityFor();
+  // memory() hands out its sessions directly, so one image read can fail.
+  if (typeof base.create !== "function") return;
+  const fault = { failReads: 0 };
+  const durability = {
+    ...base,
+    create() {
+      const backend = base.create();
+      return {
+        ...backend,
+        async session(id) {
+          const log = await backend.session(id);
+          return {
+            ...log,
+            images: {
+              put: (name, bytes) => log.images.put(name, bytes),
+              get: async (name) => {
+                if (fault.failReads > 0) {
+                  fault.failReads -= 1;
+                  throw new Error("the image store did not answer");
+                }
+                return log.images.get(name);
+              },
+            },
+          };
+        },
+      };
+    },
+  };
+  const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
+  const bytes = Uint8Array.from(atob(png), (char) => char.charCodeAt(0));
+  const first = createFxAgent(agentOptions(durability, { model: "durable/vision-model" }));
+  const session = first.session();
+  assert.equal((await session.prompt([{ type: "text", text: "look" }, { type: "image", data: bytes, mimeType: "image/png" }]).result).stopReason, "end_turn");
+  await first.close();
+  // A new agent's engine reads the session's image as it opens; that read
+  // fails once.
+  fault.failReads = 1;
+  const second = createFxAgent(agentOptions(durability, { model: "durable/vision-model" }));
+  const { result } = await collect(second.session(session.id).prompt("and now"));
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(fault.failReads, 0, "the failed read happened");
+  const files = chats.at(-1).prompt
+    .filter((message) => message.role === "user" && Array.isArray(message.content))
+    .flatMap((message) => message.content)
+    .filter((part) => part.type === "file");
+  assert.deepEqual(files.map((part) => part.data?.data), [png]);
+  await second.close();
+});
+
 test("an engine given an image the log names refuses it, so a worker that can't read names fails the turn", async () => {
   // The log holds a stored image as `data: { sha256 }`, which an engine that
   // predates names can't read, with or without a sourceRef: such a worker

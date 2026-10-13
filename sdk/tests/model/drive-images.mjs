@@ -25,7 +25,7 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createFxEngine, createMemoryPersistence } from "../../node.js";
-import { loadGraph } from "./graph.mjs";
+import { loadGraph, walkGraph } from "./graph.mjs";
 
 const args = process.argv.slice(2);
 const option = (name, fallback) => {
@@ -321,9 +321,6 @@ async function harness(n) {
 const graph = await loadGraph(resolve(here, "graphs", "images.dot"));
 const n = graph.states.get(graph.init).ph.length;
 const autoActs = new Set(["Send", "TurnStart", "Checkpoint", "Stage", "OpenMissing", "OpenOk"]);
-const actOf = (id) => graph.states.get(id).act;
-const successors = (id) => [...(graph.next.get(id) ?? [])].filter((to) => to !== id);
-const sameAct = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const view = (state) => JSON.stringify({
   made: state.made,
   ph: state.ph,
@@ -331,87 +328,17 @@ const view = (state) => JSON.stringify({
   store: [...state.store].sort(),
   held: state.up === "open" && state.ph.includes("started") ? state.mem.map((entry) => entry.i) : null,
 });
-// The states the code settles in after a step: every path of the steps it
-// takes on its own, to where it can take none.
-function settledFrom(id, edges) {
-  const seen = new Set([id]);
-  const queue = [id];
-  const quiet = [];
-  while (queue.length > 0) {
-    const from = queue.shift();
-    const autos = successors(from).filter((to) => autoActs.has(actOf(to)[0]));
-    if (autos.length === 0) quiet.push(from);
-    for (const to of autos) {
-      edges.push(`${from}>${to}`);
-      if (!seen.has(to)) { seen.add(to); queue.push(to); }
-    }
-  }
-  return quiet;
-}
-const covered = new Set();
-const totalEdges = [...graph.next.values()].reduce((sum, targets) => sum + [...targets].length, 0);
-let steps = 0;
-
-for (let walk = 1; walk <= walks; walk += 1) {
-  const code = await harness(n);
-  const path = [];
-  let current = new Set(settledFrom(graph.init, []));
-  try {
-    for (;;) {
-      const options = [];
-      for (const from of current) {
-        for (const to of successors(from)) {
-          const act = actOf(to);
-          if (autoActs.has(act[0])) continue;
-          let item = options.find((entry) => sameAct(entry.act, act));
-          if (!item) options.push(item = { act, fresh: false });
-          if (!covered.has(`${from}>${to}`)) item.fresh = true;
-        }
-      }
-      if (options.length === 0) break;
-      const fresh = options.filter((item) => item.fresh);
-      const pool = fresh.length > 0 ? fresh : options;
-      const { act } = pool[Math.floor(random() * pool.length)];
-      const label = `${act[0]}(${act.slice(1).join(",")})`;
-      path.push(label);
-      if (verbose) console.log(`walk ${walk}: ${label}`);
-      await code.perform(act);
-      const shown = await code.settle();
-      if (code.problems.length > 0) throw new Error([...new Set(code.problems)].join("; "));
-      const seen = JSON.stringify(shown);
-      if (verbose) console.log(`  shows ${seen}`);
-      steps += 1;
-      const next = new Set();
-      const allowed = new Set();
-      for (const from of current) {
-        for (const to of successors(from).filter((id) => sameAct(actOf(id), act))) {
-          const edges = [`${from}>${to}`];
-          for (const end of settledFrom(to, edges)) {
-            allowed.add(view(graph.states.get(end)));
-            if (view(graph.states.get(end)) !== seen) continue;
-            next.add(end);
-            for (const edge of edges) covered.add(edge);
-          }
-        }
-      }
-      if (next.size === 0) {
-        console.error(`FAIL walk ${walk} after ${path.join(" ")}`);
-        console.error(`  the code shows   ${seen}`);
-        for (const item of allowed) console.error(`  the model allows ${item}`);
-        process.exitCode = 1;
-        break;
-      }
-      current = next;
-    }
-  } catch (error) {
-    console.error(`FAIL walk ${walk} after ${path.join(" ")}: ${error.message}`);
-    process.exitCode = 1;
-  } finally {
-    await code.close();
-  }
-  if (process.exitCode) break;
-  if (walk % 25 === 0 || walk === walks) console.log(`${walk} walks, ${steps} steps, ${covered.size} of ${totalEdges} edges`);
-}
-assert.ok(steps > 0 || process.exitCode, "the walks took steps");
-if (!process.exitCode) console.log(`ok images: ${walks} walks, ${steps} steps matched the model; ${covered.size} of ${totalEdges} edges covered (${backend})`);
+const { steps, covered, totalEdges } = await walkGraph({
+  graph,
+  walks,
+  random,
+  verbose,
+  autoActs,
+  view,
+  nameOf: (act) => act[0],
+  sameAct: (a, b) => JSON.stringify(a) === JSON.stringify(b),
+  label: (act) => `${act[0]}(${act.slice(1).join(",")})`,
+  open: () => harness(n),
+});
+if (!process.exitCode) console.log(`ok images: ${walks} walks, ${steps} steps matched the model; ${covered} of ${totalEdges} edges covered (${backend})`);
 process.exit(process.exitCode ?? 0);
