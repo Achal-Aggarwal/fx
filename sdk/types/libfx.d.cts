@@ -219,8 +219,8 @@ export type FxAgentTools = readonly FxAgentTool[] | { readonly [name: string]: F
 export type FxTurnEvent =
   | { type: "text_delta"; delta: string }
   | { type: "reasoning_delta"; delta: string }
-  /** Accepted mid-turn steering entering the turn. */
-  | { type: "user_message"; text: string }
+  /** Steering entering the turn as its model request carries it; `id` is the steer's id. */
+  | { type: "user_message"; text: string; id?: string }
   | { type: "tool_start"; id: string; name: string; input?: JsonValue; inputTruncated?: undefined; inputPreview?: undefined }
   /** A tool input over 64 KiB of JSON arrives as a prefix. The tool still receives complete arguments. */
   | { type: "tool_start"; id: string; name: string; input?: undefined; inputTruncated: true; inputPreview: string }
@@ -643,6 +643,22 @@ export interface FxPromptOptions {
   signal?: AbortSignal;
 }
 
+/** Options for a durable session's `steer()`. */
+export interface FxSteerOptions {
+  /**
+   * The steer's id, so a retried request adds nothing. Follows the session id rule. Reusing a prompt's id rejects
+   * with `FX_MESSAGE_ID_IN_USE`; on a queue that outlives the process, the worker drops the steer and emits a
+   * `session.error` with that code instead.
+   */
+  messageId?: string;
+}
+
+/** What a durable session's `steer()` resolves to once the steer is stored. */
+export interface FxSteered {
+  /** The steer's id. Its `user_message` event carries it as `id` when it joins a turn, and its own turn's events carry it as `messageId`. */
+  messageId: string;
+}
+
 /** What `turn.accepted` resolves to once the prompt is stored. */
 export interface FxAccepted {
   messageId: string;
@@ -727,8 +743,12 @@ export interface FxSession {
   resume(): FxResumeTurn;
   /** Every event the session has produced from `cursor` on, as NDJSON, staying open for the events after them. */
   stream(cursor?: number): ReadableStream<Uint8Array>;
-  /** Adds guidance to the running turn at its next model request, or to the next turn when none is running. */
-  steer(text: string): Promise<void>;
+  /**
+   * Steers the running turn the way the fx CLI does: it cuts a streaming reply short, waits for a running tool, and
+   * joins a turn waiting to start. When no turn runs or waits, it starts one. A steer with images or resources cannot
+   * join a turn: the running one ends at its next safe point and the steer runs next.
+   */
+  steer(input: FxSessionPromptInput, options?: FxSteerOptions): Promise<FxSteered>;
   /** Cancels the running turn. */
   cancel(): Promise<void>;
   /** The session's history as opaque bytes, read without changing the session. */

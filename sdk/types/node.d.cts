@@ -91,6 +91,8 @@ export type {
   FxSessionTurnEvent,
   FxSharedOptions,
   FxSteer,
+  FxSteerOptions,
+  FxSteered,
   FxSteeringInput,
   FxStopReason,
   FxStreamLine,

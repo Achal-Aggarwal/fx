@@ -89,7 +89,7 @@ export async function sessionsAndTurns(agent: FxAgent): Promise<void> {
   for await (const event of retried) {
     if (event.type === "tool_start") console.log(event.id, event.name, event.inputTruncated ? event.inputPreview : event.input);
     if (event.type === "tool_end") console.log(event.content, event.isError);
-    if (event.type === "user_message") console.log(event.text);
+    if (event.type === "user_message") console.log(event.text, event.id);
     console.log(event.epoch);
   }
 
@@ -115,6 +115,14 @@ export async function sessionsAndTurns(agent: FxAgent): Promise<void> {
   known.stream();
 
   await known.steer("Keep the public API backward compatible.");
+  const steered = await known.steer("Prefer small diffs.", { messageId: "m12" });
+  assertType<Equal<typeof steered.messageId, string>>();
+  await known.steer([
+    { type: "text", text: "Match this screenshot." },
+    { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+  ]);
+  // @ts-expect-error a durable steer carries image data as a base64 string
+  known.steer([{ type: "image", data: new Uint8Array(4), mimeType: "image/png" }]);
   await known.cancel();
   const checkpoint = await known.checkpoint();
   assertType<Equal<typeof checkpoint, Uint8Array>>();

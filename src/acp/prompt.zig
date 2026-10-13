@@ -983,14 +983,14 @@ pub fn handlePrompt(
     } else if (session.journal) |*journal| {
         // A new prompt instead of a resume ends the open turn as interrupted.
         if (journal.pending_resume) |pending| {
-            try persistAcpHistoryTurn(alloc, session, pending.interruptedTurn(), null);
+            try persistAcpHistoryTurn(alloc, session, pending.interruptedTurn(), null, null);
             journal.dropPendingResume(state.alloc);
         }
     } else if (session.writable) |*writable| {
         if (writable.conversation_writer.turn_open) {
             const checkpoint = writable.state.recovery_checkpoint orelse
                 return error.InvalidRecoveryCheckpoint;
-            try persistAcpHistoryTurn(alloc, session, checkpoint.interruptedTurn(), null);
+            try persistAcpHistoryTurn(alloc, session, checkpoint.interruptedTurn(), null, null);
         }
     }
 
@@ -1149,6 +1149,8 @@ pub fn handlePrompt(
     try sessions.sendActiveSessionInfoUpdate(state, alloc);
     try sessions.sendActiveSessionUsageUpdate(state, alloc);
 
+    // A steer's interrupt the turn finished before reaching is not a cancel.
+    if (state.cfg.minimal_kernel) server.releaseSteeringInterrupt(state);
     if (session.cancel_flag.load(.seq_cst)) {
         ctx.stop_reason = .cancelled;
     }
@@ -1878,6 +1880,9 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .context_enabled = ctx.state.context_enabled,
         .finalize_turn = finalizeTurn,
         .take_steering_boundary = takeSteeringBoundary,
+        // The web core's host keeps its steering queue, so the core asks it
+        // while a reply streams whether a steer should cut it short.
+        .cooperative_transport_pulse = if (comptime host_target.is_wasm) .{ .ctx = @ptrCast(ctx), .run = pulseHostSteering } else null,
         .release_agent_terminal_lease = releaseAgentTerminalLease,
         .append_runtime_context = appendRuntimeContext,
         .append_static_context = appendStaticContext,
@@ -1941,7 +1946,9 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
 /// `session/prompt` with `_meta.fx.steer` during a turn; each delivered message
 /// is replayed as a user message where it joined the turn. A cancelled ACP
 /// turn stops instead of continuing with queued steering, and the steering
-/// prompt responses report what was dropped.
+/// prompt responses report what was dropped. A libfx turn continues past a
+/// cancel only when a steer interrupted its reply; after a user cancel it
+/// takes nothing, and its end hands back what was still queued.
 fn takeSteeringBoundary(
     raw_ctx: *anyopaque,
     arena: Allocator,
@@ -1951,32 +1958,77 @@ fn takeSteeringBoundary(
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const close_if_empty = kind == .finalizing;
     if (comptime host_target.is_wasm) {
+        server.noteSteeringBoundary(ctx.state);
+        // The host closes its steering when the user cancels the turn, which
+        // wins over a steer's interrupt. A handoff ends the turn here.
+        const host_steering = js_host_steering.state();
+        if (host_steering == .open and host_steering.open.handoff) {
+            // As on native: a handoff's interrupt is spent and the turn ends.
+            server.noteHostSteeringHandoff(ctx.state);
+            if (kind != .cancelled) return .handoff;
+            _ = server.takeSteeringInterrupt(ctx.state);
+            return .interrupt;
+        }
+        const steered = kind == .cancelled and host_steering != .closed and
+            server.takeSteeringInterrupt(ctx.state) != null;
         const taken = try js_host_steering.takeAll(arena);
         if (taken.len > 0) {
+            // As on native, an interrupt this boundary beat is spent here.
+            if (kind != .cancelled) server.releaseSteeringInterrupt(ctx.state);
             try acceptHostSteering(ctx, taken);
             const texts = try arena.alloc([]u8, taken.len);
-            for (taken, texts) |entry, *text| text.* = entry.text;
+            for (taken, texts) |entry, *text| {
+                text.* = entry.text;
+                try publishSteeringReplay(ctx, entry.text, null, entry.id);
+            }
             return .{ .continue_turn = texts };
         }
+        if (steered) return .{ .continue_turn = &.{} };
         if (close_if_empty) js_host_steering.close();
         return if (kind == .cancelled) .interrupt else .none;
     }
     const kernel = ctx.state.cfg.minimal_kernel;
     if (kind == .cancelled and !kernel) return .interrupt;
+    if (kind == .cancelled) {
+        // A user cancel ends the turn, and so does a handoff's interrupt.
+        const interrupt = server.takeSteeringInterrupt(ctx.state) orelse return .interrupt;
+        if (interrupt == .handoff) return .interrupt;
+    } else if (kernel and server.steeringHandoffPending(ctx.state)) {
+        // A steer that cannot join the turn runs next: the turn ends here, and
+        // its end hands back the steering it did not take.
+        return .handoff;
+    }
     // ACP keeps accepting steering until the turn has fully returned: a
     // pending subagent can continue a turn past its final boundary, and a
     // steering prompt that arrives after input closes joins the worker from
     // the connection reader, which must never wait on work that needs it.
     const drained = try server.takeSteering(ctx.state, arena, close_if_empty and kernel);
-    if (drained.texts.len == 0) return if (kind == .cancelled) .interrupt else .none;
+    // A steer's interrupt continues the turn even when the steer was
+    // withdrawn meanwhile: the cut-off request goes out again.
+    if (drained.texts.len == 0) return if (kind == .cancelled) .{ .continue_turn = &.{} } else .none;
     try noteJournalPlacement(ctx, drained.input_ids);
-    // libfx replays steering when it is queued; ACP replays it on delivery.
-    if (!kernel) {
-        for (drained.texts, drained.request_ids) |text, request_id| {
-            try publishSteeringReplay(ctx, text, request_id);
-        }
+    // A steer's interrupt that a later boundary beat is spent with its steer.
+    if (kernel and kind != .cancelled) server.releaseSteeringInterrupt(ctx.state);
+    // Steering shows where it joined the turn, a libfx steer by its input id.
+    for (drained.texts, drained.request_ids, 0..) |text, request_id, index| {
+        const input_id: ?[]const u8 = if (index < drained.input_ids.len) drained.input_ids[index] else null;
+        try publishSteeringReplay(ctx, text, request_id, input_id);
     }
     return .{ .continue_turn = drained.texts };
+}
+
+/// The web core's cooperative pulse while a model reply streams: steering its
+/// host holds interrupts the reply under the same rule as the native kernel's.
+fn pulseHostSteering(raw_ctx: *anyopaque) anyerror!void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    switch (js_host_steering.state()) {
+        .closed => {},
+        .open => |open| if (open.handoff) {
+            server.noteHostSteeringHandoff(ctx.state);
+        } else if (server.claimHostSteeringInterrupt(ctx.state, open.queued)) {
+            debug_trace.logf("acp", "host steering interrupts the streaming reply queued={d}", .{open.queued});
+        },
+    }
 }
 
 /// A journaled session's next progress places the inputs a boundary took.
@@ -2006,7 +2058,7 @@ fn acceptHostSteering(ctx: *AcpContext, taken: []const js_host_steering.Taken) !
     }
 }
 
-fn publishSteeringReplay(ctx: *AcpContext, text: []const u8, request_id: ?jsonrpc.RequestId) !void {
+fn publishSteeringReplay(ctx: *AcpContext, text: []const u8, request_id: ?jsonrpc.RequestId, input_id: ?[]const u8) !void {
     var message_id_storage: acp_types.MessageIdBuffer = undefined;
     const message_id = acp_types.generateMessageId(&message_id_storage);
     var update: std.Io.Writer.Allocating = .init(ctx.alloc);
@@ -2014,7 +2066,7 @@ fn publishSteeringReplay(ctx: *AcpContext, text: []const u8, request_id: ?jsonrp
     try update.writer.writeAll("{\"sessionId\":");
     try jsonrpc.writeJsonStr(ctx.session_id, &update.writer);
     try update.writer.writeAll(",\"update\":");
-    try acp_types.writeSteeringUserMessageChunk(&update.writer, message_id, text, request_id);
+    try acp_types.writeSteeringUserMessageChunk(&update.writer, message_id, text, request_id, input_id);
     try update.writer.writeByte('}');
     try ctx.state.writer.writeNotification(ctx.alloc, "session/update", update.written());
 }
@@ -2688,6 +2740,7 @@ fn propagateHistoryTurn(raw_ctx: *anyopaque, turn: HistoryTurn) !void {
             session,
             turn,
             ctx.current_prompt_input,
+            ctx.state.alloc,
         );
     }
 }
@@ -2764,6 +2817,21 @@ fn flushJournal(state: *server.ServerState, alloc: Allocator, session_id: []cons
     if (response.error_json != null or response.result_json == null) return error.JournalFlushFailed;
 }
 
+/// Records the libfx steers the ending turn accepted and never placed, as a
+/// user cancel leaves them, as withdrawn. The model never saw them, so the
+/// host may run them next. They are withdrawn before the turn's end, while
+/// they still belong to it. The caller holds `session_write_mutex`.
+/// `backing` owns the queued steering.
+fn handBackUnplacedSteersLocked(alloc: Allocator, backing: Allocator, session: *server.ActiveSessionState, journal: *libfx_journal.Journal) !void {
+    const ids = try session.steering.takeUnplacedInputs(backing, alloc);
+    defer {
+        for (ids) |id| alloc.free(id);
+        if (ids.len > 0) alloc.free(ids);
+    }
+    for (ids) |id| try journal.append(alloc, session.session_id, .{ .input_withdrawn = id });
+    if (ids.len > 0) debug_trace.logf("acp", "handed back unplaced libfx steers count={d}", .{ids.len});
+}
+
 /// Ends a journaled turn in the journal as it ended in the session. One that
 /// failed left no history entry, so its progress is cleared: resuming is for
 /// turns a stopped process left open. Inputs it took and never placed are
@@ -2772,6 +2840,7 @@ fn endJournalTurn(alloc: Allocator, session_alloc: Allocator, session: *server.A
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const journal = if (session.journal) |*value| value else return;
+    try handBackUnplacedSteersLocked(alloc, session_alloc, session, journal);
     if (journal.progress_open) {
         debug_trace.logf("session", "event=libfx_journal_turn_closed reason=ended_without_commit", .{});
         try journal.clearProgress(alloc, session.session_id);
@@ -2799,7 +2868,7 @@ fn commitCancelledJournalTurn(alloc: Allocator, session_alloc: Allocator, sessio
         break :cancelled checkpoint;
     };
     defer cancelled.deinit(session_alloc);
-    try persistAcpHistoryTurn(alloc, session, cancelled.interruptedTurn(), prompt_input);
+    try persistAcpHistoryTurn(alloc, session, cancelled.interruptedTurn(), prompt_input, session_alloc);
 }
 
 fn sessionChildCapability(session: *server.ActiveSessionState) ?*session_child_store.SessionChildCapability {
@@ -2808,18 +2877,26 @@ fn sessionChildCapability(session: *server.ActiveSessionState) ?*session_child_s
     return null;
 }
 
+/// `hand_back_alloc`, set when the running turn ends, owns its queued
+/// steering, which is handed back first.
 fn persistAcpHistoryTurn(
     alloc: Allocator,
     session: *server.ActiveSessionState,
     turn: HistoryTurn,
     current_prompt_input: ?*ParsedPromptInput,
+    hand_back_alloc: ?Allocator,
 ) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     var prepared = try session.session_rt.prepareHistoryEntry(alloc, turn);
     var prepared_owned = true;
     defer if (prepared_owned) types.freeHistoryTurn(alloc, prepared);
-    if (session.journal) |*journal| try journal.append(alloc, session.session_id, .{ .turn_committed = prepared });
+    if (session.journal) |*journal| {
+        // The running turn's own end hands back its unplaced steers; ending
+        // an earlier turn for a new prompt does not.
+        if (hand_back_alloc) |backing| try handBackUnplacedSteersLocked(alloc, backing, session, journal);
+        try journal.append(alloc, session.session_id, .{ .turn_committed = prepared });
+    }
     if (comptime host_target.is_wasm) {
         session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
         prepared_owned = false;
@@ -3043,6 +3120,9 @@ fn clearJournalProgress(raw_ctx: *anyopaque) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
+    // The turn ends here, cancelled or stopped: the steers it never placed
+    // are withdrawn while they still belong to it, before the clear ends it.
+    try handBackUnplacedSteersLocked(ctx.alloc, ctx.state.alloc, session, journal);
     try journal.clearProgress(ctx.alloc, session.session_id);
 }
 
@@ -3059,6 +3139,14 @@ fn pushEvent(raw_ctx: *anyopaque, event: worker_runtime.WorkerEvent) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     switch (event) {
         .clear_route_recovery_status => try ctx.clearModelRecoveryStatus(),
+        // A libfx steer cuts a streaming reply short, as in the fx CLI, but
+        // waits once the model streams a tool call's arguments.
+        .turn_phase_update => |update| if (ctx.state.cfg.minimal_kernel) {
+            server.noteSteeringPhase(ctx.state, update.step_id, switch (update.phase) {
+                .thinking, .generating => .reply,
+                .running, .waiting_for_subagent => .tools,
+            });
+        },
         else => {},
     }
     worker_runtime.freeWorkerEvent(std.heap.c_allocator, event);
@@ -3100,6 +3188,8 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     switch (event) {
         .provisional => |provisional| {
+            // A tool call the model announced is no reply a steer cuts short.
+            if (ctx.state.cfg.minimal_kernel) server.noteSteeringToolsPhase(ctx.state);
             const tool_name = provisional.tool_name orelse return;
             if (!tool_presentation.isProviderSearchAlias(tool_name)) return;
             var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
@@ -3112,6 +3202,7 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
             });
         },
         .authoritative_started => |started| {
+            if (ctx.state.cfg.minimal_kernel) server.noteSteeringTool(ctx.state, started.id.call_id, true);
             var arena_state = std.heap.ArenaAllocator.init(ctx.alloc);
             defer arena_state.deinit();
             _ = try ctx.sendToolCallPending(arena_state.allocator(), .{
@@ -3120,7 +3211,10 @@ fn pushToolLifecycle(raw_ctx: *anyopaque, event: types.ToolLifecycleEvent) !void
                 .arguments_json = started.arguments_json orelse "{}",
             });
         },
-        .terminal => |terminal| try ctx.sendProviderTerminal(terminal.id.call_id, terminal.outcome, terminal.result),
+        .terminal => |terminal| {
+            if (ctx.state.cfg.minimal_kernel) server.noteSteeringTool(ctx.state, terminal.id.call_id, false);
+            try ctx.sendProviderTerminal(terminal.id.call_id, terminal.outcome, terminal.result);
+        },
         .progress, .turn_finished => {},
     }
 }

@@ -164,11 +164,22 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
   let epoch = base?.lease?.epoch ?? 0;
   const consumed = new Set(base?.recent ?? []);
   const recent = [...(base?.recent ?? [])];
+  // Which of those were steers, so a prompt and a steer cannot share an id
+  // after a checkpoint drops their inputs. A checkpoint from before this was
+  // kept does not say.
+  const baseSteers = new Set(base?.recentSteers ?? []);
+  const kindsKnown = base === null || Array.isArray(base?.recentSteers);
+  // Inputs the open turn accepted and has not placed, which a withdrawal can
+  // hand back. They count as taken until then.
+  const held = new Set(base?.held ?? []);
+  for (const id of held) consumed.add(id);
   const seenInputs = new Set();
   const inputs = [];
   const records = [];
   // A checkpoint taken where a turn yielded leaves that turn open.
-  let openTurn = typeof base?.openTurn?.id === "string" ? { id: base.openTurn.id, at: Number(base.openTurn.at) || 0, context: base.openTurn.context ?? null, settings: base.openTurn.settings ?? null } : null;
+  // `from` is where the input that opened it was stored: steers stored after
+  // it join it, before it started too.
+  let openTurn = typeof base?.openTurn?.id === "string" ? { id: base.openTurn.id, at: Number(base.openTurn.at) || 0, from: Number(base.openTurn.from ?? base.openTurn.at) || 0, context: base.openTurn.context ?? null, settings: base.openTurn.settings ?? null } : null;
   let lastTurnId = base?.lastTurnId ?? null;
   // The agent the session belongs to: the one its first stored input, or the
   // checkpoint it was restored from, names. A session stored before agents
@@ -194,6 +205,13 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     if (consumed.has(id)) return;
     consumed.add(id);
     recent.push(id);
+  };
+  // A steer its turn accepted and ended without placing: the model never saw
+  // it, so it waits for a turn again.
+  const handBack = (id) => {
+    if (!consumed.delete(id)) return;
+    const index = recent.lastIndexOf(id);
+    if (index >= 0) recent.splice(index, 1);
   };
   for (const input of base?.pending ?? []) {
     if (seenInputs.has(input.key)) continue;
@@ -230,17 +248,26 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
           records.push({ cursor, data: entry.data });
           for (const mark of entry.marks ?? []) {
             if (typeof mark.start === "string") {
-              openTurn = { id: mark.start, at: position, context: contexts.get(mark.start) ?? null, settings: settingsOf.get(mark.start) ?? null };
+              const opener = inputs.find((input) => input.messageId === mark.start);
+              openTurn = { id: mark.start, at: position, from: opener?.cursor ?? position, context: contexts.get(mark.start) ?? null, settings: settingsOf.get(mark.start) ?? null };
               consume(mark.start);
               yielded = false;
             } else if (mark.end === true) {
               if (openTurn) lastTurnId = openTurn.id;
               openTurn = null;
               yielded = false;
+              // A turn's unplaced inputs end with it, handed back first.
+              held.clear();
             } else if (mark.yield === true) {
               yielded = true;
             } else if (typeof mark.accepted === "string") {
               consume(mark.accepted);
+              held.add(mark.accepted);
+            } else if (typeof mark.placed === "string") {
+              held.delete(mark.placed);
+            } else if (typeof mark.withdrawn === "string") {
+              held.delete(mark.withdrawn);
+              handBack(mark.withdrawn);
             }
           }
         }
@@ -270,17 +297,36 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
   for (const input of inputs) {
     if (input.type === "cancel" && typeof input.target === "string") cancelTargets.add(input.target);
   }
+  // An open turn whose harness could not start has ended for its viewers.
+  const openFailed = openTurn !== null && failed.has(openTurn.id);
+  // The turns waiting to run, each with the steers that join it when it
+  // starts, whether it waited or ran when they came, as the fx CLI's steering
+  // does: a text steer stored after the open turn's opener joins that turn,
+  // and otherwise the turn waiting before it. A steer that cannot join a
+  // turn waits as its own, and the turn it came after ends at its next safe
+  // point, at once if it has not started; the steers after it join its turn.
+  // A steer with no turn to join starts one.
   const pending = [];
   const steers = [];
+  const openOwner = openTurn !== null && !openFailed ? { joiners: steers, ends: false } : null;
   let cancelOpen = false;
+  let owner = null;
   for (const input of inputs) {
+    if (openOwner !== null && owner === null && input.cursor > openTurn.from) owner = openOwner;
     if (consumed.has(input.messageId)) continue;
     const forOpenTurn = openTurn !== null && input.cursor > openTurn.at;
-    if (input.type === "prompt") pending.push(cancelTargets.has(input.messageId) ? { ...input, cancelled: true } : input);
-    else if (input.type === "steer") {
-      // A steer its turn never took becomes the next turn.
-      if (forOpenTurn) steers.push(input);
-      else pending.push({ ...input, type: "prompt" });
+    if (input.type === "prompt") {
+      const entry = { ...input, ...(cancelTargets.has(input.messageId) ? { cancelled: true } : {}), joiners: [], ends: false };
+      pending.push(entry);
+      // While a turn runs, steers still join it: a prompt is the next turn.
+      if (owner === null || owner !== openOwner) owner = entry;
+    } else if (input.type === "steer") {
+      if (owner !== null && joinable(input.input)) owner.joiners.push(input);
+      else {
+        if (owner !== null) owner.ends = true;
+        owner = { ...input, type: "prompt", joiners: [], ends: false };
+        pending.push(owner);
+      }
     } else if (input.type === "cancel") {
       if (typeof input.target === "string") {
         if (openTurn?.id === input.target) cancelOpen = true;
@@ -298,17 +344,23 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
       : openTurn !== null && input.cursor > openTurn.at;
     if (!live) consume(input.messageId);
   }
-  // An open turn whose harness could not start has ended for its viewers; a
-  // cancel it is due waits for the next prompt's engine. One whose engine
-  // stopped each time it continued it is cancelled; one whose engine stopped
-  // even then can never go on, and the session runs no more turns.
-  const openFailed = openTurn !== null && failed.has(openTurn.id);
+  // A cancel the failed open turn is due waits for the next prompt's
+  // engine. One whose engine stopped each time it continued it is
+  // cancelled; one whose engine stopped even then can never go on, and the
+  // session runs no more turns.
   const openStops = openTurn === null ? 0 : stops.get(openTurn.id) ?? 0;
   const halted = openStops >= maxHarnessStops + maxCancelStops;
   const stuck = openStops >= maxHarnessStops && !halted;
+  const kinds = new Map(inputs.map((input) => [input.messageId, input.type]));
+  const kindOf = (id) => kinds.get(id) ?? (baseSteers.has(id) ? "steer" : kindsKnown ? "prompt" : null);
   return {
-    // Inputs no turn has taken, as written: what a checkpoint keeps.
+    // Inputs no turn has taken, as written: what a checkpoint keeps, with
+    // the ones the open turn holds unplaced, which a withdrawal hands back.
     unconsumed: inputs.filter((input) => !consumed.has(input.messageId)),
+    held: inputs.filter((input) => held.has(input.messageId)),
+    heldIds: [...held],
+    // A steer that cannot join the open turn waits for it to end.
+    endOpen: openOwner?.ends === true,
     head,
     // The lease others must respect, and the chain's latest whether or not
     // it still stands: a worker checks the latter is its own.
@@ -328,6 +380,9 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     steers,
     cancelOpen,
     recent: recent.slice(-recentIdsKept),
+    recentSteers: recent.slice(-recentIdsKept).filter((id) => kindOf(id) === "steer"),
+    // What kind of input a taken id named, or null when no record says.
+    consumedKind: (id) => (consumed.has(id) ? kindOf(id) : null),
     consumed,
     failed,
     stops,
@@ -1085,7 +1140,7 @@ function messageEntries(state, message) {
     entries.push({ k: "checkpoint", through: null, data: message.seed, ...named });
   }
   const key = `${message.type}:${message.messageId}`;
-  const known = state.inputKeys.has(key) || state.consumed.has(message.messageId);
+  const known = state.inputKeys.has(key) || state.consumed.has(message.messageId) || idInUse(state, message);
   if ((message.type === "prompt" || message.type === "steer" || message.type === "cancel") && !known) {
     entries.push({
       k: "input",
@@ -1102,9 +1157,28 @@ function messageEntries(state, message) {
   return entries;
 }
 
+// Whether a steer's input can join a turn: text. One with images or
+// resources runs as its own turn, after the running one hands off to it.
+const joinable = (input) => typeof input === "string" || (Array.isArray(input) && input.every((block) => block?.type === "text"));
+
+// Whether `message` reuses the id of the session's other kind of input: one
+// id names one input, prompt or steer.
+function idInUse(state, message) {
+  const other = message.type === "prompt" ? "steer" : message.type === "steer" ? "prompt" : null;
+  if (other === null) return false;
+  return state.inputKeys.has(`${other}:${message.messageId}`) || state.consumedKind?.(message.messageId) === other;
+}
+
+const messageIdInUse = (message) => Object.assign(
+  new TypeError(`messageId ${JSON.stringify(message.messageId)} already names a ${message.type === "prompt" ? "steer" : "prompt"} in this session`),
+  { code: "FX_MESSAGE_ID_IN_USE" },
+);
+
 // Writes what a queue message adds to its session, in order, and returns how
-// many entries it wrote. The sender and the consumer can both call it.
+// many entries it wrote. The sender and the consumer can both call it. A
+// message that reuses another input's id writes nothing and throws.
 async function recordMessage(log, state, message) {
+  if (idInUse(state, message)) throw messageIdInUse(message);
   const entries = messageEntries(state, message);
   for (const entry of entries) await log.append(entry);
   return entries.length;
@@ -1216,7 +1290,16 @@ class SessionWorker {
       if (early) {
         outcome = await this.claim(log, state, deadline, early, delivery);
       } else {
-        if (await recordMessage(log, state, message) > 0) {
+        let wrote;
+        try {
+          wrote = await recordMessage(log, state, message);
+        } catch (error) {
+          if (error?.code !== "FX_MESSAGE_ID_IN_USE") throw error;
+          // Its sender could not hear it: a durable queue took it first.
+          this.agent.emit("session.error", { sessionId: this.sessionId, error: errorSummary(error) });
+          return undefined;
+        }
+        if (wrote > 0) {
           entries = await log.read();
           state = this.fold(entries, delivery);
         }
@@ -1403,15 +1486,19 @@ class SessionWorker {
       append: ({ idempotencyKey, data, marks }) => chained({ k: "record", key: idempotencyKey, data: toBase64(data), marks }).then((cursor) => ({ cursor })),
       saveCheckpoint: async ({ through, data }) => {
         // What a fold that starts at this checkpoint would otherwise miss:
-        // inputs before it that no turn took, the ids it ran, the turn a
-        // yield left open, and the lease.
+        // inputs before it that no turn took or that the open turn holds
+        // unplaced, the ids it ran, the turn a yield left open, and the lease.
         const now = this.fold(await log.read());
+        // In log order, so a fold from here orders turns as one from the start.
+        const kept = [...now.unconsumed, ...now.held].filter((input) => input.cursor <= Number(through)).sort((a, b) => a.cursor - b.cursor);
         await log.append({
           k: "checkpoint",
           through,
           data: toBase64(data),
-          pending: now.unconsumed.filter((input) => input.cursor <= Number(through)),
+          pending: kept,
+          ...(now.heldIds.length > 0 ? { held: now.heldIds } : {}),
           recent: now.recent,
+          recentSteers: now.recentSteers,
           lastTurnId: now.lastTurnId,
           ...(now.agent === null ? {} : { agent: now.agent }),
           ...(now.openTurn ? { openTurn: now.openTurn, yielded: now.yielded } : {}),
@@ -1575,7 +1662,9 @@ class SessionWorker {
         turnNow = turn;
         if (this.stopping || claimFailed) turn.cancel({ reason: "handoff" });
         else if (spent && !(open.calls?.length > 0)) turn.cancel();
-        const outcome = await this.drive(log, harness, turn, messageId, state, ui);
+        // A new turn takes the steers sent while it waited to start.
+        const joining = fresh ? { ...state, steers: state.pending[0]?.joiners ?? [], endOpen: state.pending[0]?.ends === true } : state;
+        const outcome = await this.drive(log, harness, turn, messageId, joining, ui);
         turnNow = null;
         if (outcome === "fenced") return "fenced";
         if (outcome === "yielded") {
@@ -1671,6 +1760,19 @@ class SessionWorker {
     let polling = false;
     let again = false;
     let stopped = false;
+    // A text steer joins the turn. Any other ends it at its next safe point
+    // and, never taken, runs as the next turn, as the fx CLI hands off; the
+    // steers after that one join its turn.
+    let ending = false;
+    const endTurn = () => {
+      if (ending) return;
+      ending = true;
+      void Promise.resolve().then(() => turn.endForSteer?.()).catch(() => {});
+    };
+    const steerTurn = (steer) => {
+      if (!joinable(steer.input)) endTurn();
+      else if (!ending) void turn.steer(steer.input, steer.messageId).catch(() => {});
+    };
     const apply = async () => {
       if (stopped) return;
       if (polling) { again = true; return; }
@@ -1683,7 +1785,7 @@ class SessionWorker {
             if (Number(cursor) > Number(since)) since = cursor;
             if (entry?.k !== "input" || applied.has(entry.key)) continue;
             applied.add(entry.key);
-            if (entry.type === "steer" && typeof entry.input === "string") void turn.steer(entry.input, entry.messageId).catch(() => {});
+            if (entry.type === "steer") steerTurn(entry);
             else if (entry.type === "cancel" && (entry.target === undefined || entry.target === messageId)) turn.cancel();
           }
         } while (again && !stopped);
@@ -1693,8 +1795,9 @@ class SessionWorker {
     };
     for (const steer of state.steers) {
       applied.add(steer.key);
-      if (typeof steer.input === "string") void turn.steer(steer.input, steer.messageId).catch(() => {});
+      steerTurn(steer);
     }
+    if (state.endOpen) endTurn();
     // An open turn whose engine kept stopping is cancelled the way a user
     // would, so the prompts behind it can run.
     if (state.cancelOpen || (state.stuck && state.openTurn?.id === messageId)) turn.cancel();
@@ -1991,7 +2094,9 @@ function turnView({ messageId, resumeRequest = null, start }) {
  *   `saveCheckpoint({ through, data })` stores what the records through
  *   `through` add up to. Each record's `marks` tell the core where turns
  *   start (`{ start: turnId }`), yield (`{ yield: true }`) and end
- *   (`{ end: true }`), and which inputs a turn took (`{ accepted: id }`).
+ *   (`{ end: true }`), which inputs a turn took (`{ accepted: id }`), when
+ *   its model request first carries one (`{ placed: id }`), and which it
+ *   ended without placing (`{ withdrawn: id }`), which wait for a turn again.
  *   A write another worker's write fenced out rejects with a `FX_FENCED`
  *   code. `ready`, when given, resolves true once the worker's claim on the
  *   session lands and false when it failed: the core may start a turn
@@ -2013,8 +2118,11 @@ function turnView({ messageId, resumeRequest = null, start }) {
  * an async iterable of the events its viewers see, with `result` resolving
  * `{ stopReason, usage? }`, `steer(text, id)`, and `cancel(options)`, where
  * `{ reason: "handoff" }` stops it at once and stores nothing more, so the
- * next worker continues it. It stops before a model request once `yieldAt`
- * has passed, with the stop reason `yielded`.
+ * next worker continues it. A turn may have `endForSteer()`, which ends it
+ * at its next safe point, at once while its model streams a reply, for a
+ * steer that cannot join it; without it, such a steer waits for the turn to
+ * end. Either way the steer runs as the next turn. A turn stops before a
+ * model request once `yieldAt` has passed, with the stop reason `yielded`.
  *
  * An input the harness refuses is a turn that ends with an error.
  * `prompt()` and `resume()` throw only when the harness cannot run a turn,
@@ -2345,10 +2453,31 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
             cancel() { void reader?.cancel().catch(() => {}); },
           });
         },
-        /** Guidance for the running turn, or the next turn when none runs. */
-        async steer(text) {
-          if (typeof text !== "string" || text.length === 0) throw new TypeError("steer text must be a non-empty string");
-          await send({ type: "steer", messageId: newId("str"), input: text });
+        /**
+         * Guidance for the running turn, or the next turn when none runs: it
+         * cuts a streaming reply short, waits for a running tool, and joins a
+         * turn waiting to start. A steer with images or resources cannot
+         * join a turn: the running one ends at its next safe point and the
+         * steer runs next. With `messageId`, a retried call adds nothing;
+         * one id names one input of the session, prompt or steer: reusing a
+         * prompt's id throws `FX_MESSAGE_ID_IN_USE`, or, where the queue
+         * outlives the process and the sender reads no log, the worker drops
+         * the steer and emits a `session.error` with that code. Resolves once
+         * the steer is stored, with its id, which the stream's events for it
+         * carry.
+         */
+        async steer(input, steerOptions = {}) {
+          if (typeof input === "string" ? input.length === 0 : !Array.isArray(input) || input.length === 0) {
+            throw new TypeError("steer input must be a non-empty string or array of content blocks");
+          }
+          if (Array.isArray(input) && input.some((block) => block?.type === "image" && block.data !== undefined && typeof block.data !== "string")) {
+            throw new TypeError("a durable steer carries image data as a base64 string");
+          }
+          if (steerOptions === null || typeof steerOptions !== "object") throw new TypeError("steer options must be an object");
+          const messageId = steerOptions.messageId ?? newId("str");
+          if (!validId(messageId)) throw new TypeError(`messageId must be ${idRule}`);
+          await send({ type: "steer", messageId, input });
+          return { messageId };
         },
         /** Cancels the running turn; dropping a turn's view does not. */
         async cancel() {
