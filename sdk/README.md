@@ -54,7 +54,7 @@ agent.session(sessionId).prompt("Start with the schema.");
 ```
 
 - **One turn at a time.** A prompt sent while a turn runs waits behind it, even when it reaches a different server.
-- **Turns finish on their own.** A turn runs to the end whether or not anyone reads its events. Stop it with `session.cancel()`, or with the `signal` you passed to `prompt()`.
+- **Turns finish on their own.** A turn runs to the end whether or not anyone reads its events, and a turn nobody reads holds no connection open: its view starts reading only once you use its events, `readable` or `result`. Stop it with `session.cancel()`, or with the `signal` you passed to `prompt()`.
 - **Steering.** `session.steer(text)` adds guidance to the running turn at its next model request. When no turn is running, the text becomes the next turn.
 - **Retries are safe.** Give a prompt a `messageId`, and a repeated request with the same id runs nothing new. It follows the original turn, and its result has `repeated: true`.
 
