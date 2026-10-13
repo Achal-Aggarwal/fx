@@ -66,7 +66,9 @@ const answer = (text) => [{ type: "text-delta", id: "answer", delta: text }, fin
 // notice: "use <tool>" calls the tool once, then answers with its result;
 // "loop" calls lookup three times; "stall" never answers; "slow reply"
 // streams its answer a word at a time for a few seconds; "stalled reply"
-// sends one word and goes quiet for `stallMs`; anything else is echoed.
+// sends one word and goes quiet for `stallMs`; "slow tool call" writes a
+// lookup call's input a little at a time for a few seconds; anything else is
+// echoed.
 function framesFor(prompt) {
   const users = userTexts(prompt).filter((text) => text !== resumeNotice);
   const text = users.at(-1) ?? "";
@@ -80,6 +82,7 @@ function framesFor(prompt) {
   if (text === "stall") return null;
   if (text === "slow reply") return slowReply;
   if (text === "stalled reply") return stalledReply;
+  if (text === "slow tool call") return slowToolCall;
   if (text === "loop") {
     if (turnResults.length < 3) return toolCall(`call-${users.length}-${turnResults.length}`, "lookup", { key: `k${turnResults.length}` });
     return answer(`looped ${turnResults.length}`);
@@ -94,6 +97,8 @@ const slowFrames = 75;
 const slowReplyMs = slowFrames * 40;
 const slow = [];
 const stalledReply = Symbol("stalled reply");
+const slowToolCall = Symbol("slow tool call");
+const slowTools = [];
 const stallMs = 4000;
 
 const requests = [];
@@ -120,6 +125,26 @@ const server = createServer((request, response) => {
       response.write(`data: ${JSON.stringify({ type: "text-delta", id: "answer", delta: "first " })}\n\n`);
       const timer = setTimeout(() => response.end(`data: ${JSON.stringify(finish("stop"))}\n\ndata: [DONE]\n\n`), stallMs);
       response.on("close", () => clearTimeout(timer));
+      return;
+    }
+    if (frames === slowToolCall) {
+      const record = { sent: 0 };
+      slowTools.push(record);
+      response.writeHead(200, { "content-type": "text/event-stream" });
+      // Some text first, as a model writes before it calls a tool.
+      response.write(`data: ${JSON.stringify({ type: "text-delta", id: "answer", delta: "Looking it up. " })}\n\n`);
+      response.write(`data: ${JSON.stringify({ type: "tool-input-start", id: "slow-call", toolName: "lookup" })}\n\n`);
+      const timer = setInterval(() => {
+        if (record.sent < slowFrames) {
+          response.write(`data: ${JSON.stringify({ type: "tool-input-delta", id: "slow-call", delta: record.sent === 0 ? "{\"key\":\"k" : "k" })}\n\n`);
+          record.sent += 1;
+          return;
+        }
+        clearInterval(timer);
+        const frames = [{ type: "tool-input-delta", id: "slow-call", delta: "\"}" }, { type: "tool-input-end", id: "slow-call" }, ...toolCall("slow-call", "lookup", { key: "k" })];
+        response.end(frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join("") + "data: [DONE]\n\n");
+      }, 40);
+      response.on("close", () => clearInterval(timer));
       return;
     }
     if (frames === slowReply) {
@@ -885,6 +910,34 @@ test("a cancel keeps the steer its turn never took, and it runs next", async () 
   await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-after-stop", "the steer's own turn");
   assert.ok(userTexts(requests.at(-1)).some((text) => text.includes("after the stop")), "the steer ran as the next turn");
   await agent.close();
+});
+
+// The cancel ends the step before its call runs, so the turn's progress is
+// cleared before the turn ends: the steer is withdrawn ahead of that, while it
+// still belongs to the turn, or the session's journal no longer opens.
+test("a cancel while the model writes a tool call keeps the steer waiting for the call, and it runs next", async () => {
+  const shared = await durabilityFor();
+  const agent = createFxAgent(agentOptions(shared));
+  const session = agent.session();
+  const before = slowTools.length;
+  const turn = session.prompt("slow tool call");
+  const { sessionId } = await turn.accepted;
+  await until(() => slowTools.length > before && slowTools.at(-1).sent > 3, "the tool call's input");
+  await session.steer("after the cancel", { messageId: "m-after-cancel" });
+  // The worker gives it to the running turn, which waits for the call.
+  await new Promise((wait) => setTimeout(wait, durabilityKind === "memory" ? 50 : 600));
+  await session.cancel();
+  assert.equal((await turn.result).stopReason, "cancelled");
+  const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-after-cancel", "the steer's own turn");
+  const end = lines.find((line) => line.type === "turn_end" && line.messageId === "m-after-cancel");
+  assert.equal(end.stopReason, "end_turn", `the steer's turn ended with ${JSON.stringify(end).slice(0, 300)}`);
+  assert.ok(userTexts(requests.at(-1)).some((text) => text.includes("after the cancel")), "the steer ran as the next turn");
+  await agent.close();
+  // Another worker opens the session from its log.
+  const second = createFxAgent(agentOptions(shared));
+  const again = await second.session(sessionId).prompt("after the reload").result;
+  assert.equal(again.stopReason, "end_turn", `the reopened session ended its turn with ${JSON.stringify(again).slice(0, 300)}`);
+  await second.close();
 });
 
 test("a steer's messageId makes a retry add nothing, and names no prompt", async () => {

@@ -3158,6 +3158,9 @@ fn clearJournalProgress(raw_ctx: *anyopaque) !void {
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const journal = if (session.journal) |*value| value else return error.SessionPersistenceUnavailable;
+    // The turn ends here, cancelled or stopped: the steers it never placed
+    // are withdrawn while they still belong to it, before the clear ends it.
+    try handBackUnplacedSteersLocked(ctx.alloc, ctx.state.alloc, session, journal);
     try journal.clearProgress(ctx.alloc, session.session_id);
 }
 
