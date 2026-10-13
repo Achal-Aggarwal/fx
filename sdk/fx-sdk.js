@@ -298,7 +298,8 @@ function imageStoreError(cause) {
  * cursor is not the last record's is refused, so a second agent cannot write
  * the same session, and an append that repeats a stored write's
  * `idempotencyKey` returns that write's cursor. `images` holds each prompt
- * image once, by name, so records and checkpoints only name them.
+ * image once, by name, so records and checkpoints only name them: a host
+ * that copies the session elsewhere copies `images` with them.
  */
 export function createMemoryPersistence() {
   const records = [];
@@ -2267,9 +2268,8 @@ export async function createFxEngine(options = {}) {
   const persistence = options.persistence ?? null;
   // A persistence with an image store keeps each prompt image once, by
   // name, and the core names it in records and checkpoints instead of
-  // holding its bytes. Naming needs WebCrypto; without it images stay inline.
-  const imageStore = persistence !== null && typeof persistence.putImage === "function" &&
-    typeof globalThis.crypto?.subtle?.digest === "function";
+  // holding its bytes.
+  const imageStore = persistence !== null && typeof persistence.putImage === "function";
   const checkpointAfterBytes = options.checkpointAfterBytes ?? defaultCheckpointAfterBytes;
   // The store's last cursor, and the last seq its records hold.
   let journalHead = null;

@@ -406,7 +406,7 @@ async function harness(walk, n) {
         if (entry.input?.length !== 1) problems.push(`text prompt ${i} stored ${JSON.stringify(entry.input).slice(0, 120)}`);
         continue;
       }
-      if (image?.sha256 !== names[i] || image?.mimeType !== "image/png" || image?.type !== "image" || "data" in (image ?? {})) problems.push(`prompt ${i} stored ${JSON.stringify(image).slice(0, 120)}`);
+      if (image?.data?.sha256 !== names[i] || Object.keys(image.data).length !== 1 || image?.mimeType !== "image/png" || image?.type !== "image") problems.push(`prompt ${i} stored ${JSON.stringify(image).slice(0, 120)}`);
       if (writes.images.get(names[i]) !== expected[i]) problems.push(`prompt ${i} was stored before its image, or with other bytes`);
     }
     for (const [i, file] of Object.entries(files)) if (file.reads > 1) problems.push(`prompt ${i}'s file was read ${file.reads} times`);

@@ -1059,9 +1059,9 @@ test("a durable prompt stores each image once in the session's image store, and 
     const entries = (await log.readSince("0")).map(({ entry }) => entry);
     assert.deepEqual(entries.find((entry) => entry.k === "input")?.input, [
       { type: "text", text: "look" },
-      { type: "image", mimeType: "image/png", sha256: pngName },
-      { type: "image", mimeType: "image/png", sourceRef: "uploads:shot", sha256: pngName },
-      { type: "image", mimeType: "image/png", sha256: pngName },
+      { type: "image", mimeType: "image/png", data: { sha256: pngName } },
+      { type: "image", mimeType: "image/png", sourceRef: "uploads:shot", data: { sha256: pngName } },
+      { type: "image", mimeType: "image/png", data: { sha256: pngName } },
     ]);
     assert.ok(!JSON.stringify(entries).includes(png), "no entry holds the image's base64");
     assert.deepEqual(await log.images.get(pngName), pngBytes);
@@ -1103,8 +1103,9 @@ test("a failed image write rejects the prompt before anything is stored", async 
   const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), { failWrites: 1 }));
   const session = agent.session();
   const refused = session.prompt([{ type: "text", text: "look" }, image], { messageId: "refused-img" });
-  await assert.rejects(refused.accepted, /the store is full/);
-  await assert.rejects(refused.result, /the store is full/);
+  const storeFailed = (error) => error.code === "FX_IMAGE_STORE_FAILED" && /the store is full/.test(error.cause?.message);
+  await assert.rejects(refused.accepted, storeFailed);
+  await assert.rejects(refused.result, storeFailed);
   assert.equal((await session.prompt([{ type: "text", text: "again" }, image]).result).stopReason, "end_turn");
   assert.deepEqual(kinds(seen), ["image"], "only the second prompt was stored and ran");
   // The refused prompt was never stored, so its retry is a new turn.

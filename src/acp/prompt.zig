@@ -1574,7 +1574,8 @@ const ParsedPromptInput = struct {
     fn noteStoredImages(self: *const ParsedPromptInput, session_alloc: Allocator, journal: *libfx_journal.Journal) Allocator.Error!void {
         std.debug.assert(self.images.len == self.pending_images.len);
         for (self.images, self.pending_images) |image, pending| {
-            try journal.noteStoredImages(session_alloc, &.{image}, &.{pending.stored_name});
+            const name = pending.stored_name orelse continue;
+            try journal.noteStoredImage(session_alloc, image, name);
         }
     }
 

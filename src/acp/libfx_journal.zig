@@ -301,27 +301,22 @@ pub const Journal = struct {
         return if (self.image_store) &self.stored_images else null;
     }
 
-    /// Records the prompt images the host stored before it sent them:
-    /// `names[i]` is the name the host gave `images[i]`, and counts only when
-    /// it is that image's digest. A name that does not match leaves the image
-    /// inline.
-    pub fn noteStoredImages(
+    /// Records a prompt image the host stored before it sent it, under
+    /// `name`, which counts only when it is the image's digest. A name that
+    /// does not match leaves the image inline.
+    pub fn noteStoredImage(
         self: *Journal,
         alloc: Allocator,
-        images: []const types.ImageAttachment,
-        names: []const ?session_codec.ImageName,
+        image: types.ImageAttachment,
+        name: session_codec.ImageName,
     ) Allocator.Error!void {
         if (!self.image_store) return;
-        std.debug.assert(images.len == names.len);
-        for (images, names) |image, claimed| {
-            const name = claimed orelse continue;
-            const digest = image.snapshot_sha256 orelse continue;
-            if (image.inline_data == null or !std.mem.eql(u8, digest, &name)) {
-                debug_trace.logf("session", "event=libfx_image_not_stored id={d} reason=name_mismatch", .{image.id});
-                continue;
-            }
-            try self.stored_images.add(alloc, name);
+        const digest = image.snapshot_sha256 orelse return;
+        if (image.inline_data == null or !std.mem.eql(u8, digest, &name)) {
+            debug_trace.logf("session", "event=libfx_image_not_stored id={d} reason=name_mismatch", .{image.id});
+            return;
         }
+        try self.stored_images.add(alloc, name);
     }
 
     /// The follow-up a starting turn runs: its first progress places it.

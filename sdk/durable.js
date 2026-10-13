@@ -108,8 +108,7 @@ const fromBase64 = (text) => {
 
 // A session keeps each prompt image once, in its image store, named by the
 // lowercase hex SHA-256 of its bytes, as libfx's core names it; the log only
-// names it. Naming needs WebCrypto: without it, images stay in the log.
-const canNameImages = () => typeof globalThis.crypto?.subtle?.digest === "function";
+// names it.
 async function imageName(bytes) {
   const digest = new Uint8Array(await globalThis.crypto.subtle.digest("SHA-256", bytes));
   let name = "";
@@ -197,8 +196,10 @@ function readPromptBlobs(input, { named = false } = {}) {
 
 // Stores each image a prompt's input holds in the session's image store,
 // before the input that names it is stored, and returns the input naming
-// them: `{ type: "image", sha256, mimeType, sourceRef? }`. With `images`
-// null it only names them, for a prompt the log already holds.
+// them: `{ type: "image", mimeType, sourceRef?, data: { sha256 } }`. An older
+// libfx refuses data it can't read, so a worker that predates names fails
+// the turn rather than run it without its images. With `images` null it only
+// names them, for a prompt the log already holds.
 async function storePromptImages(images, input) {
   const blocks = [];
   for (const block of input) {
@@ -209,8 +210,17 @@ async function storePromptImages(images, input) {
     const { data, ...rest } = block;
     const bytes = typeof data === "string" ? fromBase64(data) : data;
     const sha256 = await imageName(bytes);
-    if (images) await images.put(sha256, bytes);
-    blocks.push({ ...rest, sha256 });
+    if (images) {
+      try {
+        await images.put(sha256, bytes);
+      } catch (cause) {
+        // As an engine reports a store that fails, with the store's error.
+        const error = new Error("libfx could not store a prompt image", { cause });
+        error.code = "FX_IMAGE_STORE_FAILED";
+        throw error;
+      }
+    }
+    blocks.push({ ...rest, data: { sha256 } });
   }
   return blocks;
 }
@@ -222,16 +232,16 @@ async function resolvePromptImages(images, input) {
   if (!Array.isArray(input)) return { input };
   const blocks = [];
   for (const block of input) {
-    if (block?.type !== "image" || typeof block.sha256 !== "string") {
+    const name = block?.type === "image" ? block.data?.sha256 : undefined;
+    if (typeof name !== "string") {
       blocks.push(block);
       continue;
     }
-    const bytes = await images.get(block.sha256);
-    if (!bytes) return { missing: block.sha256 };
+    const bytes = await images.get(name);
+    if (!bytes) return { missing: name };
     // Bytes that aren't the ones named are not the image its caller sent.
-    if (await imageName(bytes) !== block.sha256) return { missing: block.sha256, corrupt: true };
-    const { sha256, ...rest } = block;
-    blocks.push({ ...rest, data: toBase64(bytes) });
+    if (await imageName(bytes) !== name) return { missing: name, corrupt: true };
+    blocks.push({ ...block, data: toBase64(bytes) });
   }
   return { input: blocks };
 }
@@ -2184,7 +2194,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
           // images go to the session's image store first and the log names
           // them; a prompt aborted before the call stores nothing, so it
           // keeps them as base64.
-          const named = !aborted && canNameImages();
+          const named = !aborted;
           const stored = Array.isArray(input) ? promptInputForLog(input, { named }) : { input, blobs: false, images: false };
           const before = reading;
           const ready = before || stored.blobs || stored.images ? async () => {
@@ -2287,6 +2297,10 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
               head: state.head,
             }),
             append: async () => { throw new Error("a checkpoint reads the session without changing it"); },
+            // The records name the session's images; the engine reads them
+            // from its image store to export them.
+            getImage: (name) => log.images.get(name),
+            putImage: async () => { throw new Error("a checkpoint reads the session without changing it"); },
           };
           const harness = await agent.openHarness(sessionId, readOnly, null);
           try {

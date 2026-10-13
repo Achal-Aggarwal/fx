@@ -1,5 +1,5 @@
-// The state graph TLC writes with `-dump dot,actionlabels`, as drive.mjs and
-// drive-intake.mjs read it.
+// The state graph TLC writes with `-dump dot,actionlabels`, as drive.mjs,
+// drive-intake.mjs, and drive-images.mjs read it.
 import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 

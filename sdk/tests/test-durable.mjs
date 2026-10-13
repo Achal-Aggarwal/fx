@@ -1129,6 +1129,19 @@ test("a durable prompt's image bytes and files reach the model as base64", async
   await agent.close();
 });
 
+test("an engine given an image the log names refuses it, so a worker that can't read names fails the turn", async () => {
+  // The log holds a stored image as `data: { sha256 }`, which an engine that
+  // predates names can't read, with or without a sourceRef: such a worker
+  // fails the turn instead of running it without the image.
+  const { durability: _durability, tools: _tools, ...engineOptions } = agentOptions(null, { model: "durable/vision-model" });
+  const engine = await createFxEngine(engineOptions);
+  const named = { type: "image", mimeType: "image/png", data: { sha256: "a".repeat(64) } };
+  for (const block of [named, { ...named, sourceRef: "uploads:shot" }]) {
+    assert.throws(() => engine.prompt([{ type: "text", text: "look" }, block]), /requires base64 data, bytes, or a Blob/);
+  }
+  await engine.close();
+});
+
 test("a durable session saves each image once, and a new agent sends it again", async () => {
   // A PNG header, then filler, so its bytes are easy to look for.
   const header = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII="), (char) => char.charCodeAt(0));
@@ -1315,6 +1328,25 @@ test("a checkpoint restores the conversation in a new agent", async () => {
   const restored = createFxAgent(agentOptions(await durabilityFor(), { checkpoint }));
   assert.equal((await restored.prompt("what was the word").result).stopReason, "end_turn");
   assert.deepEqual(userTexts(requests.at(-1)), ["remember the word kiwi", "what was the word"]);
+  await restored.close();
+});
+
+test("a checkpoint after an image prompt holds the image, and a new agent sends it", async () => {
+  const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
+  const bytes = Uint8Array.from(atob(png), (char) => char.charCodeAt(0));
+  const agent = createFxAgent(agentOptions(await durabilityFor(), { model: "durable/vision-model" }));
+  const look = [{ type: "text", text: "look" }, { type: "image", data: bytes, mimeType: "image/png" }];
+  assert.equal((await agent.prompt(look).result).stopReason, "end_turn");
+  // The session's records name the image; the checkpoint carries its bytes.
+  const checkpoint = await agent.checkpoint();
+  await agent.close();
+  const restored = createFxAgent(agentOptions(await durabilityFor(), { checkpoint, model: "durable/vision-model" }));
+  assert.equal((await restored.prompt("what was in it").result).stopReason, "end_turn");
+  const files = chats.at(-1).prompt
+    .filter((message) => message.role === "user" && Array.isArray(message.content))
+    .flatMap((message) => message.content)
+    .filter((part) => part.type === "file");
+  assert.deepEqual(files.map((part) => part.data?.data), [png]);
   await restored.close();
 });
 
