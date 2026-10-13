@@ -1489,6 +1489,7 @@ pub fn spawnDetachedSession(
     var helper_argv: std.ArrayList([]const u8) = .empty;
     try helper_argv.appendSlice(scratch, &.{ executable, foreground_session_token, "none" });
     try helper_argv.appendSlice(scratch, argv);
+    const started_ms = io_mod.milliTimestamp();
     var child = try std.process.spawn(io_mod.getIo(), .{
         .argv = helper_argv.items,
         .stdin = .pipe,
@@ -1497,10 +1498,18 @@ pub fn spawnDetachedSession(
         .cwd = .{ .path = cwd },
         .environ_map = environ_map,
     });
+    debug_trace.logf("core", "detached session supervisor spawned pid={?d} elapsed_ms={d}", .{
+        child.id,
+        io_mod.milliTimestamp() - started_ms,
+    });
     var phase: ForegroundSessionPhase = .pre_ready;
     errdefer cleanupForegroundSessionChild(&child, phase);
     try waitForForegroundSessionReady(&child, .{ .max_command_output_bytes = 0 });
     phase = .group_ready;
+    debug_trace.logf("core", "detached session supervisor ready pid={?d} elapsed_ms={d}", .{
+        child.id,
+        io_mod.milliTimestamp() - started_ms,
+    });
 
     const input = child.stdin orelse return error.SpawnFailed;
     var nonce_bytes: [foreground_session_failure_nonce_bytes]u8 = undefined;
@@ -1516,6 +1525,10 @@ pub fn spawnDetachedSession(
         .little,
     );
     try input.writeStreamingAll(io_mod.getIo(), &control);
+    debug_trace.logf("core", "detached session released pid={?d} elapsed_ms={d}", .{
+        child.id,
+        io_mod.milliTimestamp() - started_ms,
+    });
     return child;
 }
 
