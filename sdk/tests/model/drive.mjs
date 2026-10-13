@@ -95,9 +95,6 @@ const addon = resolve(here, "../../../zig-out/lib/libfx.node");
 const wasm = backend === "wasm" ? await readFile(resolve(here, "../../../zig-out/bin/fx-core.wasm")) : undefined;
 const Workers = ["A", "B"];
 
-// ---------------------------------------------------------------------------
-// The state graph TLC wrote.
-
 // The epochs of the lines every reader shows, by the spec's ShownAt: each
 // line no earlier line outranks.
 const shownEpochs = (lines) => {

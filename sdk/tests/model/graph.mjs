@@ -1,11 +1,10 @@
-// The state graph TLC wrote for a spec: check.sh dumps each one with
-// `-dump dot,actionlabels`, and the drivers walk it against the code.
+// The state graphs check.sh has TLC write, as the model drivers read them.
 import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 
 // A TLA+ value as TLC prints it: numbers, strings, booleans, records (and
-// functions over names, which print as records), sequences, and sets, which
-// read as arrays in TLC's order.
+// functions over names, which print as records), sequences, and sets, read
+// as arrays in TLC's order.
 export function parseValue(text) {
   let at = 0;
   const space = () => { while (/\s/.test(text[at] ?? "")) at += 1; };
@@ -16,29 +15,17 @@ export function parseValue(text) {
   };
   const value = () => {
     space();
-    if (text.startsWith("<<", at)) {
-      at += 2;
+    for (const [open, close] of [["<<", ">>"], ["{", "}"]]) {
+      if (!text.startsWith(open, at)) continue;
+      at += open.length;
       const items = [];
       space();
-      if (text.startsWith(">>", at)) { at += 2; return items; }
+      if (text.startsWith(close, at)) { at += close.length; return items; }
       for (;;) {
         items.push(value());
         space();
         if (text[at] === ",") { at += 1; continue; }
-        expect(">>");
-        return items;
-      }
-    }
-    if (text[at] === "{") {
-      at += 1;
-      const items = [];
-      space();
-      if (text[at] === "}") { at += 1; return items; }
-      for (;;) {
-        items.push(value());
-        space();
-        if (text[at] === ",") { at += 1; continue; }
-        expect("}");
+        expect(close);
         return items;
       }
     }
@@ -77,6 +64,7 @@ export function parseValue(text) {
   return result;
 }
 
+/** The graph check.sh wrote to `path`: each state by id, its successors, and the initial state. */
 export async function loadGraph(path) {
   const dot = await readFile(path, "utf8").catch(() => {
     throw new Error(`${path} is missing; run sdk/tests/model/check.sh first`);

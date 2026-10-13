@@ -292,6 +292,8 @@ export type FxEngineEvent = FxEventBase & (
 export type FxSessionEvent = FxEventBase & (
   | { type: "session.error"; sessionId: string; error: FxErrorSummary }
   | { type: "session.fenced"; sessionId: string; epoch: number }
+  /** A message for a session of the agent `agent` reached this one, which sent it on. */
+  | { type: "session.forwarded"; sessionId: string; agent: string }
   /** `cutoffs`: the times in a row the deadline cut off the same step, this one included. */
   | { type: "session.deadline"; sessionId: string; epoch: number; cutoffs: number }
   | { type: "ui.error"; sessionId: string; error: string }
@@ -615,6 +617,12 @@ export type FxAgentOptions = Omit<FxSharedOptions<FxAgentEvent>, "tools"> & FxMo
   durability?: Durability | undefined;
   /** Checkpoint bytes the agent's new sessions start from. */
   checkpoint?: FxBytes;
+  /**
+   * The agent's name, 1 to 64 letters, digits, `.`, `_` or `-`, starting with a letter or digit. Default `"default"`.
+   * A session's turns run only on agents with the name of the agent that created it, so an app can have several
+   * durable agents. Agents with the same name are copies of one agent and share its sessions' turns.
+   */
+  name?: string;
 };
 
 /** Options for `agent.session()`. Each applies to the turns this session object starts. */
@@ -749,6 +757,8 @@ export interface FxSession {
 
 /** An agent: the configuration its sessions run under. Create one per server and open a session per conversation. */
 export interface FxAgent {
+  /** The agent's name, `"default"` unless `createFxAgent()` gave one. */
+  readonly name: string;
   /** Opens the session `id`, or starts a new one without it. Any other value, `null` included, throws. */
   session(id?: string, options?: FxSessionOptions): FxSession;
   /** An id for a new session, before its first prompt. */
@@ -759,11 +769,17 @@ export interface FxAgent {
   prompt(input: FxSessionPromptInput, options?: FxPromptOptions): FxTurn;
   /** The history of the session `agent.prompt()` uses, as opaque bytes. */
   checkpoint(): Promise<Uint8Array>;
-  /** The request handler a deployment mounts for queue deliveries. */
+  /** The request handler a deployment mounts for queue deliveries; it delivers to whichever agent in the process a message names. */
   wakeHandler(): (request: Request) => Promise<Response>;
   /** Waits for the turns this process is running, then lets their sessions go. */
   close(): Promise<void>;
 }
+
+/**
+ * The request handler a deployment mounts for queue deliveries, for every durable agent in the process: each
+ * delivery goes to the agent its message names. One route and one queue trigger serve any number of agents.
+ */
+export declare function wakeHandler(): (request: Request) => Promise<Response>;
 
 // ---------------------------------------------------------------------------
 // Backend diagnostics (Node.js)

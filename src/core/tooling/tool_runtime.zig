@@ -4914,7 +4914,7 @@ test "executeToolCall traces non-text grep skips in normal runtime" {
     try expectContains(trace, "binaryish/blob.bin");
 }
 
-test "executeToolCall traces oversized grep skips in normal runtime" {
+test "executeToolCall searches large files in normal runtime" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4939,13 +4939,13 @@ test "executeToolCall traces oversized grep skips in normal runtime" {
         .arguments_json = "{\"pattern\":\"needle\",\"path\":\"oversized\"}",
     });
 
+    // A 260 KiB file, its second line one long run, is searched in full.
     try std.testing.expectEqual(tool_contracts.ToolExecutionStatus.success, result.status);
-    try std.testing.expectEqualStrings("[grep] no matches for needle\n", result.model_output);
+    try std.testing.expectEqualStrings("[grep] 1 matches for needle\n - oversized/huge.txt:1: needle hidden\n", result.model_output);
 
     const trace = try readTraceFileForTest(alloc, trace_path);
     defer alloc.free(trace);
-    try expectContains(trace, "grep_files skipped oversized file path=");
-    try expectContains(trace, "oversized/huge.txt");
+    try std.testing.expect(std.mem.find(u8, trace, "grep_files skipped") == null);
 }
 
 test "executeToolCall returns failure status for missing grep path" {

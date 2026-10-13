@@ -12,6 +12,7 @@
 #   bun drive.mjs send && bun drive.mjs lookup && bun drive.mjs write && bun drive.mjs cutoff
 #   bun drive.mjs leased   # the Heartbeat graph, on a World without liveness
 #   bun drive.mjs queue    # the QueueHeld graph, on a World whose queue shows it
+#   bun drive-agents.mjs send && bun drive-agents.mjs consume   # AgentRouting
 #   bun drive-steer.mjs ideal && bun drive-steer.mjs faults
 set -eu
 cd "$(dirname "$0")"
@@ -88,6 +89,45 @@ for pair in NoInterrupt:NoSteerWaitsOnReply NoHandBack:NothingLost \
         echo "== steer witness $witness reached"
     else
         echo "== steer witness $witness NOT reached" >&2; status=1
+    fi
+done
+
+# AgentRouting.tla: which agent runs a session's turns when an app has
+# several. Its graphs are what drive-agents.mjs walks: inputs stored when
+# sent (memory, local) and when delivered (Vercel), with process p2 lacking
+# one agent. Drains is checked under fairness, a simulation runs a larger
+# config, and each witness breaks RunsOnOwner: NoNames is routing without
+# names, as before them, and NoOwnerCheck a worker that runs any session it
+# is handed.
+for config in send consume; do
+    echo "== AgentRouting ($config)"
+    if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
+        -metadir "$work/agents-$config" -dump dot,actionlabels "graphs/agents-$config" \
+        -config "AgentRouting-$config.cfg" AgentRouting.tla > "$work/agents-$config.log" 2>&1; then
+        cat "$work/agents-$config.log"; status=1; continue
+    fi
+    grep -E 'distinct states|depth of' "$work/agents-$config.log"
+done
+for config in drains-send drains-consume; do
+    if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/agents-$config" \
+        -config "AgentRouting-$config.cfg" AgentRouting.tla > "$work/agents-$config.log" 2>&1; then
+        echo "== AgentRouting ($config): Drains holds"
+    else
+        cat "$work/agents-$config.log"; status=1
+    fi
+done
+if "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -simulate num=20000 -depth 50 -deadlock -workers auto -cleanup \
+    -metadir "$work/agents-sim" -config AgentRouting-sim.cfg AgentRouting.tla > "$work/agents-sim.log" 2>&1; then
+    echo "== AgentRouting (simulation): $(grep -E 'states checked' "$work/agents-sim.log" | tail -1)"
+else
+    cat "$work/agents-sim.log"; status=1
+fi
+for witness in NoNames NoOwnerCheck; do
+    if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/w-$witness" \
+        -config "Witness-$witness.cfg" AgentRouting.tla 2>&1 | grep -q -E "Invariant RunsOnOwner is violated"; then
+        echo "== witness $witness reached"
+    else
+        echo "== witness $witness NOT reached" >&2; status=1
     fi
 done
 exit "$status"
