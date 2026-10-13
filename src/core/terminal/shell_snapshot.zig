@@ -787,10 +787,15 @@ fn captureWithShellChecked(request: CaptureRequest) !CaptureOutcome {
     defer {
         // Ends the shell and anything its startup files left running in its
         // process group, as the command supervisor does after each command.
-        std.posix.kill(-process_group, std.posix.SIG.KILL) catch {};
+        debug_trace.logf("core", "shell snapshot capture stopping process group pgid={d}", .{process_group});
+        std.posix.kill(-process_group, std.posix.SIG.KILL) catch |err| {
+            debug_trace.logf("core", "shell snapshot capture process group kill failed pgid={d} err={s}", .{ process_group, @errorName(err) });
+        };
+        debug_trace.logf("core", "shell snapshot capture process group signaled pgid={d}", .{process_group});
         if (child.stdin) |lifeline| {
             lifeline.close(io);
             child.stdin = null;
+            debug_trace.logf("core", "shell snapshot capture lifeline closed pid={d}", .{process_group});
         }
         if (child.wait(io)) |term| {
             traceSupervisorExit(process_group, term);
@@ -818,10 +823,16 @@ fn captureWithShellChecked(request: CaptureRequest) !CaptureOutcome {
     parsePayload(generation, payload.items, &nonce) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.MissingSection, error.InvalidEntry => {
+            debug_trace.logf("core", "shell snapshot capture payload rejected err={s}", .{@errorName(err)});
             generation.destroy();
             return .{ .failed = .incomplete };
         },
     };
+    debug_trace.logf("core", "shell snapshot capture payload parsed env_entries={d} names={d} replay_bytes={d}", .{
+        generation.environ.count(),
+        generation.names.count(),
+        generation.replay.len,
+    });
     return .{ .ready = generation };
 }
 
