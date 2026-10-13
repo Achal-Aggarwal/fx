@@ -134,8 +134,46 @@ fn promptInputFailure(err: anyerror) anyerror!TerminalOutcome {
             .code = ErrorCode.invalid_params,
             .message = "Image prompt exceeds size limit",
         } },
+        error.PromptImagesTooLarge => .{ .rpc_error = .{
+            .code = ErrorCode.invalid_params,
+            .message = "Prompt images exceed the libfx limit",
+        } },
         else => err,
     };
+}
+
+/// Whether `images` fit one libfx prompt: at most
+/// `image_attachments.max_libfx_prompt_images` of them, holding at most
+/// `max_libfx_prompt_images_bytes` together. An open stages its open turn's
+/// images on top of the session's image window, and counts on this.
+fn fitsLibfxPrompt(images: []const PendingPromptImage) bool {
+    if (images.len > image_attachments.max_libfx_prompt_images) return false;
+    var bytes: usize = 0;
+    for (images) |image| bytes += image.bytes.len;
+    return bytes <= image_attachments.max_libfx_prompt_images_bytes;
+}
+
+test "a libfx prompt holds at most its limit of images and image bytes" {
+    const alloc = std.testing.allocator;
+    var media_type = "image/png".*;
+    var byte: [1]u8 = .{0x89};
+    var images: [image_attachments.max_libfx_prompt_images + 1]PendingPromptImage = @splat(.{ .id = 1, .bytes = &byte, .media_type = &media_type });
+    try std.testing.expect(fitsLibfxPrompt(images[0..image_attachments.max_libfx_prompt_images]));
+    try std.testing.expect(!fitsLibfxPrompt(&images));
+    // Reference-only images count toward the number too.
+    var references = images;
+    for (&references) |*image| image.bytes = &.{};
+    try std.testing.expect(!fitsLibfxPrompt(&references));
+
+    const bytes = try alloc.alloc(u8, image_attachments.max_libfx_prompt_images_bytes + 1);
+    defer alloc.free(bytes);
+    const exact = [_]PendingPromptImage{.{ .id = 1, .bytes = bytes[1..], .media_type = &media_type }};
+    try std.testing.expect(fitsLibfxPrompt(&exact));
+    const over = [_]PendingPromptImage{
+        .{ .id = 1, .bytes = bytes[0..1024], .media_type = &media_type },
+        .{ .id = 2, .bytes = bytes[1024..], .media_type = &media_type },
+    };
+    try std.testing.expect(!fitsLibfxPrompt(&over));
 }
 
 fn promptExecutionFailure(err: anyerror) anyerror!TerminalOutcome {
@@ -867,6 +905,7 @@ pub fn handlePrompt(
         if (session.store == null and session.wasm_state == null and session.v2 == null) {
             // libfx kernel session: images stay in memory and ride the kernel
             // checkpoint, so no filesystem snapshot backend is needed.
+            if (!fitsLibfxPrompt(prompt_input.pending_images)) return promptInputFailure(error.PromptImagesTooLarge);
             prompt_input.captureImagesInline(alloc) catch |err|
                 return promptInputFailure(err);
             if (session.journal) |*journal| try prompt_input.noteStoredImages(state.alloc, journal);

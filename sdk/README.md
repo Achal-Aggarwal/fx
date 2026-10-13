@@ -57,6 +57,7 @@ agent.session(sessionId).prompt("Start with the schema.");
 - **Turns finish on their own.** A turn runs to the end whether or not anyone reads its events, and a turn nobody reads holds no connection open: its view starts reading only once you use its events, `readable` or `result`. Stop it with `session.cancel()`, or with the `signal` you passed to `prompt()`.
 - **Steering.** `session.steer(text)` adds guidance to the running turn at its next model request. When no turn is running, the text becomes the next turn.
 - **Retries are safe.** Give a prompt a `messageId`, and a repeated request with the same id runs nothing new. It follows the original turn, and its result has `repeated: true`.
+- **A refused prompt is never stored.** `prompt()` checks a prompt as the engine's `prompt()` does and throws a `TypeError` or `RangeError` for one libfx would refuse, such as an empty prompt, base64 that isn't canonical, an image whose bytes aren't its type, or more than 8 images. A `File` or `Blob` is checked by its size and type at once and by its bytes once read; if those are refused, `turn.accepted` rejects before anything is stored. A prompt whose `signal` aborts before the prompt is stored isn't stored either, and its turn ends `cancelled`.
 
 Each conversation can bring its own settings, which apply to the turns that session object starts:
 

@@ -1146,14 +1146,28 @@ test("an option the backend rejects fails the first turn once", async () => {
   await agent.close();
 });
 
-test("a prompt the engine refuses ends its own turn once, and the session goes on", async () => {
-  const agent = createFxAgent(agentOptions(await durabilityFor()));
+// A 1x1 PNG, as bytes, for the image tests below.
+const pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
+const pngBytes = () => Uint8Array.from(atob(pngBase64), (char) => char.charCodeAt(0));
+
+test("a prompt the engine would refuse throws, stores nothing, and the session goes on", async () => {
+  const agent = createFxAgent(agentOptions(await durabilityFor(), { model: "durable/vision-model" }));
   const session = agent.session();
-  const empty = await session.prompt("").result;
-  assert.equal(empty.stopReason, "error");
-  const malformed = await session.prompt([{ type: "text" }]).result;
-  assert.equal(malformed.stopReason, "error");
-  const { text, result } = await collect(session.prompt("hello again"));
+  const image = (data, mimeType = "image/png") => ({ type: "image", data, mimeType });
+  for (const [input, refusal] of [
+    ["", /prompt is empty/],
+    [[{ type: "text" }], /text prompt block 0 requires text/],
+    [[{ type: "text", text: "look" }, image("not base64!")], /image prompt block 1 requires canonical base64 data/],
+    [[{ type: "text", text: "look" }, image(pngBytes(), "image/jpeg")], /image prompt block 1 holds image\/png data, not image\/jpeg/],
+    [[{ type: "text", text: "look" }, image(pngBase64, "image/gif")], /image prompt block 1 holds image\/png data, not image\/gif/],
+    [[{ type: "text", text: "look" }, image(new Uint8Array([1, 2, 3, 4]))], /image prompt block 1 is not a PNG, JPEG, GIF or WebP image/],
+    [[{ type: "text", text: "look" }, image(pngBytes(), "image/bmp")], /image prompt block 1 mimeType must be image\/png, image\/jpeg, image\/gif or image\/webp/],
+    [[{ type: "text", text: "look" }, ...Array.from({ length: 9 }, () => image(pngBytes()))], /prompt cannot contain more than 8 images/],
+  ]) {
+    assert.throws(() => session.prompt(input, { messageId: "refused" }), refusal);
+  }
+  // Nothing was stored under that id, so a prompt with it runs.
+  const { text, result } = await collect(session.prompt("hello again", { messageId: "refused" }));
   assert.equal(result.stopReason, "end_turn");
   assert.equal(text, "echo: hello again");
   await agent.close();
@@ -1241,6 +1255,70 @@ test("an engine given an image the log names refuses it, so a worker that can't 
   for (const block of [named, { ...named, sourceRef: "uploads:shot" }]) {
     assert.throws(() => engine.prompt([{ type: "text", text: "look" }, block]), /requires base64 data, bytes, or a Blob/);
   }
+  await engine.close();
+});
+
+test("a durable prompt refuses a file over the limit without reading it, and one whose bytes are not its type once read", async () => {
+  const agent = createFxAgent(agentOptions(await durabilityFor(), { model: "durable/vision-model" }));
+  const session = agent.session();
+  let reads = 0;
+  class CountedFile extends File {
+    arrayBuffer() {
+      reads += 1;
+      return super.arrayBuffer();
+    }
+  }
+  const big = new CountedFile([new Uint8Array(4 * 1024 * 1024)], "big.png", { type: "image/png" });
+  assert.throws(() => session.prompt([{ type: "text", text: "look" }, { type: "image", data: big }]), /image prompt block 1 exceeds the 3932160 byte per-image libfx limit/);
+  const pair = [0, 1].map((n) => new CountedFile([new Uint8Array(3 * 1024 * 1024 + n)], `half-${n}.png`, { type: "image/png" }));
+  assert.throws(() => session.prompt([{ type: "text", text: "look" }, ...pair.map((data) => ({ type: "image", data }))]), /prompt images exceed the 6291456 byte libfx limit/);
+  assert.equal(reads, 0, "no file was read");
+  // A file's type is its own word for it: its bytes are checked once read,
+  // before anything is stored.
+  const mislabeled = session.prompt([{ type: "text", text: "look" }, { type: "image", data: new CountedFile([pngBytes()], "shot.jpg", { type: "image/jpeg" }) }], { messageId: "mislabeled" });
+  await assert.rejects(mislabeled.accepted, /image prompt block 1 holds image\/png data, not image\/jpeg/);
+  await assert.rejects(mislabeled.result, /image prompt block 1 holds image\/png data, not image\/jpeg/);
+  assert.equal(reads, 1);
+  const { result } = await collect(session.prompt("hello again", { messageId: "mislabeled" }));
+  assert.equal(result.stopReason, "end_turn", "nothing was stored under its id");
+  await agent.close();
+});
+
+test("a durable prompt cancelled while its file is read is never stored, and sends no cancel", async () => {
+  const agent = createFxAgent(agentOptions(await durabilityFor(), { model: "durable/vision-model" }));
+  const session = agent.session();
+  let release;
+  const held = new Promise((resolveHeld) => { release = resolveHeld; });
+  class HeldFile extends File {
+    async arrayBuffer() {
+      await held;
+      return super.arrayBuffer();
+    }
+  }
+  const controller = new AbortController();
+  const turn = session.prompt([{ type: "text", text: "look" }, { type: "image", data: new HeldFile([pngBytes()], "shot.png", { type: "image/png" }) }], { messageId: "withdrawn", signal: controller.signal });
+  await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  controller.abort();
+  // The prompt stops waiting for its file at once.
+  await turn.accepted;
+  assert.equal((await turn.result).stopReason, "cancelled");
+  release();
+  // Neither the prompt nor a cancel naming it was stored: one stored would
+  // answer a prompt with its id from the log, and a cancel would end it.
+  const { text, result } = await collect(session.prompt("hello again", { messageId: "withdrawn" }));
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(text, "echo: hello again");
+  await agent.close();
+});
+
+test("an engine refuses the same prompts in prompt(), before its core sees them", async () => {
+  const { durability: _durability, tools: _tools, ...engineOptions } = agentOptions(null, { model: "durable/vision-model" });
+  const engine = await createFxEngine(engineOptions);
+  assert.throws(() => engine.prompt(""), /prompt is empty/);
+  assert.throws(() => engine.prompt([{ type: "text", text: "look" }, { type: "image", data: pngBytes(), mimeType: "image/jpeg" }]), /holds image\/png data, not image\/jpeg/);
+  await assert.rejects(engine.prompt([{ type: "text", text: "look" }, { type: "image", data: new File([pngBytes()], "shot.jpg", { type: "image/jpeg" }) }]).result, /holds image\/png data, not image\/jpeg/);
+  const { result } = await collect(engine.prompt("hello"));
+  assert.equal(result.stopReason, "end_turn");
   await engine.close();
 });
 

@@ -85,9 +85,11 @@ done
 # still preparing its images is stored first. NoCloseCheck breaks
 # ClosedStopsPreparing: a prompt still preparing when the agent closes is
 # stored anyway. GateHeldOnFailure deadlocks: a failed prompt that never
-# lets the prompts behind it go leaves them waiting forever.
+# lets the prompts behind it go leaves them waiting forever. NoWithdraw
+# breaks CancelOnlyWhenSent: a prompt that goes on after an abort before
+# its send began has its cancel go out before it does.
 for pair in NoGate:"Invariant ImageOrder is violated" NoCloseCheck:"Invariant ClosedStopsPreparing is violated" \
-    GateHeldOnFailure:"Deadlock reached"; do
+    GateHeldOnFailure:"Deadlock reached" NoWithdraw:"Invariant CancelOnlyWhenSent is violated"; do
     witness="${pair%%:*}" expected="${pair#*:}"
     if "$java" -cp "$jar" tlc2.TLC -workers auto -cleanup -metadir "$work/intake-$witness" \
         -config "PromptIntake-$witness.cfg" PromptIntake.tla 2>&1 | grep -q -F "$expected"; then

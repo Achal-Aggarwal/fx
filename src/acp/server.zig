@@ -2068,14 +2068,10 @@ fn writeImagesNeeded(state: *ServerState, alloc: Allocator, id: ?jsonrpc.Request
 
 /// The most images, and image bytes, a host may stage for one open: those of
 /// the largest image window, the newest images a session keeps, and those of
-/// the open turn, which the window leaves out. That turn holds one prompt's
-/// images, at most `max_prompt_images` in `max_prompt_images_bytes`, the
-/// limits libfx takes a prompt within (`maxPromptImages` and
-/// `maxPromptImagesBytes` in `sdk/fx-sdk.js`).
-const max_staged_images = (session_codec.ImageWindow{}).max_images + max_prompt_images;
-const max_staged_image_bytes = (session_codec.ImageWindow{}).max_bytes + max_prompt_images_bytes;
-const max_prompt_images = 8;
-const max_prompt_images_bytes = 6 * 1024 * 1024;
+/// the open turn, which the window leaves out and which holds one prompt's
+/// images at most.
+const max_staged_images = (session_codec.ImageWindow{}).max_images + image_attachments.max_libfx_prompt_images;
+const max_staged_image_bytes = (session_codec.ImageWindow{}).max_bytes + image_attachments.max_libfx_prompt_images_bytes;
 
 /// The image window an open asks for, `{images, bytes}`, each at most the
 /// default: a host may keep fewer images, never more than an open stages.

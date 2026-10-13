@@ -417,6 +417,8 @@ async function harness(walk, n) {
       else if (order.includes(i)) ph.push("stored");
       else if (writes.held.has(`prompt:p${i}`)) ph.push("sending");
       else if (acc[i] === "rejected") ph.push(/is closed/.test(accError[i]?.message ?? "") ? "refused" : "failed");
+      // Accepted, yet neither stored nor on its way: an abort withdrew it.
+      else if (acc[i] === "resolved") ph.push("withdrawn");
       else ph.push("preparing");
     }
     const each = (fn) => Array.from({ length: n }, (_, index) => fn(index + 1));

@@ -2253,6 +2253,10 @@ function turnView({ messageId, resumeRequest = null, start }) {
  *   sets over the agent's options for the turns it starts, as JSON the core
  *   stores with each prompt and passes to `open()`, or undefined for none.
  *   It throws a TypeError for options it refuses.
+ * - `checkPrompt(input)` (optional): throws a TypeError or RangeError for
+ *   a prompt input the harness would refuse. A session's `prompt()` calls it
+ *   before it stores anything, and again on a file's bytes once they are
+ *   read, so a prompt it refuses is never stored.
  *
  * A harness session has `prompt(input, { turnId, yieldAt })` and
  * `resume({ yieldAt, rerun })`, each returning a turn, where `rerun: false`
@@ -2267,7 +2271,8 @@ function turnView({ messageId, resumeRequest = null, start }) {
  * next worker continues it. It stops before a model request once `yieldAt`
  * has passed, with the stop reason `yielded`.
  *
- * An input the harness refuses is a turn that ends with an error.
+ * An input the harness refuses only once a turn runs it is a turn that ends
+ * with an error.
  * `prompt()` and `resume()` throw only when the harness cannot run a turn,
  * and a turn whose harness stopped under it rejects with a
  * `FX_HARNESS_STOPPED` code; either way the same message runs the session
@@ -2436,7 +2441,10 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
       let reading = null;
       // `ready`, when given, resolves the input once it can be stored; only a
       // prompt that is stored calls it.
-      const startTurn = (type, messageId, input, retried = false, aborted = false, ready = null) => {
+      // `aborted()` says whether the prompt's signal has aborted. One that
+      // aborted before the prompt's send began never stores it; `progress.sent`
+      // is set as the send begins, after which an abort cancels the prompt.
+      const startTurn = (type, messageId, input, retried = false, aborted = () => false, ready = null, progress = null) => {
         let accept;
         const accepted = new Promise((resolve, reject) => { accept = { resolve, reject }; });
         void accepted.catch(() => {});
@@ -2445,21 +2453,27 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
           resumeRequest: type === "resume" ? messageId : null,
           start: async () => {
             try {
-              const message = { type, messageId, ...(input === undefined ? {} : { input: ready && !aborted ? await ready() : input }) };
+              const read = input === undefined || ready === null || aborted() ? input : await ready();
+              const message = { type, messageId, ...(input === undefined ? {} : { input: read }) };
+              const queue = () => {
+                if (progress) progress.sent = true;
+                return send(message, { inRequest: type === "prompt" });
+              };
               const { created, id: sessionId } = await resolved;
               const log = await created.session(sessionId);
               let attaching = type === "resume";
               let from = null;
-              if (retried && !aborted) {
-                // The viewer's start is read before the message is queued, so
-                // every line this message's own turn writes comes after it,
-                // and an end for this id before it can only be from a turn
-                // this id already ran. The log, for that answer, is read
-                // alongside the one queue send.
-                from = await log.ui.length();
+              // The viewer's start is read before the message is queued, so
+              // every line this message's own turn writes comes after it, and
+              // an end for this id before it can only be from a turn this id
+              // already ran.
+              if (retried) from = await log.ui.length();
+              if (retried && !aborted()) {
+                // The log, for that answer, is read alongside the one queue
+                // send.
                 const [state] = await Promise.all([
                   log.read().then(foldSessionLog),
-                  send(message, { inRequest: type === "prompt" }).then(() => accept.resolve({ messageId, sessionId })),
+                  queue().then(() => accept.resolve({ messageId, sessionId })),
                 ]);
                 // One the log does not know yet is this send's own. When the
                 // log says it ran and nothing shows how, either this send's
@@ -2472,9 +2486,8 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
               }
               if (retried) {
                 // A turn this id already ran answers from the log, without
-                // queueing it again. The viewer's start is read first, so a
+                // queueing it again. The viewer's start was read first, so a
                 // turn that ends after it has its end in view.
-                from = await log.ui.length();
                 const outcome = await retryOutcome(log, foldSessionLog(await log.read()), messageId, from, { sent: false });
                 if (outcome.follow) attaching = true;
                 else if (!outcome.fresh) {
@@ -2483,15 +2496,17 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
                   return { log, from, attaching: true, endWithinMs: retryEndWaitMs };
                 }
               }
-              if (aborted && !attaching) {
-                // A new prompt whose signal had aborted is never stored.
-                accept.resolve({ messageId, sessionId });
-                return { settled: { messageId, stopReason: "cancelled", usage: {} } };
-              }
               // The viewer starts where the stream is now, before the
               // message can produce anything.
               from ??= await log.ui.length();
-              await send(message, { inRequest: type === "prompt" });
+              if (aborted()) {
+                // A prompt whose signal aborted before its send began is never
+                // stored; a retry of one the log holds only follows its turn.
+                accept.resolve({ messageId, sessionId });
+                if (!attaching) return { settled: { messageId, stopReason: "cancelled", usage: {} } };
+                return { log, from, attaching };
+              }
+              await queue();
               accept.resolve({ messageId, sessionId });
               return { log, from, attaching };
             } catch (error) {
@@ -2510,7 +2525,11 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
          * turn still running and answers one that ended, without running it
          * again. Each image is stored once in the session's image store and
          * the log names it; a Blob or File is read first. A later prompt from
-         * this session object waits for an earlier one's images.
+         * this session object waits for an earlier one's images. An input the
+         * harness would refuse throws here, or for a file's bytes, rejects
+         * `accepted` once read, and is never stored. A prompt whose signal
+         * aborts before it is stored is never stored either: it ends
+         * cancelled.
          */
         prompt(input, promptOptions = {}) {
           if (closed) throw new Error(`${label} is closed`);
@@ -2519,6 +2538,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
           if (typeof input !== "string" && !Array.isArray(input)) throw new TypeError("prompt input must be a string or an array of content blocks");
           const signal = promptOptions.signal;
           if (signal !== undefined && typeof signal?.addEventListener !== "function") throw new TypeError("prompt signal must be an AbortSignal");
+          plugged.checkPrompt?.(input);
           const aborted = signal?.aborted === true;
           const retried = promptOptions.messageId !== undefined;
           // The input travels through the queue and the log as JSON. Its
@@ -2529,30 +2549,59 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
           const stored = Array.isArray(input) ? promptInputForLog(input, { named }) : { input, blobs: false, images: false };
           const before = reading;
           const ready = before || stored.blobs || stored.images ? async () => {
-            await before;
-            let read = stored.blobs ? await readPromptBlobs(stored.input) : stored.input;
-            if (stored.images) {
-              const { created, id: sessionId } = await resolved;
-              const log = await created.session(sessionId);
-              // A retry of a prompt the log already holds is answered from
-              // the log: its images are named, not written again.
-              const known = retried && logHolds(foldSessionLog(await log.read()), "prompt", messageId);
-              read = await storePromptImages(known ? null : log.images, read);
+            // The prompt waits for an earlier one, its file and its image
+            // writes only until its signal aborts; what it waited for may
+            // still land, but the prompt is not stored.
+            let release = () => {};
+            const abortion = signal === undefined ? null : new Promise((resolve) => {
+              signal.addEventListener("abort", resolve, { once: true });
+              release = () => signal.removeEventListener("abort", resolve);
+            });
+            const unlessAborted = (promise) => {
+              if (abortion === null) return promise;
+              void promise.catch(() => {});
+              return Promise.race([promise, abortion]);
+            };
+            try {
+              await unlessAborted(before ?? Promise.resolve());
+              if (signal?.aborted) return null;
+              let read = stored.blobs ? await unlessAborted(readPromptBlobs(stored.input)) : stored.input;
+              if (signal?.aborted) return null;
+              // A file's bytes are checked once there are some.
+              if (stored.blobs) plugged.checkPrompt?.(read);
+              if (stored.images) {
+                const { created, id: sessionId } = await resolved;
+                const log = await created.session(sessionId);
+                // A retry of a prompt the log already holds is answered from
+                // the log: its images are named, not written again.
+                const known = retried && logHolds(foldSessionLog(await log.read()), "prompt", messageId);
+                if (signal?.aborted) return null;
+                read = await unlessAborted(storePromptImages(known ? null : log.images, read));
+                if (signal?.aborted) return null;
+              }
+              // An agent closed meanwhile stores nothing more.
+              if (closed) throw new Error(`${label} is closed`);
+              return read;
+            } finally {
+              release();
             }
-            // An agent closed meanwhile stores nothing more.
-            if (closed) throw new Error(`${label} is closed`);
-            return read;
           } : null;
-          const turn = startTurn("prompt", messageId, stored.input, retried, aborted, ready);
+          const progress = { sent: false };
+          const turn = startTurn("prompt", messageId, stored.input, retried, () => signal?.aborted === true, ready, progress);
           if ((stored.blobs || stored.images) && !aborted) {
-            const settled = turn.accepted.then(() => {}, () => {});
+            // A later prompt waits for this one and every one before it: one
+            // withdrawn while it waited settles before them.
+            const settled = Promise.all([before, turn.accepted.then(() => {}, () => {})]).then(() => {});
             reading = settled;
             void settled.then(() => { if (reading === settled) reading = null; });
           }
           if (signal !== undefined && !signal.aborted) {
             // The prompt's own cancel: it stops this turn whether it runs or
-            // still waits, and never a later one.
-            const stop = () => { void send({ type: "cancel", messageId: newId("cnl"), target: messageId }).catch(() => {}); };
+            // still waits, and never a later one. A prompt whose send had not
+            // begun is never stored, so it needs none.
+            const stop = () => {
+              if (progress.sent) void send({ type: "cancel", messageId: newId("cnl"), target: messageId }).catch(() => {});
+            };
             signal.addEventListener("abort", stop, { once: true });
             void turn.result.finally(() => signal.removeEventListener("abort", stop)).catch(() => {});
           }

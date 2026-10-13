@@ -17,10 +17,13 @@
 (* (PromptIntake-GateHeldOnFailure.cfg, a deadlock).                       *)
 (*                                                                         *)
 (* A prompt's signal may have aborted before the call, and then nothing is *)
-(* stored, or abort later, which sends a cancel naming the prompt. The     *)
-(* cancel and the prompt land in the log in either order. Preparing (a     *)
-(* read, or an image write) or a log write may fail, up to MaxFaults       *)
-(* times.                                                                  *)
+(* stored, or abort later. Until the prompt's send begins, an abort        *)
+(* withdraws it: nothing is stored and no cancel goes out; with            *)
+(* AbortWithdraws = FALSE the prompt goes on, and a cancel naming it goes  *)
+(* out at once (PromptIntake-NoWithdraw.cfg). Once its send has begun, an  *)
+(* abort sends a cancel naming the prompt, and the cancel and the prompt   *)
+(* land in the log in either order. Preparing (a read, or an image write)  *)
+(* or a log write may fail, up to MaxFaults times.                         *)
 (*                                                                         *)
 (* The worker runs the log's prompts one at a time, in log order. It ends  *)
 (* a prompt whose cancel landed without running it, and cancels a running  *)
@@ -39,14 +42,15 @@ CONSTANTS
     MaxFaults,             \* bound on failed preparations and failed log writes
     Gate,                  \* whether a prompt waits for earlier image prompts
     CloseCheck,            \* whether a prompt ready after close is refused
-    GateReleasesOnFailure  \* whether a failed prompt lets later ones go
+    GateReleasesOnFailure, \* whether a failed prompt lets later ones go
+    AbortWithdraws         \* whether an abort before the send withdraws the prompt
 
 ASSUME N \in Nat /\ MaxFaults \in Nat
-ASSUME Gate \in BOOLEAN /\ CloseCheck \in BOOLEAN /\ GateReleasesOnFailure \in BOOLEAN
+ASSUME Gate \in BOOLEAN /\ CloseCheck \in BOOLEAN /\ GateReleasesOnFailure \in BOOLEAN /\ AbortWithdraws \in BOOLEAN
 
 Prompts == 1..N
 Kinds == {"text", "image"}
-Phases == {"unmade", "early", "preparing", "sending", "stored", "failed", "refused"}
+Phases == {"unmade", "early", "preparing", "sending", "stored", "failed", "refused", "withdrawn"}
 
 VARIABLES
     made,        \* how many prompts the caller has made
@@ -124,10 +128,14 @@ Pending(d) == SelectSeq(log, LAMBDA i : i \notin d)
 Waiting == {j \in 1..made : kind[j] = "image" /\ ~early[j] /\ acc[j] = "pending"}
 GateNow == IF Gate /\ Waiting # {} THEN CHOOSE j \in Waiting : \A k \in Waiting : k <= j ELSE 0
 
-\* Whether the prompt i waits for lets it go.
+\* Whether the prompt i waits for lets it go: it and every image prompt
+\* before it have settled, since one withdrawn while it waited settles
+\* before the prompts it waited for.
 Ready(i) ==
     IF before[i] = 0 THEN TRUE
-    ELSE IF GateReleasesOnFailure THEN acc[before[i]] # "pending" ELSE acc[before[i]] = "resolved"
+    ELSE IF GateReleasesOnFailure
+         THEN \A j \in 1..before[i] : (kind[j] = "image" /\ ~early[j]) => acc[j] # "pending"
+         ELSE acc[before[i]] = "resolved"
 
 \* A prompt that cannot be stored: both of its promises reject.
 Reject(i, phase) ==
@@ -195,14 +203,23 @@ StoreFail(i) ==
     /\ act' = Act("StoreFail", i)
     /\ UNCHANGED <<made, kind, early, before, aborted, cancel, log, ran, open, done, active, closed, prepAtClose>>
 
-\* The signal aborts while the prompt's result is still pending.
+\* The signal aborts while the prompt's result is still pending. Before the
+\* prompt's send begins, it is withdrawn: never stored, its `accepted`
+\* resolved and its result cancelled, and no cancel goes out. Once the send
+\* has begun, or the prompt is stored, a cancel naming it goes out.
 Abort(i) ==
     /\ ph[i] \notin {"unmade", "early"}
     /\ ~aborted[i] /\ res[i] = "pending"
     /\ aborted' = [aborted EXCEPT ![i] = TRUE]
-    /\ cancel' = [cancel EXCEPT ![i] = "held"]
+    /\ IF ph[i] = "preparing" /\ AbortWithdraws
+         THEN /\ ph' = [ph EXCEPT ![i] = "withdrawn"]
+              /\ acc' = [acc EXCEPT ![i] = "resolved"]
+              /\ res' = [res EXCEPT ![i] = "cancelled"]
+              /\ UNCHANGED cancel
+         ELSE /\ cancel' = [cancel EXCEPT ![i] = "held"]
+              /\ UNCHANGED <<ph, acc, res>>
     /\ act' = Act("Abort", i)
-    /\ UNCHANGED <<made, kind, early, before, ph, acc, res, log, ran, open, done, active, closed, faults, prepAtClose>>
+    /\ UNCHANGED <<made, kind, early, before, log, ran, open, done, active, closed, faults, prepAtClose>>
 
 CancelStore(i) ==
     /\ cancel[i] = "held"
@@ -288,10 +305,17 @@ DriveSpec == Init /\ [][(Quiet /\ DriverStep) \/ Auto \/ Finished]_vars
 ImageOrder ==
     \A a, b \in 1..Len(log) : a < b => ~(log[b] < log[a] /\ kind[log[b]] = "image")
 
-\* `accepted` resolves exactly when the prompt is stored, or at once for a
-\* prompt whose signal had aborted, which is never stored.
+\* `accepted` resolves exactly when the prompt is stored, or for a prompt
+\* whose signal aborted before its send began, which is never stored.
 StoredIffAccepted ==
-    \A i \in 1..made : (acc[i] = "resolved") <=> (i \in Stored \/ ph[i] = "early")
+    \A i \in 1..made : (acc[i] = "resolved") <=> (i \in Stored \/ ph[i] \in {"early", "withdrawn"})
+
+\* A cancel goes out only for a prompt whose send has begun: one that is
+\* on its way, stored, or whose store failed.
+CancelOnlyWhenSent == \A i \in Prompts : cancel[i] # "none" => ph[i] \in {"sending", "stored", "failed"}
+
+\* A withdrawn prompt leaves nothing in the log.
+WithdrawnNeverStored == \A i \in Prompts : ph[i] = "withdrawn" => i \notin Stored /\ cancel[i] = "none"
 
 NeverStoredTwice == \A a, b \in 1..Len(log) : a # b => log[a] # log[b]
 

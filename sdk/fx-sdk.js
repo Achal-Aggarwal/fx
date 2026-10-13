@@ -36,9 +36,10 @@ const maxUnreadEvents = 256;
 // Prompt images travel as raw bytes beside the ACP frame and are base64
 // encoded only in the model request. An image may use 5 MiB of encoded
 // request data, and a prompt's images 8 MiB, so the raw limits are 3/4 of that.
-// The kernel still validates content and media type. An open stages one
-// prompt's images past a session's image window, so `max_prompt_images` and
-// `max_prompt_images_bytes` in src/acp/server.zig must match the prompt limits.
+// The kernel still validates content and media type, and holds a prompt to
+// these limits too: `max_libfx_prompt_images` and
+// `max_libfx_prompt_images_bytes` in src/core/images/image_attachments.zig
+// must match them.
 const maxPromptImages = 8;
 const maxPromptImageDataBytes = 5 * 1024 * 1024;
 const maxPromptImagesDataBytes = 8 * 1024 * 1024;
@@ -1986,6 +1987,62 @@ function normalizePromptInput(input, { deferImageLimits = false } = {}) {
   return prompt;
 }
 
+// The image types libfx's core takes, each known by how its bytes start.
+const imageSignatures = [
+  ["image/png", 0, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]],
+  ["image/jpeg", 0, [0xff, 0xd8, 0xff]],
+  ["image/gif", 0, [0x47, 0x49, 0x46, 0x38, 0x37, 0x61]],
+  ["image/gif", 0, [0x47, 0x49, 0x46, 0x38, 0x39, 0x61]],
+  ["image/webp", 0, [0x52, 0x49, 0x46, 0x46]],
+];
+const imageTypes = new Set(imageSignatures.map(([type]) => type));
+const webpMarker = [0x57, 0x45, 0x42, 0x50];
+
+// The image type `bytes` start as, or null.
+function imageTypeOf(bytes) {
+  const startsWith = (offset, signature) => bytes.length >= offset + signature.length && signature.every((byte, index) => bytes[offset + index] === byte);
+  for (const [type, offset, signature] of imageSignatures) {
+    if (!startsWith(offset, signature)) continue;
+    if (type === "image/webp" && !startsWith(8, webpMarker)) continue;
+    return type;
+  }
+  return null;
+}
+
+// Refuses image bytes that are not the type they declare, as libfx's core does.
+function checkImageBytesType(bytes, mimeType, index) {
+  const type = imageTypeOf(bytes);
+  if (type === null) throw new TypeError(`image prompt block ${index} is not a PNG, JPEG, GIF or WebP image`);
+  if (type !== mimeType) throw new TypeError(`image prompt block ${index} holds ${type} data, not ${mimeType}`);
+}
+
+/**
+ * Checks a prompt's input as libfx takes it and returns it normalized:
+ * every check `prompt()` makes, and the ones libfx's core makes on images,
+ * which would otherwise refuse the prompt only once it reached the core: a
+ * supported image type, and bytes or base64 that are that type. A Blob is not
+ * read, so its bytes are checked once read (`checkImageBytesType`). With
+ * `resizeImage`, image bytes are checked after it runs instead. Throws a
+ * TypeError or RangeError.
+ */
+export function checkPromptInput(input, { resizeImage } = {}) {
+  const resized = resizeImage !== undefined;
+  const normalized = normalizePromptInput(input, { deferImageLimits: resized });
+  // The core takes no prompt without text or an image; a resource adds neither.
+  if (!normalized.some((block) => block.type === "image" || (block.type === "text" && block.text.length > 0))) {
+    throw new TypeError("prompt is empty");
+  }
+  // resizeImage decides the final image sizes, so they are counted after it runs.
+  checkPromptFrameSize(normalized, !resized);
+  normalized.forEach((block, index) => {
+    if (block.type !== "image" || (resized && block.data !== undefined)) return;
+    if (!imageTypes.has(block.mimeType)) throw new TypeError(`image prompt block ${index} mimeType must be image/png, image/jpeg, image/gif or image/webp`);
+    if (block.source === "bytes") checkImageBytesType(block.data, block.mimeType, index);
+    else if (block.source === "base64") checkImageBytesType(base64ToBytes(block.data.slice(0, 16)), block.mimeType, index);
+  });
+  return normalized;
+}
+
 // Image bytes travel beside the frame as attachment references, but the model
 // request carries them base64 encoded and the native host caps that request at
 // 8 MiB. Images therefore count at their encoded size, the same budget they
@@ -2055,6 +2112,8 @@ async function materializePromptImages(blocks, isCancelled, resizeImage) {
       bytes: image.bytes,
       ...(block.sourceRef === undefined ? {} : { sourceRef: block.sourceRef }),
     };
+    // A file's bytes, or what resizeImage made, are checked once there are some.
+    checkImageBytesType(image.bytes, image.mimeType, index);
     if (image.bytes.byteLength > maxPromptImageBytes && image.sourceRef !== undefined) {
       image = omitReferencedImageData([image])[0];
     }
@@ -3222,14 +3281,12 @@ export async function createFxEngine(options = {}) {
     const resizeImage = options.resizeImage;
     const resuming = promptOptions[resumeTurn] === true;
     const followUp = promptOptions[followUpInput] ?? null;
-    const normalized = resuming ? [] : normalizePromptInput(input, { deferImageLimits: resizeImage !== undefined });
+    const normalized = resuming ? [] : checkPromptInput(input, { resizeImage });
     const hasPixels = normalized.some((block) => block.type === "image" && block.data !== undefined);
     // Blob reads, resizeImage and storing images run before the prompt
     // frame is sent.
     const asyncImages = hasPixels && (resizeImage !== undefined || imageStore ||
       normalized.some((block) => block.type === "image" && block.source === "blob"));
-    // resizeImage decides the final image sizes, so they are counted after it runs.
-    checkPromptFrameSize(normalized, resizeImage === undefined);
     // Snapshot caller-owned bytes, which could change before an async send.
     const prompt = asyncImages
       ? normalized.map((block) => block.type === "image" && block.source === "bytes" ? { ...block, data: block.data.slice() } : block)

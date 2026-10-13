@@ -1208,17 +1208,38 @@ test("a prompt's signal or the agent closing while its file is read keeps its tu
   const { agent, seen } = recordingAgent(await durabilityFor());
   const session = agent.session();
   const controller = new AbortController();
-  const cancelled = session.prompt([{ type: "image", data: new SlowBlob({ ms: 150 }) }], { signal: controller.signal });
+  const read = new SlowBlob({ ms: 400 });
+  const cancelled = session.prompt([{ type: "image", data: read }], { messageId: "turn-read", signal: controller.signal });
   await sleep(20);
+  const aborted = Date.now();
   controller.abort();
+  await cancelled.accepted;
   assert.equal((await cancelled.result).stopReason, "cancelled");
-  assert.equal((await session.prompt("after").result).stopReason, "end_turn");
+  assert.ok(Date.now() - aborted < 300, "the prompt stopped waiting for its file at once");
+  // Neither the prompt nor a cancel naming it was stored: its id runs anew.
+  assert.equal((await session.prompt("after", { messageId: "turn-read" }).result).stopReason, "end_turn");
   assert.deepEqual(kinds(seen), ["after"]);
   const closing = session.prompt([{ type: "image", data: new SlowBlob({ ms: 150 }) }]);
   await agent.close();
   await assert.rejects(closing.accepted, /agent is closed/);
   await assert.rejects(closing.result, /agent is closed/);
   assert.deepEqual(kinds(seen), ["after"]);
+});
+
+test("a prompt withdrawn while it waits keeps the prompts behind it waiting for the ones before it", async () => {
+  const { agent, seen } = recordingAgent(await durabilityFor());
+  const session = agent.session();
+  const first = session.prompt([{ type: "image", data: new SlowBlob({ ms: 300 }) }], { messageId: "turn-first" });
+  const controller = new AbortController();
+  const second = session.prompt([{ type: "image", data: new SlowBlob() }], { messageId: "turn-second", signal: controller.signal });
+  const third = session.prompt("third", { messageId: "turn-third" });
+  await sleep(20);
+  controller.abort();
+  assert.equal((await second.result).stopReason, "cancelled");
+  assert.equal((await first.result).stopReason, "end_turn");
+  assert.equal((await third.result).stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["image", "third"], "the prompt behind the withdrawn one still came after the one before it");
+  await agent.close();
 });
 
 test("an image prompt its first worker could not start runs from the log with the same base64, once", async () => {
