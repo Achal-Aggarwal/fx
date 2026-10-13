@@ -4,7 +4,7 @@
 //! and returns or updates a value it owns. `plan` decides what a batch may
 //! write; `apply` folds a written line into the state; `encodeState` and
 //! `decodeState` turn the state into a snapshot and back. Resuming from the
-//! newest snapshot must equal a full fold (`tla/ResumeSnapshot.tla`).
+//! newest snapshot must equal a full fold (`tests/tla/session_manager/ResumeSnapshot.tla`).
 
 const std = @import("std");
 const schema = @import("schema.zig");
@@ -313,7 +313,7 @@ pub fn plan(state: *const State, events: []const Event, out: []schema.Body) Tran
                 break :blk .{ .turn_interrupted = .{ .turn = turn, .reason = reason } };
             },
             .set => |s| .{ .set = s },
-            // One unfinished work item per child (`tla/Subagents.tla`
+            // One unfinished work item per child (`tests/tla/session_manager/Subagents.tla`
             // OneOpenWork); a finish names exactly that one.
             .child_spawned => |c| blk: {
                 if (openWorkAt(state, events[0..i], c.child) != null) return error.InvalidTransition;

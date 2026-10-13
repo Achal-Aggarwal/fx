@@ -1,7 +1,7 @@
 # Session Manager (Sessions v2) Design And Contracts
 
 This document is canonical for the v2 format, API, contracts and decisions,
-and `tla/` models each step. It began as the design proposal and was kept
+and the TLA+ specs in this folder model each step. It began as the design proposal and was kept
 current through implementation, so the Decisions section also records what
 implementation found. Decisions D1 to D19 were settled on 2026-09-27.
 
@@ -248,7 +248,7 @@ every write, so they are not folded. Its
 `compaction_offset` is a byte offset, and a fork's line 1 has a different
 length, so a fork encodes each copied snapshot again from its own fold, with
 the same `seq`. Folding from line 1 and folding from the newest snapshot must
-give identical state (`tla/ResumeSnapshot.tla`).
+give identical state (`ResumeSnapshot.tla`).
 
 ### API (the only boundary fx sees)
 
@@ -331,7 +331,7 @@ manager:
   root-user evidence stay in memory: v1 drops them on restart too
   (`child_state.zig` `interruptActive`), and the child's own log holds the
   message once its turn starts. A child's turn opens on disk when its work
-  starts, as `tla/Subagents.tla` `ChildStart` models, so the bodies its
+  starts, as `Subagents.tla` `ChildStart` models, so the bodies its
   tools keep are blobs of a session on disk (D44);
   its pieces are written whole at its end, as v1's children are, while
   roots stream theirs (D28). A crash before that start leaves no log
@@ -351,10 +351,10 @@ manager:
 
   fx's usage recovery reads the v2 markers too. It takes the newest usage
   from the log without the lock, and trusts it only when the checkpoint's
-  time is at least the marker's (D20, `tla/Wiring.tla`).
+  time is at least the marker's (D20, `Wiring.tla`).
 
   fx has since dropped its local usage ledger and these markers with it,
-  so this item and the usage steps in `tla/Wiring.tla` describe the design
+  so this item and the usage steps in `Wiring.tla` describe the design
   before that change.
 - **Checks the adapter keeps:** tool call and result pairing, and v1's
   per-piece size rules, before anything reaches `append`.
@@ -418,7 +418,7 @@ reused as ideas; no v1 code is shared.
   - after a batch containing `turn_committed`, `turn_interrupted`,
     `set permissions`, `set usage`, `child_spawned` or `child_finished`
     (`set usage` since the wiring check: fx clears its usage-recovery
-    marker only after the usage is durable, `tla/Wiring.tla`);
+    marker only after the usage is durable, `Wiring.tla`);
   - on `close()`;
   - on the first publish;
   - at the end of `open(.resume)` repair.
@@ -426,7 +426,7 @@ reused as ideas; no v1 code is shared.
   A blob is durable before `put_blob` returns: its file, then its folder
   entry. That is required because one log `fsync` makes every line already
   written durable, including a line another thread wrote after its own blob,
-  so a blob cannot wait for the next durability point (`tla/Fork.tla`
+  so a blob cannot wait for the next durability point (`Fork.tla`
   `RefsExist`). Cost: two `fsync` calls per blob.
 - **What a sync guarantees:** a synced line survives an fx crash and an OS
   crash (kernel panic or freeze) on every platform, and a power cut on Linux.
@@ -439,17 +439,17 @@ reused as ideas; no v1 code is shared.
   - This is accepted by D3.
 - **Acknowledged seq:** a `seq` is stable only after a durability point. After
   a machine crash, a line that was never synced can vanish and its `seq`
-  number is handed out again (`tla/SessionLog.tla`).
+  number is handed out again (`SessionLog.tla`).
 - **Publish (D2):** the first batch that contains `turn_started`, together
   with any held `set` lines, is written to `.tmp/{id}/log.jsonl` and synced.
   Then it's renamed to `{id}` and the parent directory is synced.
-  - A visible session always has a durable first line (`tla/Lifecycle.tla`).
+  - A visible session always has a durable first line (`Lifecycle.tla`).
   - A session that never starts a turn never touches the disk.
 - **Restart:**
   - `open(.resume)` cuts a torn or bad-checksum final line.
   - It appends `turn_interrupted{reason: crash}` for an open turn, and
     `child_finished{interrupted or lost}` for unfinished children.
-  - Then it syncs (`tla/TurnLifecycle.tla`, `tla/Subagents.tla`).
+  - Then it syncs (`TurnLifecycle.tla`, `Subagents.tla`).
 - **Versioning:** `v` is on every line, and only the manager writes it.
   Readers accept every version up to their own, skip unknown kinds, and open
   newer versions read-only.
@@ -486,7 +486,7 @@ reused as ideas; no v1 code is shared.
 - **Between processes (native):** one exclusive `flock` on `{id}/lock`, held
   from open to close. A contender retries for up to 2 s, then gets Busy; a
   resume may set its own wait, and fx's session picker sets none (D38). The
-  kernel releases the lock on process death (`tla/WriterLock.tla`).
+  kernel releases the lock on process death (`WriterLock.tla`).
 - **Between writers (wasm):** single-writer is optimistic. Every commit
   carries the expected revision, and a conflict makes that Session fail with
   Busy. This is not covered by `WriterLock.tla` (Design Risks).
@@ -859,7 +859,7 @@ Settled while wiring ACP (2026-09-27):
 - **D33 Decision:** a named child whose first message was `lost` keeps its
   name. The lost message's result tells the parent it was lost, and the
   next message to that name is new work for the same child, whose log is
-  created by that work's first turn (`tla/Subagents.tla` already allows
+  created by that work's first turn (`Subagents.tla` already allows
   this). Nothing is resent on its own. **Why:** the parent decides whether
   to resend, so no work runs twice. **Alternative:** refuse the name, or
   resend the lost message on reopen.
@@ -920,7 +920,7 @@ Settled on 2026-09-28:
   said ok, and a recover copy would have named the same missing blob.
   **Alternative:** show the piece as unavailable and resume anyway, as fx
   does for a missing image; rejected because a blob holds a turn's own
-  text, which the model would then silently lose. `tla/Fork.tla` gains
+  text, which the model would then silently lose. `Fork.tla` gains
   `Lose`, and `RefsExist` now allows a missing reference only in the
   session that lost it.
 - **D40 Decision:** a failed session keeps the cause of the write or sync
@@ -943,7 +943,7 @@ Settled on 2026-09-28:
   every ACP switch in the E2E runs opened the next session first, which
   the spec's single session slot did not allow. **Alternative:** close the
   current session first, which leaves ACP without a session when the next
-  one fails to open. `tla/Wiring.tla` gains `next`, the session being
+  one fails to open. `Wiring.tla` gains `next`, the session being
   switched to.
 - **D42 Decision:** a resume rewrites the session's index entry, stamped as
   opened by the resuming host, instead of appending only an `opened` line.
@@ -953,7 +953,7 @@ Settled on 2026-09-28:
   showed a moved session under the folder it left; a repaired open turn
   left the turn count stale the same way. **Alternative:** write the entry
   only when the repair changed the listing, which saves one index line per
-  resume but needs the repair to report what it wrote. `tla/Catalog.tla`
+  resume but needs the repair to report what it wrote. `Catalog.tla`
   gains `Refresh`, a put for a live, indexed session, which the title,
   workspace and language updates already wrote.
 - **D43 Decision:** an ACP session on v2 keeps the client system prompt and
@@ -1032,8 +1032,8 @@ Settled while moving off the side folder (2026-10-01):
   v1 is removed, or treat old bodies as unavailable.
 - **D48 Decision:** with D44 to D47 a v2 session never creates
   `~/.fx/session-files/{id}`; D27 is retired. Doctor still removes leftover
-  side folders. `tla/Fork.tla` gains `set` lines with blobs, and
-  `tla/MoveSideFiles.tla` models the move under crashes.
+  side folders. `Fork.tla` gains `set` lines with blobs, and
+  `MoveSideFiles.tla` models the move under crashes.
 - **D49 Decision:** a web-fetch download is a blob, and the model opens it
   by path with its own tools, so the manager gives the path of a durable
   blob (`Manager.blobPath`) after checking it exists. Blob files are
@@ -1060,7 +1060,7 @@ Settled after main's new compactor landed (2026-10-01):
   of the same name wins. **Why:** v2 has no side folder (D48), and a map
   in a blob keeps snapshots small. **Alternative:** rebuild records from
   the log, which copies the compactor's format into fx's session code, or
-  a side folder kept only for records, which D48 rules out. `tla/Fork.tla`
+  a side folder kept only for records, which D48 rules out. `Fork.tla`
   `SetBlob` now lists a blob inside a turn as well as outside it, since
   compaction runs mid-turn; such a setting is checked as an item is.
 
@@ -1123,7 +1123,7 @@ Settled for making v2 the only store (2026-10-02):
   crash leftovers are swept before an import. A v1 session that changes
   after its import is not imported again, and the converter never writes
   a v1 file. A fresh v2 session never takes the id of a live v1 session
-  (R1). `tla/V1Conversion.tla` models this with older builds still
+  (R1). `V1Conversion.tla` models this with older builds still
   writing v1. **Why:** no window where the new build hides a user's v1
   sessions, and no v1 reader written twice. **Alternative:** remove v1
   first and write a fresh read-only importer; or re-import a v1 session
@@ -1169,14 +1169,14 @@ Settled for `/fork` (2026-10-02):
   manager already forks at turn boundaries, so the feature adds no
   format and no new way to write a log. **Alternative:** fork after the
   chosen turn's reply; or copy the log in fx instead of the manager.
-  `tla/Fork.tla` models the manager's fork at a boundary with blob links.
-  `tla/Wiring.tla` gains `Fork`: on v2, between turns and with no child
+  `Fork.tla` models the manager's fork at a boundary with blob links.
+  `Wiring.tla` gains `Fork`: on v2, between turns and with no child
   running, a session that never existed becomes the one to switch to,
   and the source is not written (`ForkIsNewSession`, `ForkLeavesSource`,
-  `ForkBetweenTurns`). `tla/trace/check_wiring_traces.py` checks the
+  `ForkBetweenTurns`). `trace/check_wiring_traces.py` checks the
   `wiring` traces of `/fork` runs against `Wiring`, and
-  `tla/trace/check_saved_logs.py` checks each saved log against
-  `TurnLifecycle` and, for a fork, `tla/trace/ForkLog.tla`, which accepts
+  `trace/check_saved_logs.py` checks each saved log against
+  `TurnLifecycle` and, for a fork, `trace/ForkLog.tla`, which accepts
   only a copy that is the source's first lines byte for byte, ending at a
   turn boundary.
 
@@ -1267,15 +1267,15 @@ Settled for the converter (2026-10-06):
 
 - **Stale index.** A crash between publish and the index append hides a
   session until rebuild; `list` self-heals missing folders
-  (`tla/Catalog.tla`).
+  (`Catalog.tla`).
 - **Wrong snapshot.** Snapshots are derived and can be ignored; a test
-  requires fold equivalence (`tla/ResumeSnapshot.tla`). A state too large
+  requires fold equivalence (`ResumeSnapshot.tla`). A state too large
   for one line gets no snapshot: the append succeeds, the diagnostic says
   so, and resume folds from the previous snapshot. Found in the API check:
   the error used to reach the host after its batch was written, skipping
   that batch's `fsync`.
 - **Seq reuse after a machine crash.** Only a seq past a durability point is
-  stable (`tla/SessionLog.tla`).
+  stable (`SessionLog.tla`).
 - **Power cut on macOS (accepted by D3).**
   - The newest synced turns can be lost.
   - A rare damaged middle line opens the session read-only up to the last
@@ -1317,12 +1317,12 @@ Settled for the converter (2026-10-06):
 
 - **Changed contract:**
   - unit tests at each level;
-  - tests asserting every invariant of the matching `tla/` spec;
-  - TLC runs of every spec plus `tla/mutants.py`;
+  - tests asserting every invariant of the matching spec;
+  - TLC runs of every spec plus `mutants.py`;
   - a fold-equivalence property test;
   - trace validation of the code against the specs, where every trace from
     unit tests, the driver and the crash matrix must be accepted by
-    `tla/trace/validate.sh`. The hook contract is in `tla/trace/README.md`;
+    `trace/validate.sh`. The hook contract is in `trace/README.md`;
     this ran in the standalone module, and fx's build compiles the hook out.
 - **Integration:** a standalone driver running the four native host thread
   models through the API, plus a wasm host double over a fake `sessionStore`.

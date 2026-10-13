@@ -67,7 +67,7 @@ export function parseValue(text) {
 /** The graph check.sh wrote to `path`: each state by id, its successors, and the initial state. */
 export async function loadGraph(path) {
   const dot = await readFile(path, "utf8").catch(() => {
-    throw new Error(`${path} is missing; run sdk/tests/model/check.sh first`);
+    throw new Error(`${path} is missing; run tests/tla/sdk/check.sh first`);
   });
   const states = new Map();
   const next = new Map();

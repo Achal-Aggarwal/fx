@@ -2,7 +2,7 @@
 // AgentRouting.tla, and checks after every step that the code is where the
 // model allows.
 //
-//   bun sdk/tests/model/drive-agents.mjs [send|consume] [--walks N] [--depth N] [--seed S]
+//   bun tests/tla/sdk/drive-agents.mjs [send|consume] [--walks N] [--depth N] [--seed S]
 //
 // Two processes, p1 and p2, are two worker threads (agent-process.mjs), each
 // with a module instance and a globalThis of its own: p1 has the agents S

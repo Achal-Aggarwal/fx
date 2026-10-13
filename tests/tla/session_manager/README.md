@@ -1,7 +1,7 @@
 # TLA+ models
 
 One model per step of the design. Each one checks the protocol described in
-`../system-design.md`, not the Zig code. The bridge to the code is that every
+`system-design.md`, not the Zig code. The bridge to the code is that every
 invariant below also becomes a test assertion for the step it models.
 
 **Status on 2026-09-27, when the first eight specs existed: all eight parsed
@@ -124,14 +124,14 @@ runs on its self-tests, on logs fx saved, and on fx's `wiring` debug traces.
 - Byte offsets. `Fork.tla` copies lines as values, so it cannot see that a
   snapshot's `compaction_offset` moves when the fork's line 1 is longer; the
   driver found that, and the fork now encodes each copied snapshot again
-  (`session.zig` test "a fork after a compaction and snapshots").
+  (`src/core/session_manager/session.zig` test "a fork after a compaction and snapshots").
 - Which bytes open reads. `SessionLog.tla` recovers a whole log; the manager
   reads only line 1, the newest snapshot and what follows, so older damage
   is found by `read` and `verify` (`system-design.md` Reliability And
   Recovery; the driver's bit-flip cells cover every region).
 - Code paths that no test runs. Trace validation (above) covers only the
   runs we execute.
-- Performance. That is the benchmark in `../system-design.md` Performance
+- Performance. That is the benchmark in `system-design.md` Performance
   And Capacity.
 - The fx adapter and host policy, such as when to offer "continue". Those are
   covered by fx E2E tests.
@@ -144,7 +144,7 @@ runs on its self-tests, on logs fx saved, and on fx's `wiring` debug traces.
 
 ## Keeping the models honest
 
-When a decision in `../system-design.md` changes, update the spec that models
+When a decision in `system-design.md` changes, update the spec that models
 it in the same change. If TLC finds a counterexample:
 
 1. If the spec is wrong, fix the spec.

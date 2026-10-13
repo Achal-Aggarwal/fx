@@ -3,7 +3,7 @@
 // WebAssembly, along paths of the TLC state graph of DurableSteer.tla, and
 // checks after every step that the code is in a state the model allows.
 //
-//   bun sdk/tests/model/drive-steer.mjs [ideal|faults] [--walks N] [--seed S]
+//   bun tests/tla/sdk/drive-steer.mjs [ideal|faults] [--walks N] [--seed S]
 //     [--backend native|wasm] [--durability local|world] [--verbose]
 //
 // `./check.sh` model-checks the spec and writes graphs/steer-<graph>.dot. The
@@ -23,8 +23,8 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../../node.js";
-import { local } from "../../durable/local.mjs";
+import { createFxAgent } from "../../../sdk/node.js";
+import { local } from "../../../sdk/durable/local.mjs";
 import { loadGraph } from "./graph.mjs";
 
 const args = process.argv.slice(2);
@@ -42,7 +42,7 @@ let seed = Number(option("seed", 1));
 const here = fileURLToPath(new URL(".", import.meta.url));
 const addon = resolve(here, "../../../zig-out/lib/libfx.node");
 const wasm = backend === "wasm" ? await readFile(resolve(here, "../../../zig-out/bin/fx-core.wasm")) : undefined;
-const { appWorldAt, closeAppWorlds } = durabilityKind === "world" ? await import("../app-world.mjs") : {};
+const { appWorldAt, closeAppWorlds } = durabilityKind === "world" ? await import("../../../sdk/tests/app-world.mjs") : {};
 const durableInternals = Symbol.for("libfx.durableInternals");
 const stepTimeoutMs = 8000;
 // How long the code must show the same state before the driver reads it.

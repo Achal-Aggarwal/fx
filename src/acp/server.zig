@@ -877,7 +877,7 @@ fn resolveSubagentAuthority(
 }
 
 /// Joins the child threads before the session they append to can close
-/// (`src/core/session_manager/tla/Wiring.tla` ParentOutlivesChildren).
+/// (`tests/tla/session_manager/Wiring.tla` ParentOutlivesChildren).
 pub fn disableSubagentHost(state: *ServerState) void {
     if (state.subagent_host) |host| {
         host.deinit();

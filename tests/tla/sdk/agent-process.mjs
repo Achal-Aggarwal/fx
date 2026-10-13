@@ -6,11 +6,11 @@
 // all until a step delivers one here, to the queue handler of the World the
 // driver picks.
 import { parentPort, workerData } from "node:worker_threads";
-import { createDurableAgentFactory, foldSessionLog } from "../../durable.js";
-import { world } from "../../durable/world.mjs";
+import { createDurableAgentFactory, foldSessionLog } from "../../../sdk/durable.js";
+import { world } from "../../../sdk/durable/world.mjs";
 
 const { names, mode } = workerData;
-const { createWorld } = await import(new URL("../../durable/node_modules/@workflow/world-local/dist/index.js", import.meta.url).href);
+const { createWorld } = await import(new URL("../../../sdk/durable/node_modules/@workflow/world-local/dist/index.js", import.meta.url).href);
 const encoder = new TextEncoder();
 const inner = Symbol("handler");
 

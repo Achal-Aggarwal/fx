@@ -18,7 +18,7 @@
 //!   ACP client's prompt and tool identities are settings (D46); hosted
 //!   terminal state lives in `~/.fx/terminal/{id}/` (D45). An older session
 //!   with a `~/.fx/session-files/{id}/` side folder moves on its first
-//!   writable open (D47, `src/core/session_manager/tla/MoveSideFiles.tla`).
+//!   writable open (D47, `tests/tla/session_manager/MoveSideFiles.tla`).
 
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
@@ -1123,7 +1123,7 @@ pub const Session = struct {
     }
 
     /// Closes the session and frees the adapter. Every child thread of this
-    /// session must have joined (`src/core/session_manager/tla/Wiring.tla` ParentOutlivesChildren).
+    /// session must have joined (`tests/tla/session_manager/Wiring.tla` ParentOutlivesChildren).
     /// A copy of its capability that a background reader still holds keeps
     /// reading, and stores nothing more (D44).
     pub fn close(self: *Session) void {
@@ -1783,7 +1783,7 @@ pub const Session = struct {
     // -- the move off the side folder (D47) -----------------------------------
 
     /// Makes an older session one manager folder (D47,
-    /// `src/core/session_manager/tla/MoveSideFiles.tla`) on its first writable
+    /// `tests/tla/session_manager/MoveSideFiles.tla`) on its first writable
     /// open, then loads the map its old handles resolve through. Every body
     /// in the side folder becomes a blob, the map from each old name to its
     /// blob is one more blob, and one batch records the map, every moved
@@ -1814,7 +1814,7 @@ pub const Session = struct {
     }
 
     /// Every step of the move but the side folder's removal, in the order
-    /// `src/core/session_manager/tla/MoveSideFiles.tla` checks; returns how many bodies moved.
+    /// `tests/tla/session_manager/MoveSideFiles.tla` checks; returns how many bodies moved.
     fn moveOut(self: *Session, side: *io_mod.VerifiedDir) !usize {
         var scratch = std.heap.ArenaAllocator.init(self.alloc);
         defer scratch.deinit();

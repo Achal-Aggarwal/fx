@@ -40,7 +40,7 @@ zig fmt src/           # format all source files
 zig fmt --check src/   # the formatting check CI runs
 ```
 
-The test suites under `tests/` use Bun but are separate from the Zig codebase. See **Testing** below.
+The test suites under `tests/` use Bun but are separate from the Zig codebase. `tests/tla/` holds the TLA+ models. See **Testing** and **TLA+ Models** below.
 
 ## Code Style
 
@@ -275,6 +275,16 @@ cd tests/e2e && bun test tui-*.test.ts               # just TUI tests (requires 
 ```
 
 TUI tests use tmux to drive the interactive terminal. They require `tmux` to be installed.
+
+## TLA+ Models
+
+Every TLA+ spec, its TLC checker, the Bun drivers that walk real code along a spec, and the session manager's design record live in `tests/tla/`, and nowhere else. `tests/tla/README.md` lists the requirements and commands.
+
+* `tests/tla/session_manager/`: the session manager's specs, mutants, and trace checkers, plus `system-design.md`, which defines the `D1` to `D62` decision numbers that session code cites
+* `tests/tla/indexer/`: the indexer refresh model; `check.sh` requires each config's expected verdict
+* `tests/tla/sdk/`: the libfx durable session and agent routing specs and their Bun drivers, which CI runs in the `SDK (Bun + N-API/WASM)` job
+
+Code comments cite a spec by its path, such as `tests/tla/session_manager/Wiring.tla`. When a change alters behavior that a spec models, update the spec in the same change and run its checker.
 
 ## Pull Request Classification
 

@@ -3,7 +3,7 @@
 // WebAssembly, along paths of the TLC state graph of DurableSession.tla, and
 // checks after every step that the code is in a state the model allows.
 //
-//   bun sdk/tests/model/drive.mjs [send|lookup|write|cutoff|leased|queue] [--walks N] [--seed S] [--backend native|wasm]
+//   bun tests/tla/sdk/drive.mjs [send|lookup|write|cutoff|leased|queue] [--walks N] [--seed S] [--backend native|wasm]
 //     [--durability local|world|vercel]
 //
 // The lookup and cutoff graphs run a lookup, which starts before its intent
@@ -47,9 +47,9 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../../node.js";
-import { local } from "../../durable/local.mjs";
-import { holdWrites } from "../hold-writes.mjs";
+import { createFxAgent } from "../../../sdk/node.js";
+import { local } from "../../../sdk/durable/local.mjs";
+import { holdWrites } from "../../../sdk/tests/hold-writes.mjs";
 import { loadGraph } from "./graph.mjs";
 
 const args = process.argv.slice(2);
@@ -74,8 +74,8 @@ if ((graphName === "queue") !== (durabilityKind === "queue")) throw new Error("t
 // How long a leased worker's lease lasts after its last renewal.
 const leaseMs = 1000;
 const leasedWorld = leased ? await (async () => {
-  const { createWorld } = await import(new URL("../../durable/node_modules/@workflow/world-local/dist/index.js", import.meta.url).href);
-  const { world } = await import("../../durable/world.mjs");
+  const { createWorld } = await import(new URL("../../../sdk/durable/node_modules/@workflow/world-local/dist/index.js", import.meta.url).href);
+  const { world } = await import("../../../sdk/durable/world.mjs");
   return (dir) => world(() => createWorld({ dataDir: dir, recoverActiveRuns: false }), { name: "leased", pollMs: 250, leaseMs });
 })() : null;
 // Vercel's World is a round trip away: settle, wait for streams, and give up
@@ -84,10 +84,10 @@ const remote = durabilityKind === "vercel";
 const settleMs = remote ? 1500 : 60;
 const streamQuietMs = remote ? 2500 : 120;
 const stepTimeoutMs = remote ? 30_000 : 5000;
-const { vercelStorage } = remote ? await import("../vercel-storage.mjs") : {};
-const { appWorldAt, closeAppWorlds } = durabilityKind === "world" ? await import("../app-world.mjs") : {};
+const { vercelStorage } = remote ? await import("../../../sdk/tests/vercel-storage.mjs") : {};
+const { appWorldAt, closeAppWorlds } = durabilityKind === "world" ? await import("../../../sdk/tests/app-world.mjs") : {};
 const queued = durabilityKind === "queue";
-const { queueWorldAt, closeQueueWorlds } = queued ? await import("../queue-world.mjs") : {};
+const { queueWorldAt, closeQueueWorlds } = queued ? await import("../../../sdk/tests/queue-world.mjs") : {};
 const verbose = args.includes("--verbose");
 let seed = Number(option("seed", 1));
 const here = fileURLToPath(new URL(".", import.meta.url));

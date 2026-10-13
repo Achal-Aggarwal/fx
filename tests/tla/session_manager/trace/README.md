@@ -72,7 +72,7 @@ Last run: 2026-09-27, TLC2 2.19. All three verdicts matched.
 
 ## The contract for the Zig trace hook
 
-These rules apply to the test-only trace hook, `../../trace.zig`:
+These rules apply to the test-only trace hook, `src/core/session_manager/trace.zig`:
 
 1. **Test builds only.** The hook is behind a build option and compiles to
    nothing in release builds, so it adds no cost and no I/O to fx.

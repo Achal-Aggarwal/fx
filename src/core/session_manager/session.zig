@@ -52,7 +52,7 @@ pub const Env = struct {
     catalog_observer: if (hooks) ?CatalogObserver else void = if (hooks) null else {},
     planted: if (hooks) trace.Planted else void = if (hooks) .none else {},
 
-    /// Hooks only: reports a catalog-level step (`tla/Catalog.tla`).
+    /// Hooks only: reports a catalog-level step (`tests/tla/session_manager/Catalog.tla`).
     pub fn observeCatalog(env: *const Env, id: []const u8, what: CatalogStep) void {
         if (hooks) {
             const observer = env.catalog_observer orelse return;
@@ -404,7 +404,7 @@ pub const Session = struct {
 
     /// The first turn: stage the session in `.tmp/{id}`, make line 1
     /// durable, then rename it into place and sync the root, so a visible
-    /// session always has a durable first line (`tla/Lifecycle.tla`).
+    /// session always has a durable first line (`tests/tla/session_manager/Lifecycle.tla`).
     fn publish(session: *Session, bodies: []const schema.Body, ts: u64) AppendError!void {
         session.writeFirstTurn(bodies, ts) catch |err| {
             // Nothing is visible; later calls name the cause (D40).
@@ -456,7 +456,7 @@ pub const Session = struct {
     /// the lines framed in `session.batch`, blobs linked from a fork's
     /// source, a synced log, the lock, a synced folder, the rename into
     /// place, and a synced root. Only then is the session visible, always
-    /// with a durable first line (`tla/Lifecycle.tla`).
+    /// with a durable first line (`tests/tla/session_manager/Lifecycle.tla`).
     fn stage(session: *Session, source_blobs: ?storage.Dir) AppendError!Live {
         const env = session.env;
         const s = env.s;
@@ -595,7 +595,7 @@ pub const Session = struct {
     }
 
     /// Every blob an item or a setting refers to must already exist in this
-    /// session (`tla/Fork.tla` `RefsExist`).
+    /// session (`tests/tla/session_manager/Fork.tla` `RefsExist`).
     fn checkBlobRefs(session: *Session, live: *Live, bodies: []const schema.Body) AppendError!void {
         if (!hasBlobRefs(bodies)) return;
         const s = session.env.s;
@@ -974,12 +974,12 @@ fn hasTurnStart(bodies: []const schema.Body) bool {
     return false;
 }
 
-/// Durability points (system-design.md "Durable State And Schema").
+/// Durability points (`tests/tla/session_manager/system-design.md` "Durable State And Schema").
 fn needsSync(bodies: []const schema.Body) bool {
     for (bodies) |body| switch (body) {
         .turn_committed, .turn_interrupted, .child_spawned, .child_finished => return true,
         // Usage is durable before fx clears its usage-recovery marker
-        // (`tla/Wiring.tla` UsageNeverSilent).
+        // (`tests/tla/session_manager/Wiring.tla` UsageNeverSilent).
         // fx removes the side folder only once the move is durable (D47).
         // Compactor records need no sync of their own: the compaction line
         // that cites them comes later in the log, which keeps a prefix (D50).
@@ -1268,7 +1268,7 @@ fn mapRead(err: log_mod.ReadError) OpenError {
     };
 }
 
-/// Crash repair at the end of `openResume` (D1, `tla/Subagents.tla`).
+/// Crash repair at the end of `openResume` (D1, `tests/tla/session_manager/Subagents.tla`).
 fn repair(session: *Session, workspace: []const u8) AppendError!void {
     const gpa = session.env.gpa;
     const live = &session.phase.live;
@@ -1278,7 +1278,7 @@ fn repair(session: *Session, workspace: []const u8) AppendError!void {
         try session.writeBodies(live, &.{.{ .turn_interrupted = .{ .turn = turn, .reason = .crash } }}, ts, .interrupt_repair);
     }
     session.observe(.reopened);
-    // Every unfinished work item gets a known outcome (tla/Subagents.tla).
+    // Every unfinished work item gets a known outcome (tests/tla/session_manager/Subagents.tla).
     var finished: std.ArrayList(schema.Body) = .empty;
     defer finished.deinit(gpa);
     for (session.state.children.items) |child| {
@@ -1765,7 +1765,7 @@ pub fn childrenOf(env: *const Env, id_: []const u8) DeleteError![][]u8 {
     return children.toOwnedSlice(gpa);
 }
 
-/// Step 1 of a delete (`tla/Catalog.tla` `Trash`): Busy if the session is
+/// Step 1 of a delete (`tests/tla/session_manager/Catalog.tla` `Trash`): Busy if the session is
 /// open anywhere, else it is renamed to `.trash/{id}`, which makes it gone
 /// for everyone at once. The caller then appends the index tombstone and
 /// calls `purgeTrashed`; owned children are deleted first (`childrenOf`),
@@ -3753,7 +3753,8 @@ const session_model_tests = struct {
             const parent = t.parent orelse return out.items;
             const bytes = (try readLog(t.root, parent)) orelse return out.items;
             defer gpa.free(bytes);
-            // A child's work number counts its spawn lines (`tla/Subagents.tla`).
+            // A child's work number counts its spawn lines
+            // (`tests/tla/session_manager/Subagents.tla`).
             var works: [2]u64 = .{ 0, 0 };
             for (try diskLines(arena, bytes)) |line| {
                 if (t.horizon) |h| if (line.seq > h) break;
