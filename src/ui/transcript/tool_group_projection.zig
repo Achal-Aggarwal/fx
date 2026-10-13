@@ -11,6 +11,7 @@ const ui_render = @import("../render.zig");
 const code_highlight = @import("../../core/agent/presentation/code_highlight.zig");
 const code_highlight_languages = @import("../../core/agent/presentation/code_highlight_languages.zig");
 const text_utils = @import("../../core/shared/text_utils.zig");
+const vt_emulator = @import("../../core/terminal/engine.zig");
 
 const TranscriptEntry = transcript_blocks.TranscriptEntry;
 const ToolDetailRecord = transcript_blocks.ToolDetailRecord;
@@ -496,12 +497,22 @@ fn applySummaryStyle(
     return try out.toOwnedSlice();
 }
 
+/// Compact group header: the summary clipped to one row and styled.
 fn formatGroupHeader(
     alloc: std.mem.Allocator,
     summary: Summary,
     cols: u16,
     style: SummaryStyle,
 ) ![]u8 {
+    const plain = try formatGroupSummary(alloc, summary);
+    defer alloc.free(plain);
+    const clipped = try clipSummary(alloc, plain, cols);
+    defer alloc.free(clipped);
+    return applySummaryStyle(alloc, clipped, style);
+}
+
+/// Unstyled, unclipped "● N tool calls · ..." summary row. Caller owns it.
+fn formatGroupSummary(alloc: std.mem.Allocator, summary: Summary) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     try out.writer.print("● {d} tool call{s}", .{
@@ -532,12 +543,7 @@ fn formatGroupHeader(
     try appendSegment(&out.writer, summary.failed, "failed");
     try appendSegment(&out.writer, summary.denied, "denied");
     try appendSegment(&out.writer, summary.cancelled, "cancelled");
-
-    const plain = try out.toOwnedSlice();
-    defer alloc.free(plain);
-    const clipped = try clipSummary(alloc, plain, cols);
-    defer alloc.free(clipped);
-    return applySummaryStyle(alloc, clipped, style);
+    return out.toOwnedSlice();
 }
 
 const GroupBlock = struct { bytes: []u8, lines: []const transcript_blocks.LineProvenance };
@@ -770,12 +776,13 @@ fn highlightCommandPhrase(
     return try scratch.print("{s} {s}", .{ phrase[0..split], highlighted });
 }
 
+/// One expanded child as complete logical rows. Expanded rows are never
+/// clipped; materializeExpandedOverride wraps them to the live width.
 fn formatExpandedChild(
     alloc: std.mem.Allocator,
     entry: TranscriptEntry,
     detail: ?*const ToolDetailRecord,
     connector: []const u8,
-    cols: u16,
 ) ![]u8 {
     var scratch_state = std.heap.ArenaAllocator.init(alloc);
     defer mem_utils.deinit_arena(scratch_state);
@@ -793,17 +800,16 @@ fn formatExpandedChild(
     // terminal default foreground.
     const display_phrase = try highlightCommandPhrase(scratch, phrase, detail, "") orelse phrase;
     const child = try scratch.print("{s} {s}", .{ connector, display_phrase });
-    const clipped = try clipSummary(scratch, child, cols);
     const accented = if (entryShowsDiffStats(detail))
-        try accentTrailingDiffStats(scratch, clipped, "")
+        try accentTrailingDiffStats(scratch, child, "")
     else
-        clipped;
+        child;
     const continuation = subagentStatusContinuation(entry, detail) orelse return alloc.dupe(u8, accented);
-    const continuation_row = try scratch.print(
-        "{s}{s}",
-        .{ if (std.mem.eql(u8, connector, "└")) "  " else "│ ", continuation },
-    );
-    return alloc.print("{s}\n{s}", .{ accented, try clipSummary(scratch, continuation_row, cols) });
+    return alloc.print("{s}\n{s}{s}", .{
+        accented,
+        if (std.mem.eql(u8, connector, "└")) "  " else "│ ",
+        continuation,
+    });
 }
 
 test "expanded subagent row preserves status continuation" {
@@ -818,7 +824,7 @@ test "expanded subagent row preserves status continuation" {
         .tool_name = @constCast("subagent"),
         .activity_kind = .subagent,
     };
-    const row = try formatExpandedChild(alloc, entry, &detail, "└", 120);
+    const row = try formatExpandedChild(alloc, entry, &detail, "└");
     defer alloc.free(row);
 
     try std.testing.expectEqualStrings(
@@ -826,7 +832,7 @@ test "expanded subagent row preserves status continuation" {
         row,
     );
 
-    const middle_row = try formatExpandedChild(alloc, entry, &detail, "├", 120);
+    const middle_row = try formatExpandedChild(alloc, entry, &detail, "├");
     defer alloc.free(middle_row);
     try std.testing.expectEqualStrings(
         "├ reviewer working · inspect auth\n│ gpt-5.5 · high · 12k/256k 4%",
@@ -842,11 +848,9 @@ fn installExpandedGroup(
     details: []const ToolDetailRecord,
     detail_indices: *const std.AutoHashMapUnmanaged(u32, usize),
     summary: Summary,
-    cols: u16,
-    style: SummaryStyle,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !void {
-    const header = try formatGroupHeader(alloc, summary, cols, style);
+    const header = try formatGroupSummary(alloc, summary);
     defer alloc.free(header);
     for (status_indices, 0..) |status_index, child_index| {
         try build_checkpoint.tick(checkpoint);
@@ -854,7 +858,7 @@ fn installExpandedGroup(
         const entry_id = toolStatusEntryId(entry) orelse continue;
         const detail = detailForEntry(details, detail_indices, entry_id, null);
         const connector = if (child_index + 1 == status_indices.len) "└" else "├";
-        const child = try formatExpandedChild(alloc, entry, detail, connector, cols);
+        const child = try formatExpandedChild(alloc, entry, detail, connector);
         defer alloc.free(child);
         const bytes = if (child_index == 0)
             try alloc.print("{s}\n{s}", .{ header, child })
@@ -976,16 +980,20 @@ pub fn buildStyled(
     };
 }
 
+/// Full-transcript tool rows fitted to `cols`. Builds the same relationships
+/// the live full transcript caches and materializes them, so every
+/// full-transcript build shares one width policy.
 pub fn buildExpandedStyledInterruptible(
     alloc: std.mem.Allocator,
     entries: []const TranscriptEntry,
     details: []const ToolDetailRecord,
     cols: u16,
     style: SummaryStyle,
-    styles: transcript_blocks.Styles,
     checkpoint: ?*build_checkpoint.BuildCheckpoint,
 ) !Projection {
-    return buildWithStyleAndStats(alloc, entries, details, cols, null, false, style, styles, .expanded, null, checkpoint);
+    var relationships = try buildExpandedRelationshipsInterruptible(alloc, entries, details, checkpoint);
+    defer relationships.deinit(alloc);
+    return materializeExpandedRelationshipsRangeInterruptible(alloc, &relationships, 0, cols, style, checkpoint);
 }
 
 pub fn buildExpandedRelationshipsInterruptible(
@@ -1043,6 +1051,9 @@ pub fn materializeExpandedRelationshipsRangeInterruptible(
     return projection;
 }
 
+/// Fits one expanded override to `cols` without hiding any of it. The full
+/// transcript exists to show everything, so rows word-wrap instead of
+/// clipping, and each wrapped row continues under its own tree rail.
 fn materializeExpandedOverride(
     alloc: std.mem.Allocator,
     bytes: []const u8,
@@ -1056,17 +1067,29 @@ fn materializeExpandedOverride(
     while (lines.next()) |line| {
         if (!first) try out.writer.writeByte('\n');
         first = false;
-        const clipped = try clipSummary(alloc, line, cols);
-        defer alloc.free(clipped);
-        if (std.mem.startsWith(u8, line, "●")) {
-            const styled = try applySummaryStyle(alloc, clipped, style);
-            defer alloc.free(styled);
-            try out.writer.writeAll(styled);
-        } else {
-            try out.writer.writeAll(clipped);
-        }
+        const styled = if (std.mem.startsWith(u8, line, "●"))
+            try applySummaryStyle(alloc, line, style)
+        else
+            null;
+        defer if (styled) |value| alloc.free(value);
+        const wrapped = try transcript_blocks.wrapFullToolStatus(
+            alloc,
+            styled orelse line,
+            cols,
+            expandedContinuationPrefix(line),
+        );
+        defer alloc.free(wrapped);
+        try out.writer.writeAll(wrapped);
     }
     return out.toOwnedSlice();
+}
+
+/// Rows written by installExpandedGroup start with their tree glyph. A
+/// non-final child ("├") and its continuation ("│") keep the rail on wrapped
+/// rows; the header and the final child ("└") indent past their marker.
+fn expandedContinuationPrefix(row: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, row, "├") or std.mem.startsWith(u8, row, "│")) return "│ ";
+    return "  ";
 }
 
 pub fn buildStyledFocused(
@@ -1221,8 +1244,6 @@ fn buildWithStyleAndStats(
                 details,
                 &detail_indices,
                 group.summary,
-                cols,
-                style,
                 checkpoint,
             );
         }
@@ -1268,8 +1289,6 @@ fn buildWithStyleAndStats(
                 details,
                 &detail_indices,
                 summary,
-                cols,
-                style,
                 checkpoint,
             );
         }
@@ -1626,7 +1645,7 @@ test "expanded tool group keeps diff count accents" {
         .marker_style = "<marker>",
         .text_style = "<secondary>",
         .reset_style = "<reset>",
-    }, .{}, null);
+    }, null);
     defer projection.deinit(alloc);
     const expanded = projection.entry_actions.items[0].override.bytes;
 
@@ -1944,6 +1963,180 @@ test "completed session and tty command rows reproject stored commands at the cu
     );
 }
 
+/// Paints expanded rows through the terminal engine so tests assert what the
+/// full transcript shows. Each row must already fit `cols`.
+fn paintExpandedRowsForTest(alloc: std.mem.Allocator, bytes: []const u8, cols: u16) !vt_emulator.Grid {
+    var rows: u16 = 0;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| : (rows += 1) {
+        try std.testing.expect(display_width.visibleWidthIgnoringAnsi(line) <= cols);
+    }
+    var grid = try vt_emulator.Grid.init(alloc, cols, rows);
+    errdefer grid.deinit();
+    try grid.feed(bytes);
+    return grid;
+}
+
+/// Visible text of grid rows `first..last` with tree glyphs and spaces
+/// removed, so a wrapped row compares equal to its source wherever the wrap
+/// fell. The caller owns the result.
+fn paintedTreeTextForTest(
+    alloc: std.mem.Allocator,
+    grid: *const vt_emulator.Grid,
+    first: u16,
+    last: u16,
+) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    var row_text: std.ArrayList(u8) = .empty;
+    defer row_text.deinit(alloc);
+    var row = first;
+    while (row <= last) : (row += 1) {
+        row_text.clearRetainingCapacity();
+        try grid.rowTextTrimmed(row, &row_text);
+        var text: []const u8 = row_text.items;
+        for ([_][]const u8{ "├", "└", "│" }) |glyph| {
+            if (std.mem.startsWith(u8, text, glyph)) {
+                text = text[glyph.len..];
+                break;
+            }
+        }
+        for (text) |byte| {
+            if (byte != ' ') try out.append(alloc, byte);
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn withoutSpacesForTest(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+    for (text) |byte| {
+        if (byte != ' ') try out.append(alloc, byte);
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn lastContentCellForTest(grid: *const vt_emulator.Grid, row: u16) vt_emulator.Cell {
+    var col = grid.cols;
+    while (col > 1) : (col -= 1) {
+        const cell = grid.cellAt(row, col).?;
+        if (cell.width > 0 and cell.codepoint != ' ') return cell;
+    }
+    return grid.cellAt(row, 1).?;
+}
+
+test "expanded rows wrap under their tree rail and keep command styling" {
+    const alloc = std.testing.allocator;
+    const first_command = "printf 'alpha beta gamma delta epsilon zeta eta theta'";
+    const last_command = "printf 'iota kappa lambda mu nu xi omicron pi rho'";
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Ran\x1b[0m \x1b[38;5;245m" ++ first_command ++ "\x1b[0m\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran\x1b[0m \x1b[38;5;245m" ++ last_command ++ "\x1b[0m\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{
+            .entry_id = 1,
+            .tool_name = @constCast("shell"),
+            .activity_kind = .command,
+            .command_display = @constCast(first_command),
+            .command_action_label = @constCast("Ran"),
+            .outcome = .completed,
+        },
+        .{
+            .entry_id = 2,
+            .tool_name = @constCast("shell"),
+            .activity_kind = .command,
+            .command_display = @constCast(last_command),
+            .command_action_label = @constCast("Ran"),
+            .outcome = .completed,
+        },
+    };
+    const cols: u16 = 24;
+
+    var projection = try buildExpandedStyledInterruptible(alloc, &entries, &details, cols, .{}, null);
+    defer projection.deinit(alloc);
+    const rows = try alloc.print("{s}\n{s}", .{
+        projection.entry_actions.items[0].override.bytes,
+        projection.entry_actions.items[1].override.bytes,
+    });
+    defer alloc.free(rows);
+    try std.testing.expect(std.mem.find(u8, rows, "…") == null);
+
+    var grid = try paintExpandedRowsForTest(alloc, rows, cols);
+    defer grid.deinit();
+    try std.testing.expectEqual(@as(u21, '●'), grid.cellAt(1, 1).?.codepoint);
+    // The header itself is wider than 24 columns and wraps before the first child.
+    var first_child_row: u16 = 2;
+    while (first_child_row <= grid.rows and grid.cellAt(first_child_row, 1).?.codepoint != '├') : (first_child_row += 1) {}
+    var last_child_row: u16 = first_child_row + 1;
+    while (last_child_row <= grid.rows and grid.cellAt(last_child_row, 1).?.codepoint != '└') : (last_child_row += 1) {}
+    try std.testing.expect(first_child_row > 2);
+    try std.testing.expect(last_child_row > first_child_row + 1 and last_child_row < grid.rows);
+
+    // A non-final child continues under an unstyled rail, and its quoted
+    // argument keeps the string color across every wrap.
+    var row: u16 = first_child_row + 1;
+    while (row < last_child_row) : (row += 1) {
+        const rail = grid.cellAt(row, 1).?;
+        try std.testing.expectEqual(@as(u21, '│'), rail.codepoint);
+        try std.testing.expect(rail.style.fg.eql(.default));
+        const before_wrap = lastContentCellForTest(&grid, row - 1);
+        try std.testing.expect(!before_wrap.style.fg.eql(.default));
+        try std.testing.expect(grid.cellAt(row, 3).?.style.fg.eql(before_wrap.style.fg));
+    }
+    // The final child indents past its marker.
+    row = last_child_row + 1;
+    while (row <= grid.rows) : (row += 1) {
+        try std.testing.expectEqual(@as(u21, ' '), grid.cellAt(row, 1).?.codepoint);
+        try std.testing.expectEqual(@as(u21, ' '), grid.cellAt(row, 2).?.codepoint);
+        try std.testing.expect(grid.cellAt(row, 3).?.codepoint != ' ');
+    }
+
+    // Nothing is hidden: each child's rows hold its whole command.
+    const first_painted = try paintedTreeTextForTest(alloc, &grid, first_child_row, last_child_row - 1);
+    defer alloc.free(first_painted);
+    const first_expected = try withoutSpacesForTest(alloc, "Ran " ++ first_command);
+    defer alloc.free(first_expected);
+    try std.testing.expectEqualStrings(first_expected, first_painted);
+    const last_painted = try paintedTreeTextForTest(alloc, &grid, last_child_row, grid.rows);
+    defer alloc.free(last_painted);
+    const last_expected = try withoutSpacesForTest(alloc, "Ran " ++ last_command);
+    defer alloc.free(last_expected);
+    try std.testing.expectEqualStrings(last_expected, last_painted);
+}
+
+test "expanded group headers wrap instead of clipping" {
+    const alloc = std.testing.allocator;
+    const entries = [_]TranscriptEntry{
+        .{ .raw_bytes = .{ .id = 1, .bytes = "● Read a.zig\n", .class = .tool_status } },
+        .{ .raw_bytes = .{ .id = 2, .bytes = "● Ran zig build\n", .class = .tool_status } },
+    };
+    const details = [_]ToolDetailRecord{
+        .{ .entry_id = 1, .tool_name = @constCast("read_file"), .activity_kind = .read },
+        .{ .entry_id = 2, .tool_name = @constCast("shell"), .activity_kind = .command, .outcome = .failed },
+    };
+
+    var projection = try buildExpandedStyledInterruptible(alloc, &entries, &details, 16, .{}, null);
+    defer projection.deinit(alloc);
+    const bytes = projection.entry_actions.items[0].override.bytes;
+    var grid = try paintExpandedRowsForTest(alloc, bytes, 16);
+    defer grid.deinit();
+
+    const header_end = blk: {
+        var row: u16 = 2;
+        while (row <= grid.rows) : (row += 1) {
+            if (grid.cellAt(row, 1).?.codepoint == '├') break :blk row - 1;
+        }
+        return error.TestExpectedFirstChildRow;
+    };
+    try std.testing.expect(header_end > 1);
+    const header_painted = try paintedTreeTextForTest(alloc, &grid, 1, header_end);
+    defer alloc.free(header_painted);
+    try std.testing.expect(std.mem.find(u8, header_painted, "failed") != null);
+    try std.testing.expect(std.mem.find(u8, bytes, "…") == null);
+}
+
 test "expanded group children reproject stored commands at the current width" {
     const alloc = std.testing.allocator;
     const command = "bun run " ++ text_utils.repeat("pipeline-stage-", 10);
@@ -1965,17 +2158,28 @@ test "expanded group children reproject stored commands at the current width" {
         .command_process_presentation = .{ .exit_code = 0 },
     }};
 
-    var wide = try buildExpandedStyledInterruptible(alloc, &entries, &details, 400, .{}, .{}, null);
+    var wide = try buildExpandedStyledInterruptible(alloc, &entries, &details, 400, .{}, null);
     defer wide.deinit(alloc);
     try std.testing.expectEqualStrings(
         "● 1 tool call · 1 command\n└ Ran \x1b[38;5;252mbun\x1b[39m run " ++ text_utils.repeat("pipeline-stage-", 10),
         wide.entry_actions.items[0].override.bytes,
     );
 
-    var narrow = try buildExpandedStyledInterruptible(alloc, &entries, &details, 80, .{}, .{}, null);
+    // A narrower full transcript wraps the stored command instead of clipping
+    // it, and the frozen generation marker never returns.
+    var narrow = try buildExpandedStyledInterruptible(alloc, &entries, &details, 80, .{}, null);
     defer narrow.deinit(alloc);
-    try std.testing.expect(std.mem.endsWith(u8, narrow.entry_actions.items[0].override.bytes, "…\x1b[0m"));
-    try std.testing.expect(std.mem.find(u8, narrow.entry_actions.items[0].override.bytes, "...") == null);
+    const narrow_rows = narrow.entry_actions.items[0].override.bytes;
+    try std.testing.expect(std.mem.find(u8, narrow_rows, "…") == null);
+    try std.testing.expect(std.mem.find(u8, narrow_rows, "...") == null);
+    var grid = try paintExpandedRowsForTest(alloc, narrow_rows, 80);
+    defer grid.deinit();
+    try std.testing.expect(grid.rows > 2);
+    const painted = try paintedTreeTextForTest(alloc, &grid, 2, grid.rows);
+    defer alloc.free(painted);
+    const expected = try withoutSpacesForTest(alloc, "Ran " ++ command);
+    defer alloc.free(expected);
+    try std.testing.expectEqualStrings(expected, painted);
 }
 
 test "command reprojection rejects a record carrying a different command" {
@@ -2775,7 +2979,7 @@ test "expanded tool title stays primary while the group summary stays secondary"
         .marker_style = "<marker>",
         .text_style = "<secondary>",
         .reset_style = "<reset>",
-    }, .{}, null);
+    }, null);
     defer projection.deinit(alloc);
     const expanded = projection.entry_actions.items[0].override.bytes;
 

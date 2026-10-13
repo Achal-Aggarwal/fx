@@ -395,9 +395,15 @@ When adding or changing user-facing behavior, update the documentation this repo
 
 1. `--help` output via command specs in `src/builtins/commands.zig`
 2. `sdk/README.md` if libfx's supported public behavior or setup changes, as `sdk/AGENTS.md` describes
-3. `CONTRIBUTING.md` if build steps, configuration, or collaboration rules change
+3. `CONTRIBUTING.md` if build steps, development setup, or collaboration rules change
 
-The user manual at fx.sh/docs lives in `vercel-labs/fx-web`, an internal Vercel repository. A page's source is `apps/marketing/app/(site)/(docs)/docs/<path>/page.mdx`, where `<path>` is the part of its URL after `fx.sh/docs/`. If a change makes a page wrong or incomplete and you have access, update it in a companion fx-web pull request and link that pull request from this one. Otherwise, name the page in the PR description so a maintainer can update it. Do not move feature descriptions, option lists, or usage examples into `README.md` in place of the manual.
+The user manual at fx.sh/docs is built from a private repository. When a change makes a page wrong or incomplete, updating the manual is part of the change:
+
+* If you are a member of the `vercel-labs` organization on GitHub, you can fetch the private repository behind fx.sh. When you can push to it, update the page there in a companion pull request and link it from this one. A page's source is `apps/marketing/app/(site)/(docs)/docs/<path>/page.mdx`, where `<path>` is the part of its URL after `fx.sh/docs/`.
+
+* If you can't push to that repository, add a `## Docs` section to the PR description with the exact change each affected page needs, as `CONTRIBUTING.md` describes, so a maintainer can make it.
+
+Do not move feature descriptions, option lists, or usage examples into `README.md` in place of the manual.
 
 `README.md` is a short introduction that links to fx.sh/docs. Change it only when one of its statements becomes false, such as a command, flag, path, or link it names, or when a change adds a capability as broad as the ones in its feature list. A single new option, command, or environment variable belongs in `--help` and the manual, not in `README.md`.
 

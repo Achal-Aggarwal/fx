@@ -340,13 +340,23 @@ test("a resumed turn answers a call a crash left running instead of running it a
   const resumed = await createFxEngine(options(targetBackend, crashed, { tools: [send] }));
   requests.length = 0;
   const turn = resumed.resume();
-  for await (const _ of turn) {}
+  const events = [];
+  for await (const event of turn) events.push(event);
   assert.equal((await turn.result).stopReason, "end_turn");
   await resumed.close();
   assert.equal(sends, 1, "the call did not run again");
   const results = toolResults(requests[0]);
   assert.equal(results.length, 1, "the running call is answered");
   assert.match(JSON.stringify(results[0]), /may have partly run/);
+  // The host sees the call end with the answer the model got, before the
+  // turn goes on.
+  const [answered] = events;
+  assert.equal(answered?.type, "tool_end");
+  assert.equal(answered.id, "call-1");
+  assert.equal(answered.name, "lookup");
+  assert.equal(answered.isError, true);
+  assert.ok(JSON.stringify(results[0]).includes(answered.content), `the event carries the model's answer: ${answered.content}`);
+  assert.equal(events.filter((event) => event.id === "call-1").length, 1, "the call ends once, and does not start again");
   assertContiguous(crashed.events);
 });
 

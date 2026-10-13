@@ -153,11 +153,10 @@ Then subscribe it to libfx's topic in `vercel.json`:
 
 That's all. `prompt()` sends each turn to Vercel Queues, and this route runs it:
 
-- When a turn gets within 30 seconds of the function's time limit, libfx stops it, and the next invocation continues it.
-- The function running a turn renews a 15-second lease on its session. If the function dies, the session frees when the lease runs out, and the turn continues in a new invocation.
+- When a turn gets within 30 seconds of the function's time limit, libfx stops it, and the next invocation continues it. `vercel({ reserveMs })` from `libfx/durable-vercel` changes that margin.
+- A function holds its session for as long as Vercel Queues keeps the turn's message for it, so nothing is written while a turn runs to show the function is alive. If the function's process exits mid-turn, Vercel runs the same delivery again about a second later, and that invocation continues the turn.
+- A function that stops without its process exiting holds the message until the queue's hold on it runs out, up to five minutes. A prompt sent to the session meanwhile continues the turn at that function's time limit, if that comes sooner. `vercel({ leaseMs: 15_000 })` bounds that case: the function renews a 15-second lease on its session every 5 seconds, and the session frees about 15 seconds after the last renewal.
 - A function that only stalled and wakes up after that is refused at its next write, so two processes never write one session.
-
-`vercel({ reserveMs, leaseMs })` from `libfx/durable-vercel` changes both timings.
 
 ### Tools that change things
 
@@ -183,7 +182,7 @@ const tools = [
 ];
 ```
 
-When the turn continues, a call to an `idempotent: true` tool runs again. A call to any other tool never runs twice on its own: the model gets an error saying the call may have partly run, and decides whether to check, try again or ask the user.
+When the turn continues, a call to an `idempotent: true` tool runs again. A call to any other tool never runs twice on its own: the model gets an error saying the call may have partly run, and decides whether to check, try again or ask the user. The turn's events end the call with that error too, as a `tool_end` with `isError: true`.
 
 Each call's `executionId` stays the same when it runs again. Pass it to the service your tool calls as an idempotency key, and a service that honors idempotency keys won't refund twice.
 
