@@ -2538,7 +2538,6 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
           if (typeof input !== "string" && !Array.isArray(input)) throw new TypeError("prompt input must be a string or an array of content blocks");
           const signal = promptOptions.signal;
           if (signal !== undefined && typeof signal?.addEventListener !== "function") throw new TypeError("prompt signal must be an AbortSignal");
-          plugged.checkPrompt?.(input);
           const aborted = signal?.aborted === true;
           const retried = promptOptions.messageId !== undefined;
           // The input travels through the queue and the log as JSON. Its
@@ -2547,6 +2546,9 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
           // keeps them as base64.
           const named = !aborted;
           const stored = Array.isArray(input) ? promptInputForLog(input, { named }) : { input, blobs: false, images: false };
+          // The copy the log will hold is what is checked: a getter can't
+          // show the check one value and the log another.
+          plugged.checkPrompt?.(stored.input);
           const before = reading;
           const ready = before || stored.blobs || stored.images ? async () => {
             // The prompt waits for an earlier one, its file and its image

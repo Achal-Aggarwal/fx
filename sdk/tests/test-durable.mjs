@@ -1258,6 +1258,19 @@ test("an engine given an image the log names refuses it, so a worker that can't 
   await engine.close();
 });
 
+test("a durable prompt checks the copy its log holds, so a getter can't pass one image and store another", async () => {
+  const agent = createFxAgent(agentOptions(await durabilityFor(), { model: "durable/vision-model" }));
+  let reads = 0;
+  const block = { type: "image", mimeType: "image/png" };
+  Object.defineProperty(block, "data", { enumerable: true, get: () => (reads++ === 0 ? pngBytes() : new Uint8Array([1, 2, 3, 4])) });
+  const { result } = await collect(agent.session().prompt([{ type: "text", text: "look" }, block]));
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(reads, 1, "the block was read once");
+  const files = chats.at(-1).prompt.flatMap((message) => Array.isArray(message.content) ? message.content : []).filter((part) => part.type === "file");
+  assert.deepEqual(files.map((part) => part.data?.data), [pngBase64]);
+  await agent.close();
+});
+
 test("a durable prompt refuses a file over the limit without reading it, and one whose bytes are not its type once read", async () => {
   const agent = createFxAgent(agentOptions(await durabilityFor(), { model: "durable/vision-model" }));
   const session = agent.session();
