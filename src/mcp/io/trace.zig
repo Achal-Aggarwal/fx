@@ -1,4 +1,4 @@
-//! JSONL trace of core steps (docs/approach.md §6, format version 1).
+//! JSONL trace of core steps (format version 1).
 //!
 //! The I/O layer writes one line per `step` call when tracing is on. The Bun
 //! bridge turns a trace into a TLA+ observation and asks TLC whether it is a

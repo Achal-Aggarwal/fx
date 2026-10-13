@@ -153,7 +153,7 @@ pub const Runtime = struct {
 
     /// A host over a v2 parent, whose children live in its log (D22).
     /// Borrows `children` and the callback contexts until deinit; the
-    /// parent stays open until then (`tla/Wiring.tla`
+    /// parent stays open until then (`src/core/session_manager/tla/Wiring.tla`
     /// ParentOutlivesChildren).
     pub fn createV2(
         alloc: Allocator,

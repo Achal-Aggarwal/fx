@@ -3,7 +3,7 @@
 //!
 //! This file (L4) is the only public root; fx imports it and nothing else.
 //! A process creates one `Manager` with `init`, which does no disk I/O.
-//! Thirteen operations cover every host (docs/session-manager/system-design.md
+//! Thirteen operations cover every host (`system-design.md`
 //! "API"), plus `verify` and `rebuild` for doctor:
 //!
 //!   openNew  openResume  openFork  openImport        -> Session
