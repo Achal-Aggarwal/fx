@@ -1254,10 +1254,15 @@ test("a durable session saves each image once, and a new agent sends it again", 
   const durability = await durabilityFor();
   const first = createFxAgent(agentOptions(durability, { model: "durable/vision-model" }));
   const session = first.session();
-  for (const text of ["look", "again"]) {
+  // Records that only name the image stay small, and a durable session saves
+  // a checkpoint once its records pass 64 KiB, so the second prompt's text
+  // passes that: the turn's end saves one, which must name the images too.
+  for (const text of ["look", `again${" and again".repeat(8000)}`]) {
     const { result } = await collect(session.prompt([{ type: "text", text }, { type: "image", data: bytes, mimeType: "image/png" }]));
     assert.equal(result.stopReason, "end_turn");
   }
+  // A turn's checkpoint is saved after its end, and close() waits for it.
+  await first.close();
   if (durabilityKind === "memory") {
     // Every entry, records and checkpoints decoded: names only.
     const entries = (await (await durability.create().session(session.id)).readSince("0")).map(({ entry }) => entry);
@@ -1265,7 +1270,6 @@ test("a durable session saves each image once, and a new agent sends it again", 
     assert.ok(entries.some((entry) => entry.k === "checkpoint"));
     assert.ok(!saved.some((data) => data.includes(Buffer.from(base64.slice(1000, 1100))) || data.includes(Buffer.from(bytes.subarray(1000, 1064)))), "no entry holds the image");
   }
-  await first.close();
   if (durabilityKind !== "memory") {
     const files = [];
     for (const entry of await readdir(dirs.at(-1), { withFileTypes: true, recursive: true })) {
