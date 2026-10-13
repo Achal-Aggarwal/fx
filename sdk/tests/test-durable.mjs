@@ -1343,6 +1343,34 @@ test("a durable session saves each image once, and a new agent sends it again", 
   for (let index = header.length; index < bytes.length; index += 1) bytes[index] = (index * 31 + 7) & 255;
   const base64 = Buffer.from(bytes).toString("base64");
   const durability = await durabilityFor();
+  const holdsImage = (data) => data.includes(Buffer.from(base64.slice(1000, 1100))) || data.includes(Buffer.from(bytes.subarray(1000, 1064)));
+  const savedData = (entry) => (entry.k === "record" || entry.k === "checkpoint" ? Buffer.from(entry.data, "base64") : Buffer.from(JSON.stringify(entry)));
+  // A remote World keeps nothing on this machine, so what reaches it is
+  // watched instead: each entry the log appends, and each stream write.
+  const sent = { entries: [], imageWrites: 0 };
+  if (remote) {
+    const open = durability.world.bind(durability);
+    durability.world = async () => {
+      const world = await open();
+      const create = world.events.create.bind(world.events);
+      world.events.create = async (runId, event, ...rest) => {
+        const input = event?.eventData?.input;
+        if (input instanceof Uint8Array) {
+          try {
+            const entry = JSON.parse(Buffer.from(input).toString("utf8"));
+            if (typeof entry?.k === "string") sent.entries.push(entry);
+          } catch {}
+        }
+        return create(runId, event, ...rest);
+      };
+      const write = world.streams.write.bind(world.streams);
+      world.streams.write = async (runId, stream, data, ...rest) => {
+        if (data instanceof Uint8Array && Buffer.from(data).equals(Buffer.from(bytes))) sent.imageWrites += 1;
+        return write(runId, stream, data, ...rest);
+      };
+      return world;
+    };
+  }
   const first = createFxAgent(agentOptions(durability, { model: "durable/vision-model" }));
   const session = first.session();
   // Records that only name the image stay small, so the second prompt is
@@ -1353,14 +1381,15 @@ test("a durable session saves each image once, and a new agent sends it again", 
   }
   // A turn's checkpoint is saved after its end, and close() waits for it.
   await first.close();
-  if (durabilityKind === "memory") {
+  if (durabilityKind === "memory" || remote) {
     // Every entry, records and checkpoints decoded: names only.
-    const entries = (await (await durability.create().session(session.id)).readSince("0")).map(({ entry }) => entry);
-    const saved = entries.map((entry) => (entry.k === "record" || entry.k === "checkpoint" ? Buffer.from(entry.data, "base64") : Buffer.from(JSON.stringify(entry))));
+    const entries = remote ? sent.entries : (await (await durability.create().session(session.id)).readSince("0")).map(({ entry }) => entry);
     assert.ok(entries.some((entry) => entry.k === "checkpoint"));
-    assert.ok(!saved.some((data) => data.includes(Buffer.from(base64.slice(1000, 1100))) || data.includes(Buffer.from(bytes.subarray(1000, 1064)))), "no entry holds the image");
+    assert.ok(!entries.map(savedData).some(holdsImage), "no entry holds the image");
   }
-  if (durabilityKind !== "memory") {
+  if (remote) {
+    assert.equal(sent.imageWrites, 1, "the World got the image's bytes once");
+  } else if (durabilityKind !== "memory") {
     const files = [];
     for (const entry of await readdir(dirs.at(-1), { withFileTypes: true, recursive: true })) {
       if (!entry.isFile()) continue;
