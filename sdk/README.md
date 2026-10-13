@@ -128,16 +128,35 @@ On `local()`, `vercel()` and `world()`, a session id is a Workflow run id, `wrun
 
 A session stores the conversation and nothing else. Every process passes its own model, credentials, tools, MCP clients and skills when it creates the agent. If a session's saved checkpoint came from a different libfx version, tool set or model, the session still loads, and `onEvent` gets a `checkpoint.mismatch` event naming what changed.
 
+### Several agents
+
+An app can have more than one durable agent, each with its own model, instructions and tools. Give each one a name:
+
+```js
+export const support = createFxAgent({ name: "support", instructions: "Answer billing questions." });
+export const coding = createFxAgent({ name: "coding", model: "anthropic/claude-opus-5.5", tools: codingTools });
+```
+
+A session belongs to the agent that created it, and its turns run only on an agent with that name. A prompt sent through another agent, such as `coding.session(supportSessionId).prompt()`, still runs on `support`, and the sending agent's `onEvent` gets a `session.forwarded` event. An agent created without a name is named `default`.
+
+- Agents with the same name are copies of one agent, such as one on each server, and take turns running its sessions.
+- Keep names stable. A session keeps the name it was created with, so renaming an agent leaves its sessions with no agent to run them.
+- A process that gets a turn for a name it has no agent for refuses it with an `FX_NO_AGENT` error naming the agent, and the queue delivers it again.
+- Agents share sessions through their durability. Give agents that share sessions the same durability, or none: agents created without one share the default.
+
 ### On Vercel
 
 Add a route for libfx's queue deliveries:
 
 ```js
 // app/api/libfx/route.js
-import { agent } from "@/lib/agent";
+import { wakeHandler } from "libfx";
+import "@/lib/agents"; // creates the app's agents, so this function has them
 
-export const POST = agent.wakeHandler();
+export const POST = wakeHandler();
 ```
+
+The route delivers each turn to the agent it belongs to, so one route serves every agent the module it imports creates. With one agent, `agent.wakeHandler()` does the same.
 
 Then subscribe it to libfx's topic in `vercel.json`:
 
@@ -492,7 +511,8 @@ Every entry point ships TypeScript types, and the package has no runtime depende
 - **One agent per process:** create it once at module scope, not per request, and open `agent.session(id)` for each conversation.
 - **Session ids:** take them from `turn.accepted` or `agent.newSessionId()`. On every durability except `memory()`, an id that isn't a Workflow run id throws.
 - **Side effects:** set `idempotent: true` only on tools that are safe to run twice, and pass `executionId` to services that take an idempotency key.
-- **Deployments:** on Vercel, the `wakeHandler()` route and its `vercel.json` trigger are both required, or prompts are stored and never run.
+- **Deployments:** on Vercel, the `wakeHandler()` route and its `vercel.json` trigger are both required, or prompts are stored and never run. The route must import the module that creates the agents.
+- **Several agents:** give each durable agent its own `name`, and never rename one that has sessions.
 - **Credentials:** keep keys and ChatGPT or Grok credentials on the server, and the object `startSignIn()` returns too.
 - **Checking a setup:** `getBackendInfo()` reports which backend would load without creating anything or making requests.
 - **Changing libfx:** the source is in the [fx repository](https://github.com/vercel-labs/fx) under `sdk/`. Its `AGENTS.md` files name the tests each change needs.

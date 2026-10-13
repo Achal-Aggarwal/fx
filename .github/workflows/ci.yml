@@ -379,6 +379,8 @@ jobs:
           bun sdk/tests/model/drive.mjs cutoff --walks 20 --seed 5
           bun sdk/tests/model/drive.mjs leased --walks 40 --seed 12
           bun sdk/tests/model/drive.mjs queue --walks 40 --seed 4
+          bun sdk/tests/model/drive-agents.mjs send --walks 60 --seed 11
+          bun sdk/tests/model/drive-agents.mjs consume --walks 60 --seed 13
 
       - name: Test libfx on a World
         run: |
