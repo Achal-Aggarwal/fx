@@ -233,6 +233,9 @@ pub const Dashboard = struct {
     mutex: Io.Mutex = .init,
     is_open: bool = false,
     fetch_state: policy.State = .{},
+    /// A new sign-in that has not had a fetch of its own finish or start yet,
+    /// because the previous sign-in's fetch was still running when it arrived.
+    fetch_owed: bool = false,
     session: ?Session = null,
     unavailable: ?Unavailable = null,
     entry: ?cache.Owned = null,
@@ -300,11 +303,12 @@ pub const Dashboard = struct {
         return started;
     }
 
-    /// Call from the event loop; starts the 15-minute refresh when due.
+    /// Call from the event loop; starts the 15-minute refresh when due, and a
+    /// new sign-in's first fetch once the previous sign-in's has finished.
     pub fn tick(self: *Dashboard) void {
         self.mutex.lockUncancelable(self.io());
         defer self.mutex.unlock(self.io());
-        if (self.maybeStartLocked(.timer)) self.bump();
+        if (self.maybeStartLocked(if (self.fetch_owed) .open else .timer)) self.bump();
     }
 
     /// The host's clock, which snapshots are taken by.
@@ -428,6 +432,12 @@ pub const Dashboard = struct {
         };
         self.unavailable = null;
         self.failure = null;
+        // The floor is per sign-in: another sign-in's fetch says nothing about
+        // how fresh these numbers are. A fetch still running for it finishes
+        // first, so the first fetch for this one may be owed to `tick`.
+        self.fetch_state.last_start_ms = null;
+        self.fetch_state.failed_at_ms = null;
+        self.fetch_owed = true;
         // Another identity's numbers never stay on screen (ShowsOwnIdentity).
         if (self.entry) |*e| e.deinit();
         self.entry = self.readCache(identity);
@@ -523,6 +533,7 @@ pub const Dashboard = struct {
         };
         self.fetch_state.in_flight = true;
         self.fetch_state.last_start_ms = now;
+        self.fetch_owed = false;
         return true;
     }
 
@@ -535,6 +546,8 @@ pub const Dashboard = struct {
                 self.fetch_state.failed_at_ms = null;
                 const current = if (self.session) |s| std.mem.eql(u8, &s.identity, &job.identity) else false;
                 if (current) {
+                    // This sign-in has had its fetch.
+                    self.fetch_owed = false;
                     self.failure = null;
                     if (self.entry) |*e| e.deinit();
                     self.entry = owned;
@@ -546,9 +559,13 @@ pub const Dashboard = struct {
                 }
             },
             .failed => |failure| {
-                self.fetch_state.failed_at_ms = self.host.now_fn(self.host.ctx);
+                // Only this sign-in's own failures hold its floor.
                 const current = if (self.session) |s| std.mem.eql(u8, &s.identity, &job.identity) else false;
-                if (current) self.failure = failure;
+                if (current) {
+                    self.fetch_owed = false;
+                    self.fetch_state.failed_at_ms = self.host.now_fn(self.host.ctx);
+                    self.failure = failure;
+                }
             },
             .cancelled => {},
         }
@@ -862,6 +879,8 @@ const FakeGateway = struct {
     teams: [16]bool = undefined,
     accounts: [16]bool = undefined,
     count: usize = 0,
+    /// While set, every request waits, so a test can keep a fetch in flight.
+    held: std.atomic.Value(bool) = .init(false),
 
     const today_body = "{\"results\":[{\"model\":\"anthropic/claude-opus-5.5\",\"request_count\":10,\"input_tokens\":5,\"total_cost\":2.5}]}";
     const window_body = "{\"results\":[{\"model\":\"anthropic/claude-opus-5.5\",\"request_count\":90,\"total_cost\":40},{\"model\":\"openai/gpt-5.6-luna\",\"request_count\":7,\"total_cost\":0.5}]}";
@@ -896,6 +915,7 @@ const FakeGateway = struct {
 
     fn fetch(ctx: ?*anyopaque, alloc: Allocator, request: Request, _: *std.atomic.Value(bool)) FetchError!Response {
         const self: *FakeGateway = @ptrCast(@alignCast(ctx.?));
+        while (self.held.load(.acquire)) std.atomic.spinLoopHint();
         self.mutex.lockUncancelable(testing.io);
         defer self.mutex.unlock(testing.io);
         const i = self.count;
@@ -1205,7 +1225,7 @@ test "a Grok sign-in reads its plan's billing and name from the Grok proxy" {
     try testing.expectEqual(@as(?f64, 42.5), refused.grok_usage.?.used_percent);
 }
 
-test "the floor, r and the 15-minute timer" {
+test "the floor holds open and the 15-minute timer, never r" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     const home = try testHome(&tmp);
@@ -1221,27 +1241,32 @@ test "the floor, r and the 15-minute timer" {
     try testing.expect(std.mem.endsWith(u8, gateway.path(0), "&api_key_id=self"));
 
     gateway.now_ms += 30 * std.time.ms_per_s;
-    try testing.expect(!dashboard.refresh());
     dashboard.tick();
     try testing.expectEqual(@as(usize, 3), gateway.count);
-
-    gateway.now_ms += 31 * std.time.ms_per_s;
+    // r fetches at once, inside the floor or not, and again after that.
     try testing.expect(dashboard.refresh());
     dashboard.waitForFetch();
     try testing.expectEqual(@as(usize, 4), gateway.count);
+    try testing.expect(dashboard.refresh());
+    dashboard.waitForFetch();
+    try testing.expectEqual(@as(usize, 5), gateway.count);
+    // Reopening inside the floor shows the cache without fetching.
+    dashboard.close();
+    dashboard.open(api_key);
+    try testing.expectEqual(@as(usize, 5), gateway.count);
 
     gateway.now_ms += policy.timer_ms - 1;
     dashboard.tick();
-    try testing.expectEqual(@as(usize, 4), gateway.count);
+    try testing.expectEqual(@as(usize, 5), gateway.count);
     gateway.now_ms += 1;
     dashboard.tick();
     dashboard.waitForFetch();
-    try testing.expectEqual(@as(usize, 5), gateway.count);
+    try testing.expectEqual(@as(usize, 6), gateway.count);
 
     dashboard.close();
     gateway.now_ms += policy.timer_ms;
     dashboard.tick();
-    try testing.expectEqual(@as(usize, 5), gateway.count);
+    try testing.expectEqual(@as(usize, 6), gateway.count);
 }
 
 test "a refused refresh keeps the cached numbers and says why" {
@@ -1426,4 +1451,68 @@ test "a dashboard never shows less than it had when the file goes back" {
     defer shown.deinit();
     try testing.expectEqual(gateway.now_ms, shown.of(.today).fetched_at_ms.?);
     try testing.expect(shown.of(.days_7).finished_current);
+}
+
+test "a provider switch fetches the new sign-in at once, and r works for it" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    var gateway: FakeGateway = .{};
+    var dashboard = Dashboard.init(testing.allocator, gateway.host(home));
+    defer dashboard.deinit();
+    dashboard.open(member);
+    dashboard.waitForFetch();
+
+    // Seconds later the provider changes and /usage opens again.
+    dashboard.close();
+    gateway.now_ms += 5 * std.time.ms_per_s;
+    const chatgpt: Credential = .{ .scope = .codex, .bearer = "chatgpt_token", .team = null, .subject = "acct_9", .account_id = "acct_9", .label = "codex (ChatGPT)" };
+    const before_switch = gateway.count;
+    dashboard.open(chatgpt);
+    dashboard.waitForFetch();
+    try testing.expect(gateway.count > before_switch);
+    var shown = try dashboard.snapshot(testing.allocator);
+    defer shown.deinit();
+    try testing.expectEqual(@as(?i64, gateway.now_ms), shown.codex_at_ms);
+
+    // r fetches for it at once too.
+    gateway.now_ms += 5 * std.time.ms_per_s;
+    const before_r = gateway.count;
+    try testing.expect(dashboard.refresh());
+    dashboard.waitForFetch();
+    try testing.expect(gateway.count > before_r);
+}
+
+test "a sign-in that arrives during another's fetch gets its fetch when that one ends" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    var gateway: FakeGateway = .{};
+    var dashboard = Dashboard.init(testing.allocator, gateway.host(home));
+    defer dashboard.deinit();
+    gateway.held.store(true, .release);
+    dashboard.open(member);
+
+    const chatgpt: Credential = .{ .scope = .codex, .bearer = "chatgpt_token", .team = null, .subject = "acct_9", .account_id = "acct_9", .label = "codex (ChatGPT)" };
+    dashboard.close();
+    dashboard.open(chatgpt);
+    gateway.held.store(false, .release);
+    dashboard.waitForFetch();
+    var before = try dashboard.snapshot(testing.allocator);
+    defer before.deinit();
+    try testing.expect(before.codex_at_ms == null);
+
+    // The next event-loop pass starts it, without waiting out any floor.
+    dashboard.tick();
+    dashboard.waitForFetch();
+    var after = try dashboard.snapshot(testing.allocator);
+    defer after.deinit();
+    try testing.expectEqual(@as(?i64, gateway.now_ms), after.codex_at_ms);
+    // Owed once: later passes wait for the 15-minute timer.
+    const fetched = gateway.count;
+    dashboard.tick();
+    dashboard.waitForFetch();
+    try testing.expectEqual(fetched, gateway.count);
 }

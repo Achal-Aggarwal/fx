@@ -5,7 +5,8 @@
 const std = @import("std");
 const report = @import("report.zig");
 
-/// The least time between two fetch starts, and after a failure.
+/// The least time before opening `/usage` or the timer fetches again, after a
+/// fetch starts or fails. `r` is never held by it.
 pub const floor_ms: i64 = 60 * std.time.ms_per_s;
 /// The refresh period while the dashboard stays open.
 pub const timer_ms: i64 = 15 * std.time.ms_per_min;
@@ -13,7 +14,7 @@ pub const timer_ms: i64 = 15 * std.time.ms_per_min;
 pub const Trigger = enum {
     /// Enter on `/usage`.
     open,
-    /// `r` with the dashboard open.
+    /// `r` with the dashboard open: fetches whenever none is in flight.
     manual,
     /// The periodic refresh with the dashboard open.
     timer,
@@ -45,7 +46,7 @@ fn floorClear(state: State, now_ms: i64) bool {
 pub fn due(trigger: Trigger, open: bool, state: State, now_ms: i64) bool {
     return switch (trigger) {
         .open => floorClear(state, now_ms),
-        .manual => open and floorClear(state, now_ms),
+        .manual => open and !state.in_flight,
         .timer => open and floorClear(state, now_ms) and
             state.last_start_ms != null and since(state.last_start_ms, timer_ms, now_ms),
     };
@@ -102,11 +103,13 @@ test "opening fetches unless the floor or a recent failure holds it" {
     try testing.expect(!due(.open, true, .{ .in_flight = true }, t0));
 }
 
-test "r needs the dashboard open and respects the floor" {
+test "r needs the dashboard open and nothing in flight, never the floor" {
     const t0: i64 = 1_000_000;
     try testing.expect(!due(.manual, false, .{}, t0));
     try testing.expect(due(.manual, true, .{}, t0));
-    try testing.expect(!due(.manual, true, .{ .last_start_ms = t0 }, t0 + 30 * std.time.ms_per_s));
+    try testing.expect(due(.manual, true, .{ .last_start_ms = t0 }, t0 + 1));
+    try testing.expect(due(.manual, true, .{ .failed_at_ms = t0 }, t0 + 1));
+    try testing.expect(!due(.manual, true, .{ .in_flight = true }, t0));
 }
 
 test "a clock corrected backward does not hold fetches until it catches up" {

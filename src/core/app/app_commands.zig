@@ -1078,7 +1078,7 @@ pub fn Handlers(comptime App: type) type {
             if (app.input_runtime.usage_menu.setPeriod(period)) app.shell.render_requests.request(.footer);
         }
 
-        /// `r`: fetches when the floor allows, then redraws.
+        /// `r`: fetches unless a fetch is already running, then redraws.
         pub fn reloadUsageMenu(app: *App, period: usage.Period) !void {
             if (comptime !@hasField(App, "usage_dashboard")) return;
             _ = period;

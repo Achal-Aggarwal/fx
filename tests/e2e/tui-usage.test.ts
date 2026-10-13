@@ -74,7 +74,7 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
   test(
     "an API key's /usage shows AI Gateway's spend by period and model",
     async () => {
-      const { clock, fake, env } = start("fx-tui-usage-key-", { report: (from) => rows(from) });
+      const { fake, env } = start("fx-tui-usage-key-", { report: (from) => rows(from) });
       session = await TmuxSession.create({
         env: { ...env, AI_GATEWAY_API_KEY: "e2e-usage-key" },
       });
@@ -102,8 +102,7 @@ describe.skipIf(!tmuxAvailable())("tui: /usage", () => {
       expect(week).toContain("provider/week");
       expect(week).not.toContain("provider/month");
 
-      // r refreshes once the one-minute floor has passed, and reads only today.
-      writeUsageClock(clock, USAGE_NOW_MS + 2 * 60 * 1000);
+      // r refreshes at once, inside the one-minute floor, and reads only today.
       await session.sendKeys("r");
       await session.waitForPane(() => fake.reportRanges().length === 4, TIMEOUT);
       expect(fake.reportRanges()[3]).toBe(`${TODAY}..${TODAY}`);
