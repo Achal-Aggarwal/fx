@@ -27,6 +27,9 @@ export function vercel({ reserveMs, leaseMs } = {}) {
     gatewayKey: () => getVercelOidcToken(),
     livenessKnown: false,
     queueLeases: leaseMs === undefined,
+    // A turn the request runs after its response keeps the function alive,
+    // through the request context `@vercel/functions` reads.
+    waitUntil: (work) => globalThis[Symbol.for("@vercel/request-context")]?.get?.()?.waitUntil?.(work),
     // Vercel Queues keeps a message until a delivery acknowledges it.
     queueDurable: true,
     pollMs: 1000,
