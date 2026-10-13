@@ -11,6 +11,13 @@ validation checks that the real code stays inside the design on every run
 we execute: unit tests, the standalone driver, and the `kill -9` and
 machine-crash matrix.
 
+In fx, the manager's trace hook is compiled out: `build.zig` sets the
+`hooks` option to false, and the standalone driver and crash matrix are not
+part of this repository. What runs here is `selftest.sh`, each checker's
+`--selftest` mode, `check_saved_logs.py` on logs fx saved, and
+`check_wiring_traces.py` on traces from a run with
+`FX_TRACE_SCOPES=wiring`.
+
 ## How it works
 
 ```text
@@ -47,8 +54,7 @@ emits one line              "log_len": 2, ...}      (Trace == <<...>>)  EXTENDS 
 | `TurnLifecycleLog.tla`, `SubagentsLog.tla` | Its wrappers. Only the disk is known, so TLC searches the process state between lines; accepted when some behavior writes exactly the saved lines |
 | `check_wiring_traces.py LOG...` | Checks the adapter's `wiring` trace lines (a run with `FX_TRACE_SCOPES=wiring`) against `Wiring.tla`: each process's lines become Start, the host steps and Exit, or Crash when it stops without Exit. A log where two processes overlap is skipped. `--selftest` requires 6 good and 8 planted traces to get their verdicts, the fork cases included |
 | `WiringTrace.tla` | Its wrapper. Accepted when every step is allowed in turn; the usage steps change nothing a traced step reads, so they are left out |
-| `bun_tlc_check.sh FX_WORKTREE [FILE [PATTERN]]` | Runs fx's E2E tests under Bun with `FX_E2E_TLA_DIR` set, then checks every kept run with TLC: the `wiring` traces with `check_wiring_traces.py` and the saved logs with `check_saved_logs.py`. Exit 0 only when all are ACCEPTED and at least `MIN_FORKS` (default 1) fork steps and saved forks were checked; a skipped trace counts as a failure |
-| `check_conversion.py --request R --report D` | Checks a v1-to-v2 conversion run against `V1Conversion.tla` (D59). The request comes from the pipeline harness suite `session-conversion-tlc`, which drives the real binary step by step (older-build v1 writes, opens, `fx sessions convert`, holds, damage, a crash mid-conversion) and observes each step's result on disk and through fx's own readers and listing. Exit 0 ACCEPTED only when TLC matched every observation, 1 REJECTED, 2 INCONCLUSIVE, 3 TOOL_ERROR. `--selftest` requires 6 good and 7 planted runs to get their verdicts |
+| `check_conversion.py --request R --report D` | Checks a recorded v1-to-v2 conversion run against `V1Conversion.tla` (D59): each step's result on disk and through fx's own readers and listing. Exit 0 ACCEPTED only when TLC matched every observation, 1 REJECTED, 2 INCONCLUSIVE, 3 TOOL_ERROR. `--selftest` requires its good and planted runs to get their verdicts |
 | `V1ConversionTrace.tla` | Its wrapper. Each observation's step kind limits the model actions that may run before it; a request step makes exactly one request, and only a writer an earlier hold step left running may write during it |
 | `selftest.sh` | Proves the tooling both accepts and rejects (below) |
 

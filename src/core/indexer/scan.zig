@@ -369,7 +369,7 @@ fn repositoryRules(arena: Allocator, index_alloc: Allocator, root: []const u8, r
                 .unavailable => incomplete.* = true,
             }
         }
-        // U3: below an ignored root, plain rules apply.
+        // Below an ignored root, plain rules apply.
         if (ignore.isPathExcluded(lists.items, found.prefix, true, settings.ignore_case)) {
             debug_trace.logf("indexer", "scan uses plain rules reason=ignored_root root={s}", .{root});
             return null;
@@ -762,7 +762,7 @@ test "repository scan follows git: index, ignore rules, folder rules and boundar
     try std.testing.expect(sub.tree.repository);
     try expectEntries(sub, &.{.{ .path = "h.txt", .kind = .file }});
 
-    // U3: a root that is itself ignored is listed with plain rules.
+    // A root that is itself ignored is listed with plain rules.
     var ignored_root = try scan(std.testing.allocator, try std.Io.Dir.path.join(arena, &.{ tree.root, "repo/dist" }), .{}, null);
     defer ignored_root.deinit();
     try std.testing.expect(!ignored_root.tree.repository);

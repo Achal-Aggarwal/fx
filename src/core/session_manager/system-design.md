@@ -1,9 +1,9 @@
 # Session Manager (Sessions v2) Design And Contracts
 
 This document is canonical for the v2 format, API, contracts and decisions,
-and `tla/` models each step. It was written before the code, so a name that
-does not cite fx source was a proposal. Decisions D1 to D19 were settled on
-2026-09-27 (Decisions section).
+and `tla/` models each step. It began as the design proposal and was kept
+current through implementation, so the Decisions section also records what
+implementation found. Decisions D1 to D19 were settled on 2026-09-27.
 
 ## Intent
 
@@ -332,7 +332,7 @@ manager:
   (`child_state.zig` `interruptActive`), and the child's own log holds the
   message once its turn starts. A child's turn opens on disk when its work
   starts, as `tla/Subagents.tla` `ChildStart` models, so the bodies its
-  tools keep are blobs of a session on disk (D44, user ruling 2026-10-01);
+  tools keep are blobs of a session on disk (D44);
   its pieces are written whole at its end, as v1's children are, while
   roots stream theirs (D28). A crash before that start leaves no log
   (`lost`); after it, the child's log keeps an open turn with no pieces,
@@ -352,6 +352,10 @@ manager:
   fx's usage recovery reads the v2 markers too. It takes the newest usage
   from the log without the lock, and trusts it only when the checkpoint's
   time is at least the marker's (D20, `tla/Wiring.tla`).
+
+  fx has since dropped its local usage ledger and these markers with it,
+  so this item and the usage steps in `tla/Wiring.tla` describe the design
+  before that change.
 - **Checks the adapter keeps:** tool call and result pairing, and v1's
   per-piece size rules, before anything reaches `append`.
 
@@ -650,7 +654,8 @@ Settled before the decision reviews:
   the discipline, not a process or call format. **Why:** one owner and one
   source of truth. **Alternative:** a separate process, which adds IPC,
   startup cost and a new failure mode.
-- **Decision:** fork is part of the API. **Why:** requested feature.
+- **Decision:** fork is part of the API. **Why:** fx offers `/fork`, and the
+  log's one owner should make the copy.
 
 Settled in the 2026-09-27 scope lock:
 - **D1 Decision:** an unfinished turn gets `turn_interrupted{reason: crash}`
@@ -717,8 +722,9 @@ Settled in the second 2026-09-27 review:
   folder inside `{id}/` (breaks the boundary), or rewriting the terminal
   store as log events.
 - **D14 Decision:** one optional diagnostics callback at manager init,
-  forwarded by the adapter to `debug_trace`. **Why:** workspace rule 3 (log
-  dropped state) without importing fx; the SQLite log-callback pattern.
+  forwarded by the adapter to `debug_trace`. **Why:** fx logs dropped user
+  state, and a callback does that without importing fx; the SQLite
+  log-callback pattern.
   **Alternative:** a separate manager log file, or repairs returned only in
   call results.
 - **D15 Decision:** fx's session commands keep working with v2 meanings.
@@ -804,8 +810,8 @@ Settled in the 2026-09-27 pre-wiring API check:
 
 Settled when wiring started (2026-09-27):
 - **D26 Decision:** the switch is `--sessions-v2` plus `FX_SESSIONS_V2=1`,
-  off by default, instead of a runtime-profile capability flag. **Why:** the
-  request was for `fx --sessions-v2`, and editors that launch ACP can only
+  off by default, instead of a runtime-profile capability flag. **Why:** a flag
+  opts one run in from the command line, and editors that launch ACP can only
   set the environment. **Alternative:** a flag only, which leaves ACP and
   the E2E suite out.
 - **D27 Decision:** until the default flips, v2 sessions keep side files in
@@ -909,7 +915,7 @@ Settled on 2026-09-28:
   found"); `verify` reports how many such blobs it met (doctor shows the
   session as damaged); a fork copies only lines whose blobs are present
   and whole, so `.last_good` ends before the first turn that names a bad
-  one and a `.turn` fork past it is refused. **Why:** found by the M1
+  one and a `.turn` fork past it is refused. **Why:** found by the
   fault matrix: resume said NotFound for a session that exists, doctor
   said ok, and a recover copy would have named the same missing blob.
   **Alternative:** show the piece as unavailable and resume anyway, as fx
@@ -920,7 +926,7 @@ Settled on 2026-09-28:
 - **D40 Decision:** a failed session keeps the cause of the write or sync
   that failed it, including a sync that failed on another thread and the
   first turn's publish, and every later call on it reports that cause
-  instead of `Io`. **Why:** found by the M1 fault matrix: fx reports a
+  instead of `Io`. **Why:** found by the fault matrix: fx reports a
   failed streamed write only at the turn's commit, so the same full disk
   read "FileTooBig" on one run and "Io" on another; the fault grid later
   found a new session in a read-only folder reading "Io". **Alternative:** keep `Io` and have every fx host
@@ -933,7 +939,7 @@ Settled on 2026-09-28:
   pending, the current session's turn may still end and its children may
   still finish, but no turn or child starts; the current session closes
   only after its children are joined, and closing the next one instead
-  abandons the switch. **Why:** found by the M1 trace check of `Wiring`:
+  abandons the switch. **Why:** found by the trace check of `Wiring`:
   every ACP switch in the E2E runs opened the next session first, which
   the spec's single session slot did not allow. **Alternative:** close the
   current session first, which leaves ACP without a session when the next
@@ -955,8 +961,8 @@ Settled on 2026-09-28:
   `SessionChildCapability` v1 uses, and `session/new` and `session/load`
   take the request's `cwd` as v1 does. The prompt is written at
   `session/new`, as on v1; closing a session that never got a prompt
-  removes its side folder (F13), and doctor sweeps one that a crash leaves
-  (D36). **Why:** main's ACP gained these after the stack was cut; without
+  removes its side folder, and doctor sweeps one that a crash leaves
+  (D36). **Why:** fx's ACP gained these while v2 was being built; without
   them a v2 session silently lost the client's instructions and its replay
   detail, and started in the process folder. **Alternative:** hold the
   prompt in memory until the first turn, which keeps D24 exact but loses
@@ -1018,7 +1024,7 @@ Settled while moving off the side folder (2026-10-01):
   repeated, so a crash at any point redoes the move on the next open, and an
   old handle resolves through the map. A read-only view of a session not
   moved yet, such as `fx session {id}`, reads its side files as today; that
-  read path goes with v1 (M4). The manager lets a `set` line list
+  read path goes with v1. The manager lets a `set` line list
   blobs, outside a turn, under the same rule as an item: each exists before
   the line, a fork hard-links them, and verify checks them. **Why:**
   teammates' sessions keep working with no permanent dual path, since an old
@@ -1058,7 +1064,7 @@ Settled after main's new compactor landed (2026-10-01):
   `SetBlob` now lists a blob inside a turn as well as outside it, since
   compaction runs mid-turn; such a setting is checked as an item is.
 
-Settled after the first dogfood finding (2026-10-01, F1):
+Settled after the first dogfood finding (2026-10-01):
 - **D51 Decision:** the message that issues running calls keeps its text
   with them. In the batch that first saves a step's calls as running
   (D28), one `assistant_running` item holds that message's text; a step
@@ -1076,7 +1082,7 @@ Settled after the first dogfood finding (2026-10-01, F1):
   message. No TLA+ change: the item rides in D28's batch, and no spec
   models fx's items.
 
-Settled after the second dogfood finding (2026-10-02, F2):
+Settled after the second dogfood finding (2026-10-02):
 - **D52 Decision:** a session's title comes from its first prompt even
   when a crash took its first turn. A new session still writes the title
   its first prompt gives with its first turn end. A resumed host session
@@ -1167,11 +1173,12 @@ Settled for `/fork` (2026-10-02):
   `tla/Wiring.tla` gains `Fork`: on v2, between turns and with no child
   running, a session that never existed becomes the one to switch to,
   and the source is not written (`ForkIsNewSession`, `ForkLeavesSource`,
-  `ForkBetweenTurns`). Every Bun E2E run of `/fork` is checked by TLC
-  through `tla/trace/bun_tlc_check.sh`: each process's `wiring` trace
-  against `Wiring`, and each saved log against `TurnLifecycle` and, for
-  a fork, `tla/trace/ForkLog.tla`, which accepts only a copy that is the
-  source's first lines byte for byte, ending at a turn boundary.
+  `ForkBetweenTurns`). `tla/trace/check_wiring_traces.py` checks the
+  `wiring` traces of `/fork` runs against `Wiring`, and
+  `tla/trace/check_saved_logs.py` checks each saved log against
+  `TurnLifecycle` and, for a fork, `tla/trace/ForkLog.tla`, which accepts
+  only a copy that is the source's first lines byte for byte, ending at a
+  turn boundary.
 
 Settled for the converter (2026-10-06):
 - **D59 Decision (amends D55 and D57):** a v1 session converts when it
@@ -1198,7 +1205,7 @@ Settled for the converter (2026-10-06):
   fsync of the log, a folder fsync, the rename, a root fsync. Its blobs
   go to `.tmp/{id}/blobs` first, and an abandoned import leaves only that
   folder, which the next attempt clears. Batches keep their original
-  times until a host appends after the publish. `zig build bench`: 1K
+  times until a host appends after the publish. The standalone benchmark: 1K
   turns import in 1.91 ms and 10K in 16.24 ms, half of each budget being
   the ceiling. **Why:** no start cost and no background work; a session
   pays once, when it is used. **Alternative:** the background import on
@@ -1280,8 +1287,8 @@ Settled for the converter (2026-10-06):
   honoring `expectedRevision`. `WriterLock.tla` models only flock; a buggy
   embedder store could allow two writers.
 - **Converter correctness.** It must handle every v1 format still on disk,
-  so it is tested against real sessions, including children and interrupted
-  turns.
+  including children and interrupted turns, so it needs testing against real
+  sessions.
 - **A session continued in an old binary after conversion** keeps its newer
   turns only in the v1 copy (D16).
 - **Two locations per session.** The session folder and the terminal folder
@@ -1299,7 +1306,7 @@ Settled for the converter (2026-10-06):
 - **Profile usage recovery.** The markers stay fx's. v2 sessions have their
   own folder, `~/.fx/usage-recovery-v2/{id}`, read by the same recovery,
   which compares the checkpoint's own time with the marker's instead of file
-  times (D20).
+  times (D20). fx has since dropped these markers with its usage ledger.
 - **Side folder retired (D27, D48).** A v2 session no longer has side files;
   older sessions move on their first writable open (D47). A move cut short
   leaves the side folder until the next open, and doctor removes folders
@@ -1311,11 +1318,12 @@ Settled for the converter (2026-10-06):
 - **Changed contract:**
   - unit tests at each level;
   - tests asserting every invariant of the matching `tla/` spec;
-  - TLC runs of all eight specs plus `tla/mutants.py`;
+  - TLC runs of every spec plus `tla/mutants.py`;
   - a fold-equivalence property test;
   - trace validation of the code against the specs, where every trace from
     unit tests, the driver and the crash matrix must be accepted by
-    `tla/trace/validate.sh`. The hook contract is in `tla/trace/README.md`.
+    `tla/trace/validate.sh`. The hook contract is in `tla/trace/README.md`;
+    this ran in the standalone module, and fx's build compiles the hook out.
 - **Integration:** a standalone driver running the four native host thread
   models through the API, plus a wasm host double over a fake `sessionStore`.
 - **Failure:**

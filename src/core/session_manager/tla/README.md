@@ -4,9 +4,10 @@ One model per step of the design. Each one checks the protocol described in
 `../system-design.md`, not the Zig code. The bridge to the code is that every
 invariant below also becomes a test assertion for the step it models.
 
-**Status: all eight specs parse (SANY) and pass TLC. Each one also catches
-its planted bugs (`./mutants.py`).** Last run: 2026-09-27, TLC2 2.19 (rev
-5a47802), OpenJDK 27 on macOS arm64.
+**Status on 2026-09-27, when the first eight specs existed: all eight parsed
+(SANY) and passed TLC, and each caught its planted bugs (`./mutants.py`).**
+TLC2 2.19 (rev 5a47802), OpenJDK 27 on macOS arm64. The table below is from
+that run; later specs and later model changes are not in it.
 
 | Spec | States generated | Distinct states | Search depth | Result |
 |---|---|---|---|---|
@@ -38,9 +39,9 @@ finishes and a parent `cancelled`. `LostMeansNoLog` became an action
 property, checked on the step that writes the line, because a persistent
 child marked lost for one work item may create its log with a later one.
 
-`./mutants.py` plants 14 realistic bugs, one to three per spec, and requires
-TLC to report the matching invariant or action property as violated. All 14
-are caught:
+`./mutants.py` plants realistic bugs, one or more per spec, and requires TLC
+to report the matching invariant or action property as violated. The first
+14, all caught on 2026-09-27:
 
 - fsync acknowledging a half-written line
 - open() keeping a torn tail
@@ -108,6 +109,8 @@ The models above check the design. To check that the Zig code actually
 behaves like them, the code writes a trace of its steps in test builds, and
 TLC validates that trace against the same specs. See
 [trace/README.md](trace/README.md).
+fx's build compiles that hook out, so in this repository the trace tooling
+runs on its self-tests, on logs fx saved, and on fx's `wiring` debug traces.
 
 ```sh
 ./trace/validate.sh SessionLog run.ndjson  # ACCEPTED, or REJECTED at step N
