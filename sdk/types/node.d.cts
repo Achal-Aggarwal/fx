@@ -21,6 +21,7 @@ export {
   listModels,
   memory,
   supportsJspi,
+  wakeHandler,
   xtermAdapter,
 } from "./libfx.cjs";
 

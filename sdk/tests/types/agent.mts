@@ -6,6 +6,7 @@ import {
   FxFencedError,
   FxJournalVersionError,
   memory,
+  wakeHandler,
   type Durability,
   type FxAgent,
   type FxAgentEvent,
@@ -327,6 +328,7 @@ export function events(): void {
       if (event.type === "session.error") console.log(event.sessionId, event.error.message);
       if (event.type === "session.deadline" || event.type === "session.fenced") assertType<Equal<typeof event.epoch, number>>();
       if (event.type === "session.deadline") assertType<Equal<typeof event.cutoffs, number>>();
+      if (event.type === "session.forwarded") assertType<Equal<typeof event.agent, string>>();
       if (event.type === "checkpoint.mismatch") console.log(event.changed.includes("model"), event.current.toolSchemaHash);
       if (event.type === "transport.activity") console.log(event.attempt, event.chunkBytes, event.totalBytes);
       if (event.type === "transport.response") console.log(event.status, event.requestId);
@@ -368,6 +370,13 @@ export async function GET(request: Request): Promise<Response> {
 }
 
 export const wake: (request: Request) => Promise<Response> = agent.wakeHandler();
+
+// Several agents: each named, one route for all of them.
+export const support: FxAgent = createFxAgent({ name: "support", instructions: "Answer billing questions." });
+assertType<Equal<typeof support.name, string>>();
+export const wakeAll: (request: Request) => Promise<Response> = wakeHandler();
+// @ts-expect-error a name is text
+createFxAgent({ name: 7 });
 
 // A durable Codex agent: each process asks the host for the session's credentials.
 export const codexAgent: FxAgent = createFxAgent({
