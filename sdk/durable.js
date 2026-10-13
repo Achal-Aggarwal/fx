@@ -336,6 +336,10 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
   // A checkpoint taken where a turn yielded leaves that turn open.
   let openTurn = typeof base?.openTurn?.id === "string" ? { id: base.openTurn.id, at: Number(base.openTurn.at) || 0, context: base.openTurn.context ?? null, settings: base.openTurn.settings ?? null } : null;
   let lastTurnId = base?.lastTurnId ?? null;
+  // The agent the session belongs to: the one its first stored input, or the
+  // checkpoint it was restored from, names. A session stored before agents
+  // had names belongs to the default agent.
+  let agent = typeof base?.agent === "string" ? base.agent : base && base.through != null ? defaultAgentName : null;
   let yielded = base?.yielded === true;
   // The context each prompt's or steer's caller gave, and the settings its
   // session object set, which its turn runs with: an untaken steer becomes a
@@ -367,6 +371,7 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     if (position > maxCursor) maxCursor = position;
     switch (entry?.k) {
       case "input":
+        agent ??= typeof entry.agent === "string" ? entry.agent : defaultAgentName;
         if (seenInputs.has(entry.key)) break;
         seenInputs.add(entry.key);
         inputs.push({ ...entry, cursor: position });
@@ -483,6 +488,7 @@ export function foldSessionLog(entries, { now = 0, alive = () => null } = {}) {
     cutoffs: openTurn === null ? 0 : cut.cutoffs,
     openFailed,
     lastTurnId,
+    agent,
     yielded,
     pending,
     steers,
@@ -537,9 +543,9 @@ function redelivers(delivery, lease) {
 function createMemoryBackend({ maxDurationMs, reserveMs } = {}) {
   const sessions = new Map();
   const holders = liveHolders;
-  // Each agent sharing the backend takes deliveries in turn.
-  const handlers = [];
-  let turnOf = 0;
+  // The agents sharing the backend, by name: an agent's copies take the
+  // deliveries for its name in turn.
+  const handlers = new Map();
   const timers = new Set();
   const sessionFor = (id) => {
     let session = sessions.get(id);
@@ -555,8 +561,14 @@ function createMemoryBackend({ maxDurationMs, reserveMs } = {}) {
   };
   // A message keeps its id across its deliveries, as a queue's does.
   const deliver = (message, attempt, messageId = newId("qmsg")) => {
-    if (handlers.length === 0) return later(() => deliver(message, attempt, messageId), 10);
-    const handler = handlers[turnOf++ % handlers.length];
+    if (handlers.size === 0) return later(() => deliver(message, attempt, messageId), 10);
+    const group = handlers.get(agentOf(message));
+    // No agent of that name here yet: tried again, as a failed delivery is.
+    if (!group) {
+      if (attempt < 48) later(() => deliver(message, attempt + 1, messageId), 1000);
+      return;
+    }
+    const handler = group.members[group.turn++ % group.members.length];
     Promise.resolve()
       .then(() => handler(message, { messageId, attempt }))
       .then((result) => {
@@ -655,12 +667,11 @@ function createMemoryBackend({ maxDurationMs, reserveMs } = {}) {
         later(() => deliver(message, 1), delaySeconds * 1000);
       },
     },
-    listen(fn) {
-      handlers.push(fn);
+    listen(fn, name = defaultAgentName) {
+      const group = joinGroup(handlers, name, fn);
       return () => {
-        const index = handlers.indexOf(fn);
-        if (index >= 0) handlers.splice(index, 1);
-        if (handlers.length > 0) return;
+        leaveGroup(handlers, name, group, fn);
+        if (handlers.size > 0) return;
         // Nobody is left to deliver to.
         for (const timer of timers) clearTimeout(timer);
         timers.clear();
@@ -680,6 +691,12 @@ const uiStreamOf = (runId) => `${runId.replace(/^wrun_/, "strm_")}_user_bGliZngt
 // namespace "libfx-image-" and the image's name.
 const imageStreamOf = (runId, name) => `${runId.replace(/^wrun_/, "strm_")}_user_${base64url(`libfx-image-${name}`)}`;
 const queuePrefix = "__libfx_wkf_workflow_";
+// The name of an agent created without one, and of whatever a message or a
+// session from before names belonged to.
+const defaultAgentName = "default";
+const agentNameRule = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+// The agent a queued message is for.
+const agentOf = (message) => (typeof message?.agent === "string" ? message.agent : defaultAgentName);
 const queueName = `${queuePrefix}session`;
 const eventIdPattern = /^[a-z]+_(\d{26})$/;
 
@@ -738,9 +755,80 @@ const laterPageEvents = 100;
 // deliveries in turn, as servers sharing a queue do.
 const listenersOf = new WeakMap();
 
+// Adds `member` to the group for `name` in `groups`, a Map of name to
+// `{ members, turn }`, and returns the group; leaveGroup takes it out again.
+function joinGroup(groups, name, member) {
+  let group = groups.get(name);
+  if (!group) groups.set(name, group = { members: [], turn: 0 });
+  group.members.push(member);
+  return group;
+}
+
+function leaveGroup(groups, name, group, member) {
+  const index = group.members.indexOf(member);
+  if (index >= 0) group.members.splice(index, 1);
+  if (group.members.length === 0 && groups.get(name) === group) groups.delete(name);
+}
+
+function noAgentNamed(name) {
+  return Object.assign(new Error(`no libfx agent named ${JSON.stringify(name)} runs in this process; the queue delivers this again`), { code: "FX_NO_AGENT", agent: name });
+}
+
+// The durable agents in this process, by name, from when each is created
+// until it closes, each as `{ open, durability }`: a route delivers each
+// message to the agent it names, and a function that only receives queue
+// messages has its agents here before any of them is used. Shared by every
+// copy of this module in the process.
+const agentsByName = (globalThis[Symbol.for("libfx.durableAgents")] ??= new Map());
+
+// The World backend of an agent named `name` in this process whose
+// durability `matches`, the agent's copies in turn, or null.
+async function agentNamed(name, matches) {
+  const group = agentsByName.get(name);
+  if (!group) return null;
+  const { members } = group;
+  const first = group.turn++;
+  for (let index = 0; index < members.length; index += 1) {
+    const member = members[(first + index) % members.length];
+    if (!matches(await member.durability())) continue;
+    const created = await member.open();
+    if (typeof created.deliverHere === "function") return created;
+  }
+  return null;
+}
+
+// Agents share sessions through the durability they were created with, so
+// one on another durability can hold other sessions.
+const agentSharing = (name, durability) => agentNamed(name, (other) => other === durability);
+
+// A route takes its deployment's deliveries, which every route durability
+// of the same kind in the process shares, such as each `vercel()` an app
+// creates: the agent a message names on this durability, or on another of
+// that kind.
+const agentOnRoute = async (name, durability) => (await agentSharing(name, durability)) ??
+  agentNamed(name, (other) => other !== durability && other.name === durability.name && typeof other.world === "function" && other.create === undefined);
+
+/**
+ * The request handler a deployment mounts for queue deliveries, for every
+ * durable agent in the process: each delivery goes to the agent its message
+ * names. One route and one queue trigger serve any number of agents.
+ */
+export function wakeHandler() {
+  return async (request) => {
+    for (const group of agentsByName.values()) {
+      for (const member of group.members) {
+        const created = await member.open();
+        if (created.viaRoute === true) return created.queueHandler(request);
+      }
+    }
+    return new Response("no libfx agent in this process takes queue deliveries from a route", { status: 503 });
+  };
+}
+
 // libfx starts and closes a World it `owned`, having created it; a World the
 // app passed in stays the app's.
-function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, holderInfo, livenessKnown = false, queueLeases = false, runInRequest = queueLeases, waitUntil, queueDurable = false, maxDurationMs, owned = true }) {
+function createWorldBackend(world, durability) {
+  const { name, reserveMs, pollMs, leaseMs, alive, holderInfo, livenessKnown = false, queueLeases = false, runInRequest = queueLeases, waitUntil, queueDurable = false, maxDurationMs, owned = true } = durability;
   const spec = world.specVersion === undefined ? {} : { specVersion: world.specVersion };
   const created = new Set();
   // Runs being created now: writes that go out together create a run once.
@@ -772,8 +860,14 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
     if (result?.redeliver === true) throw new Error("libfx asks the queue to deliver this message again");
     return Number.isFinite(result?.timeoutSeconds) ? { timeoutSeconds: result.timeoutSeconds } : undefined;
   };
-  // The route a deployment mounts delivers to this agent.
-  const queueHandler = world.createQueueHandler(queuePrefix, (message, meta) => deliverTo(handler, message, meta));
+  // The route a deployment mounts delivers to the agent in this process the
+  // message names, whichever agent's route it is.
+  const queueHandler = world.createQueueHandler(queuePrefix, async (message, meta) => {
+    const named = agentOf(message?.input);
+    const agent = await agentOnRoute(named, durability);
+    if (!agent) throw noAgentNamed(named);
+    return agent.deliverHere(message, meta);
+  });
   const backend = {
     name,
     livenessKnown,
@@ -1113,23 +1207,37 @@ function createWorldBackend(world, { name, reserveMs, pollMs, leaseMs, alive, ho
     // The route a deployment mounts for queue deliveries, until the World
     // can deliver to an in-process handler itself.
     queueHandler,
-    listen(fn) {
+    durability,
+    // Whether the queue delivers to queueHandler, mounted by the deployment.
+    viaRoute: route,
+    // Delivers a routed message to this backend's agent.
+    deliverHere: (message, meta) => deliverTo(handler, message, meta),
+    listen(fn, name = defaultAgentName) {
       handler = fn;
       if (route) return () => { if (handler === fn) handler = null; };
+      // The agents on this World, by name: an agent's copies take the
+      // deliveries for its name in turn. A name none of them has goes to an
+      // agent of that name on the same durability elsewhere in the process,
+      // as each agent has a World of its own, and one the process has none
+      // of is left for the queue to deliver again.
       let listeners = listenersOf.get(world);
       if (!listeners) {
-        listeners = { handlers: [], turn: 0 };
+        listeners = new Map();
         listenersOf.set(world, listeners);
-        world.registerHandler(queuePrefix, world.createQueueHandler(queuePrefix, (message, meta) => {
-          const { handlers } = listeners;
-          return deliverTo(handlers.length === 0 ? null : handlers[listeners.turn++ % handlers.length], message, meta);
+        world.registerHandler(queuePrefix, world.createQueueHandler(queuePrefix, async (message, meta) => {
+          const named = agentOf(message?.input);
+          const group = listeners.get(named);
+          if (group) return deliverTo(group.members[group.turn++ % group.members.length], message, meta);
+          const agent = await agentSharing(named, durability);
+          if (agent) return agent.deliverHere(message, meta);
+          if (listeners.size === 0) return deliverTo(null, message, meta);
+          throw noAgentNamed(named);
         }));
       }
-      listeners.handlers.push(fn);
+      const group = joinGroup(listeners, name, fn);
       return () => {
         if (handler === fn) handler = null;
-        const index = listeners.handlers.indexOf(fn);
-        if (index >= 0) listeners.handlers.splice(index, 1);
+        leaveGroup(listeners, name, group, fn);
       };
     },
     // Closing is best effort: a runtime whose HTTP agent cannot close, as
@@ -1193,8 +1301,9 @@ const logHolds = (state, type, messageId) => state.inputKeys.has(`${type}:${mess
 // Nothing the log already holds. Pure.
 function messageEntries(state, message) {
   const entries = [];
+  const named = typeof message.agent === "string" ? { agent: message.agent } : {};
   if (message.seed && state.checkpoint === null && state.records.length === 0) {
-    entries.push({ k: "checkpoint", through: null, data: message.seed });
+    entries.push({ k: "checkpoint", through: null, data: message.seed, ...named });
   }
   const key = `${message.type}:${message.messageId}`;
   if ((message.type === "prompt" || message.type === "steer" || message.type === "cancel") && !logHolds(state, message.type, message.messageId)) {
@@ -1203,6 +1312,7 @@ function messageEntries(state, message) {
       key,
       type: message.type,
       messageId: message.messageId,
+      ...named,
       ...(message.input === undefined ? {} : { input: message.input }),
       ...(typeof message.target === "string" ? { target: message.target } : {}),
       ...((message.type === "prompt" || message.type === "steer") && message.context !== undefined ? { context: message.context } : {}),
@@ -1306,6 +1416,17 @@ class SessionWorker {
     const deadline = this.backend.deadline() ?? (this.backend.maxDurationMs === null ? null : Date.now() + this.backend.maxDurationMs);
     let entries = await log.read();
     let state = this.fold(entries, delivery);
+    // A session runs only on the agent it belongs to, which a new one is the
+    // agent that sent its first message. A message that reached another
+    // agent, as one sent to another agent's session does, goes on to it.
+    const owner = state.agent ?? agentOf(message);
+    if (owner !== this.agent.name) {
+      await this.backend.queue.send({ ...message, agent: owner }, {
+        idempotencyKey: `${message.sessionId}:${message.type}:${message.messageId}:to:${owner}`,
+      });
+      this.agent.emit("session.forwarded", { sessionId: this.sessionId, agent: owner });
+      return undefined;
+    }
     for (let claims = 0; claims < 8; claims += 1) {
       // A session with no open turn starts its next prompt at once: the
       // first model request goes out while the input and the lease are
@@ -1526,6 +1647,7 @@ class SessionWorker {
           pending: now.unconsumed.filter((input) => input.cursor <= Number(through)),
           recent: now.recent,
           lastTurnId: now.lastTurnId,
+          ...(now.agent === null ? {} : { agent: now.agent }),
           ...(now.openTurn ? { openTurn: now.openTurn, yielded: now.yielded } : {}),
           lease: { holder: this.holder, epoch: lease.epoch, expiresAt: leaseExpiresAt, pid: lease.pid, host: lease.host, ...(lease.delivery ? { delivery: lease.delivery } : {}) },
         });
@@ -2161,9 +2283,12 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
     if (!options || typeof options !== "object" || Array.isArray(options)) {
       throw new TypeError(`${name}() options must be an object`);
     }
-    const { durability, ...harnessOptions } = options;
+    const { durability, name: agentName = defaultAgentName, ...harnessOptions } = options;
     if (durability !== undefined && !isDurability(durability)) {
       throw new TypeError("durability must come from memory(), local(), vercel() or world()");
+    }
+    if (typeof agentName !== "string" || !agentNameRule.test(agentName)) {
+      throw new TypeError(`${name}() name must be 1 to 64 letters, digits, ".", "_" or "-", starting with a letter or digit`);
     }
     const plugged = harness(harnessOptions);
     const seed = plugged.seed === undefined ? undefined : toBase64(plugged.seed);
@@ -2171,6 +2296,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
       try { options.onEvent?.({ type, timestamp: performance.now(), ...detail }); } catch {}
     };
     const agent = {
+      name: agentName,
       emit,
       // Work that outlives the delivery that started it, which close() waits
       // for: an engine that shuts down after its worker let go.
@@ -2188,6 +2314,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
       }),
     };
     let backendPromise = null;
+    let durabilityPromise = null;
     let chosenDurability = null;
     let unlisten = null;
     let closed = false;
@@ -2196,15 +2323,21 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
     const backend = () => {
       if (closed) return Promise.reject(new Error(`${label} is closed`));
       backendPromise ??= (async () => {
-        const chosen = durability ?? await defaultDurability();
+        const chosen = await durabilityOf();
         chosenDurability = chosen;
         const created = await createBackend(chosen);
         await created.start?.();
-        unlisten = created.listen((message, meta) => receive(created, message, deliveryOf(meta)));
+        unlisten = created.listen((message, meta) => receive(created, message, deliveryOf(meta)), agentName);
         return created;
       })();
       return backendPromise;
     };
+    // The durability the agent's sessions live in, chosen once.
+    const durabilityOf = () => (durabilityPromise ??= durability ? Promise.resolve(durability) : defaultDurability());
+    // In the process's agents from now, so a route that receives a message
+    // for this agent finds it before anything uses it.
+    const member = { open: backend, durability: durabilityOf };
+    const registered = joinGroup(agentsByName, agentName, member);
     // One delivery of `message` to the session's worker here: from the
     // queue, with `delivery` naming the queue's message and attempt, or with
     // `inRequest` from the request that took the prompt.
@@ -2267,7 +2400,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
           ...(context === undefined ? {} : { context }),
           ...(settings === undefined ? {} : { settings }),
         };
-        const full = { ...message, ...extra, sessionId };
+        const full = { ...message, ...extra, agent: agentName, sessionId };
         // A queue that ends with the process could lose the message, so its
         // input reaches the log before the caller hears it was accepted.
         if (!created.queueDurable) {
@@ -2573,6 +2706,10 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
       async newSessionId() {
         return (await backend()).newSessionId();
       },
+      /** The agent's name: its sessions' turns run only on agents with this name. */
+      get name() {
+        return agentName;
+      },
       /** The agent's own session, for code that holds one conversation. */
       get sessionId() {
         return defaultSession?.id ?? null;
@@ -2600,6 +2737,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
       async close() {
         if (closed) return;
         closed = true;
+        leaveGroup(agentsByName, agentName, registered, member);
         while (active.size > 0) await Promise.allSettled([...active]);
         if (backendPromise) {
           const created = await backendPromise.catch(() => null);
