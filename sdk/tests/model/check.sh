@@ -1,7 +1,7 @@
 #!/bin/sh
-# Model-checks DurableSession.tla, PromptIntake.tla and ImageStore.tla with
-# TLC, confirms each witness is violated, and writes the state graphs
-# drive.mjs, drive-intake.mjs and drive-images.mjs walk against the code.
+# Model-checks DurableSession.tla, PromptIntake.tla, ImageStore.tla and
+# AgentRouting.tla with TLC, confirms each witness is violated, and writes
+# the state graphs the drive*.mjs scripts walk against the code.
 #
 # Needs Java 11+ and tla2tools.jar:
 #   brew install openjdk

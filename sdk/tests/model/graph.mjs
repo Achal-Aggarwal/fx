@@ -1,12 +1,11 @@
-// The state graph TLC writes with `-dump dot,actionlabels`, as drive.mjs,
-// drive-intake.mjs, and drive-images.mjs read it, and the walk the last two
-// take along it against the real code.
+// The state graphs check.sh has TLC write, as the model drivers read them,
+// and the walk drive-intake.mjs and drive-images.mjs take along one.
 import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 
 // A TLA+ value as TLC prints it: numbers, strings, booleans, records (and
-// functions over names, which print as records), sequences (and functions
-// over 1..N, which print as sequences), and sets, read as arrays.
+// functions over names, which print as records), sequences, and sets, read
+// as arrays in TLC's order.
 export function parseValue(text) {
   let at = 0;
   const space = () => { while (/\s/.test(text[at] ?? "")) at += 1; };
@@ -15,23 +14,22 @@ export function parseValue(text) {
     if (!text.startsWith(token, at)) throw new Error(`expected ${token} at ${at} in ${text}`);
     at += token.length;
   };
-  const list = (open, close) => {
-    at += open.length;
-    const items = [];
-    space();
-    if (text.startsWith(close, at)) { at += close.length; return items; }
-    for (;;) {
-      items.push(value());
-      space();
-      if (text[at] === ",") { at += 1; continue; }
-      expect(close);
-      return items;
-    }
-  };
   const value = () => {
     space();
-    if (text.startsWith("<<", at)) return list("<<", ">>");
-    if (text[at] === "{") return list("{", "}");
+    for (const [open, close] of [["<<", ">>"], ["{", "}"]]) {
+      if (!text.startsWith(open, at)) continue;
+      at += open.length;
+      const items = [];
+      space();
+      if (text.startsWith(close, at)) { at += close.length; return items; }
+      for (;;) {
+        items.push(value());
+        space();
+        if (text[at] === ",") { at += 1; continue; }
+        expect(close);
+        return items;
+      }
+    }
     if (text[at] === "[") {
       at += 1;
       const record = {};
@@ -67,7 +65,7 @@ export function parseValue(text) {
   return result;
 }
 
-// The states by id, each state's successors, and the initial state.
+/** The graph check.sh wrote to `path`: each state by id, its successors, and the initial state. */
 export async function loadGraph(path) {
   const dot = await readFile(path, "utf8").catch(() => {
     throw new Error(`${path} is missing; run sdk/tests/model/check.sh first`);
