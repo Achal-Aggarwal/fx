@@ -620,33 +620,25 @@ pub const StoredImages = struct {
         const name = imageName(image.snapshot_sha256 orelse return false) orelse return false;
         return self.names.contains(name);
     }
-
-    /// Whether writing `user` names any image instead of writing its bytes:
-    /// one the store holds, or one the session dropped.
-    pub fn namesAny(self: *const StoredImages, user: session.UserTurn) bool {
-        for (user.images) |image| if (self.holds(image) or image.droppedFromSession()) return true;
-        return false;
-    }
-
-    pub fn namesAnyInTurn(self: *const StoredImages, turn: session.HistoryTurn) bool {
-        return switch (turn) {
-            .assistant => |entry| self.namesAny(entry.user),
-            .interrupted => |entry| self.namesAny(entry.user),
-            .compacted_summary => false,
-        };
-    }
 };
 
-/// Whether `turn` holds an image the session dropped, which only a format
-/// that names images can write.
-pub fn dropsAnyInTurn(turn: session.HistoryTurn) bool {
-    const user = switch (turn) {
-        .assistant => |entry| entry.user,
-        .interrupted => |entry| entry.user,
-        .compacted_summary => return false,
-    };
-    for (user.images) |image| if (image.droppedFromSession()) return true;
+/// Whether writing `user` names an image instead of holding its bytes, which
+/// only the naming format can: one `stored` holds, or one the session
+/// dropped, which keeps only its name with or without a store.
+pub fn namesImages(user: session.UserTurn, stored: ?*const StoredImages) bool {
+    for (user.images) |image| {
+        if (image.droppedFromSession()) return true;
+        if (stored) |names| if (names.holds(image)) return true;
+    }
     return false;
+}
+
+pub fn turnNamesImages(turn: session.HistoryTurn, stored: ?*const StoredImages) bool {
+    return switch (turn) {
+        .assistant => |entry| namesImages(entry.user, stored),
+        .interrupted => |entry| namesImages(entry.user, stored),
+        .compacted_summary => false,
+    };
 }
 
 /// The images a libfx session with an image store keeps: its newest, at most

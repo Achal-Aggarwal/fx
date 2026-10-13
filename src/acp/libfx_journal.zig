@@ -372,15 +372,14 @@ pub const Journal = struct {
     }
 
     /// Keeps the session within its image window when the host keeps a
-    /// store: each image older than the window loses its bytes and keeps its
-    /// name, in `history` (owned by `history_alloc`) and in the pending
-    /// resume (owned by `session_alloc`). `newest`, a prompt's images, are
-    /// newer than both; they count toward the window but stay.
+    /// store: each image of `history` (owned by `history_alloc`) older than
+    /// the window loses its bytes and keeps its name. The open turn's images
+    /// and `newest`, a prompt's, are newer than all of them: they count toward
+    /// the window but stay, as an open keeps them (`keepNeededImages`).
     pub fn dropOutsideWindow(
         self: *Journal,
         alloc: Allocator,
         history_alloc: Allocator,
-        session_alloc: Allocator,
         history: []types.HistoryTurn,
         newest: []const types.ImageAttachment,
     ) Allocator.Error!void {
@@ -390,14 +389,13 @@ pub const Journal = struct {
         var sizes: std.ArrayList(?usize) = .empty;
         defer sizes.deinit(alloc);
         for (history) |*turn| if (userOf(turn)) |user| try collectWindowImages(alloc, &held, &sizes, user.images);
-        const in_history = held.items.len;
-        if (self.pending_resume) |*pending| try collectWindowImages(alloc, &held, &sizes, pending.user.images);
-        for (newest) |image| if (image.inline_data) |bytes| try sizes.append(alloc, bytes.len);
+        if (self.pending_resume) |pending| try appendSizes(alloc, &sizes, pending.user.images);
+        try appendSizes(alloc, &sizes, newest);
         const outside = @min(self.image_window.oldestOutside(sizes.items), held.items.len);
         var dropped: usize = 0;
-        for (held.items[0..outside], 0..) |image, index| {
+        for (held.items[0..outside]) |image| {
             const bytes = image.inline_data orelse continue;
-            (if (index < in_history) history_alloc else session_alloc).free(bytes);
+            history_alloc.free(bytes);
             image.inline_data = null;
             dropped += 1;
         }
@@ -503,10 +501,17 @@ fn collectWindowImages(
     }
 }
 
+/// Appends the sizes of the images of `images` that hold bytes.
+fn appendSizes(alloc: Allocator, sizes: *std.ArrayList(?usize), images: []const types.ImageAttachment) Allocator.Error!void {
+    for (images) |image| if (image.inline_data) |bytes| try sizes.append(alloc, bytes.len);
+}
+
 /// Leaves in `images.missing` only the names of images the window keeps, so
-/// the host stages none the session would drop. An open reads each named
-/// image it has not staged as one without bytes: with the size its record
-/// gives when `images.missing` holds its name, else as one already dropped.
+/// the host stages none the session would drop. The open turn's images count
+/// toward the window and are always needed, as a running turn keeps its own
+/// (`Journal.dropOutsideWindow`). An open reads each named image it has not
+/// staged as one without bytes: with the size its record gives when
+/// `images.missing` holds its name, else as one already dropped.
 fn keepNeededImages(
     alloc: Allocator,
     images: *session_codec.ImageResolver,
@@ -526,8 +531,9 @@ fn keepNeededImages(
         };
         try countOpenedImages(alloc, &sizes, &names, user.images, &images.missing);
     }
+    const in_history = sizes.items.len;
     if (open_user) |user| try countOpenedImages(alloc, &sizes, &names, user.images, &images.missing);
-    const outside = window.oldestOutside(sizes.items);
+    const outside = @min(window.oldestOutside(sizes.items), in_history);
     var needed: std.array_hash_map.Auto(session_codec.ImageName, usize) = .empty;
     errdefer needed.deinit(images.alloc);
     for (names.items[outside..], sizes.items[outside..]) |name, size| {
@@ -632,7 +638,7 @@ pub fn open(
     // An image the open resolved is in the store; one it read inline is not.
     if (image_store) for (images.resolved.keys()) |name| try state.stored_images.add(session_alloc, name);
     const checkpoint = folded.open_turn orelse {
-        try state.dropOutsideWindow(alloc, alloc, session_alloc, runtime.agent.history.items, &.{});
+        try state.dropOutsideWindow(alloc, alloc, runtime.agent.history.items, &.{});
         return .{ state, .{ .turns = folded.history.len, .resumable = false, .last_turn_id = state.last_turn_id, .checkpoint_meta = saved_meta } };
     };
 
@@ -648,7 +654,7 @@ pub fn open(
     state.pending_resume_ambiguous = try unfinishedCalls(session_alloc, folded.running_calls, folded.finished);
     state.pending_resume_yielded = folded.yielded;
     state.pending_inputs = try dupePendingInputs(session_alloc, folded.pending_inputs);
-    try state.dropOutsideWindow(alloc, alloc, session_alloc, runtime.agent.history.items, &.{});
+    try state.dropOutsideWindow(alloc, alloc, runtime.agent.history.items, &.{});
     return .{ state, .{
         .turns = folded.history.len,
         .resumable = true,
@@ -1052,4 +1058,90 @@ test "a resume cancelled during a rerun keeps that call and the later ones answe
     try std.testing.expectEqualStrings(session_adapter.unfinished_tool_output, results[2].output);
     // A step index past the turn's steps runs nothing.
     try std.testing.expectEqual(@as(usize, 0), try rerunCalls(alloc, &answered, 5, TestRerunner{ .ids = &ids, .ran = &ran }));
+}
+
+/// An inline image of `size` bytes for the window tests, every field owned by
+/// `alloc`; `types.freeImageAttachment` frees it.
+fn windowTestImage(alloc: Allocator, id: usize, size: usize) !types.ImageAttachment {
+    const bytes = try alloc.alloc(u8, size);
+    errdefer alloc.free(bytes);
+    @memset(bytes, 'x');
+    const path = try alloc.dupe(u8, "inline://image");
+    errdefer alloc.free(path);
+    const media_type = try alloc.dupe(u8, "image/png");
+    errdefer alloc.free(media_type);
+    const digest = session_codec.imageNameOf(bytes);
+    return .{ .id = id, .path = path, .media_type = media_type, .snapshot_sha256 = try alloc.dupe(u8, &digest), .inline_data = bytes };
+}
+
+test "the image window drops the oldest history images, and the open turn's and a prompt's stay" {
+    const alloc = std.testing.allocator;
+    var capture: TestCapture = .{};
+    defer capture.frames.deinit(alloc);
+    var writer = jsonrpc.Writer.initCallback(&capture, TestCapture.write);
+    var session: Journal = .{ .writer = &writer, .image_store = true, .image_window = .{ .max_images = 3 } };
+    defer session.deinit(alloc);
+    var images: [3]types.ImageAttachment = undefined;
+    for (&images, 0..) |*image, index| image.* = try windowTestImage(alloc, index + 1, 10);
+    defer for (images) |image| types.freeImageAttachment(alloc, image);
+    var history: [3]types.HistoryTurn = undefined;
+    for (&history, &images) |*turn, *image| {
+        turn.* = .{ .assistant = .{ .user = .{ .text = @constCast("look"), .images = image[0..1] }, .assistant = @constCast("ok") } };
+    }
+    var newest = [_]types.ImageAttachment{try windowTestImage(alloc, 5, 10)};
+    defer types.freeImageAttachment(alloc, newest[0]);
+
+    // Three images at most: the prompt's and the two newest of history.
+    try session.dropOutsideWindow(alloc, alloc, &history, &newest);
+    try std.testing.expect(images[0].droppedFromSession());
+    try std.testing.expect(images[1].inline_data != null and images[2].inline_data != null);
+
+    // The open turn's image counts as well, so one more history image leaves.
+    var pending = try testProgress(alloc);
+    pending.user.images = try alloc.alloc(types.ImageAttachment, 1);
+    pending.user.images[0] = try windowTestImage(alloc, 4, 10);
+    session.pending_resume = pending;
+    try session.dropOutsideWindow(alloc, alloc, &history, &newest);
+    try std.testing.expect(images[1].droppedFromSession());
+    try std.testing.expect(images[2].inline_data != null);
+    try std.testing.expect(session.pending_resume.?.user.images[0].inline_data != null);
+    try std.testing.expect(newest[0].inline_data != null);
+}
+
+test "an open needs only the named images its window keeps, and every image of the open turn" {
+    const alloc = std.testing.allocator;
+    var staged: session_codec.StagedImages = .{};
+    defer staged.deinit(alloc);
+    var resolver: session_codec.ImageResolver = .{ .alloc = alloc, .staged = &staged };
+    defer resolver.deinit();
+    // Four named images the host has not staged yet, oldest first.
+    var names: [4]session_codec.ImageName = undefined;
+    var images: [4]types.ImageAttachment = undefined;
+    for (&names, &images, 0..) |*name, *image, index| {
+        name.* = session_codec.imageNameOf(&.{@as(u8, @intCast(index))});
+        image.* = .{ .id = index + 1, .path = @constCast("inline://image"), .media_type = @constCast("image/png"), .snapshot_sha256 = name };
+    }
+    const reset = struct {
+        fn run(target: *session_codec.ImageResolver, all: []const session_codec.ImageName) !void {
+            target.missing.clearRetainingCapacity();
+            for (all) |name| try target.missing.put(target.alloc, name, 10);
+        }
+    }.run;
+    var history: [3]types.HistoryTurn = undefined;
+    for (&history, images[0..3]) |*turn, *image| {
+        turn.* = .{ .assistant = .{ .user = .{ .text = @constCast("look"), .images = image[0..1] }, .assistant = @constCast("ok") } };
+    }
+
+    // Two images: the open turn's and the newest of history.
+    try reset(&resolver, &names);
+    try keepNeededImages(alloc, &resolver, &history, .{ .text = @constCast("now"), .images = images[3..4] }, .{ .max_images = 2 });
+    try std.testing.expectEqual(@as(usize, 2), resolver.missing.count());
+    try std.testing.expect(resolver.missing.contains(names[2]) and resolver.missing.contains(names[3]));
+
+    // An open turn larger than the window keeps all of its images, and no
+    // history image.
+    try reset(&resolver, &names);
+    try keepNeededImages(alloc, &resolver, history[0..2], .{ .text = @constCast("now"), .images = images[2..4] }, .{ .max_images = 1 });
+    try std.testing.expectEqual(@as(usize, 2), resolver.missing.count());
+    try std.testing.expect(resolver.missing.contains(names[2]) and resolver.missing.contains(names[3]));
 }

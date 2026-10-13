@@ -138,12 +138,11 @@ fn encodeWith(
     for (history, 0..) |turn, index| {
         if (index > 0) json.writer.writeByte(',') catch return error.OutOfMemory;
         const first_new_blob = blobs.items.len;
-        // An image the session dropped is written by name even here.
-        names_images = names_images or session_codec.dropsAnyInTurn(turn);
-        const written = if (stored) |names| named: {
-            names_images = names_images or names.namesAnyInTurn(turn);
-            break :named session_codec.writeHistoryTurnNamingImages(&json.writer, turn, .{ .stored = names, .blobs = image_blobs });
-        } else session_codec.writeHistoryTurnWithImageBlobs(&json.writer, turn, image_blobs);
+        names_images = names_images or session_codec.turnNamesImages(turn, stored);
+        const written = if (stored) |names|
+            session_codec.writeHistoryTurnNamingImages(&json.writer, turn, .{ .stored = names, .blobs = image_blobs })
+        else
+            session_codec.writeHistoryTurnWithImageBlobs(&json.writer, turn, image_blobs);
         written catch |err| switch (err) {
             error.InvalidSessionFormat => return error.InvalidCheckpoint,
             else => return error.OutOfMemory,

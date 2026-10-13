@@ -869,12 +869,7 @@ pub fn handlePrompt(
             // checkpoint, so no filesystem snapshot backend is needed.
             prompt_input.captureImagesInline(alloc) catch |err|
                 return promptInputFailure(err);
-            if (session.journal) |*journal| {
-                try prompt_input.noteStoredImages(state.alloc, journal);
-                // The prompt's images are the newest; older ones past the
-                // session's window give up their bytes.
-                try journal.dropOutsideWindow(alloc, state.alloc, state.alloc, session.session_rt.agent.history.items, prompt_input.images);
-            }
+            if (session.journal) |*journal| try prompt_input.noteStoredImages(state.alloc, journal);
         } else {
             if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
             var temporary_snapshot_dir: ?[]u8 = null;
@@ -1007,6 +1002,9 @@ pub fn handlePrompt(
     if (session.journal) |*journal| {
         session.session_write_mutex.lockUncancelable(io_mod.getIo());
         defer session.session_write_mutex.unlock(io_mod.getIo());
+        // The turn starts with the prompt's images as the newest: older ones
+        // past the session's window give up their bytes.
+        if (prompt_input.images.len > 0) try journal.dropOutsideWindow(alloc, state.alloc, session.session_rt.agent.history.items, prompt_input.images);
         // A host that stores inputs first already holds the prompt.
         journal.barrier_next_progress = !journal.inputs_durable;
         journal.startYieldClock(prompt_input.yield_at_ms);

@@ -139,9 +139,9 @@ pub const Event = union(EventType) {
     tool_result: ToolResult,
 
     /// The version `Cursor.write` gives the event: `naming_version` when it
-    /// names an image `stored` holds.
+    /// names an image, one `stored` holds or one the session dropped.
     fn eventVersion(self: Event, stored: ?*const session_codec.StoredImages) u8 {
-        if (stored) |names| if (eventNamesImages(self, names)) return naming_version;
+        if (eventNamesImages(self, stored)) return naming_version;
         return switch (self) {
             .tool_result => delta_version,
             .turn_progress => |progress| if (progress.delta != null) delta_version else plain_version,
@@ -256,14 +256,15 @@ pub const Cursor = struct {
     }
 };
 
-/// Whether writing `event` names any image `stored` holds.
-fn eventNamesImages(event: Event, stored: *const session_codec.StoredImages) bool {
+/// Whether writing `event` names an image: one `stored` holds, or one the
+/// session dropped.
+fn eventNamesImages(event: Event, stored: ?*const session_codec.StoredImages) bool {
     return switch (event) {
-        .turn_committed => |turn| stored.namesAnyInTurn(turn),
+        .turn_committed => |turn| session_codec.turnNamesImages(turn, stored),
         // A delta leaves out the user's turn, so it names nothing.
-        .turn_progress => |progress| progress.delta == null and stored.namesAny(progress.checkpoint.user),
+        .turn_progress => |progress| progress.delta == null and session_codec.namesImages(progress.checkpoint.user, stored),
         .history_replaced => |history| for (history) |turn| {
-            if (stored.namesAnyInTurn(turn)) break true;
+            if (session_codec.turnNamesImages(turn, stored)) break true;
         } else false,
         .tool_intent, .turn_progress_cleared, .input_accepted, .input_withdrawn, .turn_yielded, .tool_result => false,
     };
@@ -398,8 +399,8 @@ pub fn writeOpenTurn(writer: *std.Io.Writer, turn_id: ?[]const u8, progress: ses
 }
 
 /// Like `writeOpenTurn`, but names the images `stored` holds instead of
-/// writing their bytes. Returns whether it named any, which makes the
-/// snapshot version 3 (`encodeSnapshotNamingImages`).
+/// writing their bytes. Returns whether it named any, a dropped one too,
+/// which makes the snapshot version 3 (`encodeSnapshotNamingImages`).
 pub fn writeOpenTurnNamingImages(
     writer: *std.Io.Writer,
     turn_id: ?[]const u8,
@@ -407,7 +408,7 @@ pub fn writeOpenTurnNamingImages(
     stored: *const session_codec.StoredImages,
 ) !bool {
     try writeOpenTurnWith(writer, turn_id, progress, stored);
-    return stored.namesAny(progress.user);
+    return session_codec.namesImages(progress.user, stored);
 }
 
 fn writeOpenTurnWith(

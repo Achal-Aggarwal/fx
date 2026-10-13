@@ -2215,7 +2215,11 @@ fn handleKernelSnapshot(
     if (yielded) {
         if (stored) |names| {
             open_turn_names_images = try journal_events.writeOpenTurnNamingImages(&open_turn.writer, journal.open_turn_id.slice(), journal.pending_resume.?, names);
-        } else try journal_events.writeOpenTurn(&open_turn.writer, journal.open_turn_id.slice(), journal.pending_resume.?);
+        } else {
+            try journal_events.writeOpenTurn(&open_turn.writer, journal.open_turn_id.slice(), journal.pending_resume.?);
+            // An image the session dropped is written by name even here.
+            open_turn_names_images = session_codec.namesImages(journal.pending_resume.?.user, null);
+        }
     }
     const snapshot_bytes = if (open_turn_names_images)
         journal_events.encodeSnapshotNamingImages(alloc, at_seq, journal.cursor.turn, journal.last_turn_id.slice(), open_turn.written(), checkpoint)
