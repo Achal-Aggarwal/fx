@@ -24,6 +24,9 @@ const maxModelBytes = 1024;
 // Matches the kernel's ReasoningEffort.max_name_bytes.
 const maxEffortBytes = 64;
 const maxUrlBytes = 16 * 1024;
+// The answer a resumed turn gives a call its crash left running; matches
+// unfinished_tool_output in session_adapter.zig.
+const unfinishedToolOutput = "fx stopped while this tool was running, so it may have partly run. Check its effects before running it again.";
 const maxModelCatalogBytes = 4 * 1024 * 1024;
 const maxModelCatalogEntries = 10_000;
 const streamReadsPerTaskYield = 32;
@@ -2272,15 +2275,23 @@ export async function createFxEngine(options = {}) {
   let lastTurnId = null;
   // The calls the open turn left running: `{ id, name, arguments }`.
   let ambiguousCalls = [];
-  // Asks `onAmbiguous` about each of them, once, and returns the ids of the
-  // calls to run again; the resume answers the rest as possibly run.
-  const rerunIds = (onAmbiguous) => {
+  // Asks `onAmbiguous` about each of them, once. Returns the ids of the
+  // calls to run again, and the rest, which the resume answers as possibly
+  // run.
+  const settleAmbiguous = (onAmbiguous) => {
     const calls = ambiguousCalls;
     ambiguousCalls = [];
-    if (onAmbiguous === undefined) return [];
-    return calls
-      .filter((call) => onAmbiguous({ executionId: call.id, name: call.name, input: parsedToolInput(call.arguments) }) === "rerun")
-      .map((call) => call.id);
+    const rerun = onAmbiguous === undefined
+      ? []
+      : calls.filter((call) => onAmbiguous({ executionId: call.id, name: call.name, input: parsedToolInput(call.arguments) }) === "rerun").map((call) => call.id);
+    return { rerun, answered: calls.filter((call) => !rerun.includes(call.id)) };
+  };
+  // Continues the open turn: the calls it left running run again or are
+  // answered as possibly run, and each answered one ends for the turn's
+  // viewers as it does for the model.
+  const resumeOpenTurn = (promptOptions) => {
+    const { rerun, answered } = settleAmbiguous(promptOptions.onAmbiguous);
+    return normalizeTurn(startTurn(null, { ...promptOptions, [resumeTurn]: true, [rerunCallIds]: rerun }), answered);
   };
   // Follow-ups waiting for the turn ahead of them, oldest first.
   const followUps = [];
@@ -2831,7 +2842,7 @@ export async function createFxEngine(options = {}) {
       if (turnId !== undefined && journal) {
         if (resumable && turnId === openTurnId) {
           resumable = false;
-          return normalizeTurn(startTurn(null, { ...promptOptions, [resumeTurn]: true, [rerunCallIds]: rerunIds(promptOptions.onAmbiguous) }));
+          return resumeOpenTurn(promptOptions);
         }
         if (turnId === lastTurnId) return endedTurn(turnId);
       }
@@ -2855,7 +2866,7 @@ export async function createFxEngine(options = {}) {
       checkOnAmbiguous(promptOptions.onAmbiguous);
       if (resumable) {
         resumable = false;
-        return normalizeTurn(startTurn(null, { ...promptOptions, [resumeTurn]: true, [rerunCallIds]: rerunIds(promptOptions.onAmbiguous) }));
+        return resumeOpenTurn(promptOptions);
       }
       // With no open turn, the follow-ups the journal held are the work left.
       const next = followUps.find((entry) => entry.held);
@@ -2959,7 +2970,9 @@ export async function createFxEngine(options = {}) {
   };
   return agent;
 
-  function normalizeTurn(rawTurn) {
+  // `answered`: calls a resumed turn answers as possibly run before it goes
+  // on, whose `tool_end` comes first.
+  function normalizeTurn(rawTurn, answered = []) {
     const toolNames = new Map();
     const started = new Set();
     const eventFor = (update) => {
@@ -3017,6 +3030,9 @@ export async function createFxEngine(options = {}) {
       [engineInternals]: rawTurn[engineInternals],
       [Symbol.asyncIterator]() {
         const iterator = (async function* () {
+          for (const call of answered) {
+            yield { type: "tool_end", id: call.id, name: call.name, content: unfinishedToolOutput, isError: true };
+          }
           for await (const update of rawTurn) {
             const event = eventFor(update);
             if (event) yield event;

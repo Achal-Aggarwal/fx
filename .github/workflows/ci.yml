@@ -303,6 +303,7 @@ jobs:
           node sdk/tests/test-durable-core.mjs memory
           node sdk/tests/test-durable-core.mjs local
           node sdk/tests/test-durable-core.mjs world
+          node sdk/tests/test-durable-core.mjs queue
 
   sdk-bun:
     name: SDK (Bun + N-API/WASM)
@@ -376,6 +377,7 @@ jobs:
           bun sdk/tests/model/drive.mjs lookup --walks 20 --seed 9 --durability world
           bun sdk/tests/model/drive.mjs cutoff --walks 20 --seed 5
           bun sdk/tests/model/drive.mjs leased --walks 40 --seed 12
+          bun sdk/tests/model/drive.mjs queue --walks 40 --seed 4
           bun sdk/tests/model/drive-steer.mjs ideal --walks 20 --seed 2
           bun sdk/tests/model/drive-steer.mjs faults --walks 20 --seed 4
           bun sdk/tests/model/drive-steer.mjs faults --walks 10 --seed 6 --backend wasm

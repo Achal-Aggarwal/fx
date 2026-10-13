@@ -34,6 +34,13 @@
 (* one that lands after a worker wakes keeps its lease when it still heads *)
 (* the chain, and stops it when another worker took the session over.      *)
 (*                                                                         *)
+(* With QueueHeld, the queue shows whether a holder lives, as Vercel       *)
+(* Queues does: a holder's delivery keeps its message from every other     *)
+(* delivery while it runs, and nothing is renewed. A freeze is the queue   *)
+(* giving up on that delivery, and only the delivery it hands the holder's *)
+(* message to treats the lease as dead; every other worker still finds it  *)
+(* held.                                                                   *)
+(*                                                                         *)
 (* Shortly before its deadline a worker's own timer stops it: it cuts off  *)
 (* the call still running, hands the open turn back to the log, and the    *)
 (* same message comes back for a new delivery. So a lease that runs out at *)
@@ -62,7 +69,9 @@ CONSTANTS
     ClaimFenced, \* whether a claim on a stale read is refused
     MaxCutoffs,  \* cut-offs of one step in a row before it is not run again
     CutoffBound, \* whether that bound applies
-    Heartbeat    \* whether a holder renews a short lease while it runs
+    Heartbeat,   \* whether a holder renews a short lease while it runs
+    QueueHeld    \* whether only the queue's redelivery of a frozen holder's
+                 \* message frees its lease
 
 ASSUME Tool \in {"lookup", "send"}
 ASSUME SelfStop \in BOOLEAN
@@ -70,6 +79,8 @@ ASSUME ClaimFenced \in BOOLEAN
 ASSUME MaxCutoffs \in Nat
 ASSUME CutoffBound \in BOOLEAN
 ASSUME Heartbeat \in BOOLEAN
+ASSUME QueueHeld \in BOOLEAN
+ASSUME ~(QueueHeld /\ Heartbeat)
 
 None == "none"
 Waiting == {"announce", "model1", "tool", "model2"}
@@ -90,9 +101,12 @@ VARIABLES
     chain,     \* how many counted writes the chain holds
     cutoffs,   \* deadline cut-offs in a row since the turn's last record
     seen,      \* what each worker read before its claim
+    lapse,     \* with QueueHeld: "open" once the queue gave up on the
+               \* holder's delivery, the worker it then handed the
+               \* holder's message to, or "none"
     act        \* the step that led here
 
-vars == <<pc, epoch, frozen, lease, progress, runs, ui, freezes, froze, chain, cutoffs, seen, act>>
+vars == <<pc, epoch, frozen, lease, progress, runs, ui, freezes, froze, chain, cutoffs, seen, lapse, act>>
 
 TypeOK ==
     /\ pc \in [Workers -> {"none", "early", "announce", "model1", "tool", "model2", "done", "stopped"}]
@@ -107,6 +121,7 @@ TypeOK ==
     /\ chain \in Nat
     /\ cutoffs \in Nat
     /\ seen \in [Workers -> [chain: Nat, progress: Progress, epoch: 0..MaxEpoch, cutoffs: Nat]]
+    /\ lapse \in Workers \cup {"none", "open"}
     /\ act \in [name: {"Init", "Start", "Claim", "Announce", "Model1", "ToolEnd", "Model2",
                        "Freeze", "Wake", "Deadline", "Expire"},
                 w: Workers \cup {None}]
@@ -124,6 +139,7 @@ Init ==
     /\ chain = 0
     /\ cutoffs = 0
     /\ seen = [w \in Workers |-> [chain |-> 0, progress |-> "start", epoch |-> 0, cutoffs |-> 0]]
+    /\ lapse = "none"
     /\ act = [name |-> "Init", w |-> None]
 
 \* A worker's writes count while its claim heads the lease chain.
@@ -142,17 +158,27 @@ ShownAt(lines) == {i \in 1..Len(lines) : \A j \in 1..(i - 1) : lines[j].e <= lin
 \* What w reads now: where the chain stands and how far it recorded the turn.
 Read == [chain |-> chain, progress |-> progress, epoch |-> lease.epoch, cutoffs |-> cutoffs]
 
-\* Whether w, reading now, finds work it can claim.
-CanClaim == progress # "done" /\ (lease.holder = None \/ ~lease.live)
+\* Whether w, reading now, finds work it can claim. With QueueHeld, a frozen
+\* holder's lease is dead only to the delivery its message was handed to.
+CanClaim(w) == progress # "done" /\ (lease.holder = None \/ (~lease.live /\ (~QueueHeld \/ lapse = w)))
 
 \* w receives work for the session, reads the log, and finds no live worker
 \* holding it. It writes its claim and sends its first model request at
-\* once; nothing it does shows or counts until the claim lands.
+\* once; nothing it does shows or counts until the claim lands. With
+\* QueueHeld, the work that finds a frozen holder is that holder's message,
+\* which the queue hands to w.
 Start(w) ==
     /\ pc[w] \in {"none", "stopped"}
     /\ ~frozen[w]
-    /\ CanClaim
     /\ lease.epoch < MaxEpoch
+    /\ \/ /\ CanClaim(w)
+          /\ UNCHANGED lapse
+       \/ /\ QueueHeld
+          /\ progress # "done"
+          /\ lease.holder # None
+          /\ ~lease.live
+          /\ lapse = "open"
+          /\ lapse' = w
     /\ pc' = [pc EXCEPT ![w] = "early"]
     /\ seen' = [seen EXCEPT ![w] = Read]
     /\ UNCHANGED <<epoch, frozen, lease, progress, runs, ui, freezes, froze, chain, cutoffs>>
@@ -173,9 +199,10 @@ Claim(w) ==
                /\ chain' = chain + 1
                /\ pc' = [pc EXCEPT ![w] = "announce"]
                /\ froze' = [froze EXCEPT ![w] = FALSE]
+               /\ lapse' = "none"
                /\ UNCHANGED seen
-          ELSE /\ UNCHANGED <<lease, epoch, chain, froze>>
-               /\ IF CanClaim
+          ELSE /\ UNCHANGED <<lease, epoch, chain, froze, lapse>>
+               /\ IF CanClaim(w)
                      THEN /\ pc' = [pc EXCEPT ![w] = "early"]
                           /\ seen' = [seen EXCEPT ![w] = Read]
                      ELSE /\ pc' = [pc EXCEPT ![w] = "none"]
@@ -187,7 +214,8 @@ Claim(w) ==
 \* continues the turn from what it read before its claim. A call left
 \* running is rerun only when it is safe to run twice; otherwise the model
 \* is told it may have partly run, which is stored as the call's result,
-\* and the turn goes on to the answer. The records this writes are left out
+\* its viewers see the call end with that answer, and the turn goes on to
+\* the answer. The records this writes are left out
 \* of `chain`: in the code it follows its claim at once, and fewer chain
 \* moves only let the model do more. A step
 \* cut off MaxCutoffs times in a row is not run again: a call is answered
@@ -209,22 +237,24 @@ Announce(w) ==
                           /\ ui' = ui \o <<Line(w), Line(w)>>
                           /\ chain' = chain + 1
                           /\ cutoffs' = 0
+                          /\ lapse' = "none"
                      ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
                           /\ ui' \in {Append(ui, Line(w)), ui \o <<Line(w), Line(w)>>}
-                          /\ UNCHANGED <<progress, lease, chain, cutoffs>>
+                          /\ UNCHANGED <<progress, lease, chain, cutoffs, lapse>>
           ELSE /\ pc' = [pc EXCEPT ![w] =
                           CASE from = "start" -> "model1"
                             [] from = "intent" -> IF rerun THEN "tool" ELSE "model2"
                             [] from \in {"result", "done"} -> "model2"]
                /\ runs' = IF rerun THEN runs + 1 ELSE runs
-               \* then tool_start for a rerun
-               /\ ui' = IF rerun THEN ui \o <<Line(w), Line(w)>> ELSE Append(ui, Line(w))
+               \* then tool_start for a rerun, or tool_end for a call answered
+               \* as possibly run
+               /\ ui' = IF from = "intent" THEN ui \o <<Line(w), Line(w)>> ELSE Append(ui, Line(w))
                \* a call answered as possibly run is the turn's next record
                /\ IF from = "intent" /\ ~rerun /\ Heads(w)
                      THEN /\ progress' = "result"
                           /\ cutoffs' = 0
                      ELSE UNCHANGED <<progress, cutoffs>>
-               /\ UNCHANGED <<lease, chain>>
+               /\ UNCHANGED <<lease, chain, lapse>>
     /\ UNCHANGED <<epoch, frozen, freezes, froze, seen>>
     /\ act' = [name |-> "Announce", w |-> w]
 
@@ -244,7 +274,7 @@ Model1(w) ==
                /\ UNCHANGED <<progress, runs>>
     /\ chain' = IF Heads(w) THEN chain + 1 ELSE chain
     /\ cutoffs' = IF Heads(w) THEN 0 ELSE cutoffs
-    /\ UNCHANGED <<epoch, frozen, lease, freezes, froze, seen>>
+    /\ UNCHANGED <<epoch, frozen, lease, freezes, froze, seen, lapse>>
     /\ act' = [name |-> "Model1", w |-> w]
 
 \* The tool returns, and its result goes to the chain.
@@ -260,7 +290,7 @@ ToolEnd(w) ==
                /\ UNCHANGED progress
     /\ chain' = IF Heads(w) THEN chain + 1 ELSE chain
     /\ cutoffs' = IF Heads(w) THEN 0 ELSE cutoffs
-    /\ UNCHANGED <<epoch, frozen, lease, runs, freezes, froze, seen>>
+    /\ UNCHANGED <<epoch, frozen, lease, runs, freezes, froze, seen, lapse>>
     /\ act' = [name |-> "ToolEnd", w |-> w]
 
 \* The model answers; the turn ends and the worker lets the session go.
@@ -271,17 +301,19 @@ Model2(w) ==
           THEN /\ progress' = "done"
                /\ pc' = [pc EXCEPT ![w] = "done"]
                /\ lease' = [lease EXCEPT !.holder = None, !.live = FALSE]
+               /\ lapse' = "none"
                \* the answer's text, then turn_end
                /\ ui' = ui \o <<Line(w), Line(w)>>
           ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
                /\ MaybeLine(w)
-               /\ UNCHANGED <<progress, lease>>
+               /\ UNCHANGED <<progress, lease, lapse>>
     /\ chain' = IF Heads(w) THEN chain + 1 ELSE chain
     /\ cutoffs' = IF Heads(w) THEN 0 ELSE cutoffs
     /\ UNCHANGED <<epoch, frozen, runs, freezes, froze, seen>>
     /\ act' = [name |-> "Model2", w |-> w]
 
-\* w freezes while it waits; its lease no longer counts as alive.
+\* w freezes while it waits; its lease no longer counts as alive. With
+\* QueueHeld, the queue gives up on its delivery and will hand its message on.
 Freeze(w) ==
     /\ pc[w] \in Waiting
     /\ ~frozen[w]
@@ -290,6 +322,7 @@ Freeze(w) ==
     /\ freezes' = freezes + 1
     /\ froze' = [froze EXCEPT ![w] = TRUE]
     /\ lease' = IF lease.holder = w THEN [lease EXCEPT !.live = FALSE] ELSE lease
+    /\ lapse' = IF QueueHeld /\ lease.holder = w /\ lapse = "none" THEN "open" ELSE lapse
     /\ UNCHANGED <<pc, epoch, progress, runs, ui, chain, cutoffs, seen>>
     /\ act' = [name |-> "Freeze", w |-> w]
 
@@ -309,7 +342,7 @@ Wake(w) ==
           /\ ~Heads(w)
           /\ pc' = [pc EXCEPT ![w] = "stopped"]
           /\ UNCHANGED <<lease, chain>>
-    /\ UNCHANGED <<epoch, progress, runs, ui, freezes, froze, cutoffs, seen>>
+    /\ UNCHANGED <<epoch, progress, runs, ui, freezes, froze, cutoffs, seen, lapse>>
     /\ act' = [name |-> "Wake", w |-> w]
 
 \* Shortly before its deadline, w's own timer stops it and cuts off the call
@@ -337,9 +370,10 @@ Deadline(w) ==
                   \/ /\ lease' = [lease EXCEPT !.holder = None, !.live = FALSE]
                      /\ pc' = [pc EXCEPT ![w] = "none"]
                      /\ UNCHANGED <<epoch, froze, seen>>
+               /\ lapse' = "none"
           ELSE /\ pc' = [pc EXCEPT ![w] = "stopped"]
                /\ MaybeLine(w)
-               /\ UNCHANGED <<epoch, lease, froze, chain, cutoffs, seen>>
+               /\ UNCHANGED <<epoch, lease, froze, chain, cutoffs, seen, lapse>>
     /\ UNCHANGED <<frozen, progress, runs, freezes>>
     /\ act' = [name |-> "Deadline", w |-> w]
 
@@ -352,7 +386,7 @@ Expire(w) ==
     /\ Heads(w)
     /\ lease.live
     /\ lease' = [lease EXCEPT !.live = FALSE]
-    /\ UNCHANGED <<pc, epoch, frozen, progress, runs, ui, freezes, froze, chain, cutoffs, seen>>
+    /\ UNCHANGED <<pc, epoch, frozen, progress, runs, ui, freezes, froze, chain, cutoffs, seen, lapse>>
     /\ act' = [name |-> "Expire", w |-> w]
 
 Next ==
