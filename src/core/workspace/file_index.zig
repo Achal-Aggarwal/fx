@@ -1703,10 +1703,10 @@ fn alignBest(
 }
 
 /// Points a placement inside the file or folder name earns over one that
-/// starts in a parent folder. Equal matches favor the name, so `button.tsx`
-/// stays above `button/index.tsx`, while a clean folder-plus-name match such
-/// as `vercle` for `vercel-json/clean-urls.mdx` can still beat letters
-/// scattered through a name.
+/// starts in the folder holding the name. A close call favors the name, so
+/// for `abcd`, `src/x/ab-cd.ts` stays above `src/ab/cd.ts`, while a clean
+/// folder-plus-name match such as `vercle` for `vercel-json/clean-urls.mdx`
+/// can still beat letters scattered through a name.
 const name_bonus: i32 = 4;
 
 comptime {
@@ -1730,7 +1730,7 @@ fn maxCrossingQuality(comptime T: type, query: []const T) i32 {
 const Needed = struct {
     /// Placements that end in a parent folder.
     folder: bool = true,
-    /// Placements that start in a parent folder and end in the name.
+    /// Placements that start in the folder holding the name and end in the name.
     crossing: bool = true,
 };
 
@@ -1746,8 +1746,8 @@ const Placement = struct {
 /// folder. Among those, the best placement inside the name, plus
 /// `name_bonus`, competes with the best one that starts in the folder that
 /// holds the name, as in `vercle` for `vercel-json/clean-urls.mdx`. Crossing
-/// placements stop at that folder so their search stays as short as the
-/// name's.
+/// placements start no higher than that folder, so their search covers only
+/// the folder and the name.
 fn choosePlacement(
     comptime T: type,
     text: []const T,
@@ -2507,16 +2507,16 @@ test "score comparison ranks tiers before alignment quality and position" {
     var exact = base;
     exact.exact_fit = true;
     exact.quality = 0;
-    var basename = base;
-    basename.name_fit = true;
-    basename.quality = 0;
+    var name_match = base;
+    name_match.name_fit = true;
+    name_match.quality = 0;
     var stronger = base;
     stronger.quality = 11;
     stronger.first_position = 9;
     var earlier = base;
     earlier.first_position = 4;
-    try std.testing.expect(scoreBetter(exact, basename));
-    try std.testing.expect(scoreBetter(basename, stronger));
+    try std.testing.expect(scoreBetter(exact, name_match));
+    try std.testing.expect(scoreBetter(name_match, stronger));
     try std.testing.expect(scoreBetter(stronger, earlier));
     try std.testing.expect(scoreBetter(earlier, base));
     try std.testing.expect(!scoreBetter(base, base));
