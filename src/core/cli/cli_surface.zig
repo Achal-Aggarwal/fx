@@ -400,6 +400,9 @@ const GlobalLaunchArgs = struct {
     }
 };
 
+/// Parses the launch flags `fx` and `fx ask` share. How `--model`, `--fast`,
+/// `--ultrafast`, and `--effort` reach the first turn is modeled in
+/// `tests/tla/cli/LaunchSelection.tla`.
 fn parseGlobalLaunchArgs(
     alloc: Allocator,
     args: []const [:0]const u8,

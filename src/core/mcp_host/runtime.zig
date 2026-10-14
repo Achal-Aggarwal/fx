@@ -4,6 +4,10 @@
 //! engine's servers (`config.zig`), keeps sign-in credentials
 //! (`credentials.zig`), and runs logins on a loopback listener (`login.zig`).
 //! Chosen with FX_MCP_ENGINE=v2 until v1 is removed.
+//!
+//! TLA+ models: `tests/tla/mcp_host/HostLifecycle.tla`,
+//! `tests/tla/mcp_host/SignIn.tla`, `tests/tla/mcp_host/SharedLogins.tla`, and
+//! `tests/tla/mcp_host/ElicitationRouting.tla`.
 
 const std = @import("std");
 const mcp = @import("../../mcp/mcp.zig");

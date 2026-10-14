@@ -1,7 +1,7 @@
 --------------------------- MODULE ShellContract ---------------------------
 (***************************************************************************)
-(* One model turn of fx's shell tool pipeline, as traced in                *)
-(* ../data-flow.md (fx 6bdd497, orchestrator.zig processQueuedPromptLoop): *)
+(* One model turn of fx's shell tool pipeline (src/tools/shell/shell.zig    *)
+(* decode, src/core/agent/runtime/orchestrator.zig processQueuedPromptLoop):*)
 (*                                                                         *)
 (*   model emits a call -> gateway passes the bytes unchanged              *)
 (*     -> orchestrator normalizes (unwraps an exact {"request":{...}})     *)

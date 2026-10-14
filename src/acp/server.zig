@@ -3185,6 +3185,9 @@ fn handleCloseSession(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Messa
     try state.writer.writeResponse(alloc, msg.id, "{}");
 }
 
+/// Handles `session/set_config_option`. The `mode` option is modeled in
+/// `tests/tla/acp/AcpPermissionModes.tla`, and `fast` and `ultrafast` in
+/// `tests/tla/acp/AcpSpeed.tla`.
 fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
@@ -3927,6 +3930,8 @@ fn commitActiveSessionUltrafast(
     session.ultrafast_mode = ultrafast;
 }
 
+/// Handles the older `session/set_mode`, modeled with the `mode` option in
+/// `tests/tla/acp/AcpPermissionModes.tla`.
 fn handleSetMode(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void {
     const params = msg.params_raw orelse return state.writer.writeError(alloc, msg.id, .{
         .code = ErrorCode.invalid_params,
