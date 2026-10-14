@@ -21,6 +21,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -264,7 +265,7 @@ def selftest():
          [made, ob("crash", dirty=True)], "REJECTED"),
     ]
     bad = 0
-    root = Path(os.environ.get("TMPDIR", "/tmp")) / f"check-conversion-selftest-{os.getpid()}"
+    root = Path(tempfile.mkdtemp(prefix="check-conversion-selftest-"))
     for n, (label, observations, want) in enumerate(cases, 1):
         try:
             got = verify({"version": 1, "ids": ids, "observations": observations}, root / str(n))

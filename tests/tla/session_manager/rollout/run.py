@@ -15,7 +15,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import uuid
 
 ROOT = Path(__file__).resolve().parent
 
@@ -142,8 +141,9 @@ def main():
     if not jar.is_file():
         raise RuntimeError(f'missing {jar} (set TLA2TOOLS_JAR)')
     pin = {'sha256': sha256(jar)}
-    report = Path(tempfile.gettempdir()) / 'fx-tla' / 'session-rollout' / (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:8])
-    report.mkdir(parents=True)
+    # A new private folder (mkdtemp), so another user cannot plant a file or
+    # link where a report will be written.
+    report = Path(tempfile.mkdtemp(prefix='fx-tla-session-rollout-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-'))
     (report / 'environment.json').write_text(json.dumps({'java': java, 'version': version,
         'arguments': vars(args),
         'toolchain': pin}, indent=2) + '\n')

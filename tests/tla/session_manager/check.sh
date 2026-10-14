@@ -39,8 +39,10 @@ fi
 
 all="SessionLog TurnLifecycle WriterLock ResumeSnapshot Fork Subagents Catalog Lifecycle Wiring MoveSideFiles V1Conversion"
 specs="${*:-$all}"
-work="${TMPDIR:-/tmp}/session-manager-tlc"
-mkdir -p "$work"
+# A new private folder per run for TLC state, so nothing planted in the temp
+# folder can redirect it. TLC prints to the terminal, so it is removed.
+work="$(mktemp -d "${TMPDIR:-/tmp}/session-manager-tlc.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
 
 status=0
 for spec in $specs; do

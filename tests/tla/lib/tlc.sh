@@ -20,8 +20,9 @@
 # must finish without an error. Blank lines and lines starting with # are skipped. Pass config
 # names as arguments to run only those checks. It prints one ok or FAIL line
 # per check and returns 1 when any check misses its verdict, or when an
-# argument names no config. Logs go to $tlc_work, which defaults to a folder
-# under TMPDIR.
+# argument names no config. Logs go to $tlc_work, a new private folder that
+# mktemp -d makes under TMPDIR for each run, so another user cannot plant a
+# file or link where a log will be written.
 
 tlc_find() {
     tlc_jar="${TLA2TOOLS_JAR:-$HOME/.local/share/tla/tla2tools.jar}"
@@ -49,8 +50,11 @@ tlc_find() {
 
 tlc_verdicts() {
     tlc_find
-    tlc_work="${tlc_work:-${TMPDIR:-/tmp}/fx-tla/$(basename "$(pwd)")}"
-    mkdir -p "$tlc_work"
+    tlc_work="$(mktemp -d "${TMPDIR:-/tmp}/fx-tla-$(basename "$(pwd)").XXXXXX")" || {
+        echo "cannot create a private folder under ${TMPDIR:-/tmp}" >&2
+        exit 2
+    }
+    echo "logs: $tlc_work"
     tlc_status=0
     tlc_ran=""
     while read -r spec config expect flags; do

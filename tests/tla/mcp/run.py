@@ -10,7 +10,7 @@ Modes:
 
 Exit codes: 0 every selected run passed (PASS, SAMPLED, CAUGHT), 1 a run failed,
 2 usage or tooling error. Results go to <evidence-dir>/<unit>/tlc/<UTC>-<id>/, by
-default under the system temp folder.
+default in a new private folder under the system temp folder.
 """
 import argparse
 from datetime import datetime, timezone
@@ -263,7 +263,7 @@ def main(argv=None):
     parser.add_argument('--traces', type=int, default=1000)
     parser.add_argument('--depth', type=int, default=100)
     parser.add_argument('--spec-dir', default=str(HERE))
-    parser.add_argument('--evidence-dir', default=str(Path(tempfile.gettempdir()) / 'fx-tla' / 'mcp'))
+    parser.add_argument('--evidence-dir', default=None)
     args = parser.parse_args(argv)
     if args.workers < 1 or args.traces < 1 or args.depth < 1 or not 0 <= args.fp <= 63:
         parser.error('workers, traces and depth must be positive; fp must be 0..63')
@@ -291,7 +291,9 @@ def main(argv=None):
     java, java_version = find_java()
     jar, pin = pinned_jar()
     run_id = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:8]
-    evidence = Path(args.evidence_dir).resolve()
+    # By default a new private folder (mkdtemp), so another user cannot plant
+    # a file or link where a log will be written.
+    evidence = Path(args.evidence_dir or tempfile.mkdtemp(prefix='fx-tla-mcp-')).resolve()
     reports = {}
     for unit in sorted({e['unit'] for e, _, _, _ in runs}):
         reports[unit] = evidence / unit / 'tlc' / run_id

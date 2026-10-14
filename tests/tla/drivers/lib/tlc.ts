@@ -7,7 +7,7 @@
 // zig-out/bin/fx in this checkout. Output goes to FX_TLA_OUT, or a fresh folder
 // under the system temp directory.
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -29,12 +29,13 @@ export function fxBin(): string {
   return bin;
 }
 
-/// A fresh output folder for one driver run. The caller owns its contents.
+/// A new private output folder for one driver run, made by mkdtemp directly
+/// in FX_TLA_OUT or the system temp folder, so another user cannot plant a
+/// file or link where output will be written. The caller owns its contents.
 export function outDir(name: string): string {
-  const base = process.env.FX_TLA_OUT ?? join(tmpdir(), "fx-tla");
-  const dir = join(base, name, utcStamp());
-  mkdirSync(dir, { recursive: true });
-  return dir;
+  const base = process.env.FX_TLA_OUT;
+  if (base) mkdirSync(base, { recursive: true });
+  return mkdtempSync(join(base ?? tmpdir(), `fx-tla-${name}-${utcStamp()}-`));
 }
 
 export type Toolchain = { java: string; javaVersion: string; jar: string; jarSha256: string };

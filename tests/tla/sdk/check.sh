@@ -27,8 +27,11 @@ for candidate in "${JAVA_HOME:+$JAVA_HOME/bin/java}" /opt/homebrew/opt/openjdk/b
 done
 [ -n "$java" ] || { echo "no working Java runtime (set JAVA_HOME or brew install openjdk)" >&2; exit 2; }
 
-work="${TMPDIR:-/tmp}/libfx-model-tlc"
-mkdir -p "$work" graphs
+# A new private folder per run for logs and TLC state, so nothing planted in
+# the temp folder can redirect them. Logs print on failure, so it is removed.
+work="$(mktemp -d "${TMPDIR:-/tmp}/libfx-model-tlc.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+mkdir -p graphs
 status=0
 for tool in send lookup write cutoff leased queue; do
     echo "== DurableSession ($tool)"

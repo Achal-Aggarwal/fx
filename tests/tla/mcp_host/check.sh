@@ -19,6 +19,7 @@
 set -eu
 
 cd "$(dirname "$0")"
-out="${TMPDIR:-/tmp}/fx-tla/mcp_host"
-mkdir -p "$out"
+# A new private folder per run, so nothing planted in the temp folder can
+# redirect the gate's output.
+out="$(mktemp -d "${TMPDIR:-/tmp}/fx-tla-mcp_host.XXXXXX")"
 exec bun ../drivers/mcp_host/model.ts "$out" "$@"

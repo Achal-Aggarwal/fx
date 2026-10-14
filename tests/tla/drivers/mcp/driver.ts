@@ -192,7 +192,8 @@ async function main(): Promise<number> {
   const id = runId();
   const out = outDir("mcp");
   const needs = [...new Set(scenarios.flatMap((s) => s.needs))].sort();
-  const binDir = join(tmpdir(), `mcpv2-bin-${id}`);
+  // mkdtemp, not a name from the run id: the driver runs what it builds here.
+  const binDir = mkdtempSync(join(tmpdir(), `mcpv2-bin-${id}-`));
   const built = build(needs, binDir);
   const environment = { runId: id, treeSha256: treeHash(), binaries: built, bun: Bun.version, args };
   const bins = Object.fromEntries(Object.entries(built).map(([name, b]) => [name, b.path]));
