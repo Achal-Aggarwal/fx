@@ -16,6 +16,7 @@
 #   bun drive-intake.mjs   # prompts with image bytes and files
 #   bun drive-images.mjs   # images stored once, across crashes and reopens
 #   bun drive-agents.mjs send && bun drive-agents.mjs consume   # AgentRouting
+#   bun drive-steer.mjs ideal && bun drive-steer.mjs faults
 set -eu
 cd "$(dirname "$0")"
 
@@ -64,6 +65,33 @@ for pair in UiInOrder:UiInOrder NoStaleShown:NoStaleShown NotTwoActive:NotTwoAct
         echo "== witness $witness reached"
     else
         echo "== witness $witness NOT reached" >&2; status=1
+    fi
+done
+# DurableSteer.tla: where each message a user sends ends up. The ideal graph
+# has no faults, and the faults graph adds cancels, deadline handoffs and
+# client retries.
+for graph in ideal faults; do
+    echo "== DurableSteer ($graph)"
+    if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
+        -metadir "$work/steer-$graph" -dump dot,actionlabels "graphs/steer-$graph" \
+        -config "DurableSteer-$graph.cfg" DurableSteer.tla > "$work/steer-$graph.log" 2>&1; then
+        cat "$work/steer-$graph.log"; status=1; continue
+    fi
+    grep -E 'distinct states|depth of' "$work/steer-$graph.log"
+done
+# Each witness turns one rule off and must break the property it protects:
+# without Interrupt a steer waits on a streaming reply, without HandBack a
+# cancel loses a steer that never reached the model, without JoinBeforeStart
+# a steer sent before the first turn starts runs as a turn of its own, and
+# without Dedupe a retried steer reaches the model twice.
+for pair in NoInterrupt:NoSteerWaitsOnReply NoHandBack:NothingLost \
+    NoJoinBeforeStart:PreStartJoins NoDedupe:AtMostOnce; do
+    witness="${pair%%:*}" invariant="${pair#*:}"
+    if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/sw-$witness" \
+        -config "SteerWitness-$witness.cfg" DurableSteer.tla 2>&1 | grep -q -E "Invariant $invariant is violated"; then
+        echo "== steer witness $witness reached"
+    else
+        echo "== steer witness $witness NOT reached" >&2; status=1
     fi
 done
 

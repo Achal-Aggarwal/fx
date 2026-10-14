@@ -112,6 +112,7 @@ function fxTurn(turn, exited) {
   return {
     result,
     steer: (text, id) => turn.steer(text, id),
+    endForSteer: () => turn[engineInternals]?.endForSteer(),
     cancel: (options) => turn.cancel(options),
     async *[Symbol.asyncIterator]() {
       try {
@@ -129,6 +130,7 @@ function refusedTurn(error) {
   return {
     result: Promise.resolve({ stopReason: "error", usage: {}, error: { name: error?.name ?? "Error", message: String(error?.message ?? error) } }),
     steer: async () => {},
+    endForSteer: async () => {},
     cancel() {},
     async *[Symbol.asyncIterator]() {},
   };

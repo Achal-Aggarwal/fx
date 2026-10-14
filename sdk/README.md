@@ -55,8 +55,8 @@ agent.session(sessionId).prompt("Start with the schema.");
 
 - **One turn at a time.** A prompt sent while a turn runs waits behind it, even when it reaches a different server.
 - **Turns finish on their own.** A turn runs to the end whether or not anyone reads its events, and a turn nobody reads holds no connection open: its view starts reading only once you use its events, `readable` or `result`. Stop it with `session.cancel()`, or with the `signal` you passed to `prompt()`.
-- **Steering.** `session.steer(text)` adds guidance to the running turn at its next model request. When no turn is running, the text becomes the next turn.
-- **Retries are safe.** Give a prompt a `messageId`, and a repeated request with the same id runs nothing new. It follows the original turn, and its result has `repeated: true`.
+- **Steering.** `session.steer(input)` steers the running turn the way the fx CLI does. While the model streams a reply, the steer cuts it short and the turn continues with it. While a tool runs, the steer waits for the tool. A steer sent while a turn waits to start joins that turn, and when no turn runs or waits, the steer becomes the next turn. A steer with images can't join a turn, so the running turn ends at its next safe point and the steer runs next.
+- **Retries are safe.** Give a prompt or a steer a `messageId`, and a repeated request with the same id runs nothing new. A repeated prompt follows the original turn, and its result has `repeated: true`. One id names one input, so a steer that reuses a prompt's id is rejected with `FX_MESSAGE_ID_IN_USE`. On a queue that keeps messages past the process, such as `vercel()`'s, the sender doesn't read the session first, so the worker drops that steer and emits a `session.error` with the same code. A steer's `user_message` event carries its id as `id` where it joined a turn.
 - **A refused prompt is never stored.** `prompt()` checks a prompt as the engine's `prompt()` does and throws a `TypeError` or `RangeError` for one libfx would refuse, such as an empty prompt, base64 that isn't canonical, an image whose bytes aren't its type, or more than 8 images. A `File` or `Blob` is checked by its size and type at once and by its bytes once read; if those are refused, `turn.accepted` rejects before anything is stored. A prompt whose `signal` aborts before the prompt is stored isn't stored either, and its turn ends `cancelled`.
 
 Each conversation can bring its own settings, which apply to the turns that session object starts:
@@ -432,7 +432,7 @@ An engine differs from a session:
 
 - On AI Gateway, it needs an `apiKey`.
 - One prompt runs at a time, and breaking out of a turn's events cancels the turn.
-- The turn itself has `cancel()` and `steer()`.
+- The turn itself has `cancel()` and `steer()`. Like a session's steer, it cuts a streaming reply short and waits for a running tool, and it takes text only.
 
 To have the engine record the conversation as it runs, pass a `persistence` store instead of a checkpoint. A new engine on the same store can then `resume()` a turn the last process left open. A store needs two methods and can add the others, and the bytes are opaque, so it never has to understand them:
 
