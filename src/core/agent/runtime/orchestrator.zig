@@ -7578,7 +7578,14 @@ fn processQueuedPromptLoop(
                             .tool_steps = finalization.compacted_execution.tool_steps + active_cut.tool_steps,
                             .steering = finalization.compacted_execution.steering + active_cut.steering,
                         };
-                        if (overflow_pending) context_overflow_recovery = .used;
+                        if (overflow_pending) {
+                            context_overflow_recovery = .used;
+                            // The shorter history can fit more images than the
+                            // request last refused for its size carried, so size
+                            // retries count again from the next refusal. This
+                            // happens once per step, so the retries still end.
+                            request_images_last_refused = null;
+                        }
                         compactor.traceEvent(
                             step_ctx,
                             .installed,
