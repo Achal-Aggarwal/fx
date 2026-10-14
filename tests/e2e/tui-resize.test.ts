@@ -4893,8 +4893,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
       const lightReplayStart = stdoutAfterLightTheme.lastIndexOf("\x1b[3J");
       expect(lightReplayStart).toBeGreaterThanOrEqual(0);
       const lightReplayAndTail = stdoutAfterLightTheme.slice(lightReplayStart);
-      expect(lightReplayAndTail).toContain("\x1b[38;5;247m");
-      expect(lightReplayAndTail).not.toContain("\x1b[38;5;245m");
+      expect(lightReplayAndTail).toContain(`\x1b[38;5;235m${inlineMarker}`);
+      expect(lightReplayAndTail).not.toContain(`\x1b[38;5;255m${inlineMarker}`);
       const resetCountAfter = countOccurrences(
         Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString(),
         "\x1b[3J",
