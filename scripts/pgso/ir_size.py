@@ -33,8 +33,8 @@ import re
 import sys
 
 OUT_OF_LINE_HELPERS = (
-    r"mem\.Allocator\.free(?:__anon_\d+)?",
-    r"mem\.Allocator\.(?:remap|allocBytesWithAlignment)__anon_\d+",
+    r"mem\.Allocator\.free(?:__func_\d+)?",
+    r"mem\.Allocator\.(?:remap|allocBytesAligned)__func_\d+",
     r"Io\.Writer\.(?:writeAll|write|Allocating\.deinit|Allocating\.initCapacity)",
     r"array_list\.Aligned\(u8,null\)\.(?:appendSlice|deinit)",
 )

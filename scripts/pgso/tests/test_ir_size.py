@@ -10,14 +10,14 @@ import unittest
 from scripts.pgso.pipeline import _require_bitcode_header
 from scripts.pgso.toolchain import IR_SIZE_SCRIPT
 
-LLVM_BIN = pathlib.Path(os.environ.get("FX_PGSO_LLVM_BIN", "/opt/homebrew/opt/llvm@21/bin"))
+LLVM_BIN = pathlib.Path(os.environ.get("FX_PGSO_LLVM_BIN", "/opt/homebrew/opt/llvm@22/bin"))
 LIBLLVM = (LLVM_BIN.parent / "lib" / "libLLVM.dylib").resolve()
 AVAILABLE = (LLVM_BIN / "llvm-as").is_file() and LIBLLVM.is_file()
 
 # The production module layout; alignment decisions depend on it.
 TARGET = (
     'target datalayout = "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32"\n'
-    'target triple = "aarch64-apple-macosx13.0.0-unknown"\n'
+    'target triple = "aarch64-apple-macosx15.0.0-unknown"\n'
 )
 MEMCPY = "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)\n"
 ERROR_UNION = (
@@ -119,9 +119,9 @@ class IrSizeTests(unittest.TestCase):
 
     def test_shared_std_helpers_become_noinline(self) -> None:
         names = (
-            "mem.Allocator.free__anon_12",
+            "mem.Allocator.free__func_12",
             "mem.Allocator.free",
-            "mem.Allocator.remap__anon_7",
+            "mem.Allocator.remap__func_7",
             "Io.Writer.writeAll",
             '"array_list.Aligned(u8,null).deinit"',
             "mem.Allocator.dupe",
@@ -143,9 +143,9 @@ class IrSizeTests(unittest.TestCase):
             line.split("=", 1)[0].strip(): line for line in ir.splitlines() if line.startswith("attributes #")
         }
         for name, expected in (
-            ("mem.Allocator.free__anon_12", True),
+            ("mem.Allocator.free__func_12", True),
             ("mem.Allocator.free", True),
-            ("mem.Allocator.remap__anon_7", True),
+            ("mem.Allocator.remap__func_7", True),
             ("Io.Writer.writeAll", True),
             ('"array_list.Aligned(u8,null).deinit"', True),
             ("mem.Allocator.dupe", False),

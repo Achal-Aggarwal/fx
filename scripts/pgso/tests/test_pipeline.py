@@ -15,6 +15,7 @@ from scripts.pgso.pipeline import (
     IR_OUTLINER_FLAGS,
     OUTLINE_CLEANUP_FLAGS,
     OUTLINE_PARTITIONS,
+    PROFILE_PREPARATION_PASSES,
     PROFILE_SECTION_ALIGNMENTS,
     USE_FLAGS,
     ArtifactSpec,
@@ -382,7 +383,7 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'bitcode')""",
         self.assertEqual(paths.profile_use_bitcode, result)
         lines = actions.read_text().splitlines()
         self.assertEqual(3, len(lines))
-        self.assertIn("-passes=default<O2>,mergefunc,iroutliner", lines[0])
+        self.assertIn(f"-passes={PROFILE_PREPARATION_PASSES},default<O2>,mergefunc,iroutliner", lines[0])
         self.assertIn(f"sparse-constants {paths.profile_use_bitcode} ", lines[1])
         self.assertIn("-passes=globaldce,verify", lines[2])
 
