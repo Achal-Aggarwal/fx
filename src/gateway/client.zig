@@ -2617,12 +2617,11 @@ const GatewayReplayBuilder = struct {
                 try part.text.appendSlice(self.alloc, delta.string);
             } else {
                 const end = std.math.add(usize, part.offset, part.length) catch return error.ProviderStateTooLarge;
-                const text_start = if (separated and part.length == 0)
-                    std.math.sub(usize, content_offset, types.ProviderReplay.message_separator.len) catch return error.InvalidProviderState
-                else
-                    content_offset;
-                if (text_start != end) return error.InvalidProviderState;
-                if (part.length == 0) part.offset = content_offset;
+                const separator_len = types.ProviderReplay.message_separator.len;
+                // A part opened before the separator starts its text after it.
+                if (separated and part.length == 0 and content_offset >= separator_len and content_offset - separator_len == end) {
+                    part.offset = content_offset;
+                } else if (content_offset != end) return error.InvalidProviderState;
                 part.length = std.math.add(usize, part.length, delta.string.len) catch return error.ProviderStateTooLarge;
             }
         }
@@ -4704,6 +4703,15 @@ test "Gateway separates provider message items in assistant text" {
             .{ .id = "0", .item = null, .fragments = &.{"Paris is "} },
             .{ .id = "1", .item = null, .fragments = &.{"the capital."} },
         }, .expected = "Paris is the capital.", .separators = 0 },
+        // Both neighbors must be message items before they are separated.
+        .{ .messages = &.{
+            .{ .id = "A", .item = .{ .phase = "final_answer" }, .fragments = &.{"Paris is "} },
+            .{ .id = "1", .item = null, .fragments = &.{"the capital."} },
+        }, .expected = "Paris is the capital.", .separators = 0 },
+        .{ .messages = &.{
+            .{ .id = "0", .item = null, .fragments = &.{"Paris is "} },
+            .{ .id = "B", .item = .{ .phase = "final_answer" }, .fragments = &.{"the capital."} },
+        }, .expected = "Paris is the capital.", .separators = 0 },
     };
     for (cases) |case| {
         var payload: std.Io.Writer.Allocating = .init(alloc);
@@ -4724,7 +4732,7 @@ test "Gateway separates provider message items in assistant text" {
 
         const replay = completion.provider_state_json orelse {
             // Unmarked blocks carry no provider state to replay.
-            try std.testing.expect(case.messages[0].item == null);
+            for (case.messages) |message| try std.testing.expect(message.item == null);
             continue;
         };
         const parsed = try std.json.parseFromSlice(std.json.Value, alloc, replay, .{});
@@ -4737,9 +4745,13 @@ test "Gateway separates provider message items in assistant text" {
             const offset: usize = @intCast(part.object.get("offset").?.integer);
             const length: usize = @intCast(part.object.get("length").?.integer);
             try std.testing.expectEqualStrings(text, content[offset..][0..length]);
+            const item = message.item orelse {
+                try std.testing.expect(part.object.get("providerOptions") == null);
+                continue;
+            };
             const openai = part.object.get("providerOptions").?.object.get("openai").?.object;
             try std.testing.expectEqualStrings(message.id, openai.get("itemId").?.string);
-            if (message.item.?.phase) |phase| {
+            if (item.phase) |phase| {
                 try std.testing.expectEqualStrings(phase, openai.get("phase").?.string);
             } else {
                 try std.testing.expect(openai.get("phase") == null);
@@ -4777,6 +4789,29 @@ test "Gateway separates provider message items in assistant text" {
         try std.testing.expectEqualStrings("call", parts[1].object.get("toolCallId").?.string);
         try std.testing.expectEqual(@as(i64, 12), parts[2].object.get("offset").?.integer);
         try std.testing.expectEqual(@as(i64, 9), parts[2].object.get("length").?.integer);
+    }
+
+    // Text from a part that never started still follows the separator.
+    {
+        var payload: std.Io.Writer.Allocating = .init(alloc);
+        defer payload.deinit();
+        try Fixture.message(&payload.writer, .{ .id = "A", .item = .{ .phase = "commentary" }, .fragments = &.{"One."} });
+        try Fixture.event(&payload.writer, .{ .type = "text-start", .id = "E", .providerMetadata = Fixture.Metadata{ .openai = .{ .itemId = "E", .phase = "final_answer" } } });
+        try Fixture.event(&payload.writer, .{ .type = "text-delta", .id = "Z", .delta = "Two." });
+        try Fixture.event(&payload.writer, .{ .type = "finish", .finishReason = .{ .unified = "stop" } });
+        var chunks: Chunks = .{};
+        defer chunks.text.deinit(alloc);
+        var reader = std.Io.Reader.fixed(payload.written());
+        var cancelled = std.atomic.Value(bool).init(false);
+        var completion = try consumeSseStream(alloc, &reader, &chunks, Chunks.record, null, &cancelled);
+        defer deinitGatewayCompletion(alloc, &completion);
+        try std.testing.expectEqualStrings("One.\n\nTwo.", completion.content.?);
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, completion.provider_state_json.?, .{});
+        defer parsed.deinit();
+        const parts = parsed.value.array.items;
+        try std.testing.expectEqual(@as(usize, 3), parts.len);
+        try std.testing.expectEqual(@as(i64, 6), parts[2].object.get("offset").?.integer);
+        try std.testing.expectEqual(@as(i64, 4), parts[2].object.get("length").?.integer);
     }
 
     // A capture limit can end inside the separator; the stream still sees all of it.
