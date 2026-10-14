@@ -1018,6 +1018,8 @@ const ConnectedRequestWatch = struct {
 
 const RequestOpenOperation = struct {
     client: *std.http.Client,
+    /// Set when `client` is the pool's shared client.
+    pool: ?*http_pool.HttpPool,
     uri: std.Uri,
     options: std.http.Client.RequestOptions,
     request_open_override: ?RequestOpenOverride,
@@ -1032,12 +1034,14 @@ const RequestOpenOperation = struct {
                 self.options,
             );
         }
+        if (self.pool) |pool| return pool.openRequest(.POST, self.uri, self.options);
         return self.client.request(.POST, self.uri, self.options);
     }
 };
 
 fn openGatewayRequestBounded(
     client: *std.http.Client,
+    pool: ?*http_pool.HttpPool,
     uri: std.Uri,
     options: std.http.Client.RequestOptions,
     request_open_override: ?RequestOpenOverride,
@@ -1070,6 +1074,7 @@ fn openGatewayRequestBounded(
 
     var operation = RequestOpenOperation{
         .client = client,
+        .pool = pool,
         .uri = uri,
         .options = options,
         .request_open_override = request_open_override,
@@ -1553,7 +1558,7 @@ fn streamGatewayCompletionCoreWithOptions(
 
         debug_trace.eventf("gateway", "before_http_open_connect", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d}", .{ attempt + 1, retry_count, attempt });
         debug_trace.eventf("gateway", "before_request_open", trace_ctx, "attempt={d} attempt_limit={d} retries_used={d} payload_bytes={d}", .{ attempt + 1, retry_count, attempt, payload.len });
-        var req = openGatewayRequestBounded(client, uri, .{
+        var req = openGatewayRequestBounded(client, request.shared_pool, uri, .{
             .headers = request_headers,
             .extra_headers = extra_headers,
             .keep_alive = request.shared_pool != null,
@@ -7283,6 +7288,28 @@ test "shared pool reuses one keep-alive connection across sequential requests" {
     try std.testing.expectEqual(@as(usize, 2), harness.fixture.requests_served.load(.seq_cst));
     // Close the pooled connection before the fixture teardown so the serve
     // loop observes EOF and the fixture thread can join.
+    _ = pool.deinit();
+    harness.fixture.deinit();
+    if (harness.fixture.failure) |err| return err;
+}
+
+test "shared pool requests open with a current certificate clock" {
+    var harness = try ConnectionSetupHarness.init(.keep_alive_reuse, false);
+    defer harness.deinit();
+    try harness.start();
+
+    var pool = http_pool.HttpPool.init(std.testing.allocator);
+    defer _ = pool.deinit();
+    // As though the CA bundle loaded long before this request.
+    pool.client.now = std.Io.Timestamp.fromNanoseconds(1);
+    const before = std.Io.Clock.real.now(pool.client.io);
+
+    var result = try pooledLoopbackCall(&pool, harness.url);
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("ok", result.completion.content.?);
+    try std.testing.expect(pool.client.now.?.nanoseconds >= before.nanoseconds);
+
+    // Close the pooled connection so the fixture thread can join.
     _ = pool.deinit();
     harness.fixture.deinit();
     if (harness.fixture.failure) |err| return err;
