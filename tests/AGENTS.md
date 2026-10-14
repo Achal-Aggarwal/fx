@@ -32,10 +32,13 @@ tests/
 │   └── render-lab/        rendering evidence tool
 ├── evals/                 model-backed evals, run only on request
 └── tla/                   TLA+ models, their checkers, and their Bun drivers
-    ├── session_manager/   one folder per model, named after the module it describes
-    ├── indexer/
-    ├── sdk/
-    └── drivers/           Bun drivers that walk real code along a model's state graph
+    ├── session_manager/   one folder per model area, named after the module it describes,
+    ├── mcp/               each with a check.sh; tla/README.md lists them all
+    ├── ...
+    ├── lib/               tlc.sh and run-tlc.sh: find TLC and run configs with their verdicts
+    └── drivers/           Bun drivers that run real code and have TLC check each run
+        ├── lib/           tlc.ts and context.ts, shared by every driver
+        └── <area>/        one folder per model area
 ```
 
 Only files that end in `.test.ts` at the root of `tests/e2e/` are E2E tests. CI discovers them there and nowhere else, so a test in a subfolder never runs in CI.
@@ -75,10 +78,10 @@ python3 -m scripts.pgso.corpus --manifest scripts/pgso/corpus.json --list   # fr
 
 Every TLA+ spec, its TLC checker, the Bun drivers that walk code along a spec, and the design record a spec checks live in `tests/tla/`, and nowhere else. `tests/tla/README.md` lists the requirements and commands.
 
-- Name a model's folder after the module it describes: `session_manager/` for `src/core/session_manager/`, `indexer/` for `src/core/indexer/`, and `sdk/` for libfx.
-- Give each folder a `check.sh` that runs every config and exits non-zero when one misses its expected verdict. Configs that must fail, such as witnesses and planted mutations, are part of that contract, so encode their verdicts in `check.sh`.
-- Put Bun drivers in `tests/tla/drivers/`. They import the code under test by relative path and read the state graphs a model's `check.sh` writes, such as `tests/tla/sdk/graphs/`. Generated graphs are ignored by git.
-- Find TLC through `TLA2TOOLS_JAR` and Java through `JAVA_HOME`, then Homebrew's OpenJDK, then `PATH`, as the shell scripts do.
+- Name a model's folder after the module it describes: `session_manager/` for `src/core/session_manager/`, `mcp_host/` for `src/core/mcp_host/`, and `sdk/` for libfx.
+- Give each folder a `check.sh` that runs every config and exits non-zero when one misses its expected verdict. Configs that must fail, such as witnesses and planted mutations, are part of that contract, so encode their verdicts in `check.sh`. Source `../lib/tlc.sh` and list each config with its verdict for `tlc_verdicts`, rather than finding TLC yourself.
+- Put Bun drivers in `tests/tla/drivers/<area>/`. They run the code under test, from `zig-out/bin/fx` or by relative import, and have TLC check each run. Use `drivers/lib/tlc.ts` to run TLC and `drivers/lib/context.ts` for the binary, the output folder, and the `tests/e2e/` helpers. Every fx process a driver starts sets `FX_SOUND=0`. Generated output, such as `tests/tla/sdk/graphs/`, goes to the temp folder or is ignored by git.
+- A model of code that has not landed says so at the top, and the drivers that need that code run only behind an explicit flag, such as `--next` or `FX_TLA_NEXT_MCP=1`. `tests/tla/README.md` lists them. Remove the flag in the change that lands the code.
 - When a change alters behavior that a spec models, update the spec in the same change and run its checker. CI runs only the `sdk/` model and its drivers; run the others yourself.
 - A new model, checker, or driver gets a row in `tests/tla/README.md`.
 

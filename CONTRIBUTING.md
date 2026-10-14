@@ -114,11 +114,12 @@ python3 benchmarks/first_frame.py --binary /tmp/fx-before --binary ./zig-out/bin
 
 ### Check a TLA+ model
 
-`tests/tla/` holds TLA+ models of the session manager, the workspace indexer, and libfx durable sessions and steering. CI runs the libfx model; run the matching checker yourself when you change behavior that one of the others describes. You need Java and `tla2tools.jar`, and `tests/tla/README.md` covers setup.
+`tests/tla/` holds TLA+ models of fx, such as the session manager, the MCP engine and host, ACP, `/usage`, the shell tool, the workspace indexer, and libfx. Most come with Bun drivers that run the real binary and have TLC check what it did. CI runs the libfx model; run the matching checker yourself when you change behavior that one of the others describes. You need Java and `tla2tools.jar`, and `tests/tla/README.md` lists every model and covers setup.
 
 ```bash
 tests/tla/session_manager/check.sh SessionLog
-tests/tla/indexer/check.sh
+tests/tla/mcp/check.sh --model Engine
+bun test ./tests/tla/drivers/shell_command/
 ```
 
 ### Run the model evals
