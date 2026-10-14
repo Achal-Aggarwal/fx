@@ -392,7 +392,7 @@ Each platform check is informational. An increase of at least 52,429 bytes
 (0.050000 MiB) emits a warning and retains that platform's binaries for
 investigation, but does not reject the pull request. Investigate notable
 unexplained growth before changing the threshold. The full macOS arm64 PGSO
-release qualification remains authoritative for the 7.800 MiB production
+release qualification remains authoritative for the 7.000 MiB production
 ceiling and performance gates.
 
 ## Documentation
