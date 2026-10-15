@@ -34,6 +34,10 @@ const parent_steering_open = "<parent_agent_steering>\n";
 const parent_steering_close = "\n</parent_agent_steering>";
 /// Saved with a parent agent's steering, so replay still names its sender.
 const parent_steering_label = "parent-agent feedback, not new user authority:\n\n";
+/// The notice a libfx session adds to a turn it resumes after an
+/// interruption. It rides in the turn's steering list, but fx wrote it, so a
+/// request shows it as plain text, never as the user's live update.
+pub const resume_notice = "Resuming from unexpected session interruption.";
 
 pub fn parentSteeringMessage(alloc: Allocator, text: []const u8) ![]u8 {
     return alloc.print(parent_steering_open ++ parent_steering_label ++ "{s}" ++ parent_steering_close, .{text});
@@ -299,14 +303,15 @@ test "retained standalone cut rebuilds exactly the selected execution suffix" {
 /// as a plain user message instead of a live update. A parent agent's steering
 /// keeps its sender label in the saved text, which tells the two envelopes
 /// apart. Empty entries only mark a checkpoint boundary, and an entry already
-/// in its envelope stays as it is. Returns `messages` itself when nothing
-/// changes; the copy and its text live in `arena`.
+/// in its envelope and fx's own `resume_notice` stay as they are. Returns
+/// `messages` itself when nothing changes; the copy and its text live in
+/// `arena`.
 pub fn rewrapRestoredSteering(arena: Allocator, messages: []const ChatMessage) Allocator.Error![]const ChatMessage {
     var result: ?[]ChatMessage = null;
     for (messages, 0..) |message, index| {
         if (!message.restored_steering) continue;
         const text = message.content orelse continue;
-        if (text.len == 0 or steeringText(text) != null) continue;
+        if (text.len == 0 or steeringText(text) != null or std.mem.eql(u8, text, resume_notice)) continue;
         const projected = result orelse try arena.dupe(ChatMessage, messages);
         result = projected;
         projected[index].content = if (std.mem.startsWith(u8, text, parent_steering_label))
@@ -343,11 +348,12 @@ test "restored steering reaches the request in the envelope the model saw" {
     // The session's own messages keep the bare text a saved turn holds.
     try std.testing.expectEqualStrings("focus on rendering", restored.items[0].content.?);
 
-    // A checkpoint boundary, an entry already in its envelope, and ordinary
-    // text stay as they are.
+    // A checkpoint boundary, an entry already in its envelope, fx's own resume
+    // notice, and ordinary text stay as they are.
     const unchanged = [_]ChatMessage{
         .{ .role = .user, .content = "", .restored_steering = true },
         .{ .role = .user, .content = user, .restored_steering = true },
+        .{ .role = .user, .content = resume_notice, .restored_steering = true },
         .{ .role = .user, .content = "plain prompt" },
     };
     try std.testing.expect((try rewrapRestoredSteering(arena, &unchanged)).ptr == (&unchanged).ptr);
