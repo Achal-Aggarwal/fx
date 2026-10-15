@@ -1454,6 +1454,20 @@ if (durabilityKind === "memory") {
     await first.close();
   });
 
+  test("an agent created without a durability is refused at once after another of its name opened the shared default", async () => {
+    // Node keeps one default durability per environment, so every agent
+    // created without one shares its store.
+    const shared = memory();
+    const tagged = createDurableAgentFactory({ harness: ({ tag }) => scriptedHarness()(), defaultDurability: async () => shared, name: "createDefaultAgent" });
+    const first = tagged({ tag: "key-a" });
+    await first.newSessionId();
+    assert.throws(() => tagged({ tag: "key-b" }), (error) => error?.code === "FX_AGENT_NAME_IN_USE" && error.agent === "default");
+    const same = tagged({ tag: "key-a" });
+    await same.newSessionId();
+    await same.close();
+    await first.close();
+  });
+
   test("an input over the size limit is refused before anything is stored", async () => {
     const agent = createAgent({ durability: memory() });
     const session = agent.session(undefined, { context: { user: "a" } });

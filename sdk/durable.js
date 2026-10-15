@@ -755,14 +755,13 @@ function sameDefinition(a, b, depth = 0) {
 // Refuses `member` when another agent of `name` on its store has another
 // configuration: deliveries for a name on a store go to any of its agents,
 // so they must be one agent (`tests/tla/sdk/TenantIsolation.tla`
-// RunsOnSenderAgent). An agent created with the `replicaOption` symbol set
-// stands for another server's copy, as a test that runs several servers in
-// one process creates it, and is never refused.
-const replicaOption = Symbol.for("libfx.replica");
+// RunsOnSenderAgent). Agents created without a durability share their
+// factory's default, so they are on one store even before one of them has
+// learned which store that is.
+const sameStore = (a, b) => a.store === b.store || (a.defaults !== null && a.defaults === b.defaults);
 function claimName(name, member) {
-  if (member.replica) return;
   for (const other of agentsByName.get(name)?.members ?? []) {
-    if (other !== member && !other.replica && other.store === member.store && !sameDefinition(other.definition, member.definition)) throw nameInUse(name);
+    if (other !== member && sameStore(other, member) && !sameDefinition(other.definition, member.definition)) throw nameInUse(name);
   }
 }
 
@@ -2319,7 +2318,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
     // In the process's agents from now, so a route that receives a message
     // for this agent finds it before anything uses it. One created without a
     // durability claims the default's store until it knows which that is.
-    const member = { open: backend, durability: durabilityOf, definition: definitionOf(harnessOptions), store: durability ? storeOf(durability) : defaultDurability, replica: options[replicaOption] === true };
+    const member = { open: backend, durability: durabilityOf, definition: definitionOf(harnessOptions), store: durability ? storeOf(durability) : defaultDurability, defaults: durability ? null : defaultDurability };
     claimName(agentName, member);
     const registered = joinGroup(agentsByName, agentName, member);
     // One delivery of `message` to the session's worker here: from the
