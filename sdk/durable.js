@@ -1755,7 +1755,11 @@ class SessionWorker {
   // `{ stopped }` when its harness stopped under it, or `{ result }` for a
   // turn that ended, whose end the caller writes.
   async drive(log, harness, turn, messageId, state, ui) {
-    const applied = new Set();
+    // The inputs `state` was folded from are placed already: the fold gave
+    // each a turn, joined it to one, or spent it. The poll applies only the
+    // inputs stored after them. After an early start, that includes this
+    // message's own input, landing past `since`.
+    const applied = new Set(state.inputKeys);
     let since = String(state.maxCursor);
     let polling = false;
     let again = false;
@@ -1770,8 +1774,8 @@ class SessionWorker {
       void Promise.resolve().then(() => turn.endForSteer?.()).catch(() => {});
     };
     const steerTurn = (steer) => {
-      // A steer that opened this turn is its prompt. After an early start
-      // its input lands past `since`, so the poll reads it again.
+      // One id names one input, so a steer with this turn's id is its own
+      // opener or one that reused the id, which the log never runs.
       if (steer.messageId === messageId) return;
       if (!joinable(steer.input)) endTurn();
       else if (!ending) void turn.steer(steer.input, steer.messageId).catch(() => {});
