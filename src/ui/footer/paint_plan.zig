@@ -912,14 +912,14 @@ pub fn composeFooterFrame(
         } else if (input.picker_kind == .file and input.file_picker_items.len > 0) {
             const selected = input.picker_selection_index % input.file_picker_items.len;
             var row = rows.picker_start;
-            const status_rows: u16 = @intFromBool(ctx.file_completion_status != null and input.picker_rows > 1);
+            const visible_rows = picker_presentation.filePickerItemRows(input.picker_rows, ctx.file_completion_status != null);
+            const status_rows = input.picker_rows - visible_rows;
             if (status_rows > 0) {
                 const status = ctx.file_completion_status.?;
                 var status_row = try picker_presentation.composePickerOptionRow(alloc, .file, input.picker_start_col, status, false, shell.layout.cols);
                 try pushFooterBandRow(alloc, &frame, plan, row, &status_row);
                 row += 1;
             }
-            const visible_rows = input.picker_rows -| status_rows;
             const window_start = picker_presentation.updateEdgeScrollPickerWindowStart(input.picker_window_start, input.file_picker_items.len, selected, visible_rows);
             const window = picker_presentation.edgeScrollPickerWindowFromStart(input.file_picker_items.len, window_start, visible_rows);
             for (input.file_picker_items[window.start..window.end], window.start..) |item, i| {
