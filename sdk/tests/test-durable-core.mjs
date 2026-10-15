@@ -1446,7 +1446,10 @@ if (durabilityKind === "memory") {
   });
 
   test("agents created without a name or a durability are one agent only when configured alike", async () => {
-    const tagged = createDurableAgentFactory({ harness: ({ tag }) => scriptedHarness()(), defaultDurability: async () => memory(), name: "createDefaultAgent" });
+    // Node keeps one default durability per environment, so every agent
+    // created without one shares its store.
+    const shared = memory();
+    const tagged = createDurableAgentFactory({ harness: ({ tag }) => scriptedHarness()(), defaultDurability: async () => shared, defaultShared: true, name: "createDefaultAgent" });
     const first = tagged({ tag: "key-a" });
     assert.throws(() => tagged({ tag: "key-b" }), (error) => error?.code === "FX_AGENT_NAME_IN_USE" && error.agent === "default");
     const same = tagged({ tag: "key-a" });
@@ -1454,11 +1457,21 @@ if (durabilityKind === "memory") {
     await first.close();
   });
 
+  test("agents created without a durability each get their own store where the default is not shared, so any options are allowed", async () => {
+    // The browser gives every such agent a memory() of its own.
+    const tagged = createDurableAgentFactory({ harness: ({ tag }) => scriptedHarness()(), defaultDurability: async () => memory(), name: "createBrowserAgent" });
+    const first = tagged({ tag: "key-a" });
+    const other = tagged({ tag: "key-b" });
+    await first.newSessionId();
+    const opened = tagged({ tag: "key-c" });
+    await opened.newSessionId();
+    await other.newSessionId();
+    for (const agent of [first, other, opened]) await agent.close();
+  });
+
   test("an agent created without a durability is refused at once after another of its name opened the shared default", async () => {
-    // Node keeps one default durability per environment, so every agent
-    // created without one shares its store.
     const shared = memory();
-    const tagged = createDurableAgentFactory({ harness: ({ tag }) => scriptedHarness()(), defaultDurability: async () => shared, name: "createDefaultAgent" });
+    const tagged = createDurableAgentFactory({ harness: ({ tag }) => scriptedHarness()(), defaultDurability: async () => shared, defaultShared: true, name: "createDefaultAgent" });
     const first = tagged({ tag: "key-a" });
     await first.newSessionId();
     assert.throws(() => tagged({ tag: "key-b" }), (error) => error?.code === "FX_AGENT_NAME_IN_USE" && error.agent === "default");

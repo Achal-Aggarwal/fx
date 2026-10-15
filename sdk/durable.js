@@ -2237,10 +2237,12 @@ function turnView({ messageId, resumeRequest = null, start }) {
  * once, or ends with an error when it never started; when its harness stops
  * twice more, even to cancel it, the session runs no more turns.
  *
- * `defaultDurability()` picks the durability when the caller names none,
- * `name` is the factory's name in errors, and `label` the agent's.
+ * `defaultDurability()` picks the durability when the caller names none, and
+ * `defaultShared` says it hands every such agent the same one, as Node's
+ * does, so that agents created without a durability share a store. `name` is
+ * the factory's name in errors, and `label` the agent's.
  */
-export function createDurableAgentFactory({ harness, defaultDurability, name = "createAgent", label = "agent" }) {
+export function createDurableAgentFactory({ harness, defaultDurability, defaultShared = false, name = "createAgent", label = "agent" }) {
   return function createDurableAgent(options = {}) {
     if (!options || typeof options !== "object" || Array.isArray(options)) {
       throw new TypeError(`${name}() options must be an object`);
@@ -2317,8 +2319,11 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
     const durabilityOf = () => (durabilityPromise ??= durability ? Promise.resolve(durability) : defaultDurability());
     // In the process's agents from now, so a route that receives a message
     // for this agent finds it before anything uses it. One created without a
-    // durability claims the default's store until it knows which that is.
-    const member = { open: backend, durability: durabilityOf, definition: definitionOf(harnessOptions), store: durability ? storeOf(durability) : defaultDurability, defaults: durability ? null : defaultDurability };
+    // durability claims the default's store until it knows which that is:
+    // the store every such agent shares where the factory hands them all one
+    // durability, and a store of its own where each gets its own.
+    const unresolved = defaultShared ? defaultDurability : Symbol("default store");
+    const member = { open: backend, durability: durabilityOf, definition: definitionOf(harnessOptions), store: durability ? storeOf(durability) : unresolved, defaults: durability ? null : unresolved };
     claimName(agentName, member);
     const registered = joinGroup(agentsByName, agentName, member);
     // One delivery of `message` to the session's worker here: from the
