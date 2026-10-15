@@ -625,9 +625,18 @@ pub fn turnNamesImages(turn: session.HistoryTurn, stored: ?*const StoredImages) 
 /// Whether writing the items of `execution` after `from` names a tool image:
 /// one the host stored, when `stored` is given, or one the session dropped.
 pub fn executionNamesImages(execution: session.ExecutionMemory, from: ExecutionCounts, stored: ?*const StoredImages) bool {
-    for (execution.tool_steps[from.tool_steps..]) |step| for (step.tool_results) |result| for (result.tool_images) |image| {
-        if (image.droppedFromSession() or (stored != null and image.name != null)) return true;
+    for (execution.tool_steps[from.tool_steps..]) |step| for (step.tool_results) |result| {
+        if (toolImagesNameImages(result.tool_images, stored)) return true;
     };
+    return false;
+}
+
+/// Whether writing `images` names one: one the host stored, when `stored` is
+/// given, or one the session dropped.
+pub fn toolImagesNameImages(images: []const types.ToolImage, stored: ?*const StoredImages) bool {
+    for (images) |image| {
+        if (image.droppedFromSession() or (stored != null and image.name != null)) return true;
+    }
     return false;
 }
 
@@ -3076,6 +3085,13 @@ pub fn writePersistedToolImages(writer: *std.Io.Writer, images: []const types.To
 /// `writePersistedToolImages`, but with `naming`, an image the host stored is
 /// written as its name (`inline_ref`) and decoded size instead of its bytes.
 /// An image the session dropped is written as its name alone either way.
+/// Writes a tool result's `images` as a list: with `naming`, each the host
+/// stored by its name, and every other with its bytes; one the session
+/// dropped by its name alone. `parseToolImages` reads it back.
+pub fn writeToolImages(writer: *std.Io.Writer, images: []const types.ToolImage, naming: bool) !void {
+    return writeToolImagesTo(writer, images, naming);
+}
+
 fn writeToolImagesTo(writer: *std.Io.Writer, images: []const types.ToolImage, naming: bool) !void {
     try writer.writeByte('[');
     for (images, 0..) |image, index| {
@@ -3143,6 +3159,13 @@ pub fn parsePersistedToolImages(alloc: Allocator, content: []const std.json.Valu
 /// session dropped, or one an open has yet to stage, parses with its name and
 /// without bytes; the open's `missing` tells the two apart. Caller owns the
 /// images.
+/// Reads a list `writeToolImages` wrote. Caller owns the images. A name
+/// `sources.names` has no bytes for reads as an image without bytes, and the
+/// resolver records it as missing.
+pub fn parseToolImages(alloc: Allocator, content: []const std.json.Value, sources: ImageSources) ![]types.ToolImage {
+    return parseToolImagesWith(alloc, content, sources);
+}
+
 fn parseToolImagesWith(alloc: Allocator, content: []const std.json.Value, sources: ImageSources) ![]types.ToolImage {
     for (content) |item| {
         if (item == .object and item.object.contains("inline_ref")) break;

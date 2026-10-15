@@ -407,6 +407,12 @@ pub const Journal = struct {
             },
             .tool => |tool| {
                 if (tool.droppedFromSession()) continue;
+                if (tool.name == null) {
+                    tool.name = try inlineToolImageName(alloc, tool.data) orelse {
+                        debug_trace.logf("session", "event=libfx_image_kept reason=inline_tool_image_not_base64 bytes={d}", .{tool.data.len});
+                        continue;
+                    };
+                }
                 const empty = try history_alloc.alloc(u8, 0);
                 history_alloc.free(tool.data);
                 tool.data = empty;
@@ -534,13 +540,24 @@ fn windowSize(image: types.ImageAttachment) WindowSize {
     return if (image.droppedFromSession()) .dropped else .none;
 }
 
-/// What the window counts for a tool image: its decoded bytes when the host
-/// stored it, so the session can drop it and keep its name. One the host did
-/// not store, inline or only a host reference, holds nothing it can drop.
+/// What the window counts for a tool image: its decoded bytes, whether the
+/// host stored it or the session holds it inline, as one the store refused
+/// or an older libfx saved. One with only a host reference holds nothing.
 fn toolWindowSize(image: types.ToolImage) WindowSize {
     if (image.droppedFromSession()) return .dropped;
-    if (image.name == null) return .none;
+    if (image.data.len == 0) return .none;
     return .{ .bytes = std.base64.standard.Decoder.calcSizeForSlice(image.data) catch image.data.len };
+}
+
+/// The name of a tool image's bytes, which one held inline takes when it
+/// leaves the window, so it is saved dropped like a stored one; null for
+/// bytes that are not base64.
+fn inlineToolImageName(alloc: Allocator, data: []const u8) Allocator.Error!?session_codec.ImageName {
+    const size = std.base64.standard.Decoder.calcSizeForSlice(data) catch return null;
+    const bytes = try alloc.alloc(u8, size);
+    defer alloc.free(bytes);
+    std.base64.standard.Decoder.decode(bytes, data) catch return null;
+    return session_codec.imageNameOf(bytes);
 }
 
 /// An image an open has yet to stage, with the size its record gives.
@@ -583,6 +600,7 @@ fn keepNeededImages(
     history: []const types.HistoryTurn,
     open_user: ?types.UserTurn,
     open_execution: ?types.ExecutionMemory,
+    open_finished: []const journal.Finished,
     window: session_codec.ImageWindow,
 ) Allocator.Error!void {
     var sizes: std.ArrayList(?usize) = .empty;
@@ -608,6 +626,10 @@ fn keepNeededImages(
         if (unstaged(image, &images.missing)) |found| try needed.put(images.alloc, found.name, found.size);
     };
     if (open_execution) |execution| for (execution.tool_steps) |step| for (step.tool_results) |result| for (result.tool_images) |image| {
+        if (unstagedTool(image, &images.missing)) |found| try needed.put(images.alloc, found.name, found.size);
+    };
+    // A result the open turn recorded before a crash answers its call again.
+    for (open_finished) |finished| for (finished.images) |image| {
         if (unstagedTool(image, &images.missing)) |found| try needed.put(images.alloc, found.name, found.size);
     };
     if (outside > 0) debug_trace.logf("session", "event=libfx_image_window_open outside={d} needed={d}", .{ outside, needed.count() });
@@ -695,7 +717,7 @@ pub fn open(
     var folded = try journal.foldFrom(alloc, events_json, base);
     defer folded.deinit(alloc);
     if (image_store and images.missing.count() > 0) {
-        try keepNeededImages(alloc, images, folded.history, if (folded.open_turn) |turn| turn.user else null, if (folded.open_turn) |turn| turn.execution else null, window);
+        try keepNeededImages(alloc, images, folded.history, if (folded.open_turn) |turn| turn.user else null, if (folded.open_turn) |turn| turn.execution else null, folded.finished, window);
     }
     // A history missing an image it keeps is not the one saved: open none.
     if (images.missing.count() > 0) {
@@ -831,6 +853,7 @@ fn answerRunning(scratch: Allocator, turn: *session_codec.RecoveryCheckpoint, ca
             .tool_name = @constCast(call.name),
             .status = if (recorded) |entry| (if (entry.failed) .failure else .success) else .failure,
             .output = @constCast(output),
+            .tool_images = if (recorded) |entry| entry.images else &.{},
             .output_bytes = output.len,
             .stored_output_bytes = output.len,
         };
@@ -1216,7 +1239,7 @@ fn windowTestToolStep(results: *[1]types.PersistedToolResult, steps: *[1]types.T
     return .{ .tool_steps = steps };
 }
 
-test "the image window counts a turn's tool images after its prompt's, and drops them by name" {
+test "the image window counts a turn's tool images after its prompt's, inline ones too, and drops them by name" {
     const alloc = std.testing.allocator;
     var capture: TestCapture = .{};
     defer capture.frames.deinit(alloc);
@@ -1229,25 +1252,29 @@ test "the image window counts a turn's tool images after its prompt's, and drops
     var tools: [2][]types.ToolImage = undefined;
     for (&tools) |*images| images.* = try windowTestToolImages(alloc, 10, true);
     defer for (tools) |images| types.freeToolImages(alloc, images);
-    // A tool image the host did not store is neither counted nor dropped.
-    const unstored = try windowTestToolImages(alloc, 10, false);
+    // A tool image the session holds inline, as one the store refused, the
+    // oldest tool image here.
+    const unstored = try windowTestToolImages(alloc, 12, false);
     defer types.freeToolImages(alloc, unstored);
+    var unstored_bytes: [12]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&unstored_bytes, unstored[0].data);
     var results: [3][1]types.PersistedToolResult = undefined;
     var steps: [3][1]types.ToolExecutionStep = undefined;
     var history: [3]types.HistoryTurn = undefined;
-    history[0] = .{ .assistant = .{ .user = .{ .text = @constCast("one"), .images = prompts[0..1] }, .assistant = @constCast("ok"), .execution = windowTestToolStep(&results[0], &steps[0], tools[0]) } };
-    history[1] = .{ .assistant = .{ .user = .{ .text = @constCast("two"), .images = prompts[1..2] }, .assistant = @constCast("ok"), .execution = windowTestToolStep(&results[1], &steps[1], tools[1]) } };
-    history[2] = .{ .assistant = .{ .user = .{ .text = @constCast("three") }, .assistant = @constCast("ok"), .execution = windowTestToolStep(&results[2], &steps[2], unstored) } };
+    history[0] = .{ .assistant = .{ .user = .{ .text = @constCast("one"), .images = prompts[0..1] }, .assistant = @constCast("ok"), .execution = windowTestToolStep(&results[0], &steps[0], unstored) } };
+    history[1] = .{ .assistant = .{ .user = .{ .text = @constCast("two"), .images = prompts[1..2] }, .assistant = @constCast("ok"), .execution = windowTestToolStep(&results[1], &steps[1], tools[0]) } };
+    history[2] = .{ .assistant = .{ .user = .{ .text = @constCast("three") }, .assistant = @constCast("ok"), .execution = windowTestToolStep(&results[2], &steps[2], tools[1]) } };
 
-    // Two images at most: the second turn's prompt image and tool image, in
-    // the order they entered; every older one leaves, keeping its name.
+    // Two images at most: the newest two tool images, in the order they
+    // entered; every older one leaves, keeping its name. The inline one
+    // counts as any image does, and takes the name of its bytes.
     try session.dropOutsideWindow(alloc, alloc, &history);
     try std.testing.expect(prompts[0].droppedFromSession());
-    try std.testing.expect(tools[0][0].droppedFromSession());
-    try std.testing.expect(tools[0][0].name != null);
-    try std.testing.expect(prompts[1].inline_data != null);
+    try std.testing.expect(unstored[0].droppedFromSession());
+    try std.testing.expectEqualSlices(u8, &session_codec.imageNameOf(&unstored_bytes), &unstored[0].name.?);
+    try std.testing.expect(prompts[1].droppedFromSession());
+    try std.testing.expect(!tools[0][0].droppedFromSession() and tools[0][0].data.len > 0);
     try std.testing.expect(!tools[1][0].droppedFromSession() and tools[1][0].data.len > 0);
-    try std.testing.expect(unstored[0].data.len > 0);
 }
 
 test "an open needs the newest tool images its window keeps, and every one of the open turn" {
@@ -1272,10 +1299,26 @@ test "an open needs the newest tool images its window keeps, and every one of th
     }
     const open_execution = windowTestToolStep(&results[2], &steps[2], &images[2]);
 
-    try keepNeededImages(alloc, &resolver, &history, null, open_execution, .{ .max_images = 1 });
+    try keepNeededImages(alloc, &resolver, &history, null, open_execution, &.{}, .{ .max_images = 1 });
     try std.testing.expectEqual(@as(usize, 2), resolver.missing.count());
     try std.testing.expect(!resolver.missing.contains(names[0]));
     try std.testing.expect(resolver.missing.contains(names[1]) and resolver.missing.contains(names[2]));
+}
+
+test "an open needs the images of a result its open turn recorded before a crash" {
+    const alloc = std.testing.allocator;
+    var staged: session_codec.StagedImages = .{};
+    defer staged.deinit(alloc);
+    var resolver: session_codec.ImageResolver = .{ .alloc = alloc, .staged = &staged };
+    defer resolver.deinit();
+    const name = session_codec.imageNameOf("recorded shot");
+    try resolver.missing.put(alloc, name, 13);
+    var images = [_]types.ToolImage{.{ .data = @constCast(&[_]u8{}), .mime_type = @constCast("image/png"), .name = name }};
+    const finished = [_]journal.Finished{.{ .id = @constCast("call-1"), .failed = false, .output = @constCast("took it"), .images = &images }};
+
+    try keepNeededImages(alloc, &resolver, &.{}, null, null, &finished, .{ .max_images = 1 });
+    try std.testing.expectEqual(@as(usize, 1), resolver.missing.count());
+    try std.testing.expectEqual(@as(?usize, 13), resolver.missing.get(name));
 }
 
 test "an open needs only the named images its window keeps, and every image of the open turn" {
@@ -1305,13 +1348,13 @@ test "an open needs only the named images its window keeps, and every image of t
     // The window counts the history alone: its two newest, and the open
     // turn's image as well.
     try reset(&resolver, &names);
-    try keepNeededImages(alloc, &resolver, &history, .{ .text = @constCast("now"), .images = images[3..4] }, null, .{ .max_images = 2 });
+    try keepNeededImages(alloc, &resolver, &history, .{ .text = @constCast("now"), .images = images[3..4] }, null, &.{}, .{ .max_images = 2 });
     try std.testing.expectEqual(@as(usize, 3), resolver.missing.count());
     try std.testing.expect(!resolver.missing.contains(names[0]));
 
     // An open turn larger than the window keeps all of its images.
     try reset(&resolver, &names);
-    try keepNeededImages(alloc, &resolver, history[0..2], .{ .text = @constCast("now"), .images = images[2..4] }, null, .{ .max_images = 1 });
+    try keepNeededImages(alloc, &resolver, history[0..2], .{ .text = @constCast("now"), .images = images[2..4] }, null, &.{}, .{ .max_images = 1 });
     try std.testing.expectEqual(@as(usize, 3), resolver.missing.count());
     try std.testing.expect(!resolver.missing.contains(names[0]));
 }

@@ -88,7 +88,9 @@ function savedImages(store) {
       return;
     }
     if (!value || typeof value !== "object") return;
-    if (typeof value.inline_ref === "string") named.add(value.inline_ref);
+    // One the session dropped keeps its name alone, which needs no bytes: an
+    // image held inline takes the name of its bytes when it leaves.
+    if (typeof value.inline_ref === "string" && value.dropped !== true) named.add(value.inline_ref);
     if (value.inline_data !== undefined) inline.push(durableBytes(value.inline_data));
     // A tool's image held inline: its base64 data.
     if (value.type === "image" && typeof value.data === "string" && typeof value.mimeType === "string") inline.push(Buffer.from(value.data, "base64"));

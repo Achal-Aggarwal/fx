@@ -33,12 +33,14 @@
 (*                                                                         *)
 (* With Tools a turn's host tool may return an image. The engine stores it  *)
 (* before it hands the result to the core, whose next record names it; a   *)
-(* store that refuses it leaves it in the result, held inline and without  *)
-(* a name, which the window does not count. With ToolStoreFirst = FALSE    *)
-(* the result reaches the core while the write is in flight                *)
-(* (ImageStore-ToolBeforeStore.cfg). A tool image joins the window with    *)
-(* its turn, as the prompt's does, and an open stages every image of the   *)
-(* open turn.                                                              *)
+(* store that refuses it leaves it in the result, held inline. The window  *)
+(* counts it as any image, and once it leaves it keeps the name of its     *)
+(* bytes; with CountInline = FALSE the window never counts it, so the      *)
+(* session holds more than Window images (ImageStore-InlineUncounted.cfg). *)
+(* With ToolStoreFirst = FALSE the result reaches the core while the write *)
+(* is in flight (ImageStore-ToolBeforeStore.cfg). A tool image joins the   *)
+(* window with its turn, as the prompt's does, and an open stages every    *)
+(* image of the open turn.                                                 *)
 (*                                                                         *)
 (* The core may crash, losing what it held and the image writes in flight. *)
 (* It opens again in two phases: it names the images it needs, the host    *)
@@ -67,6 +69,7 @@ CONSTANTS
     Window,         \* the newest images the session keeps
     LiveWindow,     \* whether the core drops images older than the window
     WindowAtOpen,   \* whether an open stages only the window's images
+    CountInline,    \* whether the window counts a tool image held inline
     Tools,          \* whether a turn's tool may return an image
     ToolStoreFirst  \* whether a tool's result reaches the core only after its image is stored
 
@@ -75,6 +78,7 @@ ASSUME Old \in BOOLEAN /\ Durable \in BOOLEAN /\ StoreFirst \in BOOLEAN
 ASSUME MarkOnlyStored \in BOOLEAN /\ FailOnMissing \in BOOLEAN
 ASSUME MaxRetries \in Nat /\ DropRepeats \in BOOLEAN
 ASSUME Window \in Nat \ {0} /\ LiveWindow \in BOOLEAN /\ WindowAtOpen \in BOOLEAN
+ASSUME CountInline \in BOOLEAN
 ASSUME Tools \in BOOLEAN /\ ToolStoreFirst \in BOOLEAN
 ASSUME "o" \notin Imgs
 
@@ -162,9 +166,12 @@ Init ==
 \* The images the saved history names.
 Named == {saved[k].i : k \in {j \in 1..Len(saved) : saved[j].ref}}
 \* Whether image k of s is one the window keeps when it counts the first n:
-\* it counts only images with a name it can keep, which a refused tool image
-\* lacks, and keeps every image past the first n.
-WindowKeeps(s, k, n) == ~s[k].named \/ Cardinality({j \in k..n : s[j].named}) <= Window
+\* it counts every image, a tool image the store refused, held inline,
+\* too, and keeps every image past the first n. With CountInline = FALSE it
+\* counts only images with a name, which a refused tool image lacks.
+WindowKeeps(s, k, n) ==
+    IF CountInline THEN Cardinality(k..n) <= Window
+    ELSE ~s[k].named \/ Cardinality({j \in k..n : s[j].named}) <= Window
 \* A turn has started and not ended: its images are the last saved, from
 \* turnAt on, and it has not entered the history the window counts.
 OpenTurn == \E p \in Prompts : ph[p] = "started"
@@ -506,6 +513,11 @@ FailsOnlyOnLoss == up = "failed" => lostImgs # {}
 FailsOnlyOnLossInWindow ==
     up = "failed" =>
         \E k \in 1..Len(saved) : saved[k].ref /\ WindowKeeps(saved, k, Counted) /\ saved[k].i \in lostImgs
+
+\* An open core holds at most Window images between turns, counting each it
+\* holds inline, as a tool image the store refused.
+WindowBound ==
+    (up = "open" /\ ~OpenTurn) => Cardinality({k \in 1..Len(mem) : ~mem[k].dropped}) <= Window
 
 \* An open core keeps exactly its newest Window named images between turns:
 \* each older one is dropped, keeping its name. A running turn's images join

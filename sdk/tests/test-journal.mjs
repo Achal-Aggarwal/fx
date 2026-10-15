@@ -1808,6 +1808,69 @@ test("a turn that crashed after its screenshot's progress reopens with the scree
   assert.deepEqual(requestImages(requests[0]), [base64Of(screenshotOf(5))], "the screenshot came back from the store");
 });
 
+test("a turn that crashed right after its screenshot's result reopens with the screenshot, without running the tool again", async () => {
+  const journal = eventJournal();
+  const images = new Map();
+  const withImages = (persistence) => ({
+    ...persistence,
+    putImage: async (name, bytes) => { images.set(name, new Uint8Array(bytes)); },
+    getImage: async (name) => images.get(name),
+  });
+  let shots = 0;
+  const counting = { ...screenshot, execute: async (input) => { shots += 1; return screenshot.execute(input); } };
+  const withCounting = { ...visionCatalog, tools: [lookup, counting] };
+  const source = await createFxEngine(options(sourceBackend, undefined, { ...withCounting, persistence: withImages(persisted(journal)) }));
+  assert.equal((await run(source, "screenshot 9")).text, "saw 9");
+  await source.close();
+  // The result names the screenshot as the call finished, before any
+  // progress holds the step.
+  const result = journal.events.find((event) => event.type === "tool_result");
+  assert.ok(result?.v === 3 && result.data.images?.[0]?.inline_ref === await nameOf(screenshotOf(9)), "the result names the screenshot");
+  assert.ok(!JSON.stringify(result).includes(base64Of(screenshotOf(9)).slice(0, 400)), "and does not hold it");
+  const survived = journal.events.slice(0, journal.events.indexOf(result) + 1);
+  assert.ok(!survived.some((event) => event.type === "turn_progress" && event.steps === 1), "no progress holds the step yet");
+  const resumed = await createFxEngine(options(targetBackend, undefined, { ...withCounting, persistence: withImages(persisted(eventJournal(survived))) }));
+  requests.length = 0;
+  const turn = resumed.resume();
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  await resumed.close();
+  assert.equal(shots, 1, "the tool ran once");
+  assert.deepEqual(requestImages(requests[0]), [base64Of(screenshotOf(9))], "the screenshot came back from the store");
+});
+
+test("a tool image the store refused leaves the window like any other, as a note", async () => {
+  const store = createMemoryPersistence();
+  const refusedName = await nameOf(screenshotOf(6));
+  const refusing = {
+    load: () => store.load(),
+    append: (input) => store.append(input),
+    saveCheckpoint: (input) => store.saveCheckpoint(input),
+    putImage: async (name, bytes) => {
+      if (name === refusedName) throw new Error("store is full");
+      return store.putImage(name, bytes);
+    },
+    getImage: (name) => store.getImage(name),
+  };
+  const window = { [imageWindow]: { images: 2 } };
+  const source = await createFxEngine(options(sourceBackend, undefined, { ...withScreenshots, ...window, persistence: refusing, checkpointAfterBytes: 0 }));
+  for (const shot of [6, 7, 8]) assert.equal((await run(source, `screenshot ${shot}`)).text, `saw ${shot}`);
+  requests.length = 0;
+  await run(source, "what is left");
+  await source.close();
+  // The refused shot, held inline, is the oldest image: it leaves first.
+  assert.deepEqual(requestImages(requests.at(-1)), [7, 8].map((shot) => base64Of(screenshotOf(shot))));
+  assert.match(JSON.stringify(requests.at(-1)), toolDroppedNote);
+  assert.ok(!holdsImage(store.checkpoint.data, screenshotOf(6)), "the checkpoint no longer holds it");
+
+  const target = await createFxEngine(options(targetBackend, undefined, { ...withScreenshots, ...window, persistence: refusing }));
+  requests.length = 0;
+  await run(target, "and after reopening");
+  await target.close();
+  assert.deepEqual(requestImages(requests.at(-1)), [7, 8].map((shot) => base64Of(screenshotOf(shot))));
+  assert.match(JSON.stringify(requests.at(-1)), toolDroppedNote);
+});
+
 test("a turn whose tools returned more images than a window and a prompt hold reopens with all of them", async () => {
   // 514 pages of 8: 4,112 images, more than the 4,096 a session keeps and
   // the 8 of one prompt, all an open stages unless it reports more missing.
