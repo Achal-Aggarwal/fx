@@ -785,6 +785,31 @@ if (durabilityKind === "memory") {
     await agent.close();
   });
 
+  // A session cancel stops the turn running when it lands. One that finds a
+  // prompt waiting with no worker starts that prompt, and on a queue that
+  // outlives the process it does so before its own input lands; the prompt
+  // still runs, as it does when the sender stores the cancel first.
+  for (const [where, wrap] of [["on a queue that outlives the process", queueOutlivesProcess], ["when its sender stores it", (durability) => durability]]) {
+    test(`${where}, a session cancel that finds a prompt waiting to start leaves it to run`, async () => {
+      const agent = createFxAgent(agentOptions(wrap(await durabilityFor())));
+      const session = agent.session();
+      assert.equal((await session.prompt("hello there").result).stopReason, "end_turn");
+      const internals = agent[Symbol.for("libfx.durableInternals")];
+      // A worker still running would take the next prompt itself.
+      await until(() => internals.liveWorkers() === 0, "the first worker to let the session go");
+      // A prompt waits in the log with no worker, as one whose delivery has
+      // not come yet does.
+      const log = await internals.openLog(session.id);
+      await log.append({ k: "input", key: "prompt:m-waiting", type: "prompt", messageId: "m-waiting", agent: "default", input: "the waiting prompt" });
+      const before = requests.length;
+      await session.cancel();
+      const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-waiting", "the waiting prompt's turn");
+      assert.equal(lines.find((line) => line.type === "turn_end" && line.messageId === "m-waiting").stopReason, "end_turn", "the cancel landed before the turn started");
+      assert.ok(requests.slice(before).some((prompt) => userTexts(prompt).includes("the waiting prompt")), "the prompt reached the model");
+      await agent.close();
+    });
+  }
+
   test("on a queue that outlives the process, a turn a steer started that the deadline cuts off continues once in the next delivery", async () => {
     const agent = createFxAgent(agentOptions(queueOutlivesProcess(await durabilityFor({ maxDurationMs: 1500 * timeScale, reserveMs: 1000 * timeScale }))));
     const held = gate("lookup");
@@ -962,7 +987,6 @@ async function linesUntil(session, done, label, ms = 15_000 * timeScale) {
   }
   return lines;
 }
-
 
 test("a steer cuts a streaming reply short, and the turn goes on with it", async () => {
   const agent = createFxAgent(agentOptions(await durabilityFor()));
