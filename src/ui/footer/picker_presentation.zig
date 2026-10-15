@@ -638,13 +638,17 @@ pub fn activeListPickerReservedRows(terminal_rows: u16, input_extra: u16, banner
     return @min(input_presentation.max_model_picker_rows, available_rows);
 }
 
+/// The @ file picker grows past the list picker's six rows when the terminal
+/// has room, because the file a user wants is often just below row 6.
+const max_file_picker_rows: u16 = 10;
+
 /// The @ file picker keeps the list picker's height, and grows up to
-/// `list_window.max_file_picker_rows` while at least five transcript rows
-/// stay visible above it.
+/// `max_file_picker_rows` while at least five transcript rows stay visible
+/// above it.
 pub fn filePickerReservedRows(terminal_rows: u16, input_extra: u16, banner_rows: u16) u16 {
     const fixed_rows: u16 = 5 +| input_extra +| banner_rows;
     const minimum_transcript_rows: u16 = 5;
-    const grown = @min(list_window.max_file_picker_rows, (terminal_rows -| fixed_rows) -| minimum_transcript_rows);
+    const grown = @min(max_file_picker_rows, (terminal_rows -| fixed_rows) -| minimum_transcript_rows);
     return @max(activeListPickerReservedRows(terminal_rows, input_extra, banner_rows), grown);
 }
 

@@ -1,9 +1,6 @@
 const std = @import("std");
 
 pub const default_max_picker_rows: u16 = 6;
-/// The @ file picker grows past `default_max_picker_rows` when the terminal
-/// has room, because the file a user wants is often just below row 6.
-pub const max_file_picker_rows: u16 = 10;
 
 pub const Window = struct {
     start: usize,
@@ -73,10 +70,11 @@ pub fn updateEdgeStart(current_start: usize, count: usize, selected: usize, max_
 test "selection scrolls only past the picker's own row count" {
     var index: usize = 0;
     var start: usize = 0;
-    for (0..9) |_| advanceSelectionWithin(&index, &start, 30, 1, max_file_picker_rows);
+    const rows: u16 = 10;
+    for (0..9) |_| advanceSelectionWithin(&index, &start, 30, 1, rows);
     try std.testing.expectEqual(@as(usize, 9), index);
     try std.testing.expectEqual(@as(usize, 0), start);
-    advanceSelectionWithin(&index, &start, 30, 1, max_file_picker_rows);
+    advanceSelectionWithin(&index, &start, 30, 1, rows);
     try std.testing.expectEqual(@as(usize, 10), index);
     try std.testing.expectEqual(@as(usize, 1), start);
     // Other pickers keep six rows.
