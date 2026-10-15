@@ -2275,7 +2275,10 @@ export function normalizeInstructions(value) {
   return instructions;
 }
 
-function hostToolContent(value) {
+// `stored` maps an image's base64 data to its name in the image store, for
+// the images stored before the result goes to the core: their blocks carry
+// the name, so the core names them too.
+function hostToolContent(value, stored = null) {
   if (value?.type === "libfx.tool-result") {
     if (typeof value.text !== "string" || !Array.isArray(value.images) || value.images.length > 8) {
       throw new TypeError("invalid typed tool result");
@@ -2287,11 +2290,13 @@ function hostToolContent(value) {
       if ((!referenceOnly && typeof image.data !== "string") || typeof image.mimeType !== "string" || image.mimeType.length === 0 || image.mimeType.length > 128 || (image.data?.length > maxPromptImageDataBytes && sourceRef === undefined)) {
         throw new TypeError("invalid tool image");
       }
+      const data = !referenceOnly && image.data.length <= maxPromptImageDataBytes ? image.data : undefined;
       return {
         type: "image",
-        ...(!referenceOnly && image.data.length <= maxPromptImageDataBytes ? { data: image.data } : {}),
+        ...(data === undefined ? {} : { data }),
         mimeType: image.mimeType,
         ...(sourceRef === undefined ? {} : { sourceRef }),
+        ...(data !== undefined && stored?.has(data) ? { stored: stored.get(data) } : {}),
       };
     });
     if (promptImageDataBytes(images) > maxPromptImagesDataBytes) images = omitReferencedImageData(images);
@@ -2302,7 +2307,7 @@ function hostToolContent(value) {
       content = JSON.stringify({ text: value.text, images });
     }
     if (encoder.encode(content).length > maxPromptImagesDataBytes) throw new RangeError("typed tool result exceeds the result limit");
-    return { content, rich: true, isError: value.isError === true };
+    return { content, rich: true, isError: value.isError === true, images };
   }
   if (typeof value === "string") return { content: value, rich: false };
   if (value === undefined) return { content: "null", rich: false };
@@ -2672,6 +2677,29 @@ export async function createFxEngine(options = {}) {
     }
     throw new Error("transport retry exhausted");
   };
+  // A typed tool result's images go in the image store by name before the
+  // result reaches the core, as a prompt's do, so the session's records name
+  // them. The tool has already run, so an image the store refuses is not
+  // lost: it stays in the result, and the records hold it inline.
+  const storedToolContent = async (value) => {
+    const normalized = hostToolContent(value);
+    if (!imageStore || !normalized.images?.some((image) => image.data !== undefined)) return normalized;
+    const stored = new Map();
+    for (const image of normalized.images) {
+      if (image.data === undefined || stored.has(image.data)) continue;
+      let bytes;
+      // Data that is not base64 is the core's to refuse.
+      try { bytes = base64ToBytes(image.data); } catch { continue; }
+      const name = await imageName(bytes);
+      try {
+        await persistence.putImage(name, bytes);
+        stored.set(image.data, name);
+      } catch (error) {
+        emit("image.store_error", { error: error instanceof Error ? error.name : "Error", message: error?.message ?? "" });
+      }
+    }
+    return stored.size ? hostToolContent(value, stored) : normalized;
+  };
   const executeHostTool = async (name, input, requestedSessionId, toolCallId) => {
     const execute = hostTools.executors.get(name);
     const turn = requestedSessionId === undefined || requestedSessionId === sessionId
@@ -2701,7 +2729,7 @@ export async function createFxEngine(options = {}) {
       });
       const value = await Promise.race([execution, aborted]);
       if (!controller.signal.aborted) {
-        const normalized = hostToolContent(value);
+        const normalized = await storedToolContent(value);
         content = normalized.content;
         rich = normalized.rich;
         isError = normalized.isError === true;
@@ -2710,7 +2738,7 @@ export async function createFxEngine(options = {}) {
       isError = true;
       if (error?.toolResult?.type === "libfx.tool-result") {
         try {
-          const normalized = hostToolContent(error.toolResult);
+          const normalized = await storedToolContent(error.toolResult);
           content = normalized.content;
           rich = normalized.rich;
         } catch {

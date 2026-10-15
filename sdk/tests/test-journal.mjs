@@ -19,7 +19,10 @@ const usage = { inputTokens: { total: 1 }, outputTokens: { total: 1 } };
 const textOf = (message) => typeof message.content === "string"
   ? message.content
   : message.content.filter((part) => part.type === "text").map((part) => part.text).join("");
-const lastUserText = (prompt) => textOf(prompt.filter((message) => message.role === "user").at(-1));
+// The user message the gateway adds after a tool result's images.
+const toolImageFollowUp = "Attached image(s) from the tool result.";
+const isPrompt = (message) => message.role === "user" && textOf(message) !== toolImageFollowUp;
+const lastUserText = (prompt) => textOf(prompt.filter(isPrompt).at(-1));
 const toolResults = (prompt) => prompt
   .flatMap((message) => Array.isArray(message.content) ? message.content : [])
   .filter((part) => part.type === "tool-result");
@@ -112,6 +115,20 @@ function framesFor(prompt) {
       { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage },
     ];
   }
+  // "screenshot N" takes screenshot N once in its turn, then says it saw it.
+  const shot = /^screenshot (\d+)$/u.exec(text);
+  if (shot) {
+    if (toolResults(prompt.slice(prompt.findLastIndex(isPrompt) + 1)).length === 0) {
+      return [
+        { type: "tool-call", toolCallId: `call-shot-${shot[1]}`, toolName: "screenshot", input: { shot: Number(shot[1]) } },
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage },
+      ];
+    }
+    return [
+      { type: "text-delta", id: "answer", delta: `saw ${shot[1]}` },
+      { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage },
+    ];
+  }
   if (text === "use the tool" && toolResults(prompt).length === 0) {
     return [
       { type: "tool-call", toolCallId: "call-1", toolName: "lookup", input: { key: "alpha" } },
@@ -176,6 +193,17 @@ const bulky = {
   description: "Returns a large part",
   inputSchema: { type: "object", properties: { part: { type: "number" } } },
   execute: async ({ part }) => `${part}:${"x".repeat(60_000)}`,
+};
+// Returns screenshot `shot` as a typed result: a PNG distinct per shot.
+const screenshot = {
+  name: "screenshot",
+  description: "Takes a screenshot",
+  inputSchema: { type: "object", properties: { shot: { type: "number" } }, required: ["shot"] },
+  execute: async ({ shot }) => ({
+    type: "libfx.tool-result",
+    text: `shot ${shot}`,
+    images: [{ type: "image", data: base64Of(screenshotOf(shot)), mimeType: "image/png" }],
+  }),
 };
 const options = (backend, journal, extra = {}) => ({
   backend,
@@ -1636,6 +1664,115 @@ test("a session holds more images than a checkpoint could, turn after turn", asy
   await run(last, "all of them");
   await last.close();
   assert.deepEqual(requestImages(requests.at(-1)), images.map(base64Of));
+});
+
+const screenshotOf = (shot) => pngOf(300_000, 100 + shot);
+const withScreenshots = { ...visionCatalog, tools: [lookup, screenshot] };
+const toolDroppedNote = /\[1 image from this result is no longer in this session, which keeps only its newest images\.\]/;
+
+test("a store keeps each tool image once, and records and checkpoints only name it", async () => {
+  const store = createMemoryPersistence();
+  const source = await createFxEngine(options(sourceBackend, undefined, { ...withScreenshots, persistence: store, checkpointAfterBytes: 0 }));
+  for (const shot of [1, 2, 3]) assert.equal((await run(source, `screenshot ${shot}`)).text, `saw ${shot}`);
+  await source.close();
+  const shots = [1, 2, 3].map(screenshotOf);
+  assert.deepEqual([...store.images.keys()].sort(), (await Promise.all(shots.map(nameOf))).sort());
+  assert.ok(store.checkpoint, "a checkpoint was saved");
+  for (const data of savedData(store)) assert.ok(shots.every((bytes) => !holdsImage(data, bytes)), "saved data holds no tool image bytes");
+  // An event that names an image is version 3, a progress that extends
+  // another and names a new tool image too.
+  const events = storedEvents(store);
+  assert.ok(events.some((event) => event.base !== undefined && JSON.stringify(event).includes("inline_ref")), "a delta names its tool image");
+  for (const event of events) {
+    const named = JSON.stringify(event).includes("inline_ref");
+    assert.equal(event.v, named ? 3 : event.base !== undefined || event.type === "tool_result" ? 2 : 1);
+  }
+
+  const target = await createFxEngine(options(targetBackend, undefined, { ...withScreenshots, persistence: store }));
+  requests.length = 0;
+  const { result } = await run(target, "after the shots");
+  await target.close();
+  assert.equal(result.stopReason, "end_turn");
+  assert.deepEqual(requestImages(requests.at(-1)), shots.map(base64Of));
+});
+
+test("a tool image leaves the window oldest first, as a note, and stays out after a reopen", async () => {
+  const store = createMemoryPersistence();
+  const window = { [imageWindow]: { images: 2 } };
+  const shots = [1, 2, 3].map(screenshotOf);
+  const source = await createFxEngine(options(sourceBackend, undefined, { ...withScreenshots, ...window, persistence: store, checkpointAfterBytes: 0 }));
+  for (const shot of [1, 2, 3]) await run(source, `screenshot ${shot}`);
+  requests.length = 0;
+  await run(source, "what is left");
+  await source.close();
+  assert.deepEqual(requestImages(requests.at(-1)), [shots[1], shots[2]].map(base64Of));
+  assert.match(JSON.stringify(requests.at(-1)), toolDroppedNote);
+  assert.ok(savedData(store).some((data) => Buffer.from(data).includes("\"dropped\":true")), "the first shot keeps its name alone");
+
+  const target = await createFxEngine(options(targetBackend, undefined, { ...withScreenshots, ...window, persistence: store }));
+  requests.length = 0;
+  await run(target, "and after reopening");
+  await target.close();
+  assert.deepEqual(requestImages(requests.at(-1)), [shots[1], shots[2]].map(base64Of));
+  assert.match(JSON.stringify(requests.at(-1)), toolDroppedNote);
+});
+
+test("a tool image the store refuses stays in the session inline, and the host hears why", async () => {
+  const store = createMemoryPersistence();
+  const refusing = {
+    load: () => store.load(),
+    append: (input) => store.append(input),
+    saveCheckpoint: (input) => store.saveCheckpoint(input),
+    putImage: async () => { throw new Error("store is full"); },
+    getImage: (name) => store.getImage(name),
+  };
+  const refusals = [];
+  const agent = await createFxEngine(options(sourceBackend, undefined, {
+    ...withScreenshots, persistence: refusing,
+    onEvent: (event) => { if (event.type === "image.store_error") refusals.push(event.message); },
+  }));
+  requests.length = 0;
+  const { text, result } = await run(agent, "screenshot 4");
+  await agent.close();
+  assert.equal(result.stopReason, "end_turn");
+  assert.equal(text, "saw 4");
+  assert.deepEqual(refusals, ["store is full"]);
+  // The tool ran, so its image is not lost: the model saw it, and the
+  // records hold it inline.
+  assert.deepEqual(requestImages(requests.at(-1)), [base64Of(screenshotOf(4))]);
+  assert.ok(savedData(store).some((data) => holdsImage(data, screenshotOf(4))), "the records hold the image inline");
+  assert.equal(store.images.size, 0);
+
+  const reopened = await createFxEngine(options(targetBackend, undefined, { ...withScreenshots, persistence: store }));
+  requests.length = 0;
+  await run(reopened, "after the refusal");
+  await reopened.close();
+  assert.deepEqual(requestImages(requests.at(-1)), [base64Of(screenshotOf(4))]);
+});
+
+test("a turn that crashed after its screenshot's progress reopens with the screenshot", async () => {
+  const journal = eventJournal();
+  const images = new Map();
+  const withImages = (persistence) => ({
+    ...persistence,
+    putImage: async (name, bytes) => { images.set(name, new Uint8Array(bytes)); },
+    getImage: async (name) => images.get(name),
+  });
+  const source = await createFxEngine(options(sourceBackend, undefined, { ...withScreenshots, persistence: withImages(persisted(journal)) }));
+  assert.equal((await run(source, "screenshot 5")).text, "saw 5");
+  await source.close();
+  // The progress after the tool step extends the first, and names the shot.
+  const stepped = journal.events.find((event) => event.type === "turn_progress" && event.steps === 1);
+  assert.ok(stepped?.base !== undefined && stepped.v === 3 && JSON.stringify(stepped).includes("inline_ref"), "the delta names the screenshot");
+  assert.ok(!JSON.stringify(stepped).includes(base64Of(screenshotOf(5)).slice(0, 400)), "and does not hold it");
+  const survived = journal.events.slice(0, journal.events.indexOf(stepped) + 1);
+  const resumed = await createFxEngine(options(targetBackend, undefined, { ...withScreenshots, persistence: withImages(persisted(eventJournal(survived))) }));
+  requests.length = 0;
+  const turn = resumed.resume();
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  await resumed.close();
+  assert.deepEqual(requestImages(requests[0]), [base64Of(screenshotOf(5))], "the screenshot came back from the store");
 });
 
 test("a journal past the turn limit is refused by name", async () => {

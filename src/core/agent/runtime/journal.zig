@@ -194,7 +194,10 @@ pub const Cursor = struct {
                 try writer.writeAll(",\"data\":");
                 if (progress.delta) |delta| {
                     if (delta.base_seq >= self.next_seq) return error.InvalidDurableField;
-                    try session_codec.writeRecoveryCheckpointDelta(writer, progress.checkpoint, delta.from);
+                    if (stored) |names|
+                        try session_codec.writeRecoveryCheckpointDeltaNamingImages(writer, progress.checkpoint, delta.from, .{ .stored = names })
+                    else
+                        try session_codec.writeRecoveryCheckpointDelta(writer, progress.checkpoint, delta.from);
                     try writer.print(",\"base\":{d},\"steps\":{d}", .{ delta.base_seq, progress.checkpoint.execution.tool_steps.len });
                 } else if (stored) |names| {
                     try session_codec.writeRecoveryCheckpointNamingImages(writer, progress.checkpoint, .{ .stored = names });
@@ -263,8 +266,9 @@ pub const Cursor = struct {
 fn eventNamesImages(event: Event, stored: ?*const session_codec.StoredImages) bool {
     return switch (event) {
         .turn_committed => |turn| session_codec.turnNamesImages(turn, stored),
-        // A delta leaves out the user's turn, so it names nothing.
-        .turn_progress => |progress| progress.delta == null and session_codec.namesImages(progress.checkpoint.user, stored),
+        // A delta leaves out the user's turn: it names only what its new
+        // tool results do.
+        .turn_progress => |progress| session_codec.checkpointNamesImages(progress.checkpoint, if (progress.delta) |delta| delta.from else null, stored),
         .history_replaced => |history| for (history) |turn| {
             if (session_codec.turnNamesImages(turn, stored)) break true;
         } else false,
@@ -411,7 +415,7 @@ pub fn writeOpenTurnNamingImages(
     stored: *const session_codec.StoredImages,
 ) !bool {
     try writeOpenTurnWith(writer, turn_id, progress, stored);
-    return session_codec.namesImages(progress.user, stored);
+    return session_codec.checkpointNamesImages(progress, null, stored);
 }
 
 fn writeOpenTurnWith(

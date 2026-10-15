@@ -290,6 +290,8 @@ export type FxEngineEvent = FxEventBase & (
   | { type: "journal.error"; error: string }
   | { type: "checkpoint.save"; through: string; bytes: number }
   | { type: "checkpoint.error"; error: string; message: string }
+  /** The image store refused an image a tool returned. The session keeps the image, and its records hold it inline. */
+  | { type: "image.store_error"; error: string; message: string }
   /** The core refused a checkpoint: the session is past a checkpoint's bounds, and its journal keeps growing until compaction brings it back. */
   | { type: "checkpoint.skipped"; reason: "too_large" | "too_many_turns" | "invalid" }
   /** A checkpoint saved under a different libfx version, tool set, or model still loaded. */
