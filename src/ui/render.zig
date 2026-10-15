@@ -924,7 +924,7 @@ test "initTheme selects the light inline code foreground" {
     defer out.deinit(alloc);
 
     try processor.push(alloc, "run `zig build` now\n", &out);
-    try std.testing.expectEqualStrings("run \x1b[38;5;247mzig build\x1b[39m now\n", out.items);
+    try std.testing.expectEqualStrings("run \x1b[38;5;235mzig build\x1b[39m now\n", out.items);
 }
 
 test "welcomeMessage shows version and help hint" {

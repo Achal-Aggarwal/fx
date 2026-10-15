@@ -10,6 +10,8 @@
 //!
 //! Snapshot contents stay in memory. They reach a command only through its
 //! environment and the supervisor's stdin script, and are never logged.
+//!
+//! TLA+ model: `tests/tla/terminal/ShellSnapshot.tla`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -770,7 +772,6 @@ fn captureWithShellChecked(request: CaptureRequest) !CaptureOutcome {
     const invocation = try shell_resolver.capturedInvocation(scratch, .{ .user = request.shell_path }, script);
     const end_marker = try markerText(scratch, &nonce, "END", "\x00", "\x00");
 
-    const io = io_mod.getIo();
     // The capture runs an interactive login shell. Without its own session
     // it would share fx's controlling terminal, stop on job control, and its
     // startup files could write over the fx interface.
@@ -783,26 +784,14 @@ fn captureWithShellChecked(request: CaptureRequest) !CaptureOutcome {
         debug_trace.logf("core", "shell snapshot capture spawn failed err={s}", .{@errorName(err)});
         return .{ .failed = .spawn_failed };
     };
-    const process_group: std.posix.pid_t = child.id orelse return .{ .failed = .spawn_failed };
-    defer {
-        // Ends the shell and anything its startup files left running in its
-        // process group, as the command supervisor does after each command.
-        debug_trace.logf("core", "shell snapshot capture stopping process group pgid={d}", .{process_group});
-        std.posix.kill(-process_group, std.posix.SIG.KILL) catch |err| {
-            debug_trace.logf("core", "shell snapshot capture process group kill failed pgid={d} err={s}", .{ process_group, @errorName(err) });
-        };
-        debug_trace.logf("core", "shell snapshot capture process group signaled pgid={d}", .{process_group});
-        if (child.stdin) |lifeline| {
-            lifeline.close(io);
-            child.stdin = null;
-            debug_trace.logf("core", "shell snapshot capture lifeline closed pid={d}", .{process_group});
-        }
-        if (child.wait(io)) |term| {
-            traceSupervisorExit(process_group, term);
-        } else |err| {
-            debug_trace.logf("core", "shell snapshot capture wait failed err={s}", .{@errorName(err)});
-        }
-    }
+    const supervisor_pid: std.posix.pid_t = child.id orelse return .{ .failed = .spawn_failed };
+    // The supervisor, not fx, stops the shell and anything its startup files
+    // left running, then exits on its own.
+    defer if (command_runner.finishDetachedSession(&child)) |term| {
+        traceSupervisorExit(supervisor_pid, term);
+    } else |err| {
+        debug_trace.logf("core", "shell snapshot capture wait failed err={s}", .{@errorName(err)});
+    };
 
     var payload: std.ArrayList(u8) = .empty;
     const read_status = try readPayload(scratch, &payload, child.stdout.?.handle, child.stderr.?.handle, end_marker);

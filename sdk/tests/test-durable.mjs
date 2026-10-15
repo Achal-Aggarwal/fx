@@ -50,6 +50,16 @@ const leasedAt = async (dir) => {
   return world(() => createWorld({ dataDir: dir, recoverActiveRuns: false }), { name: "leased", pollMs: 250, leaseMs: leaseTestMs, maxDurationMs: 600_000 });
 };
 const usage = { inputTokens: { total: 1 }, outputTokens: { total: 1 } };
+const onePixelPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+// The same storage on a queue that outlives the process, as on Vercel: the
+// worker that takes a message writes its input, not the sender.
+const queueDurableAt = async (dir) => ({ ...(await durabilityAt(dir)), queueDurable: true });
+// The steer a crash test's child sends, which asks the model for a lookup.
+// The engine adds an image's placeholder to its text, so a word follows the
+// tool's name.
+const crashSteer = (kind) => (kind === "image"
+  ? [{ type: "text", text: "use lookup with this" }, { type: "image", data: onePixelPng, mimeType: "image/png" }]
+  : "use lookup");
 const resumeNotice = "Resuming from unexpected session interruption.";
 // The user message the gateway adds after a tool result's images.
 const toolImageFollowUp = "Attached image(s) from the tool result.";
@@ -454,6 +464,18 @@ if (childMode && process.argv[6] === "accepted") {
   process.stdout.write(`${JSON.stringify({ sessionId })}\n`, () => process.kill(process.pid, "SIGKILL"));
   await new Promise(() => {});
 }
+// With `steer`, a steer starts the turn instead, on a queue that outlives the
+// process, so the turn starts before the steer's input lands.
+if (childMode && process.argv[6] === "steer") {
+  gate("lookup");
+  const agent = createFxAgent(agentOptions(await queueDurableAt(process.argv[5])));
+  const session = agent.session();
+  await session.steer(crashSteer(process.argv[7]), { messageId: "crash-steer" });
+  await gates.get("lookup").started;
+  await agent[Symbol.for("libfx.durableInternals")].settled(session.id);
+  console.log(JSON.stringify({ sessionId: session.id, executionId: runs.find(([name]) => name === "lookup")?.[1] }));
+  await new Promise(() => {});
+}
 if (childMode) {
   const dir = process.argv[5];
   const tool = process.argv[6];
@@ -672,6 +694,120 @@ if (durabilityKind === "memory") {
     await agent.close();
   });
 
+  // On a queue that outlives the process, the worker writes a message's input
+  // with its claim and starts the turn before either lands, so the input
+  // reaches the log after the point the turn reads steers from.
+  test("on a queue that outlives the process, a steer with an image that starts a turn runs it once, with the image", async () => {
+    const agent = createFxAgent(agentOptions(queueOutlivesProcess(await durabilityFor())));
+    const session = agent.session();
+    const before = requests.length;
+    await session.steer([{ type: "text", text: "match this first" }, { type: "image", data: onePixelPng, mimeType: "image/png" }], { messageId: "m-image-first" });
+    const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-image-first", "the image's turn");
+    const end = lines.find((line) => line.type === "turn_end" && line.messageId === "m-image-first");
+    assert.equal(end.stopReason, "end_turn", `the image's turn ended with ${JSON.stringify(end).slice(0, 300)}`);
+    assert.equal(lines.filter((line) => line.type === "turn_start").length, 1, "the steer ran one turn");
+    assert.equal(requests.length - before, 1, "the turn sent one model request");
+    assert.ok(JSON.stringify(requests.at(-1)).includes("image"), "the request carried the image");
+    await agent.close();
+  });
+
+  test("on a queue that outlives the process, a text steer that starts a turn reaches the model once", async () => {
+    const agent = createFxAgent(agentOptions(queueOutlivesProcess(await durabilityFor())));
+    const session = agent.session();
+    const before = requests.length;
+    await session.steer("guide me first", { messageId: "m-text-first" });
+    const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-text-first", "the steer's turn");
+    assert.equal(lines.find((line) => line.type === "turn_end" && line.messageId === "m-text-first").stopReason, "end_turn");
+    // A turn after it, so a second request for the reapplied steer would have gone out by now.
+    assert.equal((await session.prompt("after the guide").result).stopReason, "end_turn");
+    const forSteer = requests.slice(before).filter((prompt) => !userTexts(prompt).includes("after the guide"));
+    assert.equal(forSteer.length, 1, "the steer's turn sent one model request");
+    assert.equal(userTexts(forSteer[0]).filter((text) => text.includes("guide me first")).length, 1, "the steer reached the model once");
+    await agent.close();
+  });
+
+  test("on a queue that outlives the process, a turn a steer started still takes the steers after it", async () => {
+    const agent = createFxAgent(agentOptions(queueOutlivesProcess(await durabilityFor())));
+    const session = agent.session();
+    let before = slow.length;
+    await session.steer("slow reply", { messageId: "m-slow-text" });
+    await until(() => slow.length > before && slow.at(-1).sent > 0, "the reply to stream");
+    await session.steer("be brief", { messageId: "m-brief-second" });
+    let lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-slow-text", "the steer's turn");
+    assert.equal(lines.find((line) => line.type === "turn_end" && line.messageId === "m-slow-text").stopReason, "end_turn");
+    assert.deepEqual(lines.filter((line) => line.type === "turn_start").map((line) => line.messageId), ["m-slow-text"], "the text steer joined the turn");
+    const texts = userTexts(requests.at(-1));
+    assert.equal(texts.filter((text) => text.includes("slow reply")).length, 1, "the steer that started the turn reached the model once");
+    assert.equal(texts.filter((text) => text.includes("be brief")).length, 1, "the steer after it joined the turn once");
+    // One with an image still ends the turn and runs as its own.
+    before = slow.length;
+    await session.steer("slow reply", { messageId: "m-slow-image" });
+    await until(() => slow.length > before && slow.at(-1).sent > 0, "the second reply to stream");
+    await session.steer([{ type: "text", text: "match this next" }, { type: "image", data: onePixelPng, mimeType: "image/png" }], { messageId: "m-image-second" });
+    lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-image-second", "the image's turn");
+    assert.deepEqual(lines.filter((line) => line.type === "turn_start").map((line) => line.messageId), ["m-slow-text", "m-slow-image", "m-image-second"]);
+    assert.ok(slow.at(-1).sent < slowFrames, "the image ended the streaming turn early");
+    assert.equal(lines.find((line) => line.type === "turn_end" && line.messageId === "m-image-second").stopReason, "end_turn");
+    assert.ok(JSON.stringify(requests.at(-1)).includes("image"), "the image reached the model in its own turn");
+    await agent.close();
+  });
+
+  // The redelivery reads the log before the first delivery's input lands, so
+  // it writes the input again.
+  test("on a queue that outlives the process, a steer that starts a turn and is delivered again runs once", async () => {
+    const [held, writes] = holdWrites(queueOutlivesProcess(await durabilityFor()), (entry) => entry.k === "input");
+    const agent = createFxAgent(agentOptions(held));
+    const session = agent.session();
+    const before = requests.length;
+    await session.steer("guide me again", { messageId: "m-redelivered" });
+    await writes.next();
+    void agent[Symbol.for("libfx.durableInternals")].deliver({ type: "steer", messageId: "m-redelivered", input: "guide me again", agent: "default", sessionId: session.id });
+    await until(() => writes.held.length === 2, "the redelivery's copy of the input");
+    await writes.release();
+    const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-redelivered", "the steer's turn");
+    assert.equal(lines.find((line) => line.type === "turn_end" && line.messageId === "m-redelivered").stopReason, "end_turn");
+    assert.equal((await session.prompt("after the redelivery").result).stopReason, "end_turn");
+    const all = await readLines(session.stream(0), 64);
+    assert.equal(all.filter((line) => line.type === "turn_start" && line.messageId === "m-redelivered").length, 1, "the steer ran one turn");
+    const forSteer = requests.slice(before).filter((prompt) => !userTexts(prompt).includes("after the redelivery"));
+    assert.equal(forSteer.length, 1, "the steer's turn sent one model request");
+    assert.equal(userTexts(forSteer[0]).filter((text) => text === "guide me again").length, 1, "the steer reached the model once");
+    await agent.close();
+  });
+
+  test("on a queue that outlives the process, a cancel still ends a turn a steer started", async () => {
+    const agent = createFxAgent(agentOptions(queueOutlivesProcess(await durabilityFor())));
+    const session = agent.session();
+    const before = slow.length;
+    await session.steer("slow reply", { messageId: "m-slow-cancel" });
+    await until(() => slow.length > before && slow.at(-1).sent > 0, "the reply to stream");
+    await session.cancel();
+    const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-slow-cancel", "the steer's turn");
+    assert.equal(lines.find((line) => line.type === "turn_end" && line.messageId === "m-slow-cancel").stopReason, "cancelled");
+    assert.ok(slow.at(-1).sent < slowFrames, "the cancel ended the streaming reply early");
+    assert.equal((await session.prompt("after the cancel").result).stopReason, "end_turn");
+    const all = await readLines(session.stream(0), 256);
+    assert.equal(all.filter((line) => line.type === "turn_start" && line.messageId === "m-slow-cancel").length, 1, "the cancelled steer did not run again");
+    await agent.close();
+  });
+
+  test("on a queue that outlives the process, a turn a steer started that the deadline cuts off continues once in the next delivery", async () => {
+    const agent = createFxAgent(agentOptions(queueOutlivesProcess(await durabilityFor({ maxDurationMs: 1500 * timeScale, reserveMs: 1000 * timeScale }))));
+    const held = gate("lookup");
+    const session = agent.session();
+    await session.steer("use lookup", { messageId: "m-lookup-first" });
+    await held.started;
+    // The call never returns on its own; a rerun goes through at once.
+    gates.delete("lookup");
+    const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-lookup-first", "the steer's turn");
+    assert.equal(lines.find((line) => line.type === "turn_end" && line.messageId === "m-lookup-first").stopReason, "end_turn");
+    assert.equal(lines.filter((line) => line.type === "turn_start").length, 1);
+    assert.equal(lines.filter((line) => line.type === "turn_yield").length, 1);
+    assert.equal(lines.filter((line) => line.type === "turn_resume").length, 1);
+    assert.equal(userTexts(requests.at(-1)).filter((text) => text === "use lookup").length, 1, "the steer reached the model once");
+    await agent.close();
+  });
+
   // With a queue that outlives the process, as on Vercel, a message's input
   // is written with its claim's lease, so the lease can land first.
   test("a prompt whose input landed after another worker took the session over still runs", async () => {
@@ -833,7 +969,6 @@ async function linesUntil(session, done, label, ms = 15_000 * timeScale) {
   return lines;
 }
 
-const onePixelPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
 
 test("a steer cuts a streaming reply short, and the turn goes on with it", async () => {
   const agent = createFxAgent(agentOptions(await durabilityFor()));
@@ -1298,6 +1433,51 @@ if (durabilityKind !== "memory") {
       }
       await agent.close();
     });
+  }
+
+  // Another worker takes the turn over as a queue that outlives the process
+  // would, delivering the steer again, or for a resume.
+  for (const kind of ["text", "image"]) {
+    for (const takeover of ["redelivery", "resume"]) {
+      test(`a crash during a turn ${kind === "image" ? "an image" : "a text"} steer started on a queue that outlives the process goes on once on another worker, by ${takeover === "redelivery" ? "the steer delivered again" : "a resume"}`, async () => {
+        const dir = await mkdtemp(join(tmpdir(), "libfx-durable-steer-crash-"));
+        dirs.push(dir);
+        const child = spawn(process.execPath, [...process.execArgv, fileURLToPath(import.meta.url), durabilityKind, engineBackend, "--child", dir, "steer", kind], {
+          stdio: ["ignore", "pipe", "inherit"], env: { ...process.env },
+        });
+        const exited = new Promise((resolveExit) => child.once("exit", resolveExit));
+        let output = "";
+        child.stdout.on("data", (chunk) => { output += chunk; });
+        try {
+          // Within the test's own timeout, so a child that never gets there
+          // fails here and is stopped.
+          await until(() => output.includes("\n"), "the child to start its tool", testTimeoutMs / 2);
+        } finally {
+          child.kill("SIGKILL");
+          await exited;
+        }
+        const { sessionId, executionId } = JSON.parse(output.trim().split("\n")[0]);
+        const runsBefore = runs.filter(([name]) => name === "lookup").length;
+        const errors = [];
+        const agent = createFxAgent(agentOptions(await queueDurableAt(dir), {
+          onEvent: (event) => { if (event.type === "session.error") errors.push(event); },
+        }));
+        const session = agent.session(sessionId);
+        if (takeover === "resume") assert.equal((await session.resume().result).stopReason, "end_turn");
+        else await agent[Symbol.for("libfx.durableInternals")].deliver({ type: "steer", messageId: "crash-steer", input: crashSteer(kind), agent: "default", sessionId });
+        const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "crash-steer", "the steer's turn");
+        assert.deepEqual(lines.filter((line) => line.type === "turn_end").map((line) => [line.messageId, line.stopReason]), [["crash-steer", "end_turn"]], "the turn ended once");
+        assert.ok(lines.some((line) => line.type === "turn_resume" && line.messageId === "crash-steer"), "the new worker continued the turn");
+        // The dead worker's `turn_start` may not have landed; none comes after.
+        assert.ok(lines.filter((line) => line.type === "turn_start").every((line) => line.messageId === "crash-steer"), "no other turn ran");
+        assert.ok(lines.filter((line) => line.type === "turn_start").length <= 1, "the steer did not start a second turn");
+        assert.deepEqual(runs.filter(([name]) => name === "lookup").slice(runsBefore).map(([, id]) => id), [executionId], "the idempotent call ran again under its id");
+        assert.equal(userTexts(requests.at(-1)).filter((text) => text.includes("use lookup")).length, 1, "the steer reached the model once");
+        if (kind === "image") assert.ok(JSON.stringify(requests.at(-1)).includes("image/png"), "the image is still in the turn");
+        assert.deepEqual(errors, [], "the takeover reported no error");
+        await agent.close();
+      });
+    }
   }
 }
 

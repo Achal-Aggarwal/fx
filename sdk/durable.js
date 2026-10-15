@@ -2021,6 +2021,9 @@ class SessionWorker {
       void Promise.resolve().then(() => turn.endForSteer?.()).catch(() => {});
     };
     const steerTurn = (steer) => {
+      // A steer that opened this turn is its prompt. After an early start
+      // its input lands past `since`, so the poll reads it again.
+      if (steer.messageId === messageId) return;
       if (!joinable(steer.input)) endTurn();
       else if (!ending) void turn.steer(steer.input, steer.messageId).catch(() => {});
     };
