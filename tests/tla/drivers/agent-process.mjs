@@ -9,7 +9,7 @@ import { parentPort, workerData } from "node:worker_threads";
 import { createDurableAgentFactory, foldSessionLog } from "../../../sdk/durable.js";
 import { world } from "../../../sdk/durable/world.mjs";
 
-const { names, mode } = workerData;
+const { names } = workerData;
 const { createWorld } = await import(new URL("../../../sdk/durable/node_modules/@workflow/world-local/dist/index.js", import.meta.url).href);
 const encoder = new TextEncoder();
 const inner = Symbol("handler");
@@ -80,7 +80,7 @@ const methods = {
         },
       };
     };
-    const durability = world(createInstance, { name: "routing", pollMs: 250, queueDurable: mode === "consume", runInRequest: false });
+    const durability = world(createInstance, { name: "routing", pollMs: 250, runInRequest: false });
     const agents = Object.fromEntries(names.map((name) => [name, createAgent({ durability, name, tag: name })]));
     walk = { handlers, agents };
     ran = [];

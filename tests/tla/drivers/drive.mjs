@@ -234,6 +234,8 @@ async function harness() {
     writes[w] = held;
     agents[w] = createFxAgent({
       ...(testHooks ? { hooks: testHooks } : {}),
+      // Each worker stands for another server's copy of one agent.
+      [Symbol.for("libfx.replica")]: true,
       backend,
       nativeAddon: addon,
       ...(wasm ? { wasm } : {}),

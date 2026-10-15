@@ -673,18 +673,13 @@ if (durabilityKind === "memory") {
     await second.close();
   });
 
-  // A sender whose queue outlives the process does not read the log first,
-  // so the worker reports a steer that reuses a prompt's id.
-  test("on a queue that outlives the process, a steer reusing a prompt's id is reported and runs nothing", async () => {
-    const errors = [];
-    const agent = createFxAgent(agentOptions(queueOutlivesProcess(await durabilityFor()), {
-      onEvent: (event) => { if (event.type === "session.error") errors.push(event); },
-    }));
+  // Every sender stores its input before it queues the message, whatever
+  // the queue, so it refuses a steer that reuses a prompt's id itself.
+  test("on a queue that outlives the process, a steer reusing a prompt's id is refused and runs nothing", async () => {
+    const agent = createFxAgent(agentOptions(queueOutlivesProcess(await durabilityFor())));
     const session = agent.session();
     assert.equal((await session.prompt("hello there", { messageId: "m-dup" }).result).stopReason, "end_turn");
-    await session.steer("again", { messageId: "m-dup" });
-    await until(() => errors.length > 0, "the collision's session.error");
-    assert.equal(errors[0].error?.code, "FX_MESSAGE_ID_IN_USE");
+    await assert.rejects(session.steer("again", { messageId: "m-dup" }), (error) => error?.code === "FX_MESSAGE_ID_IN_USE");
     const lines = await readLines(session.stream(0), 64);
     assert.equal(lines.filter((line) => line.type === "turn_start").length, 1, "the steer ran no turn");
     await agent.close();
@@ -748,17 +743,16 @@ if (durabilityKind === "memory") {
     await agent.close();
   });
 
-  // The redelivery reads the log before the first delivery's input lands, so
-  // it writes the input again.
+  // A redelivery names the input its sender stored and carries none, so the
+  // steer is in the log once however often it is delivered.
   test("on a queue that outlives the process, a steer that starts a turn and is delivered again runs once", async () => {
-    const [held, writes] = holdWrites(queueOutlivesProcess(await durabilityFor()), (entry) => entry.k === "input");
+    const [held, writes] = holdWrites(queueOutlivesProcess(await durabilityFor()), (entry) => entry.k === "lease");
     const agent = createFxAgent(agentOptions(held));
     const session = agent.session();
     const before = requests.length;
     await session.steer("guide me again", { messageId: "m-redelivered" });
     await writes.next();
-    void agent[Symbol.for("libfx.durableInternals")].deliver({ type: "steer", messageId: "m-redelivered", input: "guide me again", agent: "default", sessionId: session.id });
-    await until(() => writes.held.length === 2, "the redelivery's copy of the input");
+    void agent[Symbol.for("libfx.durableInternals")].deliver({ type: "steer", messageId: "m-redelivered", input: "a body the worker ignores", agent: "default", sessionId: session.id });
     await writes.release();
     const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-redelivered", "the steer's turn");
     assert.equal(lines.find((line) => line.type === "turn_end" && line.messageId === "m-redelivered").stopReason, "end_turn");
@@ -804,33 +798,26 @@ if (durabilityKind === "memory") {
     await agent.close();
   });
 
-  // With a queue that outlives the process, as on Vercel, a message's input
-  // is written with its claim's lease, so the lease can land first.
-  test("a prompt whose input landed after another worker took the session over still runs", async () => {
-    const base = queueOutlivesProcess(await durabilityFor());
-    const [held, writes] = holdWrites(base, (entry) => entry.k === "input");
-    const first = createFxAgent(agentOptions(held));
-    const turn = first.session().prompt("one");
-    const { sessionId } = await turn.accepted;
+  // With a queue that outlives the process, as on Vercel, a prompt's input
+  // still reaches the log before its message is queued, so no delivery can
+  // run ahead of it, and its caller hears it was accepted only once stored.
+  test("on a queue that outlives the process, a prompt is accepted and queued only once its input is stored", async () => {
+    const [held, writes] = holdWrites(queueOutlivesProcess(await durabilityFor()), (entry) => entry.k === "input");
+    const agent = createFxAgent(agentOptions(held));
+    const before = requests.length;
+    const turn = agent.session().prompt("one");
+    let accepted = false;
+    void turn.accepted.then(() => { accepted = true; });
     await writes.next();
-    await until(async () => (await first[Symbol.for("libfx.durableInternals")].lastLease(sessionId)) !== null, "the first worker's lease");
-    // The platform gives up on the first worker, and another takes the
-    // session over for a prompt of its own and finishes it.
-    const holders = globalThis[Symbol.for("libfx.liveHolders")];
-    for (const holder of [...holders]) holders.delete(holder);
-    const second = createFxAgent(agentOptions(base));
-    assert.equal((await collect(second.session(sessionId).prompt("two"))).result.stopReason, "end_turn");
-    // Closing waits for its delivery to finish, so it cannot take the first
-    // prompt as well.
-    await second.close();
-    // The first prompt lands only now; its worker reads the log again and
-    // runs it.
+    await new Promise((resolve) => setTimeout(resolve, 200 * timeScale));
+    assert.equal(accepted, false, "not accepted while its input is held");
+    assert.equal(requests.length, before, "nothing ran while its input is held");
     writes.release();
     let timer;
-    const stranded = new Promise((_, fail) => { timer = setTimeout(() => fail(new Error("the first prompt never ran")), 10_000 * timeScale); });
+    const stranded = new Promise((_, fail) => { timer = setTimeout(() => fail(new Error("the prompt never ran")), 10_000 * timeScale); });
     const ran = await Promise.race([collect(turn), stranded]).finally(() => clearTimeout(timer));
     assert.equal(ran.text, "echo: one");
-    await first.close();
+    await agent.close();
   });
 }
 
