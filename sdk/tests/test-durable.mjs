@@ -810,6 +810,29 @@ if (durabilityKind === "memory") {
     });
   }
 
+  // One id names one input. Two senders racing the id check can store a
+  // steer under a waiting prompt's id; the log takes the id as the prompt's,
+  // so the steer never runs.
+  test("a steer stored under a waiting prompt's id never reaches the model", async () => {
+    const agent = createFxAgent(agentOptions(await durabilityFor()));
+    const session = agent.session();
+    assert.equal((await session.prompt("hello there").result).stopReason, "end_turn");
+    const internals = agent[Symbol.for("libfx.durableInternals")];
+    await until(() => internals.liveWorkers() === 0, "the first worker to let the session go");
+    const log = await internals.openLog(session.id);
+    await log.append({ k: "input", key: "prompt:m-shared", type: "prompt", messageId: "m-shared", agent: "default", input: "the shared prompt" });
+    await log.append({ k: "input", key: "steer:m-shared", type: "steer", messageId: "m-shared", agent: "default", input: "the steer that reused its id" });
+    const before = requests.length;
+    // The prompt's delivery comes.
+    await internals.deliver({ type: "prompt", messageId: "m-shared", input: "the shared prompt", agent: "default", sessionId: session.id });
+    const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-shared", "the prompt's turn");
+    assert.equal(lines.find((line) => line.type === "turn_end" && line.messageId === "m-shared").stopReason, "end_turn");
+    const sent = requests.slice(before);
+    assert.ok(sent.some((prompt) => userTexts(prompt).includes("the shared prompt")), "the prompt reached the model");
+    assert.ok(!sent.some((prompt) => JSON.stringify(prompt).includes("the steer that reused its id")), "the steer never did");
+    await agent.close();
+  });
+
   test("on a queue that outlives the process, a turn a steer started that the deadline cuts off continues once in the next delivery", async () => {
     const agent = createFxAgent(agentOptions(queueOutlivesProcess(await durabilityFor({ maxDurationMs: 1500 * timeScale, reserveMs: 1000 * timeScale }))));
     const held = gate("lookup");
