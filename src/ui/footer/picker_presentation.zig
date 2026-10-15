@@ -648,6 +648,12 @@ pub fn filePickerReservedRows(terminal_rows: u16, input_extra: u16, banner_rows:
     return @max(activeListPickerReservedRows(terminal_rows, input_extra, banner_rows), grown);
 }
 
+/// File rows in a file picker of `picker_rows` rows; a status line, when
+/// shown, takes the first row.
+pub fn filePickerItemRows(picker_rows: u16, has_status: bool) u16 {
+    return picker_rows -| @intFromBool(has_status and picker_rows > 1);
+}
+
 pub fn authPickerReservedRows(view: auth_runtime.PickerView, terminal_rows: u16, input_extra: u16, banner_rows: u16) u16 {
     if (view.stage == .sign_in or (view.stage == .root and view.include_skip)) {
         const available_rows = terminal_rows -| (5 +| input_extra +| banner_rows);

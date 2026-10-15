@@ -32,6 +32,7 @@ const surface_invalidation = @import("../../ui/footer/surface_invalidation.zig")
 const interaction_state = @import("../../ui/footer/interaction_state.zig");
 const approval_prompt = @import("../permissions/approval_prompt.zig");
 const render_input = @import("../../ui/footer/render_input.zig");
+const picker_presentation = @import("../../ui/footer/picker_presentation.zig");
 const input_presentation = @import("../../ui/footer/input_presentation.zig");
 const footer_viewport = @import("../../ui/footer/viewport.zig");
 const render_request = @import("../../ui/render_request.zig");
@@ -1847,7 +1848,7 @@ pub fn Runtime(comptime App: type) type {
                 .file_picker_receipt = if (result.is_committed() and presentation_commits_transcript and
                     footer_measurement != null and footer_measurement.?.show_picker and
                     footer_measurement.?.picker_kind == .file and footer_measurement.?.picker_rows > 0)
-                    file_picker_receipt
+                    paintedFilePickerReceipt(file_picker_receipt, footer_measurement.?.picker_rows, footer_ctx.file_completion_status != null)
                 else
                     null,
             };
@@ -2333,6 +2334,14 @@ fn promptTurnReservation(
         return .{ .transcript_rows = canonical_rows, .activity = future_activity };
     }
     return .{};
+}
+
+/// Records how many file rows the frame painted, so keyboard navigation
+/// scrolls the same window the user sees.
+fn paintedFilePickerReceipt(receipt: ?input_completion_runtime.FilePickerReceipt, picker_rows: u16, has_status: bool) ?input_completion_runtime.FilePickerReceipt {
+    var painted = receipt orelse return null;
+    painted.visible_rows = picker_presentation.filePickerItemRows(picker_rows, has_status);
+    return painted;
 }
 
 fn footerMeasurementFromRows(rows: render_engine.footer_layout.FooterRows) render_engine.frame_layout.FooterMeasurement {

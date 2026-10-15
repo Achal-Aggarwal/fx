@@ -1863,13 +1863,15 @@ test "surface footer measurement reserves capped picker rows for active list pic
     var file_ctx = surfaceTestContext(&file_input);
     file_ctx.file_query_active = true;
     file_ctx.file_completions = &.{.{ .path = "src/main.zig", .kind = .file, .matched_spans = &.{} }};
-    try expectMeasuredPickerRows(alloc, &file_shell, approval.projection(), file_ctx, .file, expected_rows);
+    // The file picker grows to ten rows on a 24-row terminal.
+    const file_rows: u16 = 10;
+    try expectMeasuredPickerRows(alloc, &file_shell, approval.projection(), file_ctx, .file, file_rows);
 
     var file_empty_shell = surfaceTestShell(24, 80);
     defer file_empty_shell.deinit(alloc);
     file_ctx.file_completions = &.{};
     file_ctx.file_completions_failed = true;
-    try expectMeasuredPickerRows(alloc, &file_empty_shell, approval.projection(), file_ctx, .file, expected_rows);
+    try expectMeasuredPickerRows(alloc, &file_empty_shell, approval.projection(), file_ctx, .file, file_rows);
 }
 
 test "surface footer exposes file picker while a response streams" {
