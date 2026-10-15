@@ -4,7 +4,7 @@
 //! change: `put` (a session's summary), `opened` (a host opened it) and
 //! `del` (a tombstone), appended under `index.lock` and never fsynced.
 //! Folding it keeps the newest record per id; a tombstone is final, so a
-//! deleted id never comes back (`tla/Catalog.tla` `NoResurrection`).
+//! deleted id never comes back (`tests/tla/session_manager/Catalog.tla` `NoResurrection`).
 //! `list` reads only the index and self-heals entries whose folder is gone;
 //! `rebuild` re-derives it from the folders and sweeps `.tmp` and `.trash`.
 //!
@@ -540,7 +540,7 @@ pub const Catalog = struct {
     }
 
     /// Whether the session's folder still exists; if not, it is tombstoned
-    /// (`tla/Catalog.tla` `Heal`) and reported once.
+    /// (`tests/tla/session_manager/Catalog.tla` `Heal`) and reported once.
     /// One `stat` of the folder, no open: a published folder always holds
     /// its synced log (publish renames it in whole, delete renames it away),
     /// so the folder alone decides. `rebuild` checks the logs themselves.
@@ -717,7 +717,7 @@ test "the fold keeps the newest put, merges open times, and a tombstone is final
 }
 
 const catalog_model_tests = struct {
-    //! L3 and L4 against `tla/Catalog.tla`: publish, delete, crashes between
+    //! L3 and L4 against `tests/tla/session_manager/Catalog.tla`: publish, delete, crashes between
     //! the folder change and the index write, self-heal and rebuild, driven
     //! through the public API. Every run writes a trace for TLC.
 

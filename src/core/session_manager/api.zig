@@ -3,7 +3,7 @@
 //!
 //! This file (L4) is the only public root; fx imports it and nothing else.
 //! A process creates one `Manager` with `init`, which does no disk I/O.
-//! Thirteen operations cover every host (docs/session-manager/system-design.md
+//! Thirteen operations cover every host (`tests/tla/session_manager/system-design.md`
 //! "API"), plus `verify` and `rebuild` for doctor:
 //!
 //!   openNew  openResume  openFork  openImport        -> Session
@@ -431,7 +431,7 @@ pub const Manager = struct {
     }
 
     /// Deletes a session and the children it owns. Busy if any is open.
-    /// Order per session (`tla/Catalog.tla`): children first, then the
+    /// Order per session (`tests/tla/session_manager/Catalog.tla`): children first, then the
     /// rename to `.trash`, the index tombstone, and the purge. fx removes
     /// the matching terminal folders (D13).
     pub fn delete(m: *Manager, id: []const u8) DeleteError!void {

@@ -3824,7 +3824,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Stops the subagent host, joining its child threads, before the
-        /// session they append to can close (`tla/Wiring.tla`
+        /// session they append to can close (`tests/tla/session_manager/Wiring.tla`
         /// ParentOutlivesChildren).
         pub fn disableSubagentHost(app: *App) void {
             if (app.session_persistence.subagent_host) |host| {
