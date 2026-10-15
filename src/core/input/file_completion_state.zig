@@ -239,7 +239,7 @@ pub const State = struct {
             index.* = if (delta < 0) count - 1 else 0;
             window.* = 0;
             self.selection_missing = false;
-        } else list_window.advanceSelection(index, window, count, delta);
+        } else list_window.advanceSelectionWithin(index, window, count, delta, list_window.max_file_picker_rows);
     }
 
     pub fn view(self: *const State, index: usize, window: usize) View {

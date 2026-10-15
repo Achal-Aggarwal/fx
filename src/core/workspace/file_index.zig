@@ -1338,12 +1338,25 @@ fn rankTopN(generation: *const Generation, total: usize, query: PreparedQuery, o
     const query_ascii = query.ascii;
     const query_mask = if (query_ascii) |ascii| alphaMask(ascii) else 0;
     const max_crossing = maxCrossingQuality(u21, query.folded);
+    const max_name = maxNameQuality(query.folded.len);
     var scalar_scratch: FoldedPathScratch = undefined;
 
     var candidate_index: u32 = 0;
     while (candidate_index < total) : (candidate_index += 1) {
         const path_mask = generation.char_masks[candidate_index];
         const base_start = generation.basename_starts[candidate_index] - generation.offsets[candidate_index];
+        // Once the worst kept result has the best score a non-exact match can
+        // reach, only an exact match or a shorter path can still enter, so
+        // longer paths are not scored. Once every kept result is exact, only
+        // exact matches can enter.
+        const length_limit: ?usize = if (filled < top_cap) null else limit: {
+            const worst = ranked[worst_slot];
+            if (worst.score.exact_fit) break :limit 0;
+            if (worst.score.name_fit and worst.score.quality == max_name and worst.score.first_position == 0) {
+                break :limit generation.pathAt(worst.index).len;
+            }
+            break :limit null;
+        };
         // Skip the placements that can no longer enter the kept results; the
         // results stay those of scoring every path.
         const needed: Needed = if (filled < top_cap) .{} else needed: {
@@ -1358,6 +1371,10 @@ fn rankTopN(generation: *const Generation, total: usize, query: PreparedQuery, o
         const score = if ((path_mask & non_ascii_mask) == 0) ascii_path: {
             const ascii = query_ascii orelse continue;
             if ((path_mask & query_mask) != query_mask) continue;
+            if (length_limit) |limit| {
+                const path_lower = generation.lowerPathAt(candidate_index);
+                if (path_lower.len > limit and !exactFit(u8, path_lower, path_lower[base_start..], ascii)) continue;
+            }
             break :ascii_path scoreAsciiMatchWith(
                 align_scratch,
                 generation.pathAt(candidate_index),
@@ -1725,6 +1742,21 @@ fn maxCrossingQuality(comptime T: type, query: []const T) i32 {
     return if (std.mem.findScalar(T, query, '/') == null) ceiling + score_gap_start else ceiling;
 }
 
+/// The highest score a non-exact match can reach: the query as a run at the
+/// start of the name, right after its `/`, plus `name_bonus`. Its first
+/// position is 0, because only the first letter of a name follows a `/`.
+fn maxNameQuality(query_len: usize) i32 {
+    const m: i32 = @intCast(query_len);
+    return score_match * m + bonus_boundary_delimiter * (m + 1) + name_bonus;
+}
+
+/// A query that spells the whole path, the name, or the name up to a dot,
+/// such as `main` for `main.zig`, is an exact match.
+fn exactFit(comptime T: type, whole: []const T, name: []const T, query: []const T) bool {
+    return std.mem.eql(T, whole, query) or std.mem.eql(T, name, query) or
+        (name.len > query.len and std.mem.startsWith(T, name, query) and name[query.len] == '.');
+}
+
 /// Which placements a candidate may still need. Ranking turns a kind off only
 /// once it can no longer enter the kept results.
 const Needed = struct {
@@ -1825,11 +1857,7 @@ fn scoreAsciiMatchWith(
 ) ?MatchScore {
     if (query.len == 0 or path.len == 0) return null;
     const base_start: usize = basename_start;
-    const basename = path_lower[base_start..];
-    // A query that spells the file name up to a dot, such as `main` for
-    // `main.zig`, is as exact as the whole name.
-    const exact_fit = std.mem.eql(u8, path_lower, query) or std.mem.eql(u8, basename, query) or
-        (basename.len > query.len and std.mem.startsWith(u8, basename, query) and basename[query.len] == '.');
+    const exact_fit = exactFit(u8, path_lower, path_lower[base_start..], query);
     // An exact match always enters, so it is always scored in full.
     const placement = choosePlacement(u8, path_lower, path, null, base_start, query, scratch, if (exact_fit) .{} else needed) orelse return null;
     return scoreOf(exact_fit, placement);
@@ -1847,9 +1875,7 @@ fn scoreFoldedMatchWith(
     const base_start: usize = basename_byte_start;
     const decoded = decodeFoldedPath(path, base_start, scratch) orelse return null;
     const scalars = scratch.scalars[0..decoded.scalar_count];
-    const basename_scalars = scalars[decoded.basename_scalar_start..];
-    const exact_fit = std.mem.eql(u21, scalars, query) or std.mem.eql(u21, basename_scalars, query) or
-        (basename_scalars.len > query.len and std.mem.startsWith(u21, basename_scalars, query) and basename_scalars[query.len] == '.');
+    const exact_fit = exactFit(u21, scalars, scalars[decoded.basename_scalar_start..], query);
     const byte_offsets = scratch.byte_offsets[0 .. decoded.scalar_count + 1];
     const placement = choosePlacement(u21, scalars, path, byte_offsets, decoded.basename_scalar_start, query, align_scratch, if (exact_fit) .{} else needed) orelse return null;
     return scoreOf(exact_fit, placement);
@@ -2755,6 +2781,31 @@ test "pruned ranking keeps the results of scoring every path" {
     for (0..70) |i| try raw.print(alloc, "src/tools/alpha/tango/y{d}.zig\n", .{i});
     try raw.appendSlice(alloc, "docs/stat.md\nstat\nsrc/STATUS.md\n");
     try std.testing.expectEqualStrings("stat", try expectPrunedRankingMatchesFullScoring(raw.items, "stat"));
+}
+
+test "pruned ranking keeps short queries over crowded names" {
+    const alloc = std.testing.allocator;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(alloc);
+    // More than 64 names at the top score for `s` and `st`, at many path
+    // lengths and with equal-length ties, then shorter and exact paths that
+    // arrive after the kept results are full.
+    for (0..90) |i| try raw.print(alloc, "pkg/{d}/st{d}.zig\n", .{ i % 7, i });
+    for (0..40) |i| try raw.print(alloc, "deep/nested/folder/{d}/stage{d}.md\n", .{ i, i });
+    for (0..30) |i| try raw.print(alloc, "a/sx{d}.ts\nb/ts{d}.ts\n", .{ i, i });
+    try raw.appendSlice(alloc, "zz/st.md\nq/s\nst\nx/s.zig\npkg/0/st0.zig\nw/st1.zi\n");
+    _ = try expectPrunedRankingMatchesFullScoring(raw.items, "s");
+    try std.testing.expectEqualStrings("st", try expectPrunedRankingMatchesFullScoring(raw.items, "st"));
+}
+
+test "pruned ranking keeps exact matches once the kept results are all exact" {
+    const alloc = std.testing.allocator;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(alloc);
+    for (0..70) |i| try raw.print(alloc, "service/{d}/main.zig\n", .{i});
+    for (0..30) |i| try raw.print(alloc, "x/mainframe{d}.zig\n", .{i});
+    try raw.appendSlice(alloc, "src/main.zig\nmain.zig\n");
+    try std.testing.expectEqualStrings("main.zig", try expectPrunedRankingMatchesFullScoring(raw.items, "main"));
 }
 
 test "pruned ranking keeps folder-and-name matches" {

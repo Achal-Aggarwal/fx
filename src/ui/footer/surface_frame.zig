@@ -643,6 +643,8 @@ fn buildFooterSurfaceProjection(
         )
     else if (slash_menu_layout) |layout|
         layout.row_count
+    else if (show_file_query)
+        picker_presentation.filePickerReservedRows(shell.layout.rows, geometry.input_extra, banner_rows)
     else if (show_picker)
         list_picker_rows
     else
