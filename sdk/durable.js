@@ -20,6 +20,11 @@
 // the input to the log, takes the lease, and runs every turn the log holds
 // until none is left, or its time runs out: then it asks the queue to
 // deliver the same message again, and the next worker continues the turn.
+//
+// TLA+ models: `tests/tla/sdk/DurableSession.tla` (the log, leases and
+// takeovers), `tests/tla/sdk/AgentRouting.tla` (agent names and routing),
+// and `tests/tla/sdk/DurableSteer.tla` (where each message a user sends is
+// placed). The drivers in `tests/tla/drivers/` run this code along them.
 
 // A write the session's chain refused because another worker continued it.
 // Harnesses recognize it by its code.

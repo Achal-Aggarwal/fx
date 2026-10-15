@@ -6,7 +6,7 @@ TLA+ specifications for fx, checked with TLC, together with the scripts and Bun 
 |---|---|---|
 | `acp/` | The ACP permission modes, which match the CLI's `/permissions`, and the per-session Standard, Fast, and Ultrafast speed (`src/acp/`). | `acp/check.sh`, then the drivers in `drivers/acp/` |
 | `cli/` | How `fx` and `fx ask` handle `--model`, `--fast`, `--ultrafast`, and `--effort` at launch, for the current design and a proposed one that validates them. | `cli/check.sh`, `bun test drivers/cli/` |
-| `durable/` | Durable libfx sessions (`sdk/durable/`): the journal, tool replay, parallel batches, fencing, the inbox, resumption, and snapshots. | `durable/check.sh`, `durable/mutants.py` |
+| `durable/` | Durable libfx sessions (`sdk/fx-sdk.js`): the journal, tool replay, parallel batches, fencing, the inbox, resumption, and snapshots. | `durable/check.sh`, `durable/mutants.py` |
 | `indexer/` | When a scanned root's listing may be reused, merging parallel grep results, the file picker's loading row, and listing snapshots (`src/core/indexer/`). | `indexer/check.sh` |
 | `mcp/` | The MCP-v2 engine (`src/mcp/`): wire format, requests, stdio, version detection, the tool catalog, both HTTP transports, input-required rounds, authorization, subscriptions, elicitation, and the engine. `rules.md` lists the MCP specification rules the models cite by ID. | `mcp/check.sh`, then the drivers in `drivers/mcp/` |
 | `mcp_host/` | fx's MCP host (`src/core/mcp_host/`): host lifecycle, saved credentials, logins shared between processes, sign-in, and elicitation routing. | `mcp_host/check.sh`, `bun test drivers/mcp_host/` |
