@@ -4,6 +4,10 @@
 //! engine's servers (`config.zig`), keeps sign-in credentials
 //! (`credentials.zig`), and runs logins on a loopback listener (`login.zig`).
 //! Chosen with FX_MCP_ENGINE=v2 until v1 is removed.
+//!
+//! TLA+ models: `tests/tla/mcp_host/HostLifecycle.tla`,
+//! `tests/tla/mcp_host/SignIn.tla`, `tests/tla/mcp_host/SharedLogins.tla`, and
+//! `tests/tla/mcp_host/ElicitationRouting.tla`.
 
 const std = @import("std");
 const mcp = @import("../../mcp/mcp.zig");
@@ -1160,7 +1164,7 @@ pub const Runtime = struct {
     }
 
     /// Permission is fx's tool admission, before the call reaches the
-    /// runtime, and only the runtime calls the engine (D6).
+    /// runtime, and only the runtime calls the engine.
     fn allow(_: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) bool {
         return true;
     }
