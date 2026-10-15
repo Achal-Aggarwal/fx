@@ -833,6 +833,34 @@ if (durabilityKind === "memory") {
     await agent.close();
   });
 
+  // A text steer joins the latest prompt waiting to start. One whose own
+  // delivery starts the first of two waiting prompts, on a queue that
+  // outlives the process, still leaves that prompt to finish and joins the
+  // second, as it does when the sender stores it first.
+  for (const [where, wrap] of [["on a queue that outlives the process", queueOutlivesProcess], ["when its sender stores it", (durability) => durability]]) {
+    test(`${where}, a steer that finds two prompts waiting joins the second and leaves the first to finish`, async () => {
+      const agent = createFxAgent(agentOptions(wrap(await durabilityFor())));
+      const session = agent.session();
+      assert.equal((await session.prompt("hello there").result).stopReason, "end_turn");
+      const internals = agent[Symbol.for("libfx.durableInternals")];
+      await until(() => internals.liveWorkers() === 0, "the first worker to let the session go");
+      const log = await internals.openLog(session.id);
+      await log.append({ k: "input", key: "prompt:m-first-waiting", type: "prompt", messageId: "m-first-waiting", agent: "default", input: "slow reply" });
+      await log.append({ k: "input", key: "prompt:m-second-waiting", type: "prompt", messageId: "m-second-waiting", agent: "default", input: "the second prompt" });
+      const slowBefore = slow.length;
+      const before = requests.length;
+      await session.steer("and keep it short", { messageId: "m-late-steer" });
+      const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-second-waiting", "the second prompt's turn");
+      assert.deepEqual(lines.filter((line) => line.type === "turn_start").slice(1).map((line) => line.messageId), ["m-first-waiting", "m-second-waiting"], "the steer ran no turn of its own");
+      assert.deepEqual(lines.filter((line) => line.type === "turn_end").slice(1).map((line) => [line.messageId, line.stopReason]), [["m-first-waiting", "end_turn"], ["m-second-waiting", "end_turn"]]);
+      assert.deepEqual(slow.slice(slowBefore).map((record) => record.sent), [slowFrames], "the first prompt's reply streamed to the end");
+      const withSteer = requests.slice(before).filter((prompt) => userTexts(prompt).some((text) => text.includes("and keep it short")));
+      assert.ok(withSteer.length > 0, "the steer reached the model");
+      assert.ok(withSteer.every((prompt) => userTexts(prompt).includes("the second prompt")), "the steer reached only the second prompt's turn");
+      await agent.close();
+    });
+  }
+
   test("on a queue that outlives the process, a turn a steer started that the deadline cuts off continues once in the next delivery", async () => {
     const agent = createFxAgent(agentOptions(queueOutlivesProcess(await durabilityFor({ maxDurationMs: 1500 * timeScale, reserveMs: 1000 * timeScale }))));
     const held = gate("lookup");
