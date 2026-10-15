@@ -407,8 +407,9 @@ pub const Journal = struct {
             },
             .tool => |tool| {
                 if (tool.droppedFromSession()) continue;
+                const empty = try history_alloc.alloc(u8, 0);
                 history_alloc.free(tool.data);
-                tool.data = try history_alloc.alloc(u8, 0);
+                tool.data = empty;
                 dropped += 1;
             },
         };

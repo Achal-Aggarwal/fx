@@ -1469,6 +1469,20 @@ test("a failed image write rejects the prompt before anything is stored", async 
   await agent.close();
 });
 
+test("a failed image write rejects a steer before it is sent", async () => {
+  const fault = {};
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), fault));
+  const session = agent.session();
+  assert.equal((await session.prompt("first").result).stopReason, "end_turn");
+  fault.failWrites = 1;
+  const storeFailed = (error) => error.code === "FX_IMAGE_STORE_FAILED" && /the store is full/.test(error.cause?.message);
+  await assert.rejects(session.steer([{ type: "text", text: "look" }, image]), storeFailed);
+  // The steer was never sent, so no turn ran for it before the next prompt.
+  assert.equal((await session.prompt("after").result).stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["first", "after"]);
+  await agent.close();
+});
+
 test("a retried image prompt the log already holds is answered without writing its images again", async () => {
   const fault = {};
   const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), fault));

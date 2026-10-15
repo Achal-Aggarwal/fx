@@ -115,6 +115,21 @@ function framesFor(prompt) {
       { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage },
     ];
   }
+  // "album N" shows N album pages at once in one response, then says it saw
+  // them.
+  const pages = /^album (\d+)$/u.exec(text);
+  if (pages) {
+    if (toolResults(prompt.slice(prompt.findLastIndex(isPrompt) + 1)).length === 0) {
+      return [
+        ...Array.from({ length: Number(pages[1]) }, (_, page) => ({ type: "tool-call", toolCallId: `call-page-${page}`, toolName: "album", input: { page } })),
+        { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" }, usage },
+      ];
+    }
+    return [
+      { type: "text-delta", id: "answer", delta: "saw the album" },
+      { type: "finish", finishReason: { unified: "stop", raw: "stop" }, usage },
+    ];
+  }
   // "screenshot N" takes screenshot N once in its turn, then says it saw it.
   const shot = /^screenshot (\d+)$/u.exec(text);
   if (shot) {
@@ -203,6 +218,24 @@ const screenshot = {
     type: "libfx.tool-result",
     text: `shot ${shot}`,
     images: [{ type: "image", data: base64Of(screenshotOf(shot)), mimeType: "image/png" }],
+  }),
+};
+// Returns album page `page`: a result's 8 images, small and distinct from
+// every other page's.
+const albumImage = (index) => {
+  const bytes = new Uint8Array(71);
+  bytes.set(Buffer.from(pngData, "base64"));
+  new DataView(bytes.buffer).setUint32(67, index);
+  return bytes;
+};
+const album = {
+  name: "album",
+  description: "Shows an album page",
+  inputSchema: { type: "object", properties: { page: { type: "number" } }, required: ["page"] },
+  execute: async ({ page }) => ({
+    type: "libfx.tool-result",
+    text: `page ${page}`,
+    images: Array.from({ length: 8 }, (_, index) => ({ type: "image", data: base64Of(albumImage(page * 8 + index)), mimeType: "image/png" })),
   }),
 };
 const options = (backend, journal, extra = {}) => ({
@@ -1773,6 +1806,34 @@ test("a turn that crashed after its screenshot's progress reopens with the scree
   assert.equal((await turn.result).stopReason, "end_turn");
   await resumed.close();
   assert.deepEqual(requestImages(requests[0]), [base64Of(screenshotOf(5))], "the screenshot came back from the store");
+});
+
+test("a turn whose tools returned more images than a window and a prompt hold reopens with all of them", async () => {
+  // 514 pages of 8: 4,112 images, more than the 4,096 a session keeps and
+  // the 8 of one prompt, all an open stages unless it reports more missing.
+  const pages = 514;
+  const journal = eventJournal();
+  const images = new Map();
+  let staged = 0;
+  const withImages = (persistence) => ({
+    ...persistence,
+    putImage: async (name, bytes) => { images.set(name, new Uint8Array(bytes)); },
+    getImage: async (name) => { staged += 1; return images.get(name); },
+  });
+  const withAlbum = { ...visionCatalog, tools: [album] };
+  const source = await createFxEngine(options(sourceBackend, undefined, { ...withAlbum, persistence: withImages(persisted(journal)) }));
+  assert.equal((await run(source, `album ${pages}`)).text, "saw the album");
+  await source.close();
+  assert.equal(images.size, pages * 8);
+  const stepped = journal.events.find((event) => event.type === "turn_progress" && event.steps === 1);
+  assert.ok(stepped, "a progress holds the album's step");
+  const survived = journal.events.slice(0, journal.events.indexOf(stepped) + 1);
+  const resumed = await createFxEngine(options(targetBackend, undefined, { ...withAlbum, persistence: withImages(persisted(eventJournal(survived))) }));
+  assert.equal(staged, pages * 8, "the open staged every image of the open turn");
+  const turn = resumed.resume();
+  for await (const _ of turn) {}
+  assert.equal((await turn.result).stopReason, "end_turn");
+  await resumed.close();
 });
 
 test("a journal past the turn limit is refused by name", async () => {
