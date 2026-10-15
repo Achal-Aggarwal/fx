@@ -32,7 +32,7 @@
 (* starts.                                                                 *)
 (*                                                                         *)
 (* `act` names each step and its prompt, so                                *)
-(* sdk/tests/model/drive-intake.mjs can replay any path of the state graph *)
+(* tests/tla/drivers/drive-intake.mjs can replay any path of the state graph *)
 (* against the real code.                                                  *)
 (***************************************************************************)
 EXTENDS Naturals, Sequences, FiniteSets

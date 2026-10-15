@@ -2,7 +2,7 @@
 // Drives real libfx along paths of the TLC state graph of ImageStore.tla,
 // and checks after every step that the code is in a state the model allows.
 //
-//   bun sdk/tests/model/drive-images.mjs [--walks N] [--seed S] [--backend native|wasm]
+//   bun tests/tla/drivers/drive-images.mjs [--walks N] [--seed S] [--backend native|wasm]
 //
 // Each walk keeps one session in a memory persistence with an image store,
 // first written by an engine without one, so its first image is saved
@@ -19,12 +19,12 @@
 // only the old image may be saved inline, and a model request must carry
 // exactly the history the model holds.
 //
-// `./check.sh` writes graphs/images.dot from ImageStore-drive.cfg.
+// `tests/tla/sdk/check.sh` writes graphs/images.dot from ImageStore-drive.cfg.
 import { strict as assert } from "node:assert";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxEngine, createMemoryPersistence } from "../../node.js";
+import { createFxEngine, createMemoryPersistence } from "../../../sdk/node.js";
 import { loadGraph, walkGraph } from "./graph.mjs";
 
 const args = process.argv.slice(2);
@@ -43,7 +43,7 @@ const wasm = backend === "wasm" ? await readFile(resolve(here, "../../../zig-out
 const quietMs = 150;
 const stepTimeoutMs = 10_000;
 // The model's window, which every engine the walk opens keeps too.
-const windowImages = Number(/^\s*Window = (\d+)$/m.exec(await readFile(resolve(here, "ImageStore-drive.cfg"), "utf8"))[1]);
+const windowImages = Number(/^\s*Window = (\d+)$/m.exec(await readFile(resolve(here, "../sdk/ImageStore-drive.cfg"), "utf8"))[1]);
 const imageWindow = Symbol.for("libfx.imageWindow");
 const decoder = new TextDecoder();
 const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
@@ -322,7 +322,7 @@ async function harness(n) {
 // ---------------------------------------------------------------------------
 // Walks.
 
-const graph = await loadGraph(resolve(here, "graphs", "images.dot"));
+const graph = await loadGraph(resolve(here, "../sdk/graphs", "images.dot"));
 const n = graph.states.get(graph.init).ph.length;
 const autoActs = new Set(["Send", "TurnStart", "Checkpoint", "Stage", "OpenMissing", "OpenOk"]);
 const view = (state) => JSON.stringify({

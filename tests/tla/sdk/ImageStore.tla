@@ -372,7 +372,7 @@ Next ==
 
 Spec == Init /\ [][Next]_vars
 
-\* The paths sdk/tests/model/drive-images.mjs takes against a plain engine
+\* The paths tests/tla/drivers/drive-images.mjs takes against a plain engine
 \* (Durable = FALSE). The engine runs one prompt at a time, so a prompt is
 \* made only when none is in flight. The code takes the steps in Auto on its
 \* own as soon as it can, so the driver moves only when none of them can.
