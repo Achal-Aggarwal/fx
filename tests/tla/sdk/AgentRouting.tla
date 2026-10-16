@@ -11,9 +11,9 @@
 (* session belongs to the agent its first stored input names, so a prompt  *)
 (* one agent sends to another agent's session is sent on to that agent.    *)
 (*                                                                         *)
-(* An input is stored by the sender before it queues the message on a      *)
-(* queue that ends with the process (memory, local: RecordAtSend), and by  *)
-(* the worker that takes it on one that keeps messages (Vercel).           *)
+(* The sender stores an input before it queues the message, on every      *)
+(* queue, so a session has its owner from its first send on. A message     *)
+(* only names the input (TenantIsolation.tla LogFirst).                    *)
 (*                                                                         *)
 (* With ByName = FALSE a process hands each delivery to any of its agents, *)
 (* as libfx did before names (Witness-NoNames). With CheckOwner = FALSE a  *)
@@ -31,7 +31,6 @@ CONSTANTS
     Procs,         \* processes the queue delivers to; each has an agent of every name but P2Lacks
     P2Lacks,       \* a name process "p2" has no agent for, or "none"
     MaxSends,      \* prompts sent in all
-    RecordAtSend,  \* the sender stores a prompt's input before it queues it
     ByName,        \* a delivery goes to the agent the message names
     CheckOwner     \* a worker runs only its own agent's sessions
 
@@ -73,12 +72,12 @@ Send(n, s) ==
     /\ sends < MaxSends
     /\ queue' = queue \cup {[id |-> sends, s |-> s, n |-> n]}
     /\ sends' = sends + 1
-    /\ owner' = IF RecordAtSend THEN [owner EXCEPT ![s] = Stored(@, n)] ELSE owner
+    /\ owner' = [owner EXCEPT ![s] = Stored(@, n)]
     /\ act' = [name |-> "Send", n |-> n, s |-> s, id |-> sends]
     /\ UNCHANGED <<ran, missed>>
 
-\* The queue delivers m to process p. The agent a that takes it stores the
-\* input, then runs the turn or sends the message on to the session's owner.
+\* The queue delivers m to process p. The agent a that takes it runs the
+\* turn, or sends the message on to the session's owner.
 Deliver(p, m) ==
     /\ m \in queue
     /\ act' = [name |-> "Deliver", p |-> p, id |-> m.id]

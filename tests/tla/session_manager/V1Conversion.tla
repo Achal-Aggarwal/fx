@@ -85,15 +85,10 @@ VARIABLES
     refused,    \* [Procs -> SUBSET Ids]: deletes refused in the current request
     reqs,       \* requests made
     crashes,
-    famOf,      \* [Roots -> SUBSET Ids]: the members a root's conversion covered
-    mark1,      \* [Ids -> BOOLEAN]: v1's usage marker, ~/.fx/usage-recovery/{id}
-    mark2,      \* [Ids -> BOOLEAN]: v2's usage marker, ~/.fx/usage-recovery-v2/{id}
-    owed        \* [Ids -> BOOLEAN]: ghost: the member has usage still to settle
+    famOf       \* [Roots -> SUBSET Ids]: the members a root's conversion covered
 
 vars == <<v1ver, v1lock, writing, locks, bad, pub, base, staged, stagedBase,
-          extra, conv, req, out, refused, reqs, crashes, famOf, mark1, mark2, owed>>
-
-marks == <<mark1, mark2, owed>>
+          extra, conv, req, out, refused, reqs, crashes, famOf>>
 
 Idle == [pc |-> "idle", root |-> None, members |-> {}, copied |-> {}]
 NoReq == [kind |-> "none", root |-> None]
@@ -119,7 +114,6 @@ TypeOK ==
     /\ reqs \in 0..MaxReq
     /\ crashes \in 0..MaxCrash
     /\ famOf \in [Roots -> SUBSET Ids]
-    /\ mark1 \in [Ids -> BOOLEAN] /\ mark2 \in [Ids -> BOOLEAN] /\ owed \in [Ids -> BOOLEAN]
 
 Live(i) == pub[i] \in {"import", "fresh"}
 
@@ -159,9 +153,6 @@ Init ==
     /\ reqs = 0
     /\ crashes = 0
     /\ famOf = [r \in Roots |-> {}]
-    /\ mark1 = [i \in Ids |-> FALSE]
-    /\ mark2 = [i \in Ids |-> FALSE]
-    /\ owed = [i \in Ids |-> FALSE]
 
 (* -- v1 writers: older builds *)
 
@@ -172,7 +163,6 @@ WCreate(i) ==
     /\ v1ver' = [v1ver EXCEPT ![i] = 1]
     /\ UNCHANGED <<v1lock, writing, locks, bad, pub, base, staged, stagedBase,
                    extra, conv, req, out, refused, reqs, crashes, famOf>>
-    /\ UNCHANGED marks
 
 WLock(i) ==
     /\ v1ver[i] > 0
@@ -182,7 +172,6 @@ WLock(i) ==
     /\ locks' = [locks EXCEPT ![i] = @ + 1]
     /\ UNCHANGED <<v1ver, writing, bad, pub, base, staged, stagedBase, extra,
                    conv, req, out, refused, reqs, crashes, famOf>>
-    /\ UNCHANGED marks
 
 WBegin(i) ==
     /\ v1lock[i] = "writer"
@@ -191,7 +180,6 @@ WBegin(i) ==
     /\ writing' = [writing EXCEPT ![i] = TRUE]
     /\ UNCHANGED <<v1ver, v1lock, locks, bad, pub, base, staged, stagedBase,
                    extra, conv, req, out, refused, reqs, crashes, famOf>>
-    /\ UNCHANGED marks
 
 WEnd(i) ==
     /\ writing[i]
@@ -199,7 +187,6 @@ WEnd(i) ==
     /\ v1ver' = [v1ver EXCEPT ![i] = @ + 1]
     /\ UNCHANGED <<v1lock, locks, bad, pub, base, staged, stagedBase, extra,
                    conv, req, out, refused, reqs, crashes, famOf>>
-    /\ UNCHANGED marks
 
 WUnlock(i) ==
     /\ v1lock[i] = "writer"
@@ -207,7 +194,6 @@ WUnlock(i) ==
     /\ v1lock' = [v1lock EXCEPT ![i] = "free"]
     /\ UNCHANGED <<v1ver, writing, locks, bad, pub, base, staged, stagedBase,
                    extra, conv, req, out, refused, reqs, crashes, famOf>>
-    /\ UNCHANGED marks
 
 \* A writer dies: the kernel drops its lock, and v1's own open repairs a torn
 \* write back to the last whole version.
@@ -219,17 +205,6 @@ WCrash(i) ==
     /\ crashes' = crashes + 1
     /\ UNCHANGED <<v1ver, locks, bad, pub, base, staged, stagedBase, extra,
                    conv, req, out, refused, reqs, famOf>>
-    /\ UNCHANGED marks
-
-\* An older build ends a turn whose usage is not settled yet: it keeps v1's
-\* usage marker, under its lock.
-WMark(i) ==
-    /\ v1lock[i] = "writer"
-    /\ ~mark1[i]
-    /\ mark1' = [mark1 EXCEPT ![i] = TRUE]
-    /\ owed' = [owed EXCEPT ![i] = TRUE]
-    /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, pub, base, staged, stagedBase,
-                   extra, conv, req, out, refused, reqs, crashes, famOf, mark2>>
 
 \* A member's v1 files become unreadable: damage from outside fx.
 Damage(i) ==
@@ -238,7 +213,6 @@ Damage(i) ==
     /\ bad' = [bad EXCEPT ![i] = TRUE]
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, pub, base, staged,
                    stagedBase, extra, conv, req, out, refused, reqs, crashes, famOf>>
-    /\ UNCHANGED marks
 
 (* -- the new build's own v2 sessions *)
 
@@ -249,7 +223,6 @@ FCreate(i) ==
     /\ pub' = [pub EXCEPT ![i] = "fresh"]
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, base, staged,
                    stagedBase, extra, conv, req, out, refused, reqs, crashes, famOf>>
-    /\ UNCHANGED marks
 
 FAppend(i) ==
     /\ Live(i)
@@ -258,7 +231,6 @@ FAppend(i) ==
     /\ extra' = [extra EXCEPT ![i] = @ + 1]
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, pub, base, staged,
                    stagedBase, conv, req, out, refused, reqs, crashes, famOf>>
-    /\ UNCHANGED marks
 
 (* -- requests and the converter, in each requesting process *)
 
@@ -273,7 +245,6 @@ Request(p, k, r) ==
     /\ reqs' = reqs + 1
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, pub, base, staged,
                    stagedBase, extra, conv, crashes, famOf>>
-    /\ UNCHANGED marks
 
 Answer(p, a) ==
     /\ req' = [req EXCEPT ![p] = NoReq]
@@ -291,18 +262,16 @@ AHeld(p) ==
     /\ Answer(p, Done(p))
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, pub, base, staged,
                    stagedBase, extra, conv, refused, reqs, crashes, famOf>>
-    /\ UNCHANGED marks
 
 \* A leftover v1 folder, unchanged since its copy, is deleted under its lock.
 CClean(p, i) ==
     /\ Waiting(p)
     /\ Live(req[p].root)
     /\ i \in Fam(req[p].root)
-    /\ Leftover(p, i) /\ ~mark1[i]
+    /\ Leftover(p, i)
     /\ v1ver' = [v1ver EXCEPT ![i] = 0]
     /\ UNCHANGED <<v1lock, writing, locks, bad, pub, base, staged,
                    stagedBase, extra, conv, req, out, refused, reqs, crashes, famOf>>
-    /\ UNCHANGED marks
 
 \* The file system refuses that delete: the folder stays, the open goes on.
 CCleanRefused(p, i) ==
@@ -315,7 +284,6 @@ CCleanRefused(p, i) ==
     /\ crashes' = crashes + 1
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, pub, base, staged,
                    stagedBase, extra, conv, req, out, reqs, famOf>>
-    /\ UNCHANGED marks
 
 \* Neither store holds it.
 AMissing(p) ==
@@ -324,7 +292,6 @@ AMissing(p) ==
     /\ Answer(p, IF req[p].kind = "open" THEN "notfound" ELSE "converted")
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, pub, base, staged,
                    stagedBase, extra, conv, refused, reqs, crashes, famOf>>
-    /\ UNCHANGED marks
 
 \* Takes every present member's lock, or answers "busy" holding none. The
 \* check that v2 does not hold the root is made under the locks: another
@@ -342,7 +309,6 @@ CBegin(p) ==
             /\ UNCHANGED <<v1lock, conv>>
     /\ UNCHANGED <<v1ver, writing, locks, bad, pub, base, staged,
                    stagedBase, extra, refused, reqs, crashes, famOf>>
-    /\ UNCHANGED marks
 
 \* Under the locks: the family's staging leftovers go, and each member not
 \* already published gets a fresh copy in .tmp; an unreadable member drops
@@ -366,7 +332,6 @@ CStage(p) ==
             /\ UNCHANGED <<v1lock, req, out>>
     /\ UNCHANGED <<v1ver, writing, locks, bad, pub, base, extra, refused,
                    reqs, crashes, famOf>>
-    /\ UNCHANGED marks
 
 \* Publishing is the manager's atomic rename.
 CPublishChild(p, c) ==
@@ -378,7 +343,6 @@ CPublishChild(p, c) ==
     /\ base' = [base EXCEPT ![c] = stagedBase[c]]
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, stagedBase, extra, conv,
                    req, out, refused, reqs, crashes, famOf>>
-    /\ UNCHANGED marks
 
 CPublishRoot(p) ==
     LET r == conv[p].root IN
@@ -391,38 +355,12 @@ CPublishRoot(p) ==
     /\ famOf' = [famOf EXCEPT ![r] = conv[p].members]
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, stagedBase, extra, req,
                    out, refused, reqs, crashes>>
-    /\ UNCHANGED marks
 
-\* A member whose v1 state p may move to v2 and remove: one it copied in
-\* this run, or a reused child still at its copy's version and fingerprint.
-Unchanged(p, i) ==
+\* A member whose v1 folder p may delete: one it copied in this run, or a
+\* reused child still at its copy's version and fingerprint.
+Deletable(p, i) ==
     /\ i \in conv[p].members /\ v1ver[i] > 0 /\ v1ver[i] = base[i]
     /\ i \in conv[p].copied \/ ~bad[i]
-
-\* Its folder goes once its usage marker has moved (D62).
-Deletable(p, i) == Unchanged(p, i) /\ ~mark1[i]
-
-\* Where p moves a member's usage marker: after it published that member's
-\* family, or for a leftover of a family v2 already holds.
-MarkScope(p, i) ==
-    \/ conv[p].pc = "published" /\ Unchanged(p, i)
-    \/ Waiting(p) /\ Live(req[p].root) /\ i \in Fam(req[p].root) /\ Leftover(p, i)
-
-\* The v2 marker is written first, then v1's is removed: usage to settle is
-\* always behind one of them, and settling both is idempotent.
-MoveMark(p, i) ==
-    /\ MarkScope(p, i)
-    /\ mark1[i] /\ ~mark2[i]
-    /\ mark2' = [mark2 EXCEPT ![i] = TRUE]
-    /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, pub, base, staged, stagedBase,
-                   extra, conv, req, out, refused, reqs, crashes, famOf, mark1, owed>>
-
-DropMark(p, i) ==
-    /\ MarkScope(p, i)
-    /\ mark1[i] /\ mark2[i]
-    /\ mark1' = [mark1 EXCEPT ![i] = FALSE]
-    /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, pub, base, staged, stagedBase,
-                   extra, conv, req, out, refused, reqs, crashes, famOf, mark2, owed>>
 
 \* D60: with the copy durable, each member's v1 folder goes, still locked.
 CDelete(p, i) ==
@@ -432,32 +370,28 @@ CDelete(p, i) ==
     /\ v1ver' = [v1ver EXCEPT ![i] = 0]
     /\ UNCHANGED <<v1lock, writing, locks, bad, pub, base, staged, stagedBase,
                    extra, conv, req, out, refused, reqs, crashes, famOf>>
-    /\ UNCHANGED marks
 
-\* The file system refuses that delete, or the marker move: the folder
-\* stays as a leftover.
+\* The file system refuses that delete: the folder stays as a leftover.
 CDeleteRefused(p, i) ==
     /\ conv[p].pc = "published"
-    /\ Unchanged(p, i)
+    /\ Deletable(p, i)
     /\ i \notin refused[p]
     /\ crashes < MaxCrash
     /\ refused' = [refused EXCEPT ![p] = @ \cup {i}]
     /\ crashes' = crashes + 1
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, pub, base, staged,
                    stagedBase, extra, conv, req, out, reqs, famOf>>
-    /\ UNCHANGED marks
 
 \* Every member's folder is gone, refused, or not deletable (a reused child
 \* an older build changed or that was damaged): the locks go, it answers.
 CFinish(p) ==
     /\ conv[p].pc = "published"
-    /\ \A i \in conv[p].members : ~Unchanged(p, i) \/ i \in refused[p]
+    /\ \A i \in conv[p].members : ~Deletable(p, i) \/ i \in refused[p]
     /\ v1lock' = [i \in Ids |-> IF i \in conv[p].members THEN "free" ELSE v1lock[i]]
     /\ conv' = [conv EXCEPT ![p] = Idle]
     /\ Answer(p, Done(p))
     /\ UNCHANGED <<v1ver, writing, locks, bad, pub, base, staged, stagedBase,
                    extra, refused, reqs, crashes, famOf>>
-    /\ UNCHANGED marks
 
 \* The process dies: no answer, and its locks go with it.
 CCrash(p) ==
@@ -470,19 +404,18 @@ CCrash(p) ==
     /\ crashes' = crashes + 1
     /\ UNCHANGED <<v1ver, writing, locks, bad, pub, base, staged,
                    stagedBase, extra, refused, reqs, famOf>>
-    /\ UNCHANGED marks
 
 \* A converter's steps, without its faults.
 ConvWork(p) ==
     \/ AHeld(p) \/ AMissing(p) \/ CBegin(p) \/ CStage(p) \/ CPublishRoot(p) \/ CFinish(p)
-    \/ \E c \in Ids : CPublishChild(p, c) \/ CDelete(p, c) \/ CClean(p, c) \/ MoveMark(p, c) \/ DropMark(p, c)
+    \/ \E c \in Ids : CPublishChild(p, c) \/ CDelete(p, c) \/ CClean(p, c)
 
 \* Faults: a refused delete.
 ConvRefused(p) == \E c \in Ids : CDeleteRefused(p, c) \/ CCleanRefused(p, c)
 
 ConvStep(p) == ConvWork(p) \/ ConvRefused(p) \/ CCrash(p)
 
-WriterStep(i) == WCreate(i) \/ WLock(i) \/ WBegin(i) \/ WEnd(i) \/ WUnlock(i) \/ WCrash(i) \/ WMark(i)
+WriterStep(i) == WCreate(i) \/ WLock(i) \/ WBegin(i) \/ WEnd(i) \/ WUnlock(i) \/ WCrash(i)
 
 Next ==
     \/ \E p \in Procs :
@@ -501,7 +434,6 @@ FairSpec ==
          /\ WF_vars(AHeld(p)) /\ WF_vars(AMissing(p)) /\ WF_vars(CBegin(p))
          /\ WF_vars(CStage(p)) /\ WF_vars(CPublishRoot(p)) /\ WF_vars(CFinish(p))
          /\ \A c \in Ids : WF_vars(CPublishChild(p, c)) /\ WF_vars(CDelete(p, c)) /\ WF_vars(CClean(p, c))
-         /\ \A c \in Ids : WF_vars(MoveMark(p, c)) /\ WF_vars(DropMark(p, c))
     /\ \A i \in Ids : WF_vars(WUnlock(i)) /\ WF_vars(WEnd(i))
 
 (* -- properties *)
@@ -534,13 +466,6 @@ ChildrenLanded ==
 \* A child whose root never landed still has its v1 folder: no delete
 \* happens before the whole family is published.
 OrphansKeepV1 == \A i \in Ids : Orphan(i) => v1ver[i] > 0
-
-\* Usage still to settle always has a marker, v1's or v2's (D62).
-UsageKept == \A i \in Ids : owed[i] => (mark1[i] \/ mark2[i])
-
-\* v1's marker never outlives its folder: recovery would then read a
-\* session that is gone.
-NoDanglingMark == \A i \in Ids : mark1[i] => v1ver[i] > 0
 
 \* The step at which p answers; each answer is judged when it is given.
 AnswerStep(p) == req[p] # NoReq /\ req'[p] = NoReq /\ out'[p].ans # "none"

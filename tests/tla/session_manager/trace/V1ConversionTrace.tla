@@ -48,7 +48,7 @@ ConvAllowed(p, o) == ConvWork(p) \/ (o.denied /\ ConvRefused(p))
 
 \* During a request, an older build may write only if an earlier hold step
 \* left it holding the session; it cannot take a lock there.
-HolderStep(i) == WBegin(i) \/ WEnd(i) \/ WMark(i)
+HolderStep(i) == WBegin(i) \/ WEnd(i)
 
 \* The actions a step of kind `o.k` may take, at observation index `n`.
 Hidden(o, n) ==
