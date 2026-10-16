@@ -3738,8 +3738,15 @@ fn onMcpProgress(raw_ctx: *anyopaque, lifecycle_id: types.ToolLifecycleId, text:
     };
 }
 
-/// The same warning v1 gives for project servers still waiting for approval.
+/// Why a configured server isn't there, one `note:` line each, as `fx mcp
+/// list` says it; then the same warning v1 gives for project
+/// servers still waiting for approval.
 fn reportUnapprovedMcpServers(ctx: *AskContext, h: *mcp_host.Host) !void {
+    for (h.notes) |note| {
+        try ctx.writeStderr("note: ");
+        try ctx.writeStderr(note);
+        try ctx.writeStderr("\n");
+    }
     var listed = false;
     for (h.runtime.servers()) |s| {
         if (s.held != .waiting_for_approval) continue;

@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const wire = @import("../protocol/wire.zig");
+const http_headers = @import("../protocol/http_headers.zig");
 const discovery = @import("discovery.zig");
 const core = @import("../core/auth.zig");
 
@@ -283,14 +284,21 @@ fn unsendable(kind: []const u8) bool {
     return false;
 }
 
+/// Whether `access` is an access token as RFC 6749 appendix A.12 spells one,
+/// 1*VSCHAR (0x20..0x7E). It goes in the `Authorization` header, where any
+/// other byte could break the request.
+pub fn validToken(access: []const u8) bool {
+    return access.len != 0 and http_headers.printable(access);
+}
+
 /// Reads a token response. Every token is sent as Bearer; a type that
-/// can't be is refused.
+/// can't be is refused, and so is an access token that isn't valid.
 pub fn parseToken(a: Allocator, raw: []const u8) error{ OutOfMemory, Malformed }!Token {
     var f: [5]?[]const u8 = undefined;
     wire.objectFields(raw, &.{ "access_token", "token_type", "refresh_token", "expires_in", "scope" }, &f) catch return error.Malformed;
     const access = (try wire.decodeString(a, f[0] orelse return error.Malformed)) orelse return error.Malformed;
     const kind = wire.plainString(f[1] orelse return error.Malformed) orelse return error.Malformed;
-    if (access.len == 0 or unsendable(kind)) return error.Malformed;
+    if (!validToken(access) or unsendable(kind)) return error.Malformed;
     var t: Token = .{ .access = access };
     if (f[2]) |v| t.refresh = try wire.decodeString(a, v);
     if (f[3]) |v| t.expires_in = std.fmt.parseInt(u64, v, 10) catch null;
@@ -303,9 +311,9 @@ pub fn parseToken(a: Allocator, raw: []const u8) error{ OutOfMemory, Malformed }
 /// status since some answer 200 with one (Slack's `ok:false`), or what a
 /// 200 answer lacked. Owned by `a`; never any part of a token.
 pub fn tokenFailure(a: Allocator, status: u16, raw: []const u8) Allocator.Error![]const u8 {
-    var f: [3]?[]const u8 = .{ null, null, null };
-    const json = if (wire.objectFields(raw, &.{ "error", "error_description", "token_type" }, &f)) true else |_| false;
-    if (!json) f = .{ null, null, null };
+    var f: [4]?[]const u8 = .{ null, null, null, null };
+    const json = if (wire.objectFields(raw, &.{ "error", "error_description", "token_type", "access_token" }, &f)) true else |_| false;
+    if (!json) f = .{ null, null, null, null };
     if (f[0]) |raw_code| if (wire.plainString(raw_code)) |code| {
         const text = if (f[1]) |v| try wire.decodeString(a, v) else null;
         return if (text) |t| a.print("{s}: {s}", .{ code, t }) else a.dupe(u8, code);
@@ -315,6 +323,8 @@ pub fn tokenFailure(a: Allocator, status: u16, raw: []const u8) Allocator.Error!
     const kind = wire.plainString(f[2] orelse return a.dupe(u8, "its token response has no token_type")) orelse
         return a.dupe(u8, "its token response has no token_type");
     if (unsendable(kind)) return a.print("its token is of type {s}, which can't be sent as a Bearer token", .{kind});
+    if (f[3]) |v| if (try wire.decodeString(a, v)) |access| if (access.len != 0 and !validToken(access))
+        return a.dupe(u8, "its token has characters OAuth doesn't allow");
     return a.dupe(u8, "its token response has no access_token");
 }
 
@@ -498,6 +508,12 @@ test "token responses: Bearer only, refresh and expiry optional" {
     const slack = try parseToken(a, "{\"ok\":true,\"access_token\":\"xoxp-1\",\"token_type\":\"user\",\"scope\":\"search:read\"}");
     try testing.expectEqualStrings("xoxp-1", slack.access);
     try testing.expectError(error.Malformed, parseToken(a, "{\"token_type\":\"Bearer\"}"));
+    // Only VSCHAR: a CR, LF, NUL, DEL or non-ASCII byte would break the header.
+    for ([_][]const u8{ "at\\r\\n1", "at\\n1", "at\\u00001", "at\\u007f", "\\u00e9t", "" }) |bad| {
+        const raw = try a.print("{{\"access_token\":\"{s}\",\"token_type\":\"Bearer\"}}", .{bad});
+        try testing.expectError(error.Malformed, parseToken(a, raw));
+    }
+    try testing.expectEqualStrings("a b~", (try parseToken(a, "{\"access_token\":\"a b~\",\"token_type\":\"Bearer\"}")).access);
     try testing.expect(refusesGrant("{\"error\":\"invalid_grant\"}"));
     try testing.expect(!refusesGrant("{\"error\":\"temporarily_unavailable\"}"));
 }
@@ -533,4 +549,6 @@ test "a token endpoint's refusal is said in its own words, and a token never" {
     try std.testing.expectEqualStrings("invalid_code", try tokenFailure(a, 200, "{\"ok\":false,\"error\":\"invalid_code\"}"));
     try std.testing.expectEqualStrings("its token response has no token_type", try tokenFailure(a, 200, "{\"access_token\":\"secret\"}"));
     try std.testing.expectEqualStrings("its token response has no access_token", try tokenFailure(a, 200, "{\"token_type\":\"bearer\"}"));
+    try std.testing.expectEqualStrings("its token response has no access_token", try tokenFailure(a, 200, "{\"access_token\":\"\",\"token_type\":\"bearer\"}"));
+    try std.testing.expectEqualStrings("its token has characters OAuth doesn't allow", try tokenFailure(a, 200, "{\"access_token\":\"secret\\r\\nX: 1\",\"token_type\":\"bearer\"}"));
 }

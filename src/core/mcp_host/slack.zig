@@ -23,10 +23,26 @@ pub fn isSlack(url: ?[]const u8) bool {
     return std.mem.eql(u8, u, "https://mcp.slack.com") or std.mem.startsWith(u8, u, "https://mcp.slack.com/");
 }
 
+const fx_sh = "https://fx.sh";
+
 /// fx.sh, or for tests a bridge on 127.0.0.1 (`FX_E2E_SLACK_ORIGIN`), as v1 takes it.
 pub fn origin() []const u8 {
-    const configured = io_mod.getenv("FX_E2E_SLACK_ORIGIN") orelse return "https://fx.sh";
-    return if (loopbackOrigin(configured)) configured else "https://fx.sh";
+    const configured = io_mod.getenv("FX_E2E_SLACK_ORIGIN") orelse return fx_sh;
+    return if (loopbackOrigin(configured)) configured else fx_sh;
+}
+
+/// Whether `url` may sign in through the bridge. The bridge hands the code
+/// and verifier for fx's Slack app to the server's token endpoint, so only
+/// Slack's MCP server qualifies, or in tests the server at a test bridge's
+/// own origin, as v1 allowed.
+pub fn bridgeServer(url: ?[]const u8) bool {
+    return bridgeServerAt(url orelse return false, origin());
+}
+
+fn bridgeServerAt(url: []const u8, bridge_origin: []const u8) bool {
+    if (isSlack(url)) return true;
+    if (std.mem.eql(u8, bridge_origin, fx_sh)) return false;
+    return std.mem.startsWith(u8, url, bridge_origin) and std.mem.eql(u8, url[bridge_origin.len..], "/mcp");
 }
 
 fn loopbackOrigin(o: []const u8) bool {
@@ -85,4 +101,16 @@ test "only Slack's MCP server, and only a loopback test bridge" {
     try testing.expect(!loopbackOrigin("http://127.0.0.1:80"));
     try testing.expect(!loopbackOrigin("https://evil.example"));
     try testing.expect(!loopbackOrigin("http://127.0.0.1:8080/x"));
+}
+
+test "the bridge serves only Slack's MCP server, or a test bridge's own" {
+    try testing.expect(bridgeServerAt("https://mcp.slack.com/mcp", fx_sh));
+    try testing.expect(!bridgeServerAt("https://mcp.example.com/mcp", fx_sh));
+    try testing.expect(!bridgeServerAt("http://127.0.0.1:8080/mcp", fx_sh));
+    try testing.expect(bridgeServerAt("http://127.0.0.1:8080/mcp", "http://127.0.0.1:8080"));
+    try testing.expect(bridgeServerAt("https://mcp.slack.com/mcp", "http://127.0.0.1:8080"));
+    try testing.expect(!bridgeServerAt("http://127.0.0.1:9090/mcp", "http://127.0.0.1:8080"));
+    try testing.expect(!bridgeServerAt("http://127.0.0.1:80800/mcp", "http://127.0.0.1:8080"));
+    try testing.expect(!bridgeServerAt("http://127.0.0.1:8080/other", "http://127.0.0.1:8080"));
+    try testing.expect(!bridgeServer(null));
 }

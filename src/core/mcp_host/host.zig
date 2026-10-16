@@ -7,6 +7,7 @@ const mcp_contract = @import("../mcp/mcp_contract.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const runtime_mod = @import("runtime.zig");
+const debug_trace = @import("../shared/debug_trace.zig");
 const model = @import("model.zig");
 
 const Allocator = std.mem.Allocator;
@@ -19,6 +20,7 @@ pub const Notice = runtime_mod.Notice;
 pub const Status = runtime_mod.Status;
 pub const selected = runtime_mod.selected;
 pub const signalServersForExit = runtime_mod.signalServersForExit;
+pub const waitRetired = runtime_mod.waitRetired;
 pub const menu = @import("menu.zig");
 
 pub const Extras = struct {
@@ -78,6 +80,24 @@ pub const Host = struct {
         h.catalog.deinit();
         h.runtime.deinit();
         gpa.destroy(h);
+    }
+
+    /// Replaced: until this host is gone, no other host starts a server, so
+    /// none runs twice. Calls that began on it still finish here.
+    pub fn retire(h: *Host) void {
+        h.runtime.retire();
+    }
+
+    /// Retires the host and destroys it on a thread of its own, so whoever
+    /// lets it go never waits for its servers to stop. Nothing else
+    /// may use `h` after this.
+    pub fn stop(h: *Host) void {
+        h.retire();
+        const thread = std.Thread.spawn(.{}, destroy, .{h}) catch |err| {
+            debug_trace.logf("mcp", "MCP host stopped in place err={s}", .{@errorName(err)});
+            return h.destroy();
+        };
+        thread.detach();
     }
 };
 

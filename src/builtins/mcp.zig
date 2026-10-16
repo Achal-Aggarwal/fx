@@ -564,16 +564,21 @@ pub const NativeConfigs = struct {
 pub fn loadNativeConfigs(alloc: Allocator, workspace_root: []const u8) !NativeConfigs {
     var profile: std.ArrayList(McpServerConfig) = .empty;
     errdefer freeConfigs(alloc, &profile);
+    // A profile entry fx can't read is skipped with a note, ahead of the
+    // project's notes.
+    var loaded: NativeConfigs = .{};
+    errdefer loaded.deinit(alloc);
     if (io_mod.homeDir()) |home| {
         const config_path = try configPathFromHome(alloc, home);
         defer alloc.free(config_path);
-        profile = try loadConfigFromPath(alloc, config_path);
+        profile = try readProfile(alloc, config_path, &loaded.diagnostics);
     }
 
     var choice_load = config_runtime.loadProjectMcpChoices(alloc, workspace_root) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("mcp", "workspace MCP choices unavailable err={s}", .{@errorName(err)});
-        return .{ .configs = profile };
+        loaded.configs = profile;
+        return loaded;
     };
     defer choice_load.deinit(alloc);
     for (choice_load.diagnostics.items) |diagnostic| {
@@ -599,13 +604,12 @@ pub fn loadNativeConfigs(alloc: Allocator, workspace_root: []const u8) !NativeCo
     );
     defer workspace.deinit(alloc);
     traceWorkspaceDiagnostics(workspace.diagnostics.items);
+    // The workspace's notes move over, so `workspace.deinit` frees only its list.
+    try loaded.diagnostics.appendSlice(alloc, workspace.diagnostics.items);
+    workspace.diagnostics.clearRetainingCapacity();
 
-    var loaded: NativeConfigs = .{
-        .configs = try project_config.mergeNative(alloc, &profile, &workspace.configs),
-    };
+    loaded.configs = try project_config.mergeNative(alloc, &profile, &workspace.configs);
     profile.deinit(alloc);
-    loaded.diagnostics = workspace.diagnostics;
-    workspace.diagnostics = .empty;
     return loaded;
 }
 
@@ -667,6 +671,7 @@ pub fn loadHost(
     const h = try mcp_host.Host.create(alloc, io_mod.getIo(), loaded.configs.items, &inherited, .{
         .client_version = build_options.app_version,
         .credentials = .detect(alloc, home),
+        .workspace_root = workspace_root,
         .questions = extras.questions,
         .notify = extras.notify,
     }, builtins);
@@ -884,6 +889,11 @@ fn runtimeFromConfigs(
 }
 
 pub fn loadConfigFromPath(alloc: Allocator, path: []const u8) !std.ArrayList(McpServerConfig) {
+    return readProfile(alloc, path, null);
+}
+
+/// With `skipped`, see `project_config.parseProfileServers`.
+fn readProfile(alloc: Allocator, path: []const u8, skipped: ?*std.ArrayList(project_config.WorkspaceDiagnostic)) !std.ArrayList(McpServerConfig) {
     var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{}) catch |err| {
         if (err == error.FileNotFound) return .empty;
         logConfigFailure("open", path, err);
@@ -897,7 +907,7 @@ pub fn loadConfigFromPath(alloc: Allocator, path: []const u8) !std.ArrayList(Mcp
     };
     defer alloc.free(json_text);
 
-    return loadConfigFromJson(alloc, json_text) catch |err| {
+    return project_config.parseProfileServers(alloc, json_text, skipped) catch |err| {
         logConfigFailure("load", path, err);
         return err;
     };
@@ -2365,7 +2375,7 @@ test "profile config rejects a mixed set containing invalid client metadata URLs
 
 test "profile config reports literal authorization secrets" {
     try std.testing.expectError(
-        error.McpConfigInvalidHeaders,
+        error.McpConfigAuthorizationHeader,
         loadConfigFromJson(std.testing.allocator,
             \\{"mcp":{"unsafe":{"type":"http","url":"https://api.example.com/mcp","headers":{"Authorization":"Bearer secret-value"}}}}
         ),

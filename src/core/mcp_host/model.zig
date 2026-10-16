@@ -376,7 +376,7 @@ pub const Catalog = struct {
             const availability: model_catalog.Availability = switch (s.state) {
                 .waiting_for_approval, .rejected => continue,
                 .disabled => .disabled,
-                .unsupported, .missing_env => .unavailable,
+                .unsupported, .missing_env, .invalid_env => .unavailable,
                 .idle => if (l.state == .loaded) .ready else .available_on_demand,
                 .connecting, .retrying => .discovering,
                 .ready => .ready,
@@ -522,6 +522,8 @@ pub const Catalog = struct {
                 .failed => try alloc.print("MCP server '{s}' is unavailable: {s}", .{ s.name, l.failure orelse "it did not start" }),
                 else => if (s.held == .missing_env)
                     try alloc.print("MCP server '{s}' needs {s} set before fx starts.", .{ s.name, s.missing orelse "a variable" })
+                else if (s.held == .invalid_env)
+                    try alloc.print("MCP server '{s}' can't use {s}: its value holds a line break or another character a header can't carry. Fix it, then restart fx.", .{ s.name, s.missing orelse "a variable" })
                 else
                     continue,
             };
