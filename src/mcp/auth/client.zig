@@ -236,8 +236,8 @@ pub const Auth = struct {
                     // A refresh brings no new scopes; this needs a sign-in.
                     try a.stepFlow(.{ .challenged = try a.scopeBits(c.scope) });
                     try a.stepGate(.{ .accepted = key });
-                    try a.actions.append(a.gpa, .{ .give_up = .{ .key = key, .why = .needs_sign_in } });
                     try a.announce(true);
+                    try a.actions.append(a.gpa, .{ .give_up = .{ .key = key, .why = .needs_sign_in } });
                     return true;
                 }
                 // The challenge's scopes, or none, which leaves the
@@ -260,9 +260,11 @@ pub const Auth = struct {
         for (out.effects()) |effect| switch (effect) {
             .post => |p| try a.actions.append(a.gpa, .{ .post = .{ .key = p.key, .token = p.token } }),
             .refresh => try a.startRefresh(),
+            // The sign-in is announced before anything gives up for it, so a
+            // host woken by the give-up already knows.
             .give_up => |g| {
-                try a.actions.append(a.gpa, .{ .give_up = .{ .key = g.key, .why = g.why } });
                 if (g.why == .needs_sign_in) try a.announce(false);
+                try a.actions.append(a.gpa, .{ .give_up = .{ .key = g.key, .why = g.why } });
             },
         };
         // A sign-in or sign-out replaced the refresh the host was deciding.
@@ -864,6 +866,30 @@ test "a refresh the host decides waits for it, and ends however it does: replace
         try testing.expectEqual(@as(u64, 0), a.refresh_key);
         try testing.expectEqual(@as(usize, 0), actions.len);
     }
+}
+
+test "a request a sign-in is needed for gives up only after the sign-in is announced" {
+    const testing = std.testing;
+    var client: http.Client = undefined;
+    try client.init(testing.io, testing.allocator, .{ .url = "http://127.0.0.1:9/mcp" });
+    defer client.deinit();
+    var a: Auth = .init(testing.io, testing.allocator, &client, "http://127.0.0.1:9/mcp", .{}, null);
+    defer a.deinit();
+    // No login: the server's 401 leaves nothing to refresh.
+    try a.beforeSend(1);
+    a.actions.clearRetainingCapacity();
+    _ = try a.ended(1, .{ .rejected = .{ .status = 401, .challenge = "" } });
+    const actions = a.actions.items;
+    var announced: ?usize = null;
+    var gave_up: ?usize = null;
+    for (actions, 0..) |x, i| switch (x) {
+        .needs_sign_in => announced = announced orelse i,
+        .give_up => |g| if (g.key == 1 and g.why == .needs_sign_in) {
+            gave_up = gave_up orelse i;
+        },
+        else => {},
+    };
+    try testing.expect(announced.? < gave_up.?);
 }
 
 test "a saved credential whose endpoints discovery may not reach is ignored" {
