@@ -105,7 +105,6 @@ function framesFor(prompt) {
 // records how many words it sent.
 const slowReply = Symbol("slow reply");
 const slowFrames = 75;
-const slowReplyMs = slowFrames * 40;
 const slow = [];
 const stalledReply = Symbol("stalled reply");
 const slowToolCall = Symbol("slow tool call");
@@ -1031,7 +1030,7 @@ async function linesUntil(session, done, label, ms = 15_000 * timeScale) {
 test("a steer cuts a streaming reply short, and the turn goes on with it", async () => {
   const agent = createFxAgent(agentOptions(await durabilityFor()));
   const session = agent.session();
-  const started = Date.now();
+  const before = slow.length;
   const turn = session.prompt("slow reply");
   const { messageId } = await turn.accepted;
   // Steer once the reply has reached the turn's viewer.
@@ -1040,9 +1039,10 @@ test("a steer cuts a streaming reply short, and the turn goes on with it", async
   assert.deepEqual(await session.steer("be brief", { messageId: "m-brief" }), { messageId: "m-brief" });
   for (let next = await events.next(); !next.done; next = await events.next());
   const result = await turn.result;
-  const elapsed = Date.now() - started;
   assert.equal(result.stopReason, "end_turn");
-  assert.ok(elapsed < slowReplyMs, `the turn ended after ${elapsed} ms, not after the whole reply`);
+  // Counted by the model server, so a remote World's latency cannot hide a
+  // reply that ran to its end.
+  assert.ok(slow[before].sent < slowFrames, `the reply sent ${slow[before].sent} of ${slowFrames} words, not cut short`);
   const last = requests.at(-1);
   assert.ok(userTexts(last).some((text) => text.includes("be brief")), "the next request carried the steer");
   assert.ok(JSON.stringify(last).includes("w0"), "the reply so far stays in the turn");
@@ -1074,16 +1074,14 @@ test("a steer with an image ends the streaming turn, and runs as the next turn",
   const agent = createFxAgent(agentOptions(await durabilityFor()));
   const session = agent.session();
   const before = slow.length;
-  const started = Date.now();
   const turn = session.prompt("slow reply");
   const { messageId } = await turn.accepted;
   await until(() => slow.length > before && slow.at(-1).sent > 0, "the reply to stream");
   await session.steer([{ type: "text", text: "match this" }, { type: "image", data: onePixelPng, mimeType: "image/png" }], { messageId: "m-image" });
   await session.steer("and keep it small", { messageId: "m-after-image" });
   const first = await turn.result;
-  const elapsed = Date.now() - started;
   assert.notEqual(first.stopReason, "end_turn", "the running turn did not finish its reply");
-  assert.ok(elapsed < slowReplyMs, `the running turn ended after ${elapsed} ms, not after the whole reply`);
+  assert.ok(slow[before].sent < slowFrames, `the running reply sent ${slow[before].sent} of ${slowFrames} words, not cut short`);
   const lines = await linesUntil(session, (line) => line.type === "turn_end" && line.messageId === "m-image", "the image's turn");
   assert.deepEqual(lines.filter((line) => line.type === "turn_start").map((line) => line.messageId), [messageId, "m-image"]);
   const imageRequest = requests.findLast((prompt) => userTexts(prompt).some((text) => text.includes("match this")));

@@ -1493,6 +1493,26 @@ if (durabilityKind === "memory") {
     assert.equal(await inputs(), before, "no input was stored");
     await agent.close();
   });
+
+  test("a session stores its context as it was when the session opened", async () => {
+    const agent = createAgent({ durability: memory() });
+    const context = { user: "a" };
+    const session = agent.session(undefined, { context });
+    try {
+      await session.prompt("first").result;
+      const log = await agent[Symbol.for("libfx.durableInternals")].openLog(session.id);
+      const inputs = async () => (await log.read()).filter(({ entry }) => entry.k === "input").map(({ entry }) => entry);
+      // A change the caller makes later reaches neither the size check nor
+      // the log, so the 8 MiB limit holds for what is stored.
+      context.user = "x".repeat(8 * 1024 * 1024);
+      await session.steer("next", { messageId: "steer-after-change" });
+      const stored = (await inputs()).find((entry) => entry.messageId === "steer-after-change");
+      assert.deepEqual(stored.context, { user: "a" });
+      assert.ok(JSON.stringify(stored).length < 1024, "the changed context was not stored");
+    } finally {
+      await agent.close();
+    }
+  });
 }
 
 if (durabilityKind === "queue") {

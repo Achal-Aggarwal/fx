@@ -304,6 +304,7 @@ jobs:
 
       - name: Test durable sessions on N-API
         run: |
+          node sdk/tests/test-vercel-storage.mjs
           node sdk/tests/test-durable.mjs memory native
           env LIBFX_TEST_HOOKS=1 node sdk/tests/test-durable.mjs memory native
           node sdk/tests/test-durable.mjs local native

@@ -1236,6 +1236,12 @@ const knownMessage = (state, message) => state.inputKeys.has(`${message.type}:${
 // input could never run; it is refused before anything is stored.
 const maxInputBytes = 8 * 1024 * 1024;
 const jsonBytes = (value) => (value === undefined ? 0 : encoder.encode(JSON.stringify(value)).byteLength);
+// A JSON value as it stands now, so what libfx measures is what it stores,
+// however the caller changes its object later. Pure.
+const jsonSnapshot = (value) => {
+  const text = JSON.stringify(value);
+  return text === undefined ? undefined : JSON.parse(text);
+};
 const inputTooLarge = (bytes) => Object.assign(
   new RangeError(`a durable input with its context and settings is ${bytes} bytes; the most is ${maxInputBytes}`),
   { code: "FX_INPUT_TOO_LARGE", bytes, limit: maxInputBytes },
@@ -2375,11 +2381,9 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
 
     const openSession = (requestedId, sessionOptions = {}) => {
       if (requestedId !== undefined && !validId(requestedId)) throw new TypeError(`session id must be ${idRule}`);
-      const context = sessionOptions?.context;
-      if (context !== undefined) {
-        try { JSON.stringify(context); } catch { throw new TypeError("session context must be JSON"); }
-      }
-      const settings = plugged.settings?.(sessionOptions ?? {});
+      let context;
+      try { context = jsonSnapshot(sessionOptions?.context); } catch { throw new TypeError("session context must be JSON"); }
+      const settings = jsonSnapshot(plugged.settings?.(sessionOptions ?? {}));
       // What every input this session object sends carries besides itself.
       const carried = jsonBytes(context) + jsonBytes(settings);
       // Refuses an input too large to store before anything is stored

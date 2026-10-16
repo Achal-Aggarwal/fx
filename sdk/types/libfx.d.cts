@@ -754,7 +754,7 @@ export type FxAgentOptions = Omit<FxSharedOptions<FxAgentEvent>, "tools"> & FxMo
 
 /** Options for `agent.session()`. Each applies to the turns this session object starts. */
 export interface FxSessionOptions {
-  /** JSON every tool call of those turns receives as `context`. */
+  /** JSON every tool call of those turns receives as `context`, copied when `session()` is called. */
   context?: JsonValue;
   /** The model for those turns instead of the agent's whole model choice: a model ID, or a model object. */
   model?: string | FxModelOptions;
