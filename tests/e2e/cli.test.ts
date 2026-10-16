@@ -2605,6 +2605,46 @@ describe("cli: sessions", () => {
   );
 
   test(
+    "fx sessions text applies daylight saving time for each session's own date",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-dst-"));
+      try {
+        const home = join(root, "home");
+        const workspace = join(root, "workspace");
+        mkdirSync(workspace);
+        const workspaceRoot = realpathSync(workspace);
+        // 2023-07-10 14:40:00 UTC, during daylight saving time.
+        writeConversationSession(home, workspaceRoot, "summer-session", {
+          title: "Summer session",
+          updatedAtMs: 1_689_000_000_000,
+        });
+        // 2023-11-14 22:13:20.123 UTC, after daylight saving time ends.
+        writeConversationSession(home, workspaceRoot, "winter-session", {
+          title: "Winter session",
+          updatedAtMs: 1_700_000_000_123,
+        });
+
+        const listed = await runFx(["sessions"], {
+          cwd: workspaceRoot,
+          env: { HOME: home, ...NO_GATEWAY_AUTH, TZ: "EST5EDT,M3.2.0,M11.1.0" },
+          timeoutMs: TIMEOUT,
+        });
+        expect(listed.code).toBe(0);
+        expect(listed.stderr).toBe("");
+        expect(listed.stdout).toContain(
+          " - Summer session\n   id=summer-session | 0 turns | English | updated 2023-07-10 10:40:00.000 EDT",
+        );
+        expect(listed.stdout).toContain(
+          " - Winter session\n   id=winter-session | 0 turns | English | updated 2023-11-14 17:13:20.123 EST",
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "session listing pages direct metadata without an index",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-e2e-session-pages-"));

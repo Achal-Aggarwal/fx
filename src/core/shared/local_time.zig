@@ -109,11 +109,10 @@ fn writeZoneName(zone: Zone, buf: *[max_zone_name_len]u8) []const u8 {
         return buf[0..zone.name.len];
     }
     const minutes = @abs(zone.offset_s) / std.time.s_per_min;
-    return std.mem.print(buf, "{s}{d:0>2}{d:0>2}", .{
-        if (zone.offset_s < 0) "-" else "+",
-        minutes / 60,
-        minutes % 60,
-    }) catch unreachable; // An offset under a day is at most `+2359`.
+    buf[0] = if (zone.offset_s < 0) '-' else '+';
+    buf[1..3].* = std.fmt.digits2(@intCast(minutes / 60));
+    buf[3..5].* = std.fmt.digits2(@intCast(minutes % 60));
+    return buf[0..5];
 }
 
 fn isPlainZoneName(name: []const u8) bool {
@@ -124,7 +123,8 @@ fn isPlainZoneName(name: []const u8) bool {
     return true;
 }
 
-/// C `struct tm` as macOS, glibc, and musl (including wasi-libc) lay it out.
+/// C `struct tm` as macOS, glibc, and musl lay it out. wasi-libc adds a
+/// trailing field, so WASI builds never pass this to the C library.
 const Tm = extern struct {
     sec: c_int,
     min: c_int,
@@ -142,11 +142,12 @@ const Tm = extern struct {
 extern "c" fn localtime_r(timer: *const std.c.time_t, result: *Tm) ?*Tm;
 
 /// The local zone in effect at `epoch_s`, or UTC when the C library cannot
-/// convert the time. The name borrows C library storage, so `local` copies
-/// it into its reading straight away.
+/// convert the time. WASI has no time zone data, so it reads UTC. The name
+/// borrows C library storage, so `local` copies it into its reading straight
+/// away.
 fn localZoneAt(epoch_s: i64) Zone {
     if (builtin.is_test) return test_zone;
-    if (!builtin.link_libc) return .utc;
+    if (!builtin.link_libc or builtin.target.os.tag == .wasi) return .utc;
     const timer = std.math.cast(std.c.time_t, epoch_s) orelse return .utc;
     var tm: Tm = undefined;
     if (localtime_r(&timer, &tm) == null) return .utc;
