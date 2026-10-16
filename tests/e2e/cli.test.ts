@@ -1507,7 +1507,7 @@ describe("cli: usage", () => {
       });
       writeChatGptLogin(fixture.home, "acct_e2e");
       // Times show in the local zone, fixed here at five and a half hours east of UTC.
-      const env = { ...fixture.env, FX_PROVIDER: "codex", FX_MODEL: "gpt-5.6-sol", TZ: "IST-5:30" };
+      const env = { ...fixture.env, FX_PROVIDER: "codex", FX_MODEL: "codex-e2e-model", TZ: "IST-5:30" };
       try {
         const text = await runFx(["usage", "--period", "today"], { env });
         expect(text.code).toBe(0);
