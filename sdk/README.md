@@ -263,7 +263,7 @@ const agent = createFxAgent({
 | `signal` | Aborts when the turn is cancelled |
 | `executionId` | The call's id, the same if the call runs again after a crash |
 | `sessionId` | The session the call belongs to |
-| `context` | The JSON passed as `context` to `agent.session()` |
+| `context` | A copy of the JSON passed as `context` to `agent.session()`, taken when you call it |
 
 Return a string to send it as is, or any other value to send it as JSON. A thrown error reaches the model as a failed tool result. To return images, return `{ type: "libfx.tool-result", text, images }`, with base64 image data.
 
