@@ -171,6 +171,9 @@ pub const Options = struct {
     /// Where a 2025 server's URL completions go: ACP sends the editor
     /// `elicitation/complete`.
     url_completions: ?tool_mcp_runtime.LegacyUrlCompletionSink = null,
+    /// The surface takes slash commands, as fx's shell does, so the model
+    /// tells the user to sign in with `/mcp login NAME`, not in a terminal.
+    slash_commands: bool = false,
 };
 
 pub const Error = Allocator.Error || error{

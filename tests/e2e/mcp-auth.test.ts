@@ -4265,6 +4265,73 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     expect(list.code).toBe(0);
     return JSON.parse(list.stdout).servers[0].status;
   };
+  // What the model is told to ask for depends on where the user is.
+  const searchNeedingLogin = () => startFakeGateway([
+    fakeGatewayToolCall("search_auth", "capability_search", { query: "fixture", server: "fixture" }),
+    fakeGatewayFinalText("Sign in first."),
+  ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+
+  test("fx ask tells the model the user signs in with fx mcp login in a terminal", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    gateway = searchNeedingLogin();
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Find the protected MCP tool."], {
+      cwd: root.workspace,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      timeoutMs: 20_000,
+    });
+    expect(result.code).toBe(0);
+    expect(gateway.requests[1]?.body).toContain("Run fx mcp login fixture in a terminal, then search again.");
+    expect(auth.authorizationRequests).toBe(0);
+  }, 30_000);
+
+  test("an open search that matches nothing names the servers it couldn't look in, and why", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const profile = join(root.home, ".fx", "mcp.json");
+    const config = JSON.parse(readFileSync(profile, "utf8"));
+    config.mcp.broken = { type: "local", command: ["false"], startup_timeout_ms: 5_000 };
+    writeFileSync(profile, JSON.stringify(config));
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("search_open", "capability_search", { query: "weather forecast" }),
+      fakeGatewayFinalText("Nothing found."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "What's the weather?"], {
+      cwd: root.workspace,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      timeoutMs: 30_000,
+    });
+    expect(result.code).toBe(0);
+    const told = toolResultText(gateway.requests[1]?.body ?? "", "search_open");
+    expect(told).toContain('"state":"no_match"');
+    expect(told).toContain('"mcp_unavailable":[');
+    expect(told).toContain("\"MCP server 'fixture' needs a login. Ask the user to run fx mcp login fixture in a terminal, then try again.\"");
+    expect(told).toContain("\"MCP server 'broken' is unavailable: ");
+    expect(auth.authorizationRequests).toBe(0);
+  }, 45_000);
+
+  test.skipIf(!tmuxAvailable())("the shell tells the model the user signs in with /mcp login", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    gateway = searchNeedingLogin();
+    tui = await TmuxSession.create({
+      isolated: true,
+      cwd: root.workspace,
+      width: 120,
+      height: 40,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("Find the protected MCP tool.");
+    await tui.waitForText("Sign in first.", 20_000);
+    const told = gateway.requests[1]?.body ?? "";
+    expect(told).toContain("Run /mcp login fixture, then search again.");
+    expect(told).not.toContain("fx mcp login fixture in a terminal");
+    expect(auth.authorizationRequests).toBe(0);
+  }, 45_000);
 
   test("fx mcp login signs in through the browser, and logout signs out", async () => {
     upstream = startModernMcpHttpFixture("json");

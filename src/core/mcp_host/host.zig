@@ -29,6 +29,8 @@ pub const Extras = struct {
     questions: elicitation.Capabilities = .{},
     /// Gets sign-in notices.
     notify: ?runtime_mod.Notify = null,
+    /// See `runtime.Options.slash_commands`.
+    slash_commands: bool = false,
 };
 
 /// Loads the host for a workspace, or null when MCP-v2 isn't selected or no

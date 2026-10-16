@@ -694,6 +694,7 @@ pub fn loadHost(
         .workspace_root = workspace_root,
         .questions = extras.questions,
         .notify = extras.notify,
+        .slash_commands = extras.slash_commands,
     }, builtins);
     h.notes = notes;
     return h;

@@ -1747,7 +1747,7 @@ pub const State = struct {
             sink.* = .{};
             self.host_sink = sink;
         }
-        self.replaceHost(try load(alloc, workspace_root, registry, .{ .questions = questions, .notify = self.host_sink.?.notify() }));
+        self.replaceHost(try load(alloc, workspace_root, registry, .{ .questions = questions, .notify = self.host_sink.?.notify(), .slash_commands = true }));
     }
 
     /// Loads the config again after `/mcp` changed it; calls still using the
@@ -1755,7 +1755,7 @@ pub const State = struct {
     pub fn reloadHost(self: *State, alloc: Allocator, workspace_root: []const u8, registry: tool_dispatch.Registry) !void {
         const load = self.host_load orelse return;
         const sink = self.host_sink orelse return;
-        self.replaceHost(try load(alloc, workspace_root, registry, .{ .questions = self.host_questions, .notify = sink.notify() }));
+        self.replaceHost(try load(alloc, workspace_root, registry, .{ .questions = self.host_questions, .notify = sink.notify(), .slash_commands = true }));
         self.startHostServers();
     }
 
