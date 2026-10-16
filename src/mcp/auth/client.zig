@@ -652,8 +652,8 @@ pub const Auth = struct {
             if (a.options.refresh_via_host) try a.actions.append(a.gpa, .refresh_ended);
             return;
         } else |err| if (err == error.OutOfMemory) return error.OutOfMemory;
-        // invalid_grant: the refresh token is gone for good (RFC 6749 §5.2).
-        try a.refreshEnded(if (status >= 400 and status < 500 and oauth.refusesGrant(body)) .refused else .failed);
+        // An answer naming an error refuses the refresh token for good.
+        try a.refreshEnded(if (oauth.refusesRefresh(status, body)) .refused else .failed);
     }
 
     /// What a refresh needs comes from the sign-in that brought the tokens.
@@ -779,7 +779,7 @@ test "a saved credential comes back whole: requests carry its token, and it save
     try testing.expectEqualStrings("{\"access\":\"at/1\",\"refresh\":\"rt\"" ++ fields, out.written());
 }
 
-test "a refresh the host decides waits for it, and ends however it does: replaced, signed out of, answered, or refused" {
+test "a refresh the host decides waits for it, and ends however it does: replaced, signed out of, answered, refused, or failed" {
     const testing = std.testing;
     var client: http.Client = undefined;
     try client.init(testing.io, testing.allocator, .{ .url = "http://127.0.0.1:9/mcp" });
@@ -790,7 +790,7 @@ test "a refresh the host decides waits for it, and ends however it does: replace
         "\"revocation_endpoint\":null,\"resource\":\"http://127.0.0.1:9/mcp\",\"client_id\":\"c1\",\"client_secret\":null,\"method\":\"none\"}}";
     var buffer: [512]u8 = undefined;
     const actions = &a.actions.items;
-    for ([_]enum { replaced, signed_out, answered, refused }{ .replaced, .signed_out, .answered, .refused }) |case| {
+    for ([_]enum { replaced, signed_out, answered, refused, refused_200, failed_429 }{ .replaced, .signed_out, .answered, .refused, .refused_200, .failed_429 }) |case| {
         try a.restore(try std.mem.print(&buffer, saved, .{"at1"}));
         try a.beforeSend(1);
         a.actions.clearRetainingCapacity();
@@ -835,6 +835,26 @@ test "a refresh the host decides waits for it, and ends however it does: replace
                 try testing.expect(actions.*[0] == .save);
                 try testing.expect(actions.*[actions.len - 1] == .refresh_ended);
                 try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
+            },
+            // Slack refuses with HTTP 200 and ok:false: refused all the same,
+            // so the dead refresh token is never sent again.
+            .refused_200 => {
+                a.refresh_due = false;
+                a.refresh_key = a.newKey();
+                _ = try a.fetched(a.refresh_key, 200, "{\"ok\":false,\"error\":\"bad_client_secret\"}");
+                try testing.expect(actions.*[0] == .save);
+                try testing.expect(actions.*[actions.len - 1] == .refresh_ended);
+                try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
+                try testing.expectEqual(@as(?[]u8, null), a.refresh_token);
+            },
+            // A 429 may pass later: the tokens stay, and nothing is saved.
+            .failed_429 => {
+                a.refresh_due = false;
+                a.refresh_key = a.newKey();
+                _ = try a.fetched(a.refresh_key, 429, "{\"error\":\"slow_down\"}");
+                for (actions.*) |x| try testing.expect(x != .save);
+                try testing.expect(actions.*[actions.len - 1] == .refresh_ended);
+                try testing.expectEqualStrings("rt", a.refresh_token.?);
             },
         }
         if (case != .signed_out) _ = try a.ended(1, .answered);

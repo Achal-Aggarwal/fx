@@ -328,12 +328,17 @@ pub fn tokenFailure(a: Allocator, status: u16, raw: []const u8) Allocator.Error!
     return a.dupe(u8, "its token response has no access_token");
 }
 
-/// Whether a token endpoint's error refuses the grant for good: then the
-/// refresh token is dropped (`invalid_grant`, RFC 6749 §5.2).
-pub fn refusesGrant(raw: []const u8) bool {
+/// Whether a token endpoint's answer to a refresh refuses it for good, so
+/// the refresh token is dropped: an answer that names an error, at 200 or a
+/// 4xx other than 429. RFC 6749 §5.2 sends its errors with 400 or 401, and
+/// Slack sends its own with 200 and `ok:false`; none can pass on a retry. A
+/// 429, a 5xx, or an answer naming no error may.
+pub fn refusesRefresh(status: u16, raw: []const u8) bool {
+    if (status != 200 and (status < 400 or status >= 500 or status == 429)) return false;
     var f: [1]?[]const u8 = undefined;
     wire.objectFields(raw, &.{"error"}, &f) catch return false;
-    return std.mem.eql(u8, wire.plainString(f[0] orelse return false) orelse return false, "invalid_grant");
+    const code = wire.plainString(f[0] orelse return false) orelse return false;
+    return code.len != 0;
 }
 
 // ---- Scopes ----
@@ -514,8 +519,22 @@ test "token responses: Bearer only, refresh and expiry optional" {
         try testing.expectError(error.Malformed, parseToken(a, raw));
     }
     try testing.expectEqualStrings("a b~", (try parseToken(a, "{\"access_token\":\"a b~\",\"token_type\":\"Bearer\"}")).access);
-    try testing.expect(refusesGrant("{\"error\":\"invalid_grant\"}"));
-    try testing.expect(!refusesGrant("{\"error\":\"temporarily_unavailable\"}"));
+}
+
+test "a refresh answer naming an error refuses it, at 200 or a 4xx other than 429" {
+    try testing.expect(refusesRefresh(400, "{\"error\":\"invalid_grant\"}"));
+    try testing.expect(refusesRefresh(401, "{\"error\":\"invalid_client\"}"));
+    // Slack's refusals: HTTP 200 with ok:false.
+    try testing.expect(refusesRefresh(200, "{\"ok\":false,\"error\":\"bad_client_secret\"}"));
+    try testing.expect(refusesRefresh(200, "{\"ok\":false,\"error\":\"invalid_refresh_token\"}"));
+    // Passing: rate limited, unavailable, or nothing named.
+    try testing.expect(!refusesRefresh(429, "{\"error\":\"slow_down\"}"));
+    try testing.expect(!refusesRefresh(503, "{\"error\":\"temporarily_unavailable\"}"));
+    try testing.expect(!refusesRefresh(302, "{\"error\":\"invalid_grant\"}"));
+    try testing.expect(!refusesRefresh(400, "not json"));
+    try testing.expect(!refusesRefresh(200, "{\"ok\":false}"));
+    try testing.expect(!refusesRefresh(400, "{\"error\":\"\"}"));
+    try testing.expect(!refusesRefresh(400, "{\"error\":7}"));
 }
 
 test "scope sets as bits, with offline_access added once" {

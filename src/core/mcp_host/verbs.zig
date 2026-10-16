@@ -776,6 +776,10 @@ fn login(c: Context, arena: Allocator, name: []const u8, browser: bool) !u8 {
             return 1;
         },
         error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign in to", name),
+        error.CallbackPortInUse => {
+            try c.err.print("Couldn't sign in to {s}: port {d} is in use, maybe by another app signing in. Try again once it's free.\n", .{ try safe(arena, name), server.callback_port.? });
+            return 1;
+        },
         else => return err,
     };
     // The shell's host reports the address and the outcome in the transcript.

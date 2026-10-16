@@ -89,6 +89,10 @@ pub const Failure = union(enum) {
     initialized_timed_out,
     /// Detection needs a sign-in first; `detect` again after it.
     needs_auth,
+    /// Detection needed a refresh, and the authorization server gave no
+    /// usable answer: a 429, a 5xx, or none. The login stays, and the
+    /// server starts again after its backoff.
+    auth_unavailable,
 };
 
 /// How a call ended: the exchange's outcomes, and a chain's.
@@ -1764,14 +1768,16 @@ pub const Server = struct {
         r.unkeep(key);
         if (key < aux_base) if (r.logicalFor(key)) |l| {
             l.needs_auth = why == .needs_sign_in;
-            if ((l.what == .discover or l.what == .initialize) and !r.detector.ready()) return r.abortDetection();
+            if ((l.what == .discover or l.what == .initialize) and !r.detector.ready()) return r.abortDetection(why);
         };
         try r.onEndedDomain(key, if (why == .needs_sign_in) 401 else 0, if (why == .needs_sign_in) .http_failure else .broken);
     }
 
-    /// A rejection says nothing about the era. Detection stops, and the
-    /// host signs in and detects again, as a new run with its own traces.
-    fn abortDetection(r: *Server) Error!void {
+    /// A rejection says nothing about the era. Detection stops, as a new run
+    /// with its own traces: for a sign-in, the host signs in and detects
+    /// again; for a refresh that got no usable answer, the start failed and
+    /// the server starts again after its backoff, keeping its login.
+    fn abortDetection(r: *Server, why: auth_core.GiveUp) Error!void {
         for (&r.logicals) |*l| if (l.used and (l.what == .discover or l.what == .initialize)) {
             if (l.id) |id| {
                 try r.stepRequest(.{ .transport_lost = id });
@@ -1786,7 +1792,7 @@ pub const Server = struct {
         r.legacy = null;
         try r.endElicitations();
         r.newEraRun();
-        r.emit(.{ .failed = .needs_auth });
+        r.emit(.{ .failed = if (why == .needs_sign_in) .needs_auth else .auth_unavailable });
     }
 
     /// Detection starts over as a new run, with its own era and session

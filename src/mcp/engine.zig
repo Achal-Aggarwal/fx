@@ -379,6 +379,7 @@ pub const Engine = struct {
                     .session => "session",
                     .initialized_timed_out => "initialized_timed_out",
                     .needs_auth => "needs_auth",
+                    .auth_unavailable => "auth_unavailable",
                 };
                 // One that needs a sign-in is dropped, as the host would,
                 // and what waits ends needs_auth; once signed in, the next

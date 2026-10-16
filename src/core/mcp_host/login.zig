@@ -1,7 +1,8 @@
 //! The loopback redirect for an MCP sign-in (RFC 8252 §7.3): fx listens on
 //! 127.0.0.1, the browser comes back to `GET /callback`, and the address it
-//! came to goes to MCP-v2's `finishSignIn`. A bridged sign-in (Slack's,
-//! through fx.sh) comes back instead as a form its page posts.
+//! came to goes to MCP-v2's `finishSignIn`. Slack's app allows only a
+//! `localhost` redirect, so for it the redirect and that address say
+//! `localhost`, which browsers reach on 127.0.0.1.
 //!
 //! fx's browser callback reader reads the requests, so a connection that
 //! stays silent, as a browser's spare one does, is dropped and the next one
@@ -16,21 +17,14 @@ const browser_callback = @import("../auth/browser_callback.zig");
 
 const Allocator = std.mem.Allocator;
 
-/// A sign-in whose redirect is a page elsewhere: it posts what came back to
-/// it as a form here, from `origin`. Both borrowed.
-pub const Bridge = struct {
-    origin: []const u8,
-    /// The redirect MCP-v2 signs in with; the form's fields become its query.
-    redirect: []const u8,
-};
-
 /// The reader's own cancellation; a login's wait is cancelled through `io`.
 var never_canceled: std.atomic.Value(bool) = .init(false);
 
 pub const Listener = struct {
     server: std.Io.net.Server,
     port: u16,
-    bridge: ?Bridge = null,
+    /// The redirect says `localhost`, as Slack's app needs, not `127.0.0.1`.
+    localhost: bool = false,
     /// The sign-in's state, from its authorization address (`expect`).
     /// Until it comes, every return is someone else's.
     state: struct {
@@ -52,14 +46,18 @@ pub const Listener = struct {
 
     /// The redirect URI to sign in with, in `buffer`.
     pub fn redirectUri(l: *const Listener, buffer: *[64]u8) []const u8 {
-        if (l.bridge) |b| return b.redirect;
-        const origin = "http://127.0.0.1:";
+        const origin = l.prefix();
         const path = "/callback";
-        comptime std.debug.assert(origin.len + std.fmt.count("{d}", .{std.math.maxInt(@TypeOf(l.port))}) + path.len <= buffer.len);
-        buffer[0..origin.len].* = origin.*;
+        comptime std.debug.assert("http://127.0.0.1:".len + std.fmt.count("{d}", .{std.math.maxInt(@TypeOf(l.port))}) + path.len <= buffer.len);
+        @memcpy(buffer[0..origin.len], origin);
         const port_end = origin.len + std.fmt.printInt(buffer[origin.len..], l.port, 10, .lower, .{});
         buffer[port_end..][0..path.len].* = path.*;
         return buffer[0 .. port_end + path.len];
+    }
+
+    /// The redirect's origin up to its port; both spellings are as long.
+    fn prefix(l: *const Listener) []const u8 {
+        return if (l.localhost) "http://localhost:" else "http://127.0.0.1:";
     }
 
     /// Takes the sign-in's state from `authorize`, its authorization address.
@@ -89,10 +87,7 @@ pub const Listener = struct {
         var waiting: Waiting = .{ .listener = l, .io = io };
         while (true) {
             try io.checkCancel();
-            const taken = if (l.bridge) |b|
-                try browser_callback.await_form(Return, takeForm, alloc, &l.server, &waiting, null, null, b.origin)
-            else
-                try browser_callback.await(Return, takeReturn, alloc, &l.server, &waiting, &never_canceled, null);
+            const taken = try browser_callback.await(Return, takeReturn, alloc, &l.server, &waiting, &never_canceled, null);
             var got = taken orelse continue;
             defer got.deinit();
             got.respond(if (got.callback.refused) .failed else .ok) catch {};
@@ -112,19 +107,10 @@ fn takeReturn(context: ?*anyopaque, alloc: Allocator, target: []const u8) browse
     const query_at = std.mem.findScalar(u8, target, '?') orelse return .unrelated;
     const query = target[query_at + 1 ..];
     if (!std.mem.eql(u8, target[0..query_at], "/callback") or !w.listener.isOwn(w.io, query)) return .unrelated;
-    const url = alloc.print("http://127.0.0.1:{d}{s}", .{ w.listener.port, target }) catch |err| return .{ .failed = err };
+    const url = alloc.print("{s}{d}{s}", .{ w.listener.prefix(), w.listener.port, target }) catch |err| return .{ .failed = err };
     // A refusal comes back with an `error` (RFC 6749 §4.1.2.1); MCP-v2 reads
     // the rest from the address.
     return .{ .accepted = .{ .url = url, .refused = hasParam(query, "error") } };
-}
-
-/// A bridge's form with the sign-in's state: its fields become the query of
-/// the redirect MCP-v2 signed in with. The reader checked the rest.
-fn takeForm(context: ?*anyopaque, alloc: Allocator, form: []const u8) browser_callback.ParseResult(Return) {
-    const w: *Waiting = @ptrCast(@alignCast(context.?));
-    if (!w.listener.isOwn(w.io, form)) return .unrelated;
-    const url = alloc.print("{s}?{s}", .{ w.listener.bridge.?.redirect, form }) catch |err| return .{ .failed = err };
-    return .{ .accepted = .{ .url = url, .refused = hasParam(form, "error") } };
 }
 
 /// The raw value of the parameter `name` in `query`, if it has one.
@@ -278,50 +264,34 @@ test "a silent connection, like a browser's spare one, doesn't hold up the retur
     try testing.expect(took_ms < 1000);
 }
 
-/// Sends one form POST from `origin` and returns the reply, as much as fits in `out`.
-fn post(port: u16, origin: []const u8, body: []const u8, out: []u8) ![]const u8 {
-    const stream = try connect(port);
-    defer stream.close(testing.io);
-    var request: [1024]u8 = undefined;
-    var writer = stream.writer(testing.io, &request);
-    try writer.interface.print("POST /slack/oauth/callback HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nOrigin: {s}\r\n" ++
-        "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {d}\r\n\r\n{s}", .{ port, origin, body.len, body });
-    try writer.interface.flush();
-    return readReply(stream, out);
-}
-
-test "a bridge's form from its origin with the sign-in's state is the callback; anything else is a 404" {
+test "a localhost listener, as for Slack's app, says localhost in the redirect and in the address it hands on" {
     var listener = try Listener.open(testing.io, null);
     defer listener.close(testing.io);
-    listener.bridge = .{ .origin = "https://fx.sh", .redirect = "https://fx.sh/api/slack/oauth/callback" };
+    listener.localhost = true;
     var buffer: [64]u8 = undefined;
-    try testing.expectEqualStrings("https://fx.sh/api/slack/oauth/callback", listener.redirectUri(&buffer));
+    const redirect = try testing.allocator.print("http://localhost:{d}/callback", .{listener.port});
+    defer testing.allocator.free(redirect);
+    try testing.expectEqualStrings(redirect, listener.redirectUri(&buffer));
     listener.expect(testing.io, authorize_s1);
-    const Page = struct {
-        bad: [4096]u8 = undefined,
-        bad_reply: []const u8 = "",
-        good: [4096]u8 = undefined,
-        good_reply: []const u8 = "",
-        stray: [4096]u8 = undefined,
-        stray_reply: []const u8 = "",
+    const Browser = struct {
+        page: [4096]u8 = undefined,
+        reply: []const u8 = "",
         fn run(b: *@This(), port: u16) void {
-            b.bad_reply = post(port, "https://evil.example", "state=s1&code=c1", &b.bad) catch "";
-            b.stray_reply = post(port, "https://fx.sh", "state=s2&code=c0", &b.stray) catch "";
-            b.good_reply = post(port, "https://fx.sh", "state=s1&code=c1", &b.good) catch "";
+            b.reply = get(port, "/callback?code=c1&state=s1", &b.page) catch "";
         }
     };
-    var page: Page = .{};
-    const thread = try std.Thread.spawn(.{}, Page.run, .{ &page, listener.port });
+    var browser: Browser = .{};
+    const thread = try std.Thread.spawn(.{}, Browser.run, .{ &browser, listener.port });
     const url = listener.accept(testing.io, testing.allocator) catch |err| {
         thread.join();
         return err;
     };
     thread.join();
     defer testing.allocator.free(url);
-    try testing.expectEqualStrings("https://fx.sh/api/slack/oauth/callback?state=s1&code=c1", url);
-    try testing.expect(std.mem.startsWith(u8, page.bad_reply, "HTTP/1.1 404"));
-    try testing.expect(std.mem.startsWith(u8, page.stray_reply, "HTTP/1.1 404"));
-    try testing.expect(std.mem.startsWith(u8, page.good_reply, "HTTP/1.1 200 OK"));
+    const want = try testing.allocator.print("http://localhost:{d}/callback?code=c1&state=s1", .{listener.port});
+    defer testing.allocator.free(want);
+    try testing.expectEqualStrings(want, url);
+    try testing.expect(std.mem.startsWith(u8, browser.reply, "HTTP/1.1 200 OK"));
 }
 
 test "a refused sign-in comes back to the failure page; someone else's refusal is a 404" {
@@ -361,4 +331,6 @@ test "the redirect URI spells out every port in full" {
         const listener: Listener = .{ .server = undefined, .port = case[0] };
         try testing.expectEqualStrings(case[1], listener.redirectUri(&buffer));
     }
+    const slack_app: Listener = .{ .server = undefined, .port = 65535, .localhost = true };
+    try testing.expectEqualStrings("http://localhost:65535/callback", slack_app.redirectUri(&buffer));
 }

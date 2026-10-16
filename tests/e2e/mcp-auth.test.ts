@@ -229,6 +229,10 @@ function startAuthFixture(
     rejectDiscoveryWithoutChallenge?: boolean;
     rejectDiscoveryWithRestAuthorizationDocument?: boolean;
     slackBridgeClientId?: string;
+    /** fx's Slack app signs in with `http://localhost:<port>/callback`, as MCP-v2 does, not fx.sh's redirect. */
+    slackLocalhostRedirect?: boolean;
+    /** Answer every refresh with this status and body, such as Slack's HTTP-200 `ok:false`. */
+    refreshAnswer?: { status: number; body: unknown };
     slackBridgeStatus?: number;
     slackBridgeScopes?: unknown;
     challengeScope?: string;
@@ -589,6 +593,7 @@ function startAuthFixture(
               { status: 400 },
             );
           }
+          if (options.refreshAnswer) return Response.json(options.refreshAnswer.body, { status: options.refreshAnswer.status });
           return Response.json({
             access_token: ACCESS_REFRESHED,
             refresh_token: REFRESH_ROTATED,
@@ -607,7 +612,9 @@ function startAuthFixture(
         // Only a server playing Slack's bridge gets fx.sh's redirect; another
         // server that names fx's Slack app signs in on its own.
         if (options.slackBridgeClientId && form.get("client_id") === FX_SLACK_CLIENT_ID) {
-          expect(form.get("redirect_uri")).toBe("https://fx.sh/api/slack/oauth/callback");
+          if (options.slackLocalhostRedirect) expect(form.get("redirect_uri")).toMatch(/^http:\/\/localhost:\d+\/callback$/);
+          else expect(form.get("redirect_uri")).toBe("https://fx.sh/api/slack/oauth/callback");
+          expect(form.get("client_secret")).toBeNull();
         }
         if (options.rejectCodeExchange) return Response.json({ error: "invalid_grant" }, { status: 400 });
         expect(form.get("grant_type")).toBe("authorization_code");
@@ -4766,41 +4773,115 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
     expect(existsSync(join(root.home, ".fx", "mcp-credentials", "credentials-v2.json"))).toBe(false);
   }, 60_000);
 
-  test("Slack signs in through fx.sh: the bridge's form comes back from its origin only", async () => {
+  test("a refresh refused with HTTP 200 and ok:false, as Slack refuses, needs a new login at once and isn't tried again", async () => {
     upstream = startModernMcpHttpFixture("json");
-    auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID });
-    const root = createRoot(auth, true, "http", auth.url, false, FX_SLACK_CLIENT_ID);
-    const bridgeOrigin = new URL(auth.url).origin;
-    const env = { ...v2Env(root), FX_E2E_SLACK_ORIGIN: bridgeOrigin };
-    const login = runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
-    // The browser opens fx.sh's start, which goes on to Slack's page.
-    expect(await waitForFileText(root.openLog, "/api/slack/auth?", 10_000)).toBe(true);
-    const start = new URL(readFileSync(root.openLog, "utf8").trim());
-    expect(start.origin).toBe(bridgeOrigin);
-    expect([...start.searchParams.keys()].sort()).toEqual(["challenge", "client_id", "port", "scope", "state"]);
-    expect(start.searchParams.get("state")).toMatch(/^[A-Za-z0-9_-]{43}$/);
-    expect(start.searchParams.get("challenge")).toMatch(/^[A-Za-z0-9_-]{43}$/);
-    expect(start.searchParams.get("client_id")).toBe(FX_SLACK_CLIENT_ID);
-    expect(start.searchParams.get("scope")!.split(" ").sort()).toEqual([...FX_SLACK_SCOPES, "groups:history", "im:history", "mpim:history"].sort());
-    // fx.sh's page posts what Slack sent back; only its origin is taken.
-    const target = `http://127.0.0.1:${start.searchParams.get("port")}/slack/oauth/callback`;
-    const body = await authorizePersonalFixture(auth, start);
-    const post = (fields: URLSearchParams, origin: string) => fetch(target, { method: "POST", headers: { origin }, body: fields, redirect: "manual" });
-    expect((await post(body, "https://evil.example")).status).toBe(404);
-    expect(auth.tokenExchanges).toBe(0);
-    expect((await post(body, bridgeOrigin)).status).toBe(200);
-    const done = await login;
-    expect(done.stderr).toBe("");
-    expect(done.code).toBe(0);
-    expect(done.stdout).toContain("Signed in to fixture.");
-    expect(auth.tokenExchanges).toBe(1);
-    expect(await statusOf(root)).toBe("signed_in");
+    auth = startAuthFixture(upstream.url, { refreshAnswer: { status: 200, body: { ok: false, error: "bad_client_secret" } } });
+    const root = createRoot(auth);
+    seedV2Credential(root, auth, { expires_at_ms: 0 });
+    const env = v2Env(root);
+    const started = Date.now();
+    const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.signal).toBeNull();
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(JSON.parse(show.stdout).status).toBe("needs_login");
+    expect(auth.refreshes).toBe(1);
+    // The dead refresh token is dropped, so the next run doesn't send it.
+    const again = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(JSON.parse(again.stdout).status).toBe("needs_login");
+    expect(auth.refreshes).toBe(1);
   }, 60_000);
 
-  test("a server that only names fx's Slack app signs in on its own, never through the Slack bridge", async () => {
+  test("a refresh that fails for now (503) ends fx mcp show as retrying, keeps the login, and asks for no new one", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { refreshAnswer: { status: 503, body: { error: "temporarily_unavailable" } } });
+    const root = createRoot(auth);
+    const store = seedV2Credential(root, auth, { expires_at_ms: 0 });
+    const env = v2Env(root);
+    const started = Date.now();
+    const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.signal).toBeNull();
+    expect(Date.now() - started).toBeLessThan(10_000);
+    // A sign-in server that didn't answer says nothing about the login.
+    const status = JSON.parse(show.stdout);
+    expect(status.status).toBe("retrying");
+    expect(status.error).toContain("couldn't be renewed");
+    expect(auth.refreshes).toBe(1);
+    expect(readFileSync(store, "utf8")).toContain(REFRESH_INITIAL);
+  }, 60_000);
+
+  // Slack refreshes a PKCE app's tokens without its secret only for a
+  // localhost redirect, so fx's Slack app signs in with one.
+  test("Slack signs in as fx's Slack app at Slack's own page, with a localhost redirect on its port and the app's scopes, and refreshes without a secret", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID, slackLocalhostRedirect: true });
+    const root = createRoot(auth, true, "http", auth.url, true, FX_SLACK_CLIENT_ID);
+    // fx's Slack app with no scopes of the config's own, on a free port.
+    const probe = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
+    const port = probe.port;
+    probe.stop(true);
+    const profilePath = join(root.home, ".fx", "mcp.json");
+    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+    profile.mcp.fixture.oauth = { client_id: FX_SLACK_CLIENT_ID, callback_port: port };
+    writeFileSync(profilePath, JSON.stringify(profile));
+    const standIn = new URL(auth.url).origin;
+    const env = { ...v2Env(root), FX_E2E_SLACK_ORIGIN: standIn };
+    const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(login.stderr).toBe("");
+    expect(login.code).toBe(0);
+    expect(login.stdout).toContain("Signed in to fixture.");
+    // The browser goes to Slack's own page; nothing asks fx.sh.
+    const opened = new URL(readFileSync(root.openLog, "utf8").trim());
+    expect(opened.origin).toBe(standIn);
+    expect(opened.pathname).toBe("/authorize");
+    expect(opened.searchParams.get("client_id")).toBe(FX_SLACK_CLIENT_ID);
+    expect(opened.searchParams.get("redirect_uri")).toBe(`http://localhost:${port}/callback`);
+    // MCP-v2 adds offline_access when the authorization server lists it, as
+    // the stand-in does; Slack doesn't list it.
+    expect(opened.searchParams.get("scope")!.split(" ").filter((x) => x !== "offline_access").sort()).toEqual([
+      "channels:history", "channels:read", "channels:write", "chat:write", "emoji:read", "files:write",
+      "groups:history", "im:history", "mpim:history", "search:read.public", "search:read.users", "users:read",
+    ]);
+    expect(auth.requests.some((r) => r.path.startsWith("/api/slack/"))).toBe(false);
+    expect(auth.tokenExchanges).toBe(1);
+    // Its token runs out: the refresh goes without a secret, and the server is ready.
+    const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v2.json");
+    const store = JSON.parse(readFileSync(storePath, "utf8"));
+    const credential = JSON.parse(store.servers[0].credential);
+    expect(credential.client_secret).toBeNull();
+    store.servers[0].credential = JSON.stringify({ ...credential, expires_at_ms: 0 });
+    writeFileSync(storePath, JSON.stringify(store), { mode: 0o600 });
+    const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.stderr).toBe("");
+    expect(JSON.parse(show.stdout).status).toBe("ready");
+    expect(auth.refreshes).toBe(1);
+    const refresh = auth.requests.find((r) => r.path === "/token" && new URLSearchParams(r.body).get("grant_type") === "refresh_token");
+    expect(new URLSearchParams(refresh!.body).get("client_secret")).toBeNull();
+  }, 60_000);
+
+  test("a sign-in whose fixed callback port is taken says so, and sends nothing", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
-    // A stand-in fx.sh at another origin, which must never be asked.
+    const root = createRoot(auth);
+    const taken = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("taken") });
+    try {
+      const profilePath = join(root.home, ".fx", "mcp.json");
+      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
+      profile.mcp.fixture.oauth.callback_port = taken.port;
+      writeFileSync(profilePath, JSON.stringify(profile));
+      const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 });
+      expect(login.code).toBe(1);
+      expect(login.stderr).toBe(`Couldn't sign in to fixture: port ${taken.port} is in use, maybe by another app signing in. Try again once it's free.\n`);
+      expect(existsSync(root.openLog)).toBe(false);
+      expect(auth.tokenExchanges).toBe(0);
+    } finally {
+      taken.stop(true);
+    }
+  }, 60_000);
+
+  test("a server that only names fx's Slack app signs in on its own, never as fx's Slack app", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    // A stand-in for Slack at another origin, which must never be asked.
     const bridgeRequests: string[] = [];
     const bridge = Bun.serve({
       hostname: "127.0.0.1",
@@ -4815,7 +4896,7 @@ describe("MCP-v2 login (FX_MCP_ENGINE=v2)", () => {
       const env = { ...v2Env(root), FX_E2E_SLACK_ORIGIN: `http://127.0.0.1:${bridge.port}` };
       const login = await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 });
       expect(bridgeRequests).toEqual([]);
-      // The browser goes to the server's own page, not fx.sh's.
+      // The browser goes to the server's own page, with fx's own loopback redirect.
       const opened = new URL(readFileSync(root.openLog, "utf8").trim());
       expect(opened.origin).toBe(new URL(auth.url).origin);
       expect(opened.pathname).toBe("/authorize");

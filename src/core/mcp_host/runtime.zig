@@ -22,7 +22,6 @@ const secret = @import("../auth/secret.zig");
 const config = @import("config.zig");
 const credentials = @import("credentials.zig");
 const loopback = @import("login.zig");
-const slack = @import("slack.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 
@@ -191,6 +190,8 @@ pub const Error = Allocator.Error || error{
     /// The saved sign-ins can't be read, damaged or saved by a newer fx, so a
     /// sign-in or sign-out changes nothing.
     CredentialStoreUnreadable,
+    /// Another program holds the sign-in's fixed callback port.
+    CallbackPortInUse,
 };
 
 const Request = struct {
@@ -789,8 +790,10 @@ pub const Runtime = struct {
             else => debug_trace.logf("mcp", "MCP credential store not checked server={s} err={s}", .{ s.name, @errorName(err) }),
         };
         r.endLogin(i);
-        // The bridge passes the port on, so any free one does.
-        var listener = try loopback.Listener.open(r.io, if (s.bridge) null else s.callback_port);
+        var listener = loopback.Listener.open(r.io, s.callback_port) catch |err| switch (err) {
+            error.AddressInUse => return r.finish(req, .{ .failed = error.CallbackPortInUse }),
+            else => return err,
+        };
         const l = r.gpa.create(Login) catch |err| {
             listener.close(r.io);
             return err;
@@ -802,7 +805,7 @@ pub const Runtime = struct {
             .deadline_ms = r.nowMs() + login_timeout_ms,
             .open_browser = open_browser,
         };
-        if (s.bridge) l.listener.bridge = .{ .origin = slack.origin(), .redirect = slack.redirect_uri };
+        l.listener.localhost = s.slack_app;
         r.logins.append(r.gpa, l) catch |err| {
             l.listener.close(r.io);
             r.gpa.destroy(l);
@@ -846,16 +849,6 @@ pub const Runtime = struct {
             r.gpa.free(url);
             r.gpa.destroy(req);
         };
-    }
-
-    /// fx.sh's start for a bridged sign-in to `server`, owned by `gpa`; null
-    /// for any other, or when the address lacks what the bridge needs.
-    fn bridgeStart(r: *const Runtime, server: usize, authorize: []const u8) ?[]u8 {
-        if (!r.resolved.servers[server].bridge) return null;
-        const l = r.loginFor(server) orelse return null;
-        const url = slack.startUrl(r.gpa, slack.origin(), authorize, l.listener.port) catch null;
-        if (url == null) debug_trace.logf("mcp", "MCP sign-in has no bridge start server={s}", .{r.resolved.servers[server].name});
-        return url;
     }
 
     fn loginFor(r: *const Runtime, server: usize) ?*Login {
@@ -965,17 +958,13 @@ pub const Runtime = struct {
                 r.endToolWaiters(i, .needs_login);
             },
             .authorize => |authorize| {
-                // A bridged sign-in starts at the bridge, which goes on to the server's page.
-                const bridged = r.bridgeStart(i, authorize);
-                defer if (bridged) |owned| r.gpa.free(owned);
-                const url = bridged orelse authorize;
-                r.notify(.{ .authorize = .{ .server = name, .url = url } });
+                r.notify(.{ .authorize = .{ .server = name, .url = authorize } });
                 for (r.logins.items) |l| if (l.server == i) {
                     // Only a return carrying this sign-in's state ends its wait.
                     l.listener.expect(r.io, authorize);
                     if (!l.open_browser) continue;
                     // The URL went out in the notice either way.
-                    const opened = url_opener.native_opener.open(r.gpa, url) catch false;
+                    const opened = url_opener.native_opener.open(r.gpa, authorize) catch false;
                     if (!opened) debug_trace.logf("mcp", "browser not opened for MCP login server={s}", .{name});
                 };
             },
@@ -1497,6 +1486,7 @@ fn describeFailure(why: []const u8) []const u8 {
         .{ "session", "its session ended" },
         .{ "initialized_timed_out", "it never answered fx's initialized notification" },
         .{ "needs_auth", "it needs a login" },
+        .{ "auth_unavailable", "its login couldn't be renewed: the sign-in server didn't answer; fx tries again" },
         .{ "process", "its process exited" },
         .{ "FileNotFound", "its command was not found" },
         .{ "AccessDenied", "its command could not be run (permission denied)" },

@@ -39,8 +39,8 @@ pub const Server = struct {
     /// What a stdio server runs, to show what is trusted.
     command: ?[]const u8,
     callback_port: ?u16,
-    /// Signs in through fx.sh's Slack bridge: its client is fx's Slack app.
-    bridge: bool = false,
+    /// Signs in as fx's Slack app, whose redirect says `localhost`.
+    slack_app: bool = false,
     held: ?Held = null,
     /// An editor's server whose tools go to the model every turn (ACP
     /// `_meta.fx.alwaysLoaded`).
@@ -134,18 +134,22 @@ pub fn resolve(
             }
         }
         // Slack registers no clients: without an app of the user's own, fx's
-        // Slack app signs in, through fx.sh as v1 did.
+        // Slack app signs in.
         if (auth.client_id == null and slack.isSlack(s.url)) auth.client_id = slack.client_id;
-        // Only Slack's own server gets the bridge: another server that names
-        // fx's Slack app signs in on its own, so the code never reaches it.
+        // Only Slack's own server signs in as fx's app, with the redirect
+        // and scopes the app has: another server that names fx's app signs
+        // in on its own, with a redirect Slack refuses.
         const fx_slack_app = if (auth.client_id) |id| std.mem.eql(u8, id, slack.client_id) else false;
-        s.bridge = fx_slack_app and slack.bridgeServer(s.url);
-        // fx.sh asks Slack for the resource with a trailing slash, so the
-        // token exchange asks for the same; MCP-v2 takes it only if it is
-        // the server's own.
-        if (s.bridge and auth.resource == null) if (s.url) |url| {
-            auth.resource = try arena.print("{s}/", .{origin(url)});
-        };
+        s.slack_app = fx_slack_app and slack.appServer(s.url);
+        if (s.slack_app) {
+            if (s.callback_port == null) s.callback_port = slack.callback_port;
+            if (auth.scopes == null) auth.scopes = slack.scopes;
+            // Slack's tokens are for its origin with a trailing slash; MCP-v2
+            // takes it only if it is the server's own.
+            if (auth.resource == null) if (s.url) |url| {
+                auth.resource = try arena.print("{s}/", .{origin(url)});
+            };
+        }
         if (saved) |lookup| if (s.url) |url| {
             auth.saved = try lookup.get(lookup.context, arena, .{ .name = s.name, .url = url, .workspace = s.workspace });
             // Where fx keeps logins, it decides each refresh.
@@ -320,7 +324,7 @@ test "stdio and HTTP servers become engine configs; the rest are held back with 
     try testing.expectEqualStrings("NOT_SET", r.servers[7].missing.?);
 }
 
-test "Slack signs in as fx's Slack app through the bridge, unless the config names its own app; no other server gets the bridge" {
+test "Slack signs in as fx's Slack app on port 3118 with the app's scopes, unless the config names its own app or port; no other server does" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     var inherited: std.process.Environ.Map = .init(testing.allocator);
@@ -330,20 +334,30 @@ test "Slack signs in as fx's Slack app through the bridge, unless the config nam
         .{ .name = "mine", .transport = .http, .url = "https://mcp.slack.com/mcp", .auth = .{ .client_id = @constCast("my-app") } },
         .{ .name = "linear", .transport = .http, .url = "https://mcp.linear.app/mcp" },
         .{ .name = "posing", .transport = .http, .url = "https://mcp.example.com/mcp", .auth = .{ .client_id = @constCast(slack.client_id) } },
+        .{ .name = "ported", .transport = .http, .url = "https://mcp.slack.com/mcp", .auth = .{ .callback_port = 4242 } },
     };
     const r = try resolve(arena_state.allocator(), &configs, &inherited, null, "/Users/example/repo");
     try testing.expectEqualStrings(slack.client_id, r.engine[0].auth.client_id.?);
-    try testing.expect(r.servers[0].bridge);
+    try testing.expect(r.servers[0].slack_app);
+    try testing.expectEqual(@as(?u16, 3118), r.servers[0].callback_port);
+    try testing.expectEqualStrings(slack.scopes, r.engine[0].auth.scopes.?);
     try testing.expectEqualStrings("https://mcp.slack.com/", r.engine[0].auth.resource.?);
     try testing.expectEqualStrings("my-app", r.engine[1].auth.client_id.?);
-    try testing.expect(!r.servers[1].bridge);
+    try testing.expect(!r.servers[1].slack_app);
+    try testing.expect(r.servers[1].callback_port == null);
+    try testing.expect(r.engine[1].auth.scopes == null);
     try testing.expect(r.engine[1].auth.resource == null);
     try testing.expect(r.engine[2].auth.client_id == null);
-    try testing.expect(!r.servers[2].bridge);
+    try testing.expect(!r.servers[2].slack_app);
     // Naming fx's Slack app doesn't make a server Slack: it signs in on its own.
     try testing.expectEqualStrings(slack.client_id, r.engine[3].auth.client_id.?);
-    try testing.expect(!r.servers[3].bridge);
+    try testing.expect(!r.servers[3].slack_app);
+    try testing.expect(r.servers[3].callback_port == null);
+    try testing.expect(r.engine[3].auth.scopes == null);
     try testing.expect(r.engine[3].auth.resource == null);
+    // A port the config names wins.
+    try testing.expect(r.servers[4].slack_app);
+    try testing.expectEqual(@as(?u16, 4242), r.servers[4].callback_port);
 }
 
 test "a stdio server gets only the MCP SDKs' few variables of fx's, then its own env" {
