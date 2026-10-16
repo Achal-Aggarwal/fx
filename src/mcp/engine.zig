@@ -49,7 +49,7 @@ pub const Options = struct {
 };
 
 /// How a call ended: the server's outcomes, and the engine's own.
-pub const Outcome = enum { result, failure, lost, http_failure, cancelled, rounds_exceeded, unsupported_input, malformed, needs_auth, denied, transport_failed };
+pub const Outcome = enum { result, failure, lost, http_failure, cancelled, rounds_exceeded, unsupported_input, malformed, needs_auth, auth_unavailable, denied, transport_failed };
 
 pub const Event = struct {
     /// The server's name, valid until the next `reload`.

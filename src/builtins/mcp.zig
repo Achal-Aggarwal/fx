@@ -640,6 +640,25 @@ pub fn loadRuntime(
     return runtime;
 }
 
+/// A server name a terminal can't show as is, such as one with an escape
+/// sequence in a repository's `.mcp.json`, never reaches a terminal or the
+/// model: the server is skipped with a note, which escapes the name.
+fn skipUnprintableNames(alloc: Allocator, loaded: *NativeConfigs) Allocator.Error!void {
+    var i: usize = 0;
+    while (i < loaded.configs.items.len) {
+        const c = &loaded.configs.items[i];
+        if (text_utils.isTerminalSafe(c.name)) {
+            i += 1;
+            continue;
+        }
+        try loaded.diagnostics.ensureUnusedCapacity(alloc, 1);
+        const name = try alloc.dupe(u8, c.name);
+        loaded.diagnostics.appendAssumeCapacity(.{ .profile = c.source != .workspace, .server_name = name, .cause = .invalid_entry, .problem = .name });
+        var removed = loaded.configs.orderedRemove(i);
+        removed.deinit(alloc);
+    }
+}
+
 /// MCP-v2's host for the workspace when FX_MCP_ENGINE=v2 selects it,
 /// or null. Its servers start when the model first needs them.
 pub fn loadHost(
@@ -656,6 +675,7 @@ pub fn loadHost(
     var inherited = try io_mod.cloneEnvironMap(alloc);
     defer inherited.deinit();
     try project_config.expandProfileConfigs(alloc, &loaded.configs, &loaded.diagnostics, &inherited);
+    try skipUnprintableNames(alloc, &loaded);
     // A host with no servers still carries the notes saying why.
     if (loaded.configs.items.len == 0 and loaded.diagnostics.items.len == 0) return null;
     const notes = try alloc.alloc([]const u8, loaded.diagnostics.items.len);
@@ -1341,6 +1361,36 @@ fn tmpRoot(alloc: Allocator, tmp: std.testing.TmpDir) ![]u8 {
 
 fn tmpPath(alloc: Allocator, root: []const u8, name: []const u8) ![]u8 {
     return std.Io.Dir.path.join(alloc, &.{ root, name });
+}
+
+test "a server whose name a terminal can't show is skipped with a note that escapes it" {
+    const alloc = std.testing.allocator;
+    // An escape sequence, a right-to-left override, and a lone byte that
+    // isn't UTF-8; "caf\u00e9" and a space are printable and stay.
+    const json =
+        \\{"mcpServers":{"ok":{"command":"true"},"evil\u001b]0;x\u0007":{"command":"true"},"rtl\u202etxt":{"command":"true"},"caf\u00e9 two":{"command":"true"}}}
+    ;
+    var loaded: NativeConfigs = .{};
+    defer loaded.deinit(alloc);
+    loaded.configs = try project_config.parseProfileServers(alloc, json, &loaded.diagnostics);
+    try std.testing.expectEqual(@as(usize, 4), loaded.configs.items.len);
+    alloc.free(loaded.configs.items[0].name);
+    loaded.configs.items[0].name = try alloc.dupe(u8, "bad\xff");
+
+    try skipUnprintableNames(alloc, &loaded);
+    try std.testing.expectEqual(@as(usize, 1), loaded.configs.items.len);
+    try std.testing.expectEqualStrings("caf\u{e9} two", loaded.configs.items[0].name);
+    try std.testing.expectEqual(@as(usize, 3), loaded.diagnostics.items.len);
+    const expected = [_][]const u8{
+        "~/.fx/mcp.json server 'bad\\xff' was skipped: its name has a character fx won't print.",
+        "~/.fx/mcp.json server 'evil\\x1b]0;x\\x07' was skipped: its name has a character fx won't print.",
+        "~/.fx/mcp.json server 'rtl\\u{202e}txt' was skipped: its name has a character fx won't print.",
+    };
+    for (loaded.diagnostics.items, expected) |diagnostic, want| {
+        const note = try project_config.renderWorkspaceDiagnostic(alloc, diagnostic);
+        defer alloc.free(note);
+        try std.testing.expectEqualStrings(want, note);
+    }
 }
 
 test "saving MCP config replaces the file durably" {

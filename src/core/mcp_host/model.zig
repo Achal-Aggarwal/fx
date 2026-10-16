@@ -633,6 +633,7 @@ fn ended(arena: Allocator, server: []const u8, name: []const u8, e: @FieldType(r
             .status = .tool_failure,
         },
         .lost => "the server went away",
+        .auth_unavailable => "its login couldn't be renewed because the sign-in server didn't answer. The tool didn't run; try again shortly",
         .transport_failed, .http_failure => "the connection failed",
         .malformed => "the server's answer was malformed",
         .rounds_exceeded => "the server asked for input too many times",
@@ -781,5 +782,8 @@ test "a search says why a server it names has no tools, and calls that end say h
     const lost = try ended(a, "linear", "mcp_linear_list", .{ .outcome = .lost, .maybe_ran = true, .timed_out = false }, 4096);
     try testing.expectEqual(tool_mcp_runtime.CallStatus.protocol_failure, lost.status);
     try testing.expect(std.mem.find(u8, lost.model_output, "the server went away. The tool may have run.") != null);
+    const unrenewed = try ended(a, "slack", "mcp_slack_send", .{ .outcome = .auth_unavailable, .maybe_ran = false, .timed_out = false }, 4096);
+    try testing.expect(std.mem.find(u8, unrenewed.model_output, "its login couldn't be renewed because the sign-in server didn't answer. The tool didn't run; try again shortly.") != null);
+    try testing.expect(std.mem.find(u8, unrenewed.model_output, "may have run") == null);
     try testing.expectError(error.Cancelled, ended(a, "linear", "mcp_linear_list", .{ .outcome = .cancelled, .maybe_ran = false, .timed_out = false }, 4096));
 }

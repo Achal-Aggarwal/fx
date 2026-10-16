@@ -3751,6 +3751,7 @@ fn reportUnapprovedMcpServers(ctx: *AskContext, h: *mcp_host.Host) !void {
     for (h.runtime.servers()) |s| {
         if (s.held != .waiting_for_approval) continue;
         try ctx.writeStderr(if (listed) ", " else "fx ask: skipped unapproved project MCP servers: ");
+        // Printable: `loadHost` skips a server whose name isn't.
         try ctx.writeStderr(s.name);
         listed = true;
     }

@@ -168,6 +168,9 @@ pub const Gate = struct {
                 };
                 s.phase = .idle;
                 s.attempts = 0;
+                // A disconnect refuses a waiting tool list need, so the host
+                // hears; a reconnect keeps it.
+                if (s.need and !d.keep) out.emit(.refuse_need);
                 s.need = s.need and d.keep;
                 s.retry = false;
                 s.connect(out);
@@ -333,7 +336,7 @@ const World = struct {
             },
             .end => |e| if (e.end == .denied) try testing.expect(event == .asked and !event.asked.allowed),
             .list => try testing.expect(s.phase == .ready),
-            .refuse_need => try testing.expect(s.phase == .failed),
+            .refuse_need => try testing.expect(s.phase == .failed or (event == .drop and !event.drop.keep)),
             else => {},
         };
         try testing.expect(s.attempts <= s.config.max_attempts);
@@ -366,8 +369,16 @@ const World = struct {
             .answered, .cancel => |h| for (before.calls) |c| if (c.used and c.handle == h and c.sent == (event == .cancel)) {
                 try testing.expect(out.ignored);
             },
-            // A host drop starts the tries over.
-            .drop => try testing.expect(s.attempts <= 1),
+            // A host drop starts the tries over, and a disconnect answers a
+            // waiting need.
+            .drop => |d| {
+                try testing.expect(s.attempts <= 1);
+                if (before.need and !d.keep) {
+                    var refused = false;
+                    for (out.effects()) |effect| refused = refused or effect == .refuse_need;
+                    try testing.expect(refused);
+                }
+            },
             else => {},
         }
     }

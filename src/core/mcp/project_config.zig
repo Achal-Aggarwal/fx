@@ -153,6 +153,8 @@ pub const EntryProblem = enum {
     restart_limit,
     /// A `${...}` that isn't a variable, or a header it made invalid.
     variable,
+    /// A name with a control character, or another a terminal can't show as is.
+    name,
     other,
 };
 
@@ -239,6 +241,7 @@ pub fn renderWorkspaceDiagnostic(
         .url_without_type => "it has a \"url\" but no \"type\"; add \"type\": \"http\"",
         .command => "it needs a \"command\", with any \"args\" as strings",
         .variable => "a ${...} in it isn't valid",
+        .name => "its name has a character fx won't print",
         .authorization => "fx won't send its Authorization header; put the token in \"bearer_token_env\", or sign in with login",
         .other => "fx can't read it",
         inline else => |field| "its \"" ++ @tagName(field) ++ "\" isn't valid",

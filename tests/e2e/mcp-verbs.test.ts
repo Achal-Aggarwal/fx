@@ -385,6 +385,15 @@ describe("fx mcp on MCP-v2", () => {
     }
     expect(existsSync(root.profilePath)).toBe(false);
   });
+
+  test("fx mcp commands keep a trace when FX_TRACE_LOG asks for one", async () => {
+    const root = createRoot({ mcp: { noisy: { command: "sh", args: ["-c", "echo trace-me >&2; exit 3"], startup_timeout_ms: 2_000 } } });
+    const trace = join(root.home, "trace.log");
+    const show = await runFx(["mcp", "show", "noisy"], { cwd: root.workspace, env: { ...root.env, FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "mcp" }, timeoutMs: 20_000 });
+    expect(show.signal).toBeNull();
+    expect(existsSync(trace)).toBe(true);
+    expect(readFileSync(trace, "utf8")).toContain("line=trace-me");
+  }, 30_000);
 });
 
 describe("/mcp in the shell on MCP-v2", () => {
@@ -713,5 +722,29 @@ describe("fx ask on MCP-v2", () => {
     });
     expect(result.stderr).toContain("fx ask: skipped unapproved project MCP servers: proj. Approve with fx mcp approve <name> before retrying.");
     expect(result.stderr).not.toContain("trust");
+  }, 60_000);
+
+  test("a project server whose name holds an escape sequence is skipped with an escaped note, never printed raw", async () => {
+    // An OSC sequence that would retitle the terminal if printed as is.
+    const evil = "evil\u001b]0;pwned\u0007";
+    const root = createRoot(undefined, { mcpServers: { proj: fixtureServer(), [evil]: fixtureServer() } });
+    const note = "note: .mcp.json server 'evil\\x1b]0;pwned\\x07' was skipped: its name has a character fx won't print.";
+
+    const list = await runFx(["mcp", "list"], { cwd: root.workspace, env: root.env, timeoutMs: 30_000 });
+    expect(list.code).toBe(0);
+    expect(list.stderr).toContain(note);
+    expect(list.stdout).toContain("proj");
+    expect(list.stdout).not.toContain("evil");
+    expect(list.stdout + list.stderr).not.toContain("\u001b");
+
+    gateway = startFakeGateway([fakeGatewayFinalText("done")], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    const ask = await runFx(["ask", "--no-save", "hello"], {
+      cwd: root.workspace,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+      timeoutMs: 30_000,
+    });
+    expect(ask.stderr).toContain(note);
+    expect(ask.stderr).toContain("fx ask: skipped unapproved project MCP servers: proj. Approve");
+    expect(ask.stdout + ask.stderr).not.toContain("\u001b");
   }, 60_000);
 });

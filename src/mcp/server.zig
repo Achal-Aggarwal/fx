@@ -96,7 +96,7 @@ pub const Failure = union(enum) {
 };
 
 /// How a call ended: the exchange's outcomes, and a chain's.
-pub const CallOutcome = enum { result, failure, lost, http_failure, cancelled, rounds_exceeded, unsupported_input, malformed, needs_auth };
+pub const CallOutcome = enum { result, failure, lost, http_failure, cancelled, rounds_exceeded, unsupported_input, malformed, needs_auth, auth_unavailable };
 
 pub const Event = union(enum) {
     /// Detection finished; requests carry this version.
@@ -180,6 +180,8 @@ const Logical = struct {
     chain_instance: []const u8 = "",
     /// The gate gave up on it for want of a sign-in.
     needs_auth: bool = false,
+    /// The gate gave up on it: its login couldn't be renewed.
+    unrenewed: bool = false,
     /// A listen: its subscription and filter, its id once sent, and
     /// whether it listens again after an abrupt end.
     sub: u8 = 0,
@@ -1206,7 +1208,7 @@ pub const Server = struct {
                 r.emit(.{
                     .called = .{
                         .handle = l.handle,
-                        .outcome = if (l.needs_auth and o == .http_failure) .needs_auth else switch (o) {
+                        .outcome = if (l.needs_auth and o == .http_failure) .needs_auth else if (l.unrenewed and o == .http_failure) .auth_unavailable else switch (o) {
                             .none => .failure,
                             inline else => |tag| @field(CallOutcome, @tagName(tag)),
                         },
@@ -1564,7 +1566,7 @@ pub const Server = struct {
                         else => .result,
                     } else .result,
                     .lost => .lost,
-                    .failed, .none => if (l.needs_auth) .needs_auth else .http_failure,
+                    .failed, .none => if (l.needs_auth) .needs_auth else if (l.unrenewed) .auth_unavailable else .http_failure,
                     .cancelled => .cancelled,
                 },
                 // Only a lost stream leaves the call maybe run.
@@ -1761,14 +1763,19 @@ pub const Server = struct {
         try r.client.send(key, k.method, k.body, k.headers[0..count]);
     }
 
-    /// The gate gave up on `key`. Before the era is known that stops detection;
-    /// otherwise the request ends as it would have: a 401 for want of a
-    /// sign-in, a broken stream when the refresh got no answer.
+    /// The gate gave up on `key`. Before the era is known that stops detection.
+    /// Otherwise a request ends as the server's 401: the server never read
+    /// it, whether it waited for a sign-in or for a renewal that got no usable
+    /// answer, so a call never counts as maybe run. Anything else, such as
+    /// the listening GET, ends as a broken stream when the refresh got no
+    /// answer.
     fn authGaveUp(r: *Server, key: u64, why: auth_core.GiveUp) Error!void {
         r.unkeep(key);
         if (key < aux_base) if (r.logicalFor(key)) |l| {
             l.needs_auth = why == .needs_sign_in;
+            l.unrenewed = why == .failed;
             if ((l.what == .discover or l.what == .initialize) and !r.detector.ready()) return r.abortDetection(why);
+            return r.onEndedDomain(key, 401, .http_failure);
         };
         try r.onEndedDomain(key, if (why == .needs_sign_in) 401 else 0, if (why == .needs_sign_in) .http_failure else .broken);
     }
