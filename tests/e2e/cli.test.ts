@@ -1506,17 +1506,18 @@ describe("cli: usage", () => {
         },
       });
       writeChatGptLogin(fixture.home, "acct_e2e");
-      const env = { ...fixture.env, FX_PROVIDER: "codex", FX_MODEL: "gpt-5.6-sol" };
+      // Times show in the local zone, fixed here at five and a half hours east of UTC.
+      const env = { ...fixture.env, FX_PROVIDER: "codex", FX_MODEL: "gpt-5.6-sol", TZ: "IST-5:30" };
       try {
         const text = await runFx(["usage", "--period", "today"], { env });
         expect(text.code).toBe(0);
         expect(text.stderr).toBe("");
-        expect(text.stdout).toContain("Codex usage from ChatGPT for samdoe, updated 15:30 UTC");
+        expect(text.stdout).toContain("Codex usage from ChatGPT for samdoe, updated 21:00 IST");
         expect(text.stdout).toContain("Tokens        40000 today, 100000 7d, 100000 month, 9000000 lifetime");
         expect(text.stdout).toContain("Share by model (today): gpt-e2e-large fast 70.0%, gpt-e2e-small standard 30.0%");
         expect(text.stdout).toContain("Plan          pro");
         expect(text.stdout).toContain("Credits       12.40");
-        expect(text.stdout).toContain("- codex (5h window): 42% used, resets 17:30 UTC");
+        expect(text.stdout).toContain("- codex (5h window): 42% used, resets 23:00 IST");
         expect(text.stdout).toContain("- codex (168h window): 18% used");
         const paths = fixture.fake.requests.map((request) => request.path).sort();
         expect(paths).toEqual([
@@ -1550,14 +1551,15 @@ describe("cli: usage", () => {
         grok: { billing: grokBillingBody(), settings: grokSettingsBody() },
       });
       writeGrokLogin(fixture.home, "acct_grok_e2e");
-      const env = { ...fixture.env, FX_PROVIDER: "grok", FX_MODEL: "grok-4.20" };
+      // Times show in the local zone; five and a half hours east, the reset moves to the next day.
+      const env = { ...fixture.env, FX_PROVIDER: "grok", FX_MODEL: "grok-4.20", TZ: "IST-5:30" };
       try {
         const text = await runFx(["usage"], { env });
         expect(text.code).toBe(0);
         expect(text.stderr).toBe("");
-        expect(text.stdout).toContain("Grok usage from xAI, updated 15:30 UTC");
+        expect(text.stdout).toContain("Grok usage from xAI, updated 21:00 IST");
         expect(text.stdout).toContain("Plan          SuperGrok Heavy");
-        expect(text.stdout).toContain("Used          63% of the weekly allowance, resets Oct 14, 2026 20:30 UTC");
+        expect(text.stdout).toContain("Used          63% of the weekly allowance, resets Oct 15, 2026 02:00 IST");
         expect(text.stdout).toContain("Credits       $12.50");
         expect(text.stdout).toContain("Pay as you go $3.00 of $100.00 this month");
         expect(fixture.fake.requests.map((request) => request.path).sort()).toEqual(["/billing", "/settings"]);
@@ -2545,21 +2547,22 @@ describe("cli: sessions", () => {
           turns: ["review the landing page"],
         });
 
+        // Updated times show in the local zone, fixed here at five and a half hours east of UTC.
         const first = await runFx(["sessions"], {
           cwd: workspaceRoot,
-          env: { HOME: home, ...NO_GATEWAY_AUTH },
+          env: { HOME: home, ...NO_GATEWAY_AUTH, TZ: "IST-5:30" },
           timeoutMs: TIMEOUT,
         });
         expect(first.code).toBe(0);
         expect(first.stderr).toBe("");
         expect(first.stdout).toContain(
-          " - Investigate cache misses\n   id=named-session | 2 turns | English | updated 1970-01-01 00:00:00.003 UTC",
+          " - Investigate cache misses\n   id=named-session | 2 turns | English | updated 1970-01-01 05:30:00.003 IST",
         );
         expect(first.stdout).toContain(
-          " - Untitled session\n   id=unnamed-session | 0 turns | English | updated 1970-01-01 00:00:00.002 UTC",
+          " - Untitled session\n   id=unnamed-session | 0 turns | English | updated 1970-01-01 05:30:00.002 IST",
         );
         expect(first.stdout).toContain(
-          " - Review landing page\n   id=script-only-session | 1 turn | Latin script | updated 2023-11-14 22:13:20.123 UTC",
+          " - Review landing page\n   id=script-only-session | 1 turn | Latin script | updated 2023-11-15 03:43:20.123 IST",
         );
         expect(first.stdout).not.toContain("updated_at_ms");
         expect(first.stdout).not.toContain("language=");
