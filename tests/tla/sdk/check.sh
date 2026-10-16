@@ -14,8 +14,9 @@
 #   bun ../drivers/drive.mjs write && bun ../drivers/drive.mjs cutoff
 #   bun ../drivers/drive.mjs leased   # the Heartbeat graph, on a World without liveness
 #   bun ../drivers/drive.mjs queue    # the QueueHeld graph, on a World whose queue shows it
-#   bun ../drivers/drive-agents.mjs send && bun ../drivers/drive-agents.mjs consume   # AgentRouting
+#   bun ../drivers/drive-agents.mjs   # AgentRouting
 #   bun ../drivers/drive-steer.mjs ideal && bun ../drivers/drive-steer.mjs faults   # DurableSteer
+#   bun ../drivers/drive-tenants.mjs   # TenantIsolation
 set -eu
 cd "$(dirname "$0")"
 
@@ -98,13 +99,12 @@ for pair in NoInterrupt:NoSteerWaitsOnReply NoHandBack:NothingLost \
 done
 
 # AgentRouting.tla: which agent runs a session's turns when an app has
-# several. Its graphs are what ../drivers/drive-agents.mjs walks: inputs stored when
-# sent (memory, local) and when delivered (Vercel), with process p2 lacking
-# one agent. Drains is checked under fairness, a simulation runs a larger
+# several. Its graph is what ../drivers/drive-agents.mjs walks, with process p2
+# lacking one agent; every sender stores its input before it queues it. Drains is checked under fairness, a simulation runs a larger
 # config, and each witness breaks RunsOnOwner: NoNames is routing without
 # names, as before them, and NoOwnerCheck a worker that runs any session it
 # is handed.
-for config in send consume; do
+for config in send; do
     echo "== AgentRouting ($config)"
     if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
         -metadir "$work/agents-$config" -dump dot,actionlabels "graphs/agents-$config" \
@@ -113,7 +113,7 @@ for config in send consume; do
     fi
     grep -E 'distinct states|depth of' "$work/agents-$config.log"
 done
-for config in drains-send drains-consume; do
+for config in drains-send; do
     if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/agents-$config" \
         -config "AgentRouting-$config.cfg" AgentRouting.tla > "$work/agents-$config.log" 2>&1; then
         echo "== AgentRouting ($config): Drains holds"
@@ -133,6 +133,40 @@ for witness in NoNames NoOwnerCheck; do
         echo "== witness $witness reached"
     else
         echo "== witness $witness NOT reached" >&2; status=1
+    fi
+done
+
+# TenantIsolation.tla: tenants whose agents share one process, and an
+# attacker who can post to its route. Its graph, with every rule on, is what
+# ../drivers/drive-tenants.mjs walks; SentRuns is checked under fairness.
+# Each witness turns one rule off and must break what it protects:
+# TrustBody runs a forged delivery, ShareName runs one tenant's prompt on
+# another's agent, RouteByName strands a prompt on another store,
+# NoAdmission stores an oversized input, and Today, every rule off as libfx
+# was before them, runs a prompt in another tenant's store.
+echo "== TenantIsolation (route)"
+if ! "$java" -XX:+UseParallelGC -cp "$jar" tlc2.TLC -deadlock -workers 1 -cleanup \
+    -metadir "$work/tenants-route" -dump dot,actionlabels graphs/tenants-route \
+    -config TenantIsolation-route.cfg TenantIsolation.tla > "$work/tenants-route.log" 2>&1; then
+    cat "$work/tenants-route.log"; status=1
+else
+    grep -E 'distinct states|depth of' "$work/tenants-route.log"
+fi
+if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/tenants-drains" \
+    -config TenantIsolation-drains.cfg TenantIsolation.tla > "$work/tenants-drains.log" 2>&1; then
+    echo "== TenantIsolation (drains): SentRuns holds"
+else
+    cat "$work/tenants-drains.log"; status=1
+fi
+for pair in "TrustBody:Invariant OnlySentRuns is violated" "ShareName:Invariant RunsOnSenderAgent is violated" \
+    "RouteByName:Temporal properties were violated" "NoAdmission:Invariant StoredWithinLimit is violated" \
+    "Today:Invariant RunsInSenderStore is violated"; do
+    witness="${pair%%:*}" verdict="${pair#*:}"
+    if "$java" -cp "$jar" tlc2.TLC -deadlock -workers auto -cleanup -metadir "$work/tw-$witness" \
+        -config "TenantWitness-$witness.cfg" TenantIsolation.tla 2>&1 | grep -q -F "$verdict"; then
+        echo "== tenant witness $witness reached"
+    else
+        echo "== tenant witness $witness NOT reached" >&2; status=1
     fi
 done
 exit "$status"

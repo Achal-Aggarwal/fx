@@ -2,7 +2,7 @@
 // AgentRouting.tla, and checks after every step that the code is where the
 // model allows.
 //
-//   bun tests/tla/drivers/drive-agents.mjs [send|consume] [--walks N] [--depth N] [--seed S]
+//   bun tests/tla/drivers/drive-agents.mjs [--walks N] [--depth N] [--seed S]
 //
 // Two processes, p1 and p2, are two worker threads (agent-process.mjs), each
 // with a module instance and a globalThis of its own: p1 has the agents S
@@ -10,9 +10,8 @@
 // World of its own, as agents created without a durability have. The
 // queue they share is the driver's: it holds every message until the walk
 // delivers it to a process, to one of its Worlds picked at random, as the
-// graph's Send and Deliver steps say. With "send" a prompt's input is stored
-// before it is queued, as on local(); with "consume" the worker that takes
-// it stores it, as on a World whose queue keeps its messages (Vercel).
+// graph's Send and Deliver steps say. A prompt's input is stored before it
+// is queued, as on every durability.
 //
 // After each step the driver reads back each session's owner from its log,
 // the turns each agent ran, the names a process had no agent for, and the
@@ -32,7 +31,6 @@ const option = (name, fallback) => {
   const index = args.indexOf(`--${name}`);
   return index >= 0 ? args[index + 1] : fallback;
 };
-const mode = args.find((arg) => arg === "send" || arg === "consume") ?? "send";
 const walks = Number(option("walks", 40));
 const depth = Number(option("depth", 24));
 let seed = Number(option("seed", Date.now() % 100000));
@@ -45,7 +43,7 @@ const random = () => {
 const pick = (items) => items[Math.floor(random() * items.length)];
 
 const here = fileURLToPath(new URL(".", import.meta.url));
-const graph = await loadGraph(resolve(here, "../sdk/graphs", `agents-${mode}.dot`));
+const graph = await loadGraph(resolve(here, "../sdk/graphs/agents-send.dot"));
 const hosts = { p1: ["S", "C"], p2: ["S"] };
 
 // The queue the processes share: every message, until a step delivers it.
@@ -63,7 +61,7 @@ function enqueue({ queueName, payload, idempotencyKey }) {
 
 // A process: calls to its worker, which also sends to the queue.
 function startProcess(name) {
-  const worker = new Worker(new URL("./agent-process.mjs", import.meta.url), { workerData: { names: hosts[name], mode } });
+  const worker = new Worker(new URL("./agent-process.mjs", import.meta.url), { workerData: { names: hosts[name] } });
   const calls = new Map();
   let called = 0;
   worker.on("message", (message) => {
@@ -197,5 +195,5 @@ try {
   for (const process of Object.values(processes)) await process.stop();
 }
 const edges = [...graph.next.values()].reduce((total, successors) => total + successors.size, 0);
-console.log(`${walks} walks (${mode}, seed ${firstSeed}), ${steps} steps (${Object.entries(outcomes).map(([name, count]) => `${count} ${name}`).join(", ")}): ${seenStates.size} of ${graph.states.size} states and ${seenEdges.size} of ${edges} edges, every step one the model allows`);
+console.log(`${walks} walks (seed ${firstSeed}), ${steps} steps (${Object.entries(outcomes).map(([name, count]) => `${count} ${name}`).join(", ")}): ${seenStates.size} of ${graph.states.size} states and ${seenEdges.size} of ${edges} edges, every step one the model allows`);
 assert.ok(outcomes.forward > 0 && outcomes.miss > 0, "the walks forward a message and miss an agent at least once");
