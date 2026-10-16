@@ -3,6 +3,7 @@
 //! until v1 is removed.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
 const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const elicitation = @import("../mcp/elicitation.zig");
@@ -93,6 +94,8 @@ pub const Host = struct {
     /// may use `h` after this.
     pub fn stop(h: *Host) void {
         h.retire();
+        // Without threads, as in the wasm builds, it is destroyed in place.
+        if (comptime builtin.single_threaded) return h.destroy();
         const thread = std.Thread.spawn(.{}, destroy, .{h}) catch |err| {
             debug_trace.logf("mcp", "MCP host stopped in place err={s}", .{@errorName(err)});
             return h.destroy();
