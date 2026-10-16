@@ -39,7 +39,7 @@ function fixture(label: string) {
     FX_TRACE_LOG: trace, FX_TRACE_SCOPES: "wiring", ...(v2 ? { FX_SESSIONS_V2: "1" } : {}),
   });
   return {
-    root, home, trace, sessionsRoot, processes,
+    root, trace, sessionsRoot, processes,
     script(next: Reply) { reply = next; },
     async app(args: string[] = [], v2 = true): Promise<App> {
       const stderr = join(root, `app-${apps.length + 1}.stderr`);
