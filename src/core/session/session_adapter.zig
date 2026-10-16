@@ -19,6 +19,19 @@
 //!   terminal state lives in `~/.fx/terminal/{id}/` (D45). An older session
 //!   with a `~/.fx/session-files/{id}/` side folder moves on its first
 //!   writable open (D47, `tests/tla/session_manager/MoveSideFiles.tla`).
+//!
+//! Models of the sessions v2 rollout, one per step that changed this file:
+//! - `tests/tla/session_manager/rollout/pr-1072/PR1072Ask.tla`: `fx ask`
+//! - `tests/tla/session_manager/rollout/pr-1073/PR1073Interactive.tla`: resume and switch
+//! - `tests/tla/session_manager/rollout/pr-1076/PR1076RunningTools.tla`: running tool calls
+//! - `tests/tla/session_manager/rollout/pr-1079/PR1079ACP.tla`: ACP sessions
+//! - `tests/tla/session_manager/rollout/pr-1081/PR1081Subagents.tla`: subagents
+//! - `tests/tla/session_manager/rollout/pr-1082/PR1082Commands.tla`: session commands
+//! - `tests/tla/session_manager/rollout/pr-1116/PR1116Blobs.tla`: bodies as blobs
+//! - `tests/tla/session_manager/rollout/pr-1116/PR1116ChildCheckpoint.tla`: child checkpoints
+//! - `tests/tla/session_manager/rollout/pr-1116/PR1116Migration.tla`: moving older sessions
+//! - `tests/tla/session_manager/rollout/pr-1116/PR1116Records.tla`: records and forks
+//! - `tests/tla/session_manager/rollout/pr-1116/PR1116Terminal.tla`: hosted terminal state
 
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");

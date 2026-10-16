@@ -429,6 +429,7 @@ function checkpointSeq(bytes) {
 
 // Reads what `persistence.load()` returns: the latest checkpoint, if any, and
 // the records after it, as the events the core folds after that checkpoint.
+// Modeled in `tests/tla/durable/SnapshotTail.tla`.
 async function loadPersistence(persistence) {
   const loaded = await persistence.load();
   if (!loaded || typeof loaded !== "object") {
@@ -2087,7 +2088,10 @@ function toolSchemaHash(descriptors) {
 }
 
 // `tools` is an array of descriptors, or an object of descriptors keyed by
-// name.
+// name. What `idempotent` and `writes` mean after a crash and for calls that
+// run together is modeled in `tests/tla/durable/ToolReplay.tla`, whose
+// `replay: "safe"` is an idempotent tool that does not write, and in
+// `tests/tla/durable/ParallelBatch.tla`.
 function normalizeHostTools(value) {
   if (value === undefined) return { descriptors: [], executors: new Map() };
   let entries;
@@ -2314,6 +2318,8 @@ export async function createFxEngine(options = {}) {
   let appendTail = Promise.resolve();
   // One per agent, so a store can tell a repeated write from another writer's.
   const writerId = crypto.randomUUID();
+  // Pipelined appends and barriers are modeled in `tests/tla/durable/Journal.tla`,
+  // and two processes appending to one log in `tests/tla/durable/Fencing.tla`.
   const journal = persistence && {
     append(events, barrier) {
       const data = encodeJournalRecord(events);
@@ -2354,7 +2360,8 @@ export async function createFxEngine(options = {}) {
   };
   // Continues the open turn: the calls it left running run again or are
   // answered as possibly run, and each answered one ends for the turn's
-  // viewers as it does for the model.
+  // viewers as it does for the model. Modeled in
+  // `tests/tla/durable/Resumption.tla`.
   const resumeOpenTurn = (promptOptions) => {
     const { rerun, answered } = settleAmbiguous(promptOptions.onAmbiguous);
     return normalizeTurn(startTurn(null, { ...promptOptions, [resumeTurn]: true, [rerunCallIds]: rerun }), answered);
@@ -2391,7 +2398,8 @@ export async function createFxEngine(options = {}) {
   let handedOff = false;
   const handedOffError = () => new Error("this agent handed its session off; open it again to continue");
   // Input events (`accepted:<id>`, `withdrawn:<id>`) once stored, and the
-  // steer and withdraw calls waiting for them.
+  // steer and withdraw calls waiting for them, which resolve only then
+  // (`tests/tla/durable/Inbox.tla`).
   const durableInputs = new Set();
   const inputWaiters = new Map();
   const waitForInput = (key) => {
