@@ -16,7 +16,7 @@ TLA+ specifications for fx, checked with TLC, together with the scripts and Bun 
 | `terminal/` | The in-memory shell snapshot owner (`src/core/terminal/shell_snapshot.zig`) and the lifecycle of hosted terminals. | `terminal/check.sh` |
 | `usage/` | `/usage` refreshes and the shared usage cache (`src/usage/`): `LeanUsage.tla` and `UsageModel.tla`. | `usage/check.sh`, then the drivers in `drivers/usage/` |
 | `drivers/` | The Bun drivers. They run the real fx binary or SDK code, record what happens, and have TLC check each run against its model. `drive.mjs`, `drive-agents.mjs`, `drive-tenants.mjs`, and `drive-steer.mjs` walk the SDK code along the `sdk/` state graphs. | See each folder's `check.sh` |
-| `lib/` | `tlc.sh`, which finds TLC and Java and runs a table of configs with their expected verdicts, and `run-tlc.sh`, which runs TLC once for the drivers. | |
+| `lib/` | `tlc.sh`, which finds TLC and Java and runs a table of configs with their expected verdicts, `tlc.py`, which asks `tlc.sh` for TLC and Java on behalf of the Python checkers, and `run-tlc.sh`, which runs TLC once for the drivers. | |
 
 ## Requirements
 
