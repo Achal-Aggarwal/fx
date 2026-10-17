@@ -1398,14 +1398,22 @@ const requestImages = (prompt) => prompt
   .flatMap((message) => Array.isArray(message.content) ? message.content : [])
   .filter((part) => part.type === "file")
   .map((part) => part.data?.data ?? part.data);
-// A memory store without the image methods, which keeps images inline.
-const inlineStore = () => {
-  const store = createMemoryPersistence();
-  return { store, persistence: { load: () => store.load(), append: (input) => store.append(input), saveCheckpoint: (input) => store.saveCheckpoint(input) } };
-};
+// libfx's own key for a persistence's image store, which durable sessions
+// give the engines they run.
+const persistenceImages = Symbol.for("libfx.persistenceImages");
+// `persistence` with an image store that keeps each image once, by name, in
+// `images`, as a durable session gives its engines.
+const withImageStore = (persistence, images = new Map()) => Object.assign(persistence, {
+  images,
+  [persistenceImages]: {
+    put: async (name, bytes) => { if (!images.has(name)) images.set(name, bytes.slice()); },
+    get: async (name) => images.get(name)?.slice(),
+  },
+});
+const createImagePersistence = () => withImageStore(createMemoryPersistence());
 
 test("a store keeps each prompt image once, and records and checkpoints only name it", async () => {
-  const store = createMemoryPersistence();
+  const store = createImagePersistence();
   const first = pngOf(300_000, 1);
   const second = pngOf(200_000, 2);
   const source = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: store, checkpointAfterBytes: 0 }));
@@ -1440,7 +1448,7 @@ test("a store keeps each prompt image once, and records and checkpoints only nam
 });
 
 test("a session whose store lost an image is refused, naming it", async () => {
-  const store = createMemoryPersistence();
+  const store = createImagePersistence();
   const kept = pngOf(50_000, 4);
   const lost = pngOf(60_000, 5);
   const source = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: store, checkpointAfterBytes: 0 }));
@@ -1473,13 +1481,8 @@ test("an image turn that crashed after a delta reopens with its image", async ()
   // one brings the image back from the first.
   const image = pngOf(50_000, 8);
   const images = new Map();
-  const withImages = (persistence) => ({
-    ...persistence,
-    putImage: async (name, bytes) => { images.set(name, new Uint8Array(bytes)); },
-    getImage: async (name) => images.get(name),
-  });
   const journal = eventJournal();
-  const source = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: withImages(persisted(journal)) }));
+  const source = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: withImageStore(persisted(journal), images) }));
   assert.equal((await run(source, [{ type: "text", text: "use the tool" }, imageBlock(image)])).text, "tool said beta");
   await source.close();
   const progress = journal.events.filter((event) => event.type === "turn_progress");
@@ -1488,7 +1491,7 @@ test("an image turn that crashed after a delta reopens with its image", async ()
   assert.ok(stepped?.base !== undefined && stepped.v === 2, "the progress after the tool extends it");
   assert.ok(!JSON.stringify(stepped).includes("inline_ref"), "and names no image");
   const survived = journal.events.slice(0, journal.events.indexOf(stepped) + 1);
-  const resumed = await createFxEngine(options(targetBackend, undefined, { ...visionCatalog, persistence: withImages(persisted(eventJournal(survived))) }));
+  const resumed = await createFxEngine(options(targetBackend, undefined, { ...visionCatalog, persistence: withImageStore(persisted(eventJournal(survived)), images) }));
   requests.length = 0;
   const turn = resumed.resume();
   for await (const _ of turn) {}
@@ -1504,7 +1507,7 @@ const droppedNote = /\[Image #1 is no longer in this session, which keeps only i
 
 for (const [label, limits] of [["images", { images: 2 }], ["bytes", { bytes: 2 * 40_000 }]]) {
   test(`a session keeps its newest images within its window of ${label}, and an older one leaves as a note`, async () => {
-    const store = createMemoryPersistence();
+    const store = createImagePersistence();
     const pictures = [pngOf(40_000, 11), pngOf(40_000, 12), pngOf(40_000, 13)];
     const window = { [imageWindow]: limits };
     const source = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: store, checkpointAfterBytes: 0, ...window }));
@@ -1525,10 +1528,10 @@ for (const [label, limits] of [["images", { images: 2 }], ["bytes", { bytes: 2 *
     // only the images its window keeps.
     store.images.delete(await nameOf(pictures[0]));
     const read = [];
-    const getImage = store.getImage.bind(store);
-    store.getImage = async (name) => {
+    const { get } = store[persistenceImages];
+    store[persistenceImages].get = async (name) => {
       read.push(name);
-      return getImage(name);
+      return get(name);
     };
     const target = await createFxEngine(options(targetBackend, undefined, { ...visionCatalog, persistence: store, ...window }));
     await run(target, "and now?");
@@ -1540,7 +1543,7 @@ for (const [label, limits] of [["images", { images: 2 }], ["bytes", { bytes: 2 *
 }
 
 test("a turn that fails before it enters the history drops no image", async () => {
-  const store = createMemoryPersistence();
+  const store = createImagePersistence();
   const pictures = [pngOf(40_000, 21), pngOf(40_000, 22), pngOf(40_000, 23)];
   const agent = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: store, [imageWindow]: { images: 2 } }));
   await run(agent, [{ type: "text", text: "look 0" }, imageBlock(pictures[0])]);
@@ -1565,13 +1568,8 @@ test("a turn that crashed with a full image window reopens with all of its image
   let made = 0;
   const prompt = (text) => [{ type: "text", text }, ...Array.from({ length: 8 }, () => imageBlock(tiny(made++)))];
   const images = new Map();
-  const withImages = (persistence) => ({
-    ...persistence,
-    putImage: async (name, bytes) => { images.set(name, new Uint8Array(bytes)); },
-    getImage: async (name) => images.get(name),
-  });
   const journal = eventJournal();
-  const source = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: withImages(persisted(journal)) }));
+  const source = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: withImageStore(persisted(journal), images) }));
   for (let turn = 0; turn < 4096 / 8; turn += 1) await run(source, prompt(`look ${turn}`));
   const open = prompt("use the tool");
   assert.equal((await run(source, open)).text, "tool said beta");
@@ -1582,10 +1580,10 @@ test("a turn that crashed with a full image window reopens with all of its image
   const stepped = journal.events.findLast((event) => event.type === "turn_progress" && event.steps === 1);
   const survived = journal.events.slice(0, journal.events.indexOf(stepped) + 1);
   const read = new Set();
-  const resumed = await createFxEngine(options(targetBackend, undefined, {
-    ...visionCatalog,
-    persistence: { ...withImages(persisted(eventJournal(survived))), getImage: async (name) => { read.add(name); return images.get(name); } },
-  }));
+  const reading = withImageStore(persisted(eventJournal(survived)), images);
+  const { get } = reading[persistenceImages];
+  reading[persistenceImages].get = async (name) => { read.add(name); return get(name); };
+  const resumed = await createFxEngine(options(targetBackend, undefined, { ...visionCatalog, persistence: reading }));
   requests.length = 0;
   const turn = resumed.resume();
   for await (const _ of turn) {}
@@ -1597,12 +1595,13 @@ test("a turn that crashed with a full image window reopens with all of its image
 });
 
 test("a failed image write fails the prompt before it is sent", async () => {
-  const store = createMemoryPersistence();
-  store.putImage = async () => { throw new Error("disk full"); };
+  const store = createImagePersistence();
+  store[persistenceImages].put = async () => { throw new Error("disk full"); };
   const agent = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: store }));
   requests.length = 0;
   const turn = agent.prompt([{ type: "text", text: "look" }, imageBlock(pngOf(1_000, 7))]);
-  await assert.rejects(turn.result, (error) => error.code === "FX_IMAGE_STORE_FAILED" && error.cause?.message === "disk full");
+  // The store's own error.
+  await assert.rejects(turn.result, (error) => error.message === "disk full");
   assert.equal(requests.length, 0, "the prompt never reached the model");
   assert.equal(storedEvents(store).length, 0, "nothing was recorded");
   const { result } = await run(agent, "text only");
@@ -1619,11 +1618,7 @@ test("a session saved inline opens behind an image store, and only new images ar
   await before.close();
 
   const images = new Map();
-  const upgraded = {
-    ...persisted(journal),
-    putImage: async (name, bytes) => { images.set(name, bytes.slice()); },
-    getImage: async (name) => images.get(name),
-  };
+  const upgraded = withImageStore(persisted(journal), images);
   const after = await createFxEngine(options(targetBackend, undefined, { ...visionCatalog, persistence: upgraded }));
   requests.length = 0;
   await run(after, [{ type: "text", text: "new" }, imageBlock(fresh)]);
@@ -1638,33 +1633,23 @@ test("a session saved inline opens behind an image store, and only new images ar
   assert.deepEqual(requestImages(requests.at(-1)), [base64Of(old), base64Of(fresh)]);
 });
 
-test("an image store is both methods or neither", async () => {
-  const store = createMemoryPersistence();
-  await assert.rejects(createFxEngine(options(sourceBackend, undefined, { persistence: { load: store.load, append: store.append, putImage: store.putImage } })), TypeError);
-  await assert.rejects(createFxEngine(options(sourceBackend, undefined, { persistence: { load: store.load, append: store.append, getImage: store.getImage } })), TypeError);
-});
-
-test("images too large for a checkpoint are named instead, and a refused checkpoint is reported", async () => {
+test("images too large for a checkpoint are named instead", async () => {
   // Two 2.1 MiB images: more than one checkpoint holds raw.
   const images = [pngOf(2_200_000, 10), pngOf(2_200_000, 11)];
   const prompt = [{ type: "text", text: "large" }, ...images.map(imageBlock)];
 
-  const inline = inlineStore();
-  const refusals = [];
-  const without = await createFxEngine(options(sourceBackend, undefined, {
-    ...visionCatalog, persistence: inline.persistence, checkpointAfterBytes: 0,
-    onEvent: (event) => { if (event.type === "checkpoint.skipped") refusals.push(event.reason); },
-  }));
+  // Without an image store, the core refuses the checkpoint.
+  const inline = createMemoryPersistence();
+  const without = await createFxEngine(options(sourceBackend, undefined, { ...visionCatalog, persistence: inline, checkpointAfterBytes: 0 }));
   await run(without, prompt);
   await without.close();
-  assert.deepEqual(refusals, ["too_large"]);
-  assert.equal(inline.store.checkpoint, null);
+  assert.equal(inline.checkpoint, null);
 
-  const store = createMemoryPersistence();
+  const store = createImagePersistence();
   const saved = [];
   const named = await createFxEngine(options(sourceBackend, undefined, {
     ...visionCatalog, persistence: store, checkpointAfterBytes: 0,
-    onEvent: (event) => { if (event.type === "checkpoint.save" || event.type === "checkpoint.skipped") saved.push(event.type); },
+    onEvent: (event) => { if (event.type === "checkpoint.save") saved.push(event.type); },
   }));
   await run(named, prompt);
   await named.close();
@@ -1680,7 +1665,7 @@ test("images too large for a checkpoint are named instead, and a refused checkpo
 });
 
 test("a session holds more images than a checkpoint could, turn after turn", async () => {
-  const store = createMemoryPersistence();
+  const store = createImagePersistence();
   const images = Array.from({ length: 5 }, (_, index) => pngOf(1024 * 1024, 20 + index));
   let saves = 0;
   const countSaves = { onEvent: (event) => { if (event.type === "checkpoint.save") saves += 1; } };

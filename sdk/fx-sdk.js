@@ -201,11 +201,6 @@ export function normalizeAgentOptions(value) {
       (persistence.saveCheckpoint !== undefined && typeof persistence.saveCheckpoint !== "function")) {
       throw new TypeError("persistence must be an object with load(), append() and, optionally, saveCheckpoint()");
     }
-    // An image store is both methods or neither.
-    if ((persistence.putImage !== undefined || persistence.getImage !== undefined) &&
-      (typeof persistence.putImage !== "function" || typeof persistence.getImage !== "function")) {
-      throw new TypeError("persistence keeps images with both putImage() and getImage(), or neither");
-    }
     if (options.checkpoint !== undefined) {
       throw new TypeError("persistence cannot be combined with checkpoint");
     }
@@ -223,6 +218,11 @@ export function normalizeAgentOptions(value) {
 // public surface.
 export const engineInternals = Symbol.for("libfx.engineInternals");
 export const journalMarksWanted = Symbol.for("libfx.journalMarks");
+// A persistence's image store, `{ put(name, bytes), get(name) }`, which keeps
+// each image once, named by the SHA-256 of its bytes, so records and
+// checkpoints only name it. Durable sessions give one to the engines they
+// run; without it, images stay inline.
+export const persistenceImages = Symbol.for("libfx.persistenceImages");
 // `{ images, bytes }`: a smaller image window than the core's, the newest
 // images a session with an image store keeps, so tests can reach its edge.
 const imageWindowLimits = Symbol.for("libfx.imageWindow");
@@ -291,38 +291,22 @@ function imageMissingError(name, cause) {
   return error;
 }
 
-function imageStoreError(cause) {
-  const error = new Error("libfx could not store a prompt image", { cause });
-  error.code = "FX_IMAGE_STORE_FAILED";
-  return error;
-}
-
 /**
  * A persistence store that keeps a session's records and its latest
  * checkpoint in memory, for tests and for hosts that copy them elsewhere.
  * `records` is the stored list, oldest first. An append whose `expected`
  * cursor is not the last record's is refused, so a second agent cannot write
  * the same session, and an append that repeats a stored write's
- * `idempotencyKey` returns that write's cursor. `images` holds each prompt
- * image once, by name, so records and checkpoints only name them: a host
- * that copies the session elsewhere copies `images` with them.
+ * `idempotencyKey` returns that write's cursor.
  */
 export function createMemoryPersistence() {
   const records = [];
-  const images = new Map();
   let checkpoint = null;
   const head = () => records.at(-1)?.cursor ?? null;
   return {
     records,
-    images,
     get checkpoint() {
       return checkpoint;
-    },
-    async putImage(name, bytes) {
-      if (!images.has(name)) images.set(name, bytes.slice());
-    },
-    async getImage(name) {
-      return images.get(name)?.slice();
     },
     async load() {
       const after = checkpoint ? records.findIndex((record) => record.cursor === checkpoint.through) + 1 : 0;
@@ -2372,7 +2356,8 @@ export async function createFxEngine(options = {}) {
   // A persistence with an image store keeps each prompt image once, by
   // name, and the core names it in records and checkpoints instead of
   // holding its bytes.
-  const imageStore = persistence !== null && typeof persistence.putImage === "function";
+  const imageStorage = persistence?.[persistenceImages] ?? null;
+  const imageStore = imageStorage !== null;
   const wantsMarks = persistence?.marks === true || persistence?.[journalMarksWanted] === true;
   const checkpointAfterBytes = options.checkpointAfterBytes ?? defaultCheckpointAfterBytes;
   // The store's last cursor, and the last seq its records hold.
@@ -2594,9 +2579,6 @@ export async function createFxEngine(options = {}) {
       if (bytesSinceCheckpoint === 0 || (!force && bytesSinceCheckpoint < checkpointAfterBytes)) return;
       const response = await request("libfx/snapshot", { sessionId, checkpointMeta });
       const id = response?.snapshotAttachment;
-      // A session past a checkpoint's bounds keeps growing its journal;
-      // the host hears why no checkpoint came.
-      if (typeof response?.skipped === "string") emit("checkpoint.skipped", { reason: response.skipped });
       if (!Number.isSafeInteger(id) || id <= 0) return;
       const bytes = runtime.takeAttachment?.(id);
       // The core took it after every event this agent stored, and no later.
@@ -2830,11 +2812,7 @@ export async function createFxEngine(options = {}) {
       }
       const name = await imageName(block.bytes);
       if (stopped()) return null;
-      try {
-        await persistence.putImage(name, block.bytes);
-      } catch (error) {
-        throw imageStoreError(error);
-      }
+      await imageStorage.put(name, block.bytes);
       if (stopped()) return null;
       named.push({ ...block, stored: name });
     }
@@ -3000,9 +2978,9 @@ export async function createFxEngine(options = {}) {
           await request("libfx/journal_images", { sessionId, images }).catch(openFailed);
         };
         for (const name of new Set(names.map(String))) {
-          const stored = imageStore ? await persistence.getImage(name) : undefined;
+          const stored = imageStore ? await imageStorage.get(name) : undefined;
           if (stored === undefined || stored === null) throw imageMissingError(name);
-          const bytes = persistenceBytes(stored, "an image persistence.getImage() returns");
+          const bytes = persistenceBytes(stored, "an image the image store returns");
           if (batch.length === maxPendingAttachments || batchBytes + bytes.byteLength > maxPendingAttachmentBytes) await flush();
           batch.push({ name, bytes });
           batchBytes += bytes.byteLength;

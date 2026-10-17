@@ -153,8 +153,14 @@ const answer = () => new Response(
   { headers: { "content-type": "text/event-stream" } },
 );
 
+// libfx's own key for a persistence's image store, which durable sessions
+// give the engines they run.
+const persistenceImages = Symbol.for("libfx.persistenceImages");
+
 async function harness(n) {
   const store = createMemoryPersistence();
+  // The image store: each image once, by name.
+  const storedImages = new Map();
   const problems = [];
   // Held image writes by name, and the model request held now.
   const imageGates = new Map();
@@ -185,19 +191,24 @@ async function harness(n) {
     load: () => (current.alive ? store.load() : Promise.reject(new Error("crashed"))),
     append: (input) => (current.alive ? store.append(input) : Promise.reject(new Error("crashed"))),
     saveCheckpoint: (input) => (current.alive ? store.saveCheckpoint(input) : Promise.reject(new Error("crashed"))),
-    async putImage(name, bytes) {
-      if (!current.alive) throw new Error("crashed");
-      const gate = imageGates.get(name);
-      if (gate) {
-        imageGates.delete(name);
-        const lands = await gate.promise;
-        if (!lands) throw new Error("injected image write failure");
-        // A write the crash caught in flight never lands.
-        if (!current.alive) return new Promise(() => {});
-      }
-      return store.putImage(name, bytes);
+    [persistenceImages]: {
+      async put(name, bytes) {
+        if (!current.alive) throw new Error("crashed");
+        const gate = imageGates.get(name);
+        if (gate) {
+          imageGates.delete(name);
+          const lands = await gate.promise;
+          if (!lands) throw new Error("injected image write failure");
+          // A write the crash caught in flight never lands.
+          if (!current.alive) return new Promise(() => {});
+        }
+        if (!storedImages.has(name)) storedImages.set(name, bytes.slice());
+      },
+      get: async (name) => {
+        if (!current.alive) throw new Error("crashed");
+        return storedImages.get(name)?.slice();
+      },
     },
-    getImage: (name) => (current.alive ? store.getImage(name) : Promise.reject(new Error("crashed"))),
   });
   const engineOptions = (persistence, current = null) => ({
     backend,
@@ -237,7 +248,7 @@ async function harness(n) {
   const watch = (p, turn) => {
     turn.result.then(
       (result) => { if (result.stopReason === "end_turn") ph[p - 1] = "ended"; },
-      (error) => { if (error?.code === "FX_IMAGE_STORE_FAILED") ph[p - 1] = "failed"; },
+      (error) => { if (error?.message === "injected image write failure") ph[p - 1] = "failed"; },
     );
   };
 
@@ -316,7 +327,7 @@ async function harness(n) {
       }
       case "Lose": {
         lost = true;
-        store.images.delete(nameOf[p]);
+        storedImages.delete(nameOf[p]);
         return;
       }
       default: throw new Error(`the driver cannot take ${name}`);
@@ -327,7 +338,7 @@ async function harness(n) {
     // A prompt whose model request is held has started.
     if (held && held.life === life && ph[held.p - 1] !== "ended") ph[held.p - 1] = "started";
     const { named, inline } = savedImages(store);
-    if (!lost) for (const name of named) if (!store.images.has(name)) problems.push(`a record or checkpoint names ${labelOfName[name] ?? name}, which the store does not hold`);
+    if (!lost) for (const name of named) if (!storedImages.has(name)) problems.push(`a record or checkpoint names ${labelOfName[name] ?? name}, which the store does not hold`);
     for (const bytes of inline) {
       const label = labelOfBytes(bytes);
       if (label !== "o" && !refused.has(label)) problems.push(`image ${label} is saved inline`);
@@ -336,7 +347,7 @@ async function harness(n) {
       made,
       ph: [...ph],
       up,
-      store: [...store.images.keys()].map((name) => labelOfName[name] ?? "?").sort(),
+      store: [...storedImages.keys()].map((name) => labelOfName[name] ?? "?").sort(),
       held: held && held.life === life ? held.images : null,
     };
   }
