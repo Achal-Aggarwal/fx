@@ -327,6 +327,11 @@ const resumeTurn = Symbol("libfx.resume");
 const followUpInput = Symbol("libfx.followUp");
 // Carries the ids of the calls a resumed turn runs again.
 const rerunCallIds = Symbol("libfx.rerun");
+// Marks a resume whose host already holds what the turn sent before it
+// stopped, as a durable session's stream does, so the turn does not send it
+// again. Any other resume runs in a host that saw none of it. Never a
+// caller-visible option; `fx-harness.js` sets it.
+export const resumeOutputShown = Symbol.for("libfx.resumeOutputShown");
 
 function journalAppendError(cause) {
   const error = new Error("libfx journal append failed", { cause });
@@ -2741,12 +2746,12 @@ export async function createFxEngine(options = {}) {
     if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) throw new Error("fx returned an invalid checkpoint");
     return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   }
-  const sendPrompt = (blocks, resuming = false, followUp = null, turnId = null, rerun = [], yieldAt = undefined) => {
+  const sendPrompt = (blocks, resuming = false, followUp = null, turnId = null, rerun = [], yieldAt = undefined, outputShown = false) => {
     // A journaled turn given a time to stop at yields before its first model
     // request after it, keeping the turn open.
     const stopAt = journal && yieldAt !== undefined ? { yieldAt } : {};
     if (resuming) {
-      return request("session/prompt", { sessionId, prompt: [], _meta: { fx: { continueRecovery: true, ...(rerun.length ? { rerun } : {}), ...stopAt } } });
+      return request("session/prompt", { sessionId, prompt: [], _meta: { fx: { continueRecovery: true, ...(outputShown ? {} : { freshOutput: true }), ...(rerun.length ? { rerun } : {}), ...stopAt } } });
     }
     const images = blocks.filter((block) => block.type === "image" && block.bytes !== undefined);
     const ids = images.length ? attachBytes(images.map((block) => block.bytes)) : [];
@@ -3432,7 +3437,7 @@ export async function createFxEngine(options = {}) {
         return sendPrompt(prepared, false, followUp, turn.id, [], yieldAt);
       });
     } else {
-      try { response = sendPrompt(prompt, resuming, followUp, turn.id, promptOptions[rerunCallIds] ?? [], yieldAt); } catch (error) { response = Promise.reject(error); }
+      try { response = sendPrompt(prompt, resuming, followUp, turn.id, promptOptions[rerunCallIds] ?? [], yieldAt, promptOptions[resumeOutputShown] === true); } catch (error) { response = Promise.reject(error); }
     }
     // Appends after a turn's first progress are lazy, so the turn runs ahead
     // of them, but its result waits until every record it wrote is stored:

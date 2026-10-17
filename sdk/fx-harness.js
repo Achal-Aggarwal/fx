@@ -1,7 +1,7 @@
 // fx as a harness of the durable core in durable.js: `createFxAgent` is that
 // core running fx engines. Everything the core needs to know about fx is
 // here; the core itself knows only the harness contract.
-import { coreAnswered, engineInternals, journalMarksWanted, normalizeInstructions, normalizeModelChoice } from "./fx-sdk.js";
+import { coreAnswered, engineInternals, journalMarksWanted, normalizeInstructions, normalizeModelChoice, resumeOutputShown } from "./fx-sdk.js";
 import { createCredentialMemory, credentialMemory } from "./subscription.js";
 
 const encoder = new TextEncoder();
@@ -147,7 +147,9 @@ function fxSession(engine, idempotent) {
     // A call left running reruns only when running it twice is safe, and
     // with `rerun: false` not even then. Any other call is never run again:
     // the model is told it may have partly run, and the turn goes on.
-    resume: ({ rerun = true, ...options } = {}) => fxTurn(engine.resume({ ...options, onAmbiguous: (call) => (rerun && idempotent.has(call.name) ? "rerun" : undefined) }), internals.exited),
+    // The session's stream already holds what the turn sent before it
+    // stopped, so the resume does not send it again.
+    resume: ({ rerun = true, ...options } = {}) => fxTurn(engine.resume({ ...options, [resumeOutputShown]: true, onAmbiguous: (call) => (rerun && idempotent.has(call.name) ? "rerun" : undefined) }), internals.exited),
     get openTurn() {
       return internals.openTurn;
     },

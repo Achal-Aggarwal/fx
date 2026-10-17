@@ -515,9 +515,9 @@ test("a crash after the final reply, before its turn ends, delivers the saved re
   assert.equal((await turn.result).stopReason, "end_turn");
   assert.equal(resumed.resume(), null, "the turn resumes once");
   assert.equal(requests.length, 0, "the saved reply is delivered without a model request");
-  // As with any resumed turn, the host keeps what it was sent before the
-  // crash, so nothing is sent again: no restart notice and no second reply.
-  assert.equal(text, "", "the resumed turn sends no restart notice and no new text");
+  // The new engine's host holds none of the turn, so the resumed turn sends
+  // the saved reply as its text, with no restart notice.
+  assert.equal(text, "answer to remember plums", "the resumed turn sends the saved reply as its text");
   // The next turn's history holds the delivered reply once.
   await run(resumed, "and then");
   await resumed.close();
@@ -528,6 +528,46 @@ test("a crash after the final reply, before its turn ends, delivers the saved re
   assert.equal(commits[1].data.kind, "assistant");
   assert.equal(commits[1].data.user.text, "remember plums");
   assertContiguous(crashed.events);
+
+  // A durable session's stream already holds what the turn sent, so its
+  // worker resumes saying so: the turn ends with the saved reply and sends
+  // nothing again.
+  const again = await createFxEngine(options(targetBackend, eventJournal(journal.events.slice(0, -1))));
+  requests.length = 0;
+  const shown = again.resume({ [Symbol.for("libfx.resumeOutputShown")]: true });
+  let shownText = "";
+  for await (const update of shown) if (update.type === "text_delta") shownText += update.delta;
+  assert.equal((await shown.result).stopReason, "end_turn");
+  await again.close();
+  assert.equal(requests.length, 0);
+  assert.equal(shownText, "", "a host that holds the reply is not sent it again");
+});
+
+test("a resume that restarts a reply the last process had started sends that start first", async () => {
+  const journal = eventJournal();
+  const agent = await createFxEngine(options(sourceBackend, journal));
+  await run(agent, "remember plums");
+  await agent.close();
+  // The process died after the response's checkpoint, before the turn
+  // accepted the response as its reply: the reply is held for a restart.
+  const crashed = eventJournal(journal.events.slice(0, -2));
+  const held = crashed.events.at(-1);
+  assert.equal(held.type, "turn_progress");
+  assert.equal(held.data.assistant_source, "answer to remember plums");
+  assert.notEqual(held.data.action, "delivering_response");
+
+  const resumed = await createFxEngine(options(targetBackend, crashed));
+  requests.length = 0;
+  const turn = resumed.resume();
+  let text = "";
+  for await (const update of turn) if (update.type === "text_delta") text += update.delta;
+  assert.equal((await turn.result).stopReason, "end_turn");
+  await resumed.close();
+  assert.equal(requests.length, 1, "the restarted reply asks the model again");
+  // The new engine's host saw none of the turn: it gets what the last
+  // process had sent of the reply, then the restart.
+  assert.ok(text.startsWith("answer to remember plums"), JSON.stringify(text));
+  assert.ok(text.includes("[Response interrupted. Restarting.]"), JSON.stringify(text));
 });
 
 test("a turn's result waits until its end is stored", async () => {

@@ -7220,11 +7220,13 @@ fn processQueuedPromptLoop(
                     "bytes={d}",
                     .{checkpoint.assistant_source.len},
                 );
+                // A host that already holds the reply got its closing newline
+                // too; one that holds none of the turn gets both now.
                 try stream_ctx.restoreRecoverySource(
                     checkpoint.assistant_source,
                     job.recovery_source_already_presented,
                 );
-                try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
+                if (!job.recovery_source_already_presented) try deps.push_text(deps.ctx, .{ .assistant_rendered = "\n" });
                 try finishCommonAssistantTerminal(
                     deps,
                     finalization,

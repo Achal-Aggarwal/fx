@@ -6002,6 +6002,28 @@ test "processQueuedPrompt delivers a reply saved before its turn ended without a
         "The saved answer",
         restored_hooks.history_turns.items[0].assistant.assistant,
     );
+    // A host that holds none of the turn's output gets the reply as its text.
+    try std.testing.expectEqual(@as(usize, 1), restored_hooks.assistant_sources.items.len);
+    try std.testing.expectEqualStrings("The saved answer", restored_hooks.assistant_sources.items[0]);
+
+    // A host that already holds it, as a durable session's stream does, gets
+    // nothing again.
+    var shown_gateway = FakeGateway.init(alloc, &.{});
+    defer shown_gateway.deinit();
+    var shown_hooks = FakeAgentRuntimeDeps.init(alloc);
+    defer shown_hooks.deinit();
+    var shown_job = fixture.job();
+    shown_job.recovery_checkpoint = restored_checkpoint;
+    shown_job.recovery_source_already_presented = true;
+
+    try runFakePrompt(&shown_gateway, &shown_hooks, config, shown_job);
+
+    try std.testing.expectEqual(@as(usize, 0), shown_gateway.request_bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 0), shown_hooks.assistant_sources.items.len);
+    try std.testing.expectEqualStrings(
+        "The saved answer",
+        shown_hooks.history_turns.items[0].assistant.assistant,
+    );
 }
 
 test "processQueuedPrompt saves a reply that calls a tool for a retry, not for delivery" {
