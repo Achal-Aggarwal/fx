@@ -103,15 +103,15 @@ pub const Catalog = struct {
     }
 
     pub fn hasTool(c: *Catalog, name: []const u8, access: Access) bool {
-        if (!access.allowsTool(c.generation, name)) return false;
+        if (!c.mayAllow(access)) return false;
         c.ensure(name, null) catch return false;
-        return c.known(name);
+        return c.allows(access, name);
     }
 
     pub fn validateTool(c: *Catalog, arena: Allocator, name: []const u8, arguments_json: []const u8, access: Access) !tool_mcp_runtime.ValidationResult {
-        if (!access.allowsTool(c.generation, name)) return .not_available;
+        if (!c.mayAllow(access)) return .not_available;
         try c.ensure(name, null);
-        if (!c.known(name)) return .not_available;
+        if (!c.allows(access, name)) return .not_available;
         tools_feature.validateArguments(arena, arguments_json, .{}) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return .{ .invalid = try arena.print("Invalid arguments for MCP tool {s}: {s}", .{ name, @errorName(err) }) };
@@ -128,7 +128,7 @@ pub const Catalog = struct {
         max_tool_result_bytes: usize,
         options: tool_mcp_runtime.CallOptions,
     ) !?tool_mcp_runtime.CallResult {
-        if (!options.access.allowsTool(c.generation, name)) return error.McpAccessDenied;
+        if (!c.mayAllow(options.access)) return error.McpAccessDenied;
         if (options.expected_binding) |b| if (b.runtime_generation != c.generation) return error.McpAdvertisedToolChanged;
         if (options.expected_runtime_generation) |g| if (g != c.generation) return error.McpAuthorityChanged;
         try c.ensure(name, options.cancel_flag);
@@ -136,6 +136,7 @@ pub const Catalog = struct {
             c.mutex.lockUncancelable(c.io);
             defer c.mutex.unlock(c.io);
             const found = c.findLocked(name) orelse return null;
+            if (!c.allowsLocked(options.access, found.server, name)) return error.McpAccessDenied;
             if (options.expected_binding) |b| {
                 if (!b.sameDefinition(c.bindingLocked(found.server, found.tool.*))) return error.McpAdvertisedToolChanged;
             }
@@ -188,7 +189,7 @@ pub const Catalog = struct {
         for (servers, c.lists, 0..) |s, l, i| {
             if (!searched(request, s) or l.state != .loaded) continue;
             for (l.tools) |*tool| {
-                if (!access.allowsTool(c.generation, tool.prefixed_name)) continue;
+                if (!c.allowsLocked(access, i, tool.prefixed_name)) continue;
                 if (!try tool_search.searchable(scratch.allocator(), permission_rules, s.name, tool)) continue;
                 try candidates.append(scratch.allocator(), .{ .server_name = s.name, .instructions = try c.runtime.instructions(scratch.allocator(), i), .tool = tool, .binding = c.bindingLocked(i, tool.*) });
             }
@@ -234,11 +235,12 @@ pub const Catalog = struct {
         cancel: Cancel,
     ) !?tool_mcp_runtime.ToolSchemaResult {
         if (cancel) |flag| if (flag.load(.acquire)) return error.Cancelled;
-        if (!access.allowsTool(c.generation, name)) return null;
+        if (!c.mayAllow(access)) return null;
         try c.ensure(name, cancel);
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
         const found = c.findLocked(name) orelse return c.whyUnavailableLocked(alloc, name);
+        if (!c.allowsLocked(access, found.server, name)) return null;
         if (permissions.rulesDenyAllTargetsForPermission(permission_rules, name)) return null;
         const instructions = try c.runtime.instructions(alloc, found.server);
         defer if (instructions) |text| alloc.free(text);
@@ -271,7 +273,7 @@ pub const Catalog = struct {
             defer if (instructions) |text| alloc.free(text);
             for (l.tools) |*tool| {
                 if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
-                if (!access.allowsTool(c.generation, tool.prefixed_name)) continue;
+                if (!c.allowsLocked(access, i, tool.prefixed_name)) continue;
                 try loaded.add(alloc, tool.*, instructions, c.bindingLocked(i, tool.*), limits);
             }
         }
@@ -288,10 +290,11 @@ pub const Catalog = struct {
         limits: context_limits.Values,
         access: Access,
     ) !tool_mcp_runtime.DefinitionSnapshot {
-        if (!access.allowsTool(c.generation, name)) return .unavailable;
+        if (!c.mayAllow(access)) return .unavailable;
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
         const found = c.findLocked(name) orelse return .unavailable;
+        if (!c.allowsLocked(access, found.server, name)) return .unavailable;
         if (permissions.rulesDenyAllTargetsForPermission(permission_rules, name)) return .unavailable;
         const current = c.bindingLocked(found.server, found.tool.*);
         if (std.meta.eql(known_binding, current)) return .current;
@@ -330,7 +333,8 @@ pub const Catalog = struct {
         return names.toOwnedSlice(alloc);
     }
 
-    /// What a subagent may use: the tools in the lists the catalog has.
+    /// What a subagent may use: every server its parent may use, whether or
+    /// not its list has loaded, and the tools of the lists already loaded.
     pub fn snapshotAccessView(
         c: *Catalog,
         alloc: Allocator,
@@ -347,10 +351,16 @@ pub const Catalog = struct {
             for (tools.items) |*t| t.deinit(alloc);
             tools.deinit(alloc);
         }
+        var scratch: std.heap.ArenaAllocator = .init(c.gpa);
+        defer scratch.deinit();
+        const statuses = try c.runtime.statuses(scratch.allocator());
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
-        for (c.runtime.servers(), c.lists) |s, l| {
-            if (l.state != .loaded) continue;
+        for (c.runtime.servers(), c.lists, statuses) |s, l, status| {
+            switch (status.state) {
+                .waiting_for_approval, .rejected, .disabled, .unsupported, .missing_env, .invalid_env => continue,
+                else => {},
+            }
             try servers.ensureUnusedCapacity(alloc, 1);
             servers.appendAssumeCapacity(.{
                 .name = try alloc.dupe(u8, s.name),
@@ -360,6 +370,7 @@ pub const Catalog = struct {
                 .catalog_generation = l.generation,
                 .auth_generation = 0,
             });
+            if (l.state != .loaded) continue;
             for (l.tools) |tool| {
                 if (permissions.rulesDenyAllTargetsForPermission(permission_rules, tool.prefixed_name)) continue;
                 try tools.ensureUnusedCapacity(alloc, 1);
@@ -442,6 +453,37 @@ pub const Catalog = struct {
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
         return c.findLocked(name) != null;
+    }
+
+    /// False when `access` can allow nothing here: no MCP, or a subagent's
+    /// view from another host. Checked before a list is loaded.
+    fn mayAllow(c: *const Catalog, access: Access) bool {
+        return switch (access) {
+            .unrestricted => true,
+            .disabled => false,
+            .scoped => |scope| scope.captured.runtime_generation == c.generation,
+        };
+    }
+
+    /// A subagent may use a tool its view lists, or any tool of a server in
+    /// its view. Servers start when first needed, so a list that loads after
+    /// the subagent was made still counts
+    /// (tests/tla/mcp_host/SubagentAccess.tla NotNarrower).
+    fn allowsLocked(c: *const Catalog, access: Access, server: usize, name: []const u8) bool {
+        if (!c.mayAllow(access)) return false;
+        return switch (access) {
+            .scoped => |scope| scope.captured.tool(name) != null or
+                scope.captured.server(c.runtime.servers()[server].name) != null,
+            else => true,
+        };
+    }
+
+    /// `allowsLocked` for a tool in a loaded list; false when none has it.
+    fn allows(c: *Catalog, access: Access, name: []const u8) bool {
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        const found = c.findLocked(name) orelse return false;
+        return c.allowsLocked(access, found.server, name);
     }
 
     fn findLocked(c: *const Catalog, name: []const u8) ?Found {
@@ -722,6 +764,45 @@ const testing = std.testing;
 const Fixture = @import("fake_server.zig").Fixture;
 const lexical_relevance = @import("../shared/lexical_relevance.zig");
 const mcp_contract = @import("../mcp/mcp_contract.zig");
+
+test "a subagent made before its parent's server starts may use the server's tools" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{
+        .{ .name = "fake", .command = f.server },
+        .{ .name = "off", .command = f.server, .enabled = false },
+    };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var c: Catalog = undefined;
+    try c.init(testing.allocator, testing.io, &r, .{});
+    defer c.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Nothing has started `fake` yet; the disabled server stays out.
+    var view = try c.snapshotAccessView(testing.allocator, "child", "parent", .{}, false);
+    defer view.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), view.servers.len);
+    try testing.expectEqualStrings("fake", view.servers[0].name);
+    try testing.expectEqual(@as(usize, 0), view.tools.len);
+    const child: Access = .{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } };
+    try testing.expect(c.hasTool("mcp_fake_echo", child));
+    try testing.expectEqual(c.generation, (try c.validateTool(a, "mcp_fake_echo", "{}", child)).valid);
+    const result = (try c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .access = child })).?;
+    try testing.expectEqual(tool_mcp_runtime.CallStatus.success, result.status);
+
+    // A view from another host allows nothing.
+    var other = try view.clone(testing.allocator);
+    defer other.deinit(testing.allocator);
+    other.runtime_generation +%= 1;
+    const stale: Access = .{ .scoped = .{ .captured = &other, .admission_authority_generation = 0, .live = undefined } };
+    try testing.expect(!c.hasTool("mcp_fake_echo", stale));
+    try testing.expectError(error.McpAccessDenied, c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .access = stale }));
+}
 
 test "an MCP-v2 server's tools reach the model under fx's names" {
     var f: Fixture = undefined;

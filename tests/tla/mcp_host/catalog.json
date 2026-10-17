@@ -45,5 +45,12 @@
     "stress": "SharedLogins.stress.cfg",
     "findings": [],
     "repair": []
+  },
+  {
+    "module": "SubagentAccess",
+    "smoke": "SubagentAccess.cfg",
+    "stress": "SubagentAccess.stress.cfg",
+    "findings": [],
+    "repair": []
   }
 ]
