@@ -117,6 +117,15 @@ runs on its self-tests, on logs fx saved, and on fx's `wiring` debug traces.
 ./trace/selftest.sh                        # the validator must accept and reject
 ```
 
+The Bun drivers in `../drivers/session_manager/` run the real binary and have
+TLC judge each run's saved logs and `wiring` trace: `runtime.test.ts` through
+`fx ask`, and `fork.test.ts` through `/fork` in a terminal, including a fork's
+log against `trace/ForkLog.tla` and planted faults that must be rejected.
+
+```sh
+bun test ../drivers/session_manager/       # from this folder; needs tmux
+```
+
 ## What the models do not cover
 
 - Byte encoding, JSON parsing and line size caps. Those are covered by unit

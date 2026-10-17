@@ -1368,6 +1368,10 @@ const App = struct {
         return SessionAppRuntime.resumeSelectedSession(self);
     }
 
+    pub fn forkBeforeSelectedPrompt(self: *App) ![]u8 {
+        return SessionAppRuntime.forkBeforeSelectedPrompt(self);
+    }
+
     pub fn startSessionCatalogPreload(self: *App) void {
         SessionAppRuntime.preloadSessionCatalog(self);
     }
@@ -4839,6 +4843,8 @@ test {
     _ = @import("gateway/chat_completions_protocol.zig");
     _ = provider_runtime;
     _ = @import("acp/prompt.zig");
+    _ = @import("acp/libfx_hooks.zig");
+    _ = @import("core/mcp_host/model.zig");
     _ = @import("core/output/activity_status.zig");
     _ = @import("core/agent/agent_runtime.zig");
     _ = @import("core/agent/execution_memory.zig");

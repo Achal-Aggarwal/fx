@@ -19,6 +19,9 @@
 - Prompts sent to a busy libfx session queue behind its running turn and start when it finishes.
 - Reusing a libfx `messageId` follows the original turn instead of starting it again.
 - libfx now includes TypeScript types for its public APIs.
+- Pass `hooks` to `createFxAgent()` or `createFxEngine()` to observe model calls, tools, approvals, subagents, and saved-session activity on native and WebAssembly backends. Content capture is opt-in, and callback failures do not interrupt or retry agent work.
+- With `--sessions-v2`, opening a session saved in the previous format converts it together with its subagent sessions. The previous-format files are removed only after the converted sessions are saved.
+- Use `fx --sessions-v2 sessions convert` to convert all sessions saved in the previous format at once.
 - On Vercel, libfx can use deployment OIDC credentials instead of an API key.
 - `createFxEngine()` adds queued follow-ups with `followUp()` and lets you withdraw pending steering with `turn.withdraw()`.
 - `/usage` and `fx usage` now show your provider's usage reports instead of locally recorded usage.
@@ -39,6 +42,8 @@
 - Native libfx reuses HTTP connections between turns without delaying streamed output.
 - libfx shares token refreshes across sessions and supports `refreshLock` for multi-server apps.
 - `@` suggestions reuse a saved workspace index, and file-content searches run in parallel.
+- `@` suggestions rank exact file names, name prefixes, and whole-word matches above scattered letters. Searches can span a file's containing folder and its name, and highlighted letters show the match used to rank it.
+- Short `@` searches and searches with many exact matches return faster. The file picker shows up to 10 rows when the terminal has room.
 - Repeated file searches use less memory during long turns.
 - `grep_files` now searches files larger than 200 KiB and reports when results are incomplete.
 - `ctrl+o` now wraps long commands and tool details instead of cutting them off.
@@ -63,6 +68,8 @@
 - libfx saves each tool result as it finishes, so recovery can reuse completed work.
 - Interrupted libfx tools no longer appear to run forever after recovery. Their events report that the call may have partly run.
 - libfx rejects checkpoints created by a newer version instead of attempting to restore them.
+- A steer that starts a durable libfx turn is no longer applied twice or dropped when it contains images.
+- Cancelling a durable libfx session no longer stops a queued prompt that starts after the cancellation. Steering already assigned to another queued prompt no longer reaches the running turn.
 - Usage totals stay visible when a refresh fails or the local cache becomes unreadable.
 - Gateway requests no longer fail intermittently at startup.
 - libfx rejects invalid host HTTP statuses instead of crashing the process.
@@ -79,6 +86,8 @@
 - Grok token refresh rejects credentials belonging to a different account.
 - libfx sign-in helpers reject pasted callbacks from a different sign-in.
 - Custom libfx endpoints require HTTPS outside localhost.
+- libfx routes queued work to the named agent on the intended store, rather than another store with the same agent name. Use a separate `world()` store for each customer whose sessions must stay separate.
+- libfx ignores queue deliveries that do not refer to an input already saved by the app. A delivery cannot replace that input or its caller context and session settings; apps must still authorize session access and authenticate their queue routes.
 
 ### Breaking Changes
 
@@ -89,6 +98,8 @@
 - Native libfx runs idempotent tools in parallel unless marked `writes: true`. Other tools run alone by default.
 - Images sent to durable libfx sessions must be Base64-encoded. `createFxEngine()` still accepts image files and raw bytes directly.
 - Disconnecting from a durable libfx turn no longer stops it. Use `session.cancel()` or an abort signal.
+- In one process, libfx agents with the same name on the same store must use the same configuration. Creating a conflicting agent throws `FX_AGENT_NAME_IN_USE`; give different configurations separate names or stores.
+- Durable libfx prompts and steers, including their context and session settings, must fit within 8 MiB of JSON. Larger inputs throw `FX_INPUT_TOO_LARGE` before anything is saved.
 - ACP's `code` mode has been replaced by `auto`. Clients should use `auto`, `ask`, or `full-access`.
 - `/cost` has been removed. Use `/usage`.
 - `fx usage --period` now accepts `today`, `7d`, and `month`. The `24h` and `30d` periods have been removed.

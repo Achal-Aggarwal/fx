@@ -4,7 +4,7 @@
 // checks after every step that the code is in a state the model allows.
 //
 //   bun tests/tla/drivers/drive.mjs [send|lookup|write|cutoff|leased|queue] [--walks N] [--seed S] [--backend native|wasm]
-//     [--durability local|world|vercel]
+//     [--durability local|world|vercel] [--hooks]
 //
 // The lookup and cutoff graphs run a lookup, which starts before its intent
 // is stored: the driver holds that intent's record, so the call runs while
@@ -36,7 +36,9 @@
 // graphs/<graph>.dot; the cutoff
 // graph runs lookup with more claims and no freezes, so a step can be cut off
 // at the deadline until the bound stops running it. Each walk
-// starts two agents, A and B, on one local() World directory. Every model
+// starts two agents, A and B, on one World directory, each in a server of its
+// own: a worker thread, session-process.mjs, with its own registry of agents,
+// as another server has, so the two are copies of one agent. Every model
 // request and tool call waits until the driver releases it, and so does each
 // worker's claim on the session, so the driver decides the interleaving: it
 // performs the step the walk chose, waits for the code to settle, reads back
@@ -48,10 +50,9 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createFxAgent } from "../../../sdk/node.js";
-import { local } from "../../../sdk/durable/local.mjs";
-import { holdWrites } from "../../../sdk/tests/hold-writes.mjs";
+import { Worker } from "node:worker_threads";
 import { loadGraph } from "./graph.mjs";
+import { sharedSet, sharedSetBuffer } from "./shared-set.mjs";
 
 const args = process.argv.slice(2);
 const option = (name, fallback) => {
@@ -74,21 +75,14 @@ if (leased !== (durabilityKind === "leased")) throw new Error("the leased graph 
 if ((graphName === "queue") !== (durabilityKind === "queue")) throw new Error("the queue graph runs on its own World, and only it does");
 // How long a leased worker's lease lasts after its last renewal.
 const leaseMs = 1000;
-const leasedWorld = leased ? await (async () => {
-  const { createWorld } = await import(new URL("../../../sdk/durable/node_modules/@workflow/world-local/dist/index.js", import.meta.url).href);
-  const { world } = await import("../../../sdk/durable/world.mjs");
-  return (dir) => world(() => createWorld({ dataDir: dir, recoverActiveRuns: false }), { name: "leased", pollMs: 250, leaseMs });
-})() : null;
 // Vercel's World is a round trip away: settle, wait for streams, and give up
 // on a step later.
 const remote = durabilityKind === "vercel";
 const settleMs = remote ? 1500 : 60;
 const streamQuietMs = remote ? 2500 : 120;
 const stepTimeoutMs = remote ? 30_000 : 5000;
-const { vercelStorage } = remote ? await import("../../../sdk/tests/vercel-storage.mjs") : {};
-const { appWorldAt, closeAppWorlds } = durabilityKind === "world" ? await import("../../../sdk/tests/app-world.mjs") : {};
 const queued = durabilityKind === "queue";
-const { queueWorldAt, closeQueueWorlds } = queued ? await import("../../../sdk/tests/queue-world.mjs") : {};
+const hooks = args.includes("--hooks") || process.env.LIBFX_TEST_HOOKS === "1";
 const verbose = args.includes("--verbose");
 let seed = Number(option("seed", 1));
 const here = fileURLToPath(new URL(".", import.meta.url));
@@ -117,21 +111,12 @@ const view = (state) => JSON.stringify({
 const sameAct = (a, b) => a.name === b.name && a.w === b.w;
 
 // ---------------------------------------------------------------------------
-// The code under test: two agents on one World, with every model request and
-// tool call held until the driver lets it go.
+// The code under test: two agents, each in a server of its own, on one World,
+// with every model request and tool call held until the driver lets it go.
 
 const usage = { inputTokens: { total: 1 }, outputTokens: { total: 1 } };
 const finish = (reason) => ({ type: "finish", finishReason: { unified: reason, raw: reason }, usage });
-const sse = (frames) => new Response(
-  [...frames, "[DONE]"].map((frame) => `data: ${typeof frame === "string" ? frame : JSON.stringify(frame)}\n\n`).join(""),
-  { headers: { "content-type": "text/event-stream" } },
-);
-const toolResults = (prompt) => prompt
-  .flatMap((message) => Array.isArray(message.content) ? message.content : [])
-  .filter((part) => part.type === "tool-result");
 const modeledLines = new Set(["turn_start", "turn_resume", "tool_start", "tool_end", "text_delta", "turn_yield", "turn_end"]);
-const liveHolders = globalThis[Symbol.for("libfx.liveHolders")];
-const durableInternals = Symbol.for("libfx.durableInternals");
 const until = async (check, ms = stepTimeoutMs) => {
   const started = Date.now();
   while (!(await check())) {
@@ -142,62 +127,76 @@ const until = async (check, ms = stepTimeoutMs) => {
 };
 const sleep = (ms) => new Promise((resolveWait) => setTimeout(resolveWait, ms));
 
-// The ids of the calls a session-log record announces, from its stored
-// journal events.
-const intentCallIds = (entry) => {
-  try {
-    const { events } = JSON.parse(Buffer.from(entry.data, "base64").toString("utf8"));
-    return events.filter((event) => event?.type === "tool_intent").flatMap((event) => event.data.map((call) => call.id));
-  } catch {
-    return [];
-  }
-};
+// The lease holders that run, one set for every server, as the agents of one
+// process share libfx's: the driver, as the platform, takes a frozen
+// worker's holders out of it. And the call ids whose first intent was seen,
+// by either server.
+const liveBuffer = sharedSetBuffer();
+const announcedBuffer = sharedSetBuffer();
+const liveHolders = sharedSet(liveBuffer);
+const announced = sharedSet(announcedBuffer);
 
-// The queue as the driver runs it: a message the code asks to have delivered
-// again later, as a backstop, is not, so nothing runs that the driver did not
-// start. One handed back at a deadline still comes back at once.
-function withoutBackstops(durability) {
-  return {
-    ...durability,
-    async world() {
-      const world = await durability.world();
-      return new Proxy(world, {
-        get(target, key) {
-          const value = Reflect.get(target, key);
-          if (key !== "createQueueHandler") return typeof value === "function" ? value.bind(target) : value;
-          return (prefix, handler) => value.call(target, prefix, async (...args) => {
-            const result = await handler(...args);
-            return result?.timeoutSeconds > 0 ? undefined : result;
-          });
-        },
-      });
-    },
-  };
+// The servers, kept across walks. A call to one resolves with its method's
+// result; what its agent reports between calls goes to the walk now open.
+let walkId = 0;
+let report = null;
+let callCount = 0;
+const pending = new Map();
+const servers = {};
+for (const w of Workers) {
+  const server = new Worker(new URL("./session-process.mjs", import.meta.url), {
+    workerData: { w, liveBuffer, announcedBuffer, tool, toolFlags, runsAhead, durabilityKind, leaseMs, streamQuietMs, backend, addon, wasm, hooks },
+    // The hooks fixture turns on with the flag in its own process's argv.
+    ...(hooks ? { argv: ["--hooks"] } : {}),
+  });
+  server.on("message", (message) => {
+    if (message.type !== "result") {
+      if (message.walk === walkId) report?.(w, message);
+      return;
+    }
+    const call = pending.get(message.id);
+    pending.delete(message.id);
+    if (message.error) call?.reject(Object.assign(new Error(message.error.message), { code: message.error.code }));
+    else call?.resolve(message.value);
+  });
+  server.on("error", (error) => {
+    console.error(`FAIL server ${w}: ${error?.stack ?? error}`);
+    process.exit(1);
+  });
+  servers[w] = server;
 }
+const call = (w, method, args = {}) => new Promise((resolveCall, rejectCall) => {
+  callCount += 1;
+  pending.set(callCount, { resolve: resolveCall, reject: rejectCall });
+  servers[w].postMessage({ id: callCount, method, args });
+});
+// A call whose result the driver does not wait for.
+const tell = (w, method, args) => {
+  call(w, method, args).catch((error) => console.error(`server ${w}: ${error.message}`));
+};
 
 async function harness() {
   const dir = await mkdtemp(join(tmpdir(), "libfx-model-"));
+  walkId += 1;
+  // The last walk's agents have closed: no holder runs, and no call was seen.
+  liveHolders.clear();
+  announced.clear();
+  // What each server's agent waits on, as the servers report it.
   const requests = [];
   const calls = [];
   const fenced = { A: 0, B: 0 };
   const holders = { A: [], B: [] };
   const claimed = { A: null, B: null };
   const frozen = { A: false, B: false };
-  // Each worker's claims on the session: a holder's first lease waits until
-  // the driver lets it land.
-  const writes = {};
-  // The renewals a frozen leased worker has not been let to write.
-  const renewals = { A: [], B: [] };
-  // On the queue's World: each agent's queue, and the message a frozen
-  // holder's delivery held, which the queue delivers again.
-  const brokers = {};
+  // Each worker's held writes: its claims on the session, a call's first
+  // intent, and a frozen leased worker's renewals.
+  const held = { A: [], B: [] };
+  // On the queue's World, the message a frozen holder's delivery held, which
+  // the queue delivers again.
   const lapsed = { A: null, B: null };
   let runs = 0;
-  // The execution ids the tool ran under, and the call ids whose first
-  // intent was seen: a rerun announces its call again, and that record is
-  // not held.
+  // The execution ids the tool ran under.
   const executions = new Set();
-  const announced = new Set();
   let modelCalls = 0;
   // Each agent's events, for a failure.
   const events = [];
@@ -206,105 +205,45 @@ async function harness() {
     const index = list.indexOf(entry);
     if (index >= 0) list.splice(index, 1);
   };
-  const agents = {};
-  for (const w of Workers) {
-    const claims = new Set();
-    // A queue-held lease runs to its worker's deadline, ten minutes away.
-    const queueWorld = queued ? await queueWorldAt(dir, { queueLeases: true, maxDurationMs: 600_000 }) : null;
-    if (queueWorld) brokers[w] = queueWorld.broker;
-    const stored = leased ? leasedWorld(dir) : durabilityKind === "world" ? await appWorldAt(dir) : remote ? vercelStorage({ dir }) : queueWorld ? queueWorld.durability : local({ dir });
-    const [durability, held] = holdWrites(withoutBackstops(stored), (entry) => {
-      // The first intent of a call that runs ahead waits for the Intent step.
-      if (entry.k === "record") {
-        if (!runsAhead) return false;
-        const fresh = intentCallIds(entry).filter((id) => !announced.has(id));
-        for (const id of fresh) announced.add(id);
-        return fresh.length > 0;
-      }
-      if (entry.k !== "lease") return false;
-      if (!claims.has(entry.holder)) {
-        claims.add(entry.holder);
-        return true;
-      }
-      if (!frozen[w]) return false;
-      renewals[w].push(entry);
-      return true;
-    });
-    writes[w] = held;
-    agents[w] = createFxAgent({
-      backend,
-      nativeAddon: addon,
-      ...(wasm ? { wasm } : {}),
-      apiKey: "model-key",
-      model: "model/test",
-      async fetch(input, init) {
-        // The WebAssembly host passes a Request, the native one a URL and init.
-        const request = input instanceof Request ? input : new Request(input, init);
-        if (request.method === "GET") return Response.json({ object: "list", data: [{ id: "model/test", type: "language" }] });
-        const prompt = JSON.parse(await request.text()).prompt;
-        const signal = init?.signal ?? request.signal;
-        return new Promise((resolveResponse, rejectResponse) => {
-          const entry = { w, kind: toolResults(prompt).length > 0 ? "model2" : "model1", answer: (frames) => { remove(requests, entry); resolveResponse(sse(frames)); } };
-          requests.push(entry);
-          signal?.addEventListener("abort", () => { remove(requests, entry); rejectResponse(signal.reason ?? new Error("aborted")); }, { once: true });
-        });
-      },
-      tools: [{
-        name: tool,
-        description: { send: "Sends an invoice", write: "Saves a key", lookup: "Looks up a key" }[tool],
-        ...toolFlags,
-        inputSchema: { type: "object", properties: { key: { type: "string" } } },
-        execute: (input, { signal, executionId }) => {
-          runs += 1;
-          executions.add(executionId);
-          return new Promise((resolveCall, rejectCall) => {
-            const entry = { w, end: () => { remove(calls, entry); resolveCall(`value of ${input.key}`); } };
-            calls.push(entry);
-            signal?.addEventListener("abort", () => { remove(calls, entry); rejectCall(signal.reason ?? new Error("aborted")); }, { once: true });
-          });
-        },
-      }],
-      durability,
-      onEvent: (event) => {
-        if (event.type === "session.fenced") fenced[w] += 1;
-        if (!/^(acp|transport)\./.test(event.type)) events.push(`${w}:${event.type}${event.error ? `:${JSON.stringify(event.error)}` : ""}`);
-      },
-    });
-  }
-
-  async function streamLines(cursor = 0) {
-    if (!sessionId) return [];
-    const reader = agents.A.session(sessionId).stream(cursor).getReader();
-    const decoder = new TextDecoder();
-    const lines = [];
-    let buffered = "";
-    for (;;) {
-      let timer;
-      const quiet = new Promise((resolveQuiet) => { timer = setTimeout(() => resolveQuiet({ done: true }), streamQuietMs); });
-      const { value, done } = await Promise.race([reader.read(), quiet]);
-      clearTimeout(timer);
-      if (done) break;
-      buffered += decoder.decode(value, { stream: true });
-      for (let index = buffered.indexOf("\n"); index >= 0; index = buffered.indexOf("\n")) {
-        lines.push(JSON.parse(buffered.slice(0, index)));
-        buffered = buffered.slice(index + 1);
-      }
+  report = (w, message) => {
+    if (message.type === "held") held[w] = message.held;
+    else if (message.type === "request") requests.push({ w, id: message.id, kind: message.kind });
+    else if (message.type === "request-gone") remove(requests, requests.find((entry) => entry.w === w && entry.id === message.id));
+    else if (message.type === "call") {
+      runs += 1;
+      executions.add(message.executionId);
+      calls.push({ w, id: message.id });
+    } else if (message.type === "call-gone") remove(calls, calls.find((entry) => entry.w === w && entry.id === message.id));
+    else if (message.type === "event") {
+      if (message.event === "session.fenced") fenced[w] += 1;
+      if (!/^(acp|transport)\./.test(message.event)) events.push(`${w}:${message.event}${message.error ? `:${message.error}` : ""}`);
     }
-    await reader.cancel().catch(() => {});
-    return lines;
-  }
+  };
+  for (const w of Workers) await call(w, "open", { id: walkId, dir });
+  const answer = (entry, frames) => {
+    remove(requests, entry);
+    tell(entry.w, "answer", { id: entry.id, frames });
+  };
+  const end = (entry) => {
+    remove(calls, entry);
+    tell(entry.w, "end", { id: entry.id });
+  };
+  const leaseHolder = (w) => call(w, "leaseHolder", { sessionId });
+  const liveWorkers = (w) => call(w, "liveWorkers");
+
+  const streamLines = (cursor = 0) => (sessionId ? call("A", "stream", { sessionId, cursor }) : []);
 
   // Where each worker is, by what it waits on. A worker whose claim is held
   // may already wait on its first model request; one whose call's intent is
   // held runs that call ahead of it.
   const position = (w, lines) => {
-    if (writes[w].held.some((entry) => entry.k === "lease" && !renewals[w].includes(entry))) return "early";
+    if (held[w].some((entry) => entry.k === "lease" && !entry.renewal)) return "early";
     if (claimed[w] === null) return "none";
     if (fenced[w] > claimed[w].fenced) return "stopped";
     if (lines.some((line) => line.type === "turn_end" && line.epoch === claimed[w].epoch)) return "done";
     const request = requests.find((entry) => entry.w === w);
     if (request) return request.kind;
-    if (calls.some((entry) => entry.w === w)) return writes[w].held.some((entry) => entry.k === "record") ? "ahead" : "tool";
+    if (calls.some((entry) => entry.w === w)) return held[w].some((entry) => entry.k === "record") ? "ahead" : "tool";
     return "busy";
   };
   const waiting = (w) => requests.some((entry) => entry.w === w) || calls.some((entry) => entry.w === w);
@@ -344,7 +283,7 @@ async function harness() {
       runs,
       ids: executions.size,
       ui: lines.filter((line) => modeledLines.has(line.type)).map((line) => line.epoch ?? 0),
-      ...(leased ? { live: sessionId ? await agents.A[durableInternals].leaseStands(sessionId) : false } : {}),
+      ...(leased ? { live: sessionId ? await call("A", "leaseStands", { sessionId }) : false } : {}),
     };
   }
 
@@ -356,38 +295,36 @@ async function harness() {
       const before = new Set(liveHolders);
       // The queue hands on the message of a worker it gave up on, frozen or
       // woken since, while that worker still holds the session.
-      const head = sessionId ? (await agents[w][durableInternals].lastLease(sessionId))?.holder : null;
+      const head = sessionId ? await leaseHolder(w) : null;
       const handedOn = Workers.find((v) => v !== w && lapsed[v] && holders[v].includes(head));
       if (!sessionId) {
-        const turn = agents[w].session().prompt(`use ${tool}`, { messageId: "turn-1" });
-        void turn.result.catch(() => {});
-        sessionId = (await turn.accepted).sessionId;
+        sessionId = await call(w, "prompt", { text: `use ${tool}`, messageId: "turn-1" });
       } else if (handedOn) {
         // The queue hands the frozen holder's message to w.
-        brokers[w].adopt(lapsed[handedOn]);
+        await call(w, "adopt", { message: lapsed[handedOn] });
         lapsed[handedOn] = null;
       } else {
-        void agents[w].session(sessionId).resume().result.catch(() => {});
+        await call(w, "resume", { sessionId });
       }
-      await until(() => writes[w].held.length > 0);
+      await until(() => held[w].length > 0);
       holders[w] = newHolders(before);
     } else if (name === "Claim") {
       // w's claim lands, and the log says whether it counted. One that did
       // goes on with the turn; a refused one leaves w to read the log again,
       // and to claim again or let the message go.
-      const holder = writes[w].held.filter((entry) => entry.k === "lease").at(-1).holder;
-      const before = new Set(liveHolders);
-      await writes[w].releaseHeld();
+      const landed = await call(w, "claim");
+      assert.ok(landed.holder, `${w} has a claim to land`);
+      const before = new Set(landed.before);
       // A lease the World's in-band fence refused only because a count was
       // still settling goes out again, so the claim has settled once w holds
       // the session, holds a new write, or has let the session go.
-      const holds = async () => (await agents[w][durableInternals].lastLease(sessionId))?.holder === holder;
-      await until(async () => (await holds()) || writes[w].held.length > 0 || agents[w][durableInternals].liveWorkers() === 0);
+      const holds = async () => (await leaseHolder(w)) === landed.holder;
+      await until(async () => (await holds()) || held[w].length > 0 || (await liveWorkers(w)) === 0);
       if (await holds()) {
         claimed[w] = { fenced: fenced[w], epoch: expectedEpoch };
         await until(() => waiting(w) || stopped());
       } else {
-        await until(() => writes[w].held.length > 0 || agents[w][durableInternals].liveWorkers() === 0);
+        await until(async () => held[w].length > 0 || (await liveWorkers(w)) === 0);
         holders[w] = newHolders(before);
         claimed[w] = null;
       }
@@ -395,7 +332,7 @@ async function harness() {
       const request = requests.find((entry) => entry.w === w);
       assert.ok(request, `${w} has a model request to answer`);
       // A response that calls the tool names a new call id, as a model's does.
-      request.answer(name === "Model1"
+      answer(request, name === "Model1"
         ? [{ type: "tool-call", toolCallId: `call-${(modelCalls += 1)}`, toolName: tool, input: { key: "alpha" } }, finish("tool-calls")]
         : [{ type: "text-delta", id: "answer", delta: "done" }, finish("stop")]);
       if (name === "Model1") await until(() => calls.some((entry) => entry.w === w) || stopped());
@@ -404,40 +341,39 @@ async function harness() {
       // The intent of w's call that ran ahead lands. Where w still heads the
       // chain its call goes on; where it was replaced the write is refused,
       // and w stops.
-      await writes[w].releaseHeld();
-      const head = (await agents[w][durableInternals].lastLease(sessionId))?.holder;
+      await call(w, "releaseHeld");
+      const head = await leaseHolder(w);
       if (!holders[w].includes(head)) await until(() => stopped());
     } else if (name === "ToolEnd") {
-      const call = calls.find((entry) => entry.w === w);
-      assert.ok(call, `${w} has a tool call to end`);
-      call.end();
-      await until(() => requests.some((entry) => entry.w === w && entry.kind === "model2") || stopped());
+      const entry = calls.find((item) => item.w === w);
+      assert.ok(entry, `${w} has a tool call to end`);
+      end(entry);
+      await until(() => requests.some((item) => item.w === w && item.kind === "model2") || stopped());
     } else if (name === "Freeze") {
       // The platform gives up on w: its lease no longer counts as alive. A
       // leased worker's renewals are held until its lease runs out.
-      for (const holder of holders[w]) liveHolders.delete(holder);
       frozen[w] = true;
+      await call(w, "freeze");
+      for (const holder of holders[w]) liveHolders.delete(holder);
       if (leased) await sleep(leaseMs + 400);
       // On the queue's World, the queue gives up on w's delivery; once w
       // holds the lease, the message comes back for the next Start.
-      if (queued && holders[w].includes((await agents[w][durableInternals].lastLease(sessionId))?.holder)) {
-        lapsed[w] = brokers[w].held((input) => input.sessionId === sessionId).filter((message) => message.attempt > 0).at(-1) ?? null;
+      if (queued && holders[w].includes(await leaseHolder(w))) {
+        lapsed[w] = await call(w, "lapsed", { sessionId });
       }
     } else if (name === "Wake") {
       frozen[w] = false;
-      if (leased && renewals[w].length > 0) {
-        // Its held renewals land: they keep its lease, or fence it out, and
-        // a worker fenced out stops its turn.
-        renewals[w] = [];
-        await writes[w].releaseHeld();
-        const head = (await agents[w][durableInternals].lastLease(sessionId))?.holder;
+      // On the leased World its held renewals land: they keep its lease, or
+      // fence it out, and a worker fenced out stops its turn.
+      if (await call(w, "wake", { leased })) {
+        const head = await leaseHolder(w);
         if (claimed[w] && !holders[w].includes(head)) await until(() => stopped());
       }
     } else if (name === "Deadline") {
       // w's timer fires: it stops, and the same message comes back to it.
       const before = new Set(liveHolders);
       const fencedBefore = fenced[w];
-      agents[w][durableInternals].stopAtDeadline(sessionId);
+      await call(w, "stopAtDeadline", { sessionId });
       const reclaimed = () => [...liveHolders].some((holder) => !before.has(holder));
       // The same message comes back to w, and its claim lands at once. Past
       // the bound, the step is not run again: a model request ends the turn.
@@ -446,9 +382,9 @@ async function harness() {
       const ended = async () => (await streamLines()).some((line) => line.type === "turn_end" && line.epoch === expectedEpoch);
       let took = false;
       await until(async () => {
-        if (writes[w].held.length > 0) writes[w].releaseHeld();
+        if (held[w].length > 0) await call(w, "releaseHeld", { settle: false });
         if (reclaimed()) took = true;
-        if (writes[w].held.length > 0) return false;
+        if (held[w].length > 0) return false;
         if (took && waiting(w)) return true;
         if (await ended()) return (took = true);
         return fenced[w] > fencedBefore;
@@ -463,12 +399,8 @@ async function harness() {
   }
 
   async function close() {
-    for (const w of Workers) writes[w].release();
-    for (const entry of [...requests]) entry.answer([{ type: "error", errorText: "walk over" }]);
-    for (const entry of [...calls]) entry.end();
-    await Promise.race([Promise.all(Workers.map((w) => agents[w].close().catch(() => {}))), sleep(3000)]);
-    await closeAppWorlds?.();
-    await closeQueueWorlds?.();
+    await Promise.all(Workers.map((w) => call(w, "close").catch(() => {})));
+    report = null;
     await rm(dir, { recursive: true, force: true });
   }
 
@@ -478,7 +410,7 @@ async function harness() {
     return [
       `  stream: ${lines.map((line) => `${line.type}:e${line.epoch ?? 0}${line.toolCallId ? `:${line.toolCallId}` : ""}`).join(" ")}`,
       ...lines.filter((line) => line.type === "turn_end").map((line) => `  ${JSON.stringify(line).slice(0, 400)}`),
-      `  waiting: requests ${JSON.stringify(requests.map((entry) => `${entry.w}:${entry.kind}`))}, calls ${JSON.stringify(calls.map((entry) => entry.w))}, held ${JSON.stringify(Object.fromEntries(Workers.map((w) => [w, writes[w].held.map((entry) => entry.k)])))}, fenced ${JSON.stringify(fenced)}`,
+      `  waiting: requests ${JSON.stringify(requests.map((entry) => `${entry.w}:${entry.kind}`))}, calls ${JSON.stringify(calls.map((entry) => entry.w))}, held ${JSON.stringify(Object.fromEntries(Workers.map((w) => [w, held[w].map((entry) => entry.k)])))}, fenced ${JSON.stringify(fenced)}`,
       `  events: ${events.slice(-30).join(" ")}`,
     ].join("\n");
   }
@@ -585,6 +517,16 @@ for (let walk = 1; walk <= walks; walk += 1) {
   }
   if (process.exitCode) break;
   if (walk % 25 === 0 || walk === walks) console.log(`${walk} walks, ${steps} steps, ${covered.size} of ${totalEdges} edges`);
+}
+// With --hooks, every server's observer must have seen events and no error,
+// as sdk/tests/hooks-fixture.mjs checks at the exit of one process.
+if (hooks && !process.exitCode) {
+  const seen = await Promise.all(Workers.map((w) => call(w, "hooksSeen")));
+  const errors = seen.flatMap((counts) => counts.errors);
+  if (errors.length > 0 || seen.every((counts) => counts.events === 0)) {
+    console.error(`FAIL hooks: ${errors.length > 0 ? errors.join("\n") : "hooks-enabled conformance run observed no events"}`);
+    process.exitCode = 1;
+  }
 }
 if (!process.exitCode) console.log(`ok ${graphName}: ${walks} walks, ${steps} steps matched the model; ${covered.size} of ${totalEdges} edges covered (${backend})`);
 // An agent a failed walk left mid-turn keeps timers alive; nothing more runs.
