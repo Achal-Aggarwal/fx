@@ -4,7 +4,7 @@
 // checks after every step that the code is in a state the model allows.
 //
 //   bun tests/tla/drivers/drive-steer.mjs [ideal|faults] [--walks N] [--seed S]
-//     [--backend native|wasm] [--durability local|world] [--verbose]
+//     [--backend native|wasm] [--durability local|world] [--verbose] [--hooks]
 //
 // `tests/tla/sdk/check.sh` model-checks the spec and writes its
 // graphs/steer-<graph>.dot. The
@@ -27,6 +27,7 @@ import { fileURLToPath } from "node:url";
 import { createFxAgent } from "../../../sdk/node.js";
 import { local } from "../../../sdk/durable/local.mjs";
 import { loadGraph } from "./graph.mjs";
+import { testHooks } from "../../../sdk/tests/hooks-fixture.mjs";
 
 const args = process.argv.slice(2);
 const option = (name, fallback) => {
@@ -139,6 +140,7 @@ async function harness() {
   const stored = durabilityKind === "world" ? await appWorldAt(dir) : local({ dir });
   const durability = gatedDeliveries(stored, gate);
   const agent = createFxAgent({
+    ...(testHooks ? { hooks: testHooks } : {}),
     backend,
     nativeAddon: addon,
     ...(wasm ? { wasm } : {}),
