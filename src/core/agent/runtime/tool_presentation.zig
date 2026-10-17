@@ -14,7 +14,7 @@ const debug_trace = @import("../../shared/debug_trace.zig");
 const diff = @import("../../output/diff.zig");
 const file_mutation_contract = @import("../../tooling/file_mutation_contract.zig");
 const tool_result_errors = @import("../../tooling/tool_result_errors.zig");
-const read_tool_result = @import("../../../tools/session/read_tool_result.zig");
+const read_result_presentation = @import("../../tooling/read_tool_result_presentation.zig");
 const command_result_mapping = if (@import("builtin").is_test)
     @import("../../tooling/command_result_mapping.zig")
 else
@@ -887,11 +887,11 @@ pub fn readToolResultDisplayTarget(
 ) !?[]const u8 {
     const spec = registry.lookup(call.name) orelse return null;
     if (spec.executor_kind != .read_tool_result) return null;
-    const source = if (try read_tool_result.requestedHandle(arena, call.arguments_json)) |handle|
+    const source = if (try read_result_presentation.requestedHandle(arena, call.arguments_json)) |handle|
         try sources.find(arena, handle)
     else
         null;
-    return try read_tool_result.displayTarget(arena, call.arguments_json, source);
+    return try read_result_presentation.displayTarget(arena, call.arguments_json, source);
 }
 
 test "read_tool_result rows name the earlier call whose output they read" {
