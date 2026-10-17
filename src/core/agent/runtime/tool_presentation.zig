@@ -753,7 +753,7 @@ pub fn fileMutationDisplayPath(
 }
 
 /// The handles under which a tool result keeps its full output or images.
-pub fn savedOutputHandles(
+fn savedOutputHandles(
     output_handle: ?[]const u8,
     tool_image_handle: ?[]const u8,
     command_output_replay: ?types.CommandOutputReplay,

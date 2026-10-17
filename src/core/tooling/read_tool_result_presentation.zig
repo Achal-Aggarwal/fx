@@ -12,7 +12,7 @@ const max_query_label_bytes = 60;
 
 /// A handle as `validate` resolves it: without surrounding whitespace, plus
 /// the `.txt` a stored result or image handle may omit.
-pub const HandleNormalization = struct {
+const HandleNormalization = struct {
     trimmed: []const u8,
     suffix: []const u8,
 };

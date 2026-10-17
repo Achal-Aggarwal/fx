@@ -977,13 +977,17 @@ fn handleRestoreSession(
             }
             if (previous_host) |h| h.destroy();
             server.enableSubagentHost(state);
+            // One map, so a recovered read can name a call from an earlier turn.
+            var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
+            defer sources.deinit(alloc);
             if (kind.replaysHistory()) {
-                try sendActiveHistoryUpdates(state, alloc, session_id);
+                try sendActiveHistoryUpdates(state, alloc, session_id, &sources);
             }
             try sendPendingRecoveryUpdate(
                 state,
                 alloc,
                 session_id,
+                &sources,
                 if (active.writable) |*writable| writable.state.recovery_checkpoint else null,
             );
             try sendActiveSessionInfoUpdate(state, alloc);
@@ -1143,13 +1147,17 @@ fn handleRestoreSession(
     session_rt_owned = false;
     session_mcp_owned = false;
     session_host_owned = false;
+    // One map, so a recovered read can name a call from an earlier turn.
+    var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
+    defer sources.deinit(alloc);
     if (kind.replaysHistory()) {
-        try sendActiveHistoryUpdates(state, alloc, session_id);
+        try sendActiveHistoryUpdates(state, alloc, session_id, &sources);
     }
     try sendPendingRecoveryUpdate(
         state,
         alloc,
         session_id,
+        &sources,
         if (state.active_session.?.writable) |*value| value.state.recovery_checkpoint else null,
     );
     try sendActiveSessionInfoUpdate(state, alloc);
@@ -1296,13 +1304,12 @@ fn sendPendingRecoveryUpdate(
     state: *server.ServerState,
     alloc: Allocator,
     session_id: []const u8,
+    sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
     checkpoint: ?session_codec.RecoveryCheckpoint,
 ) !void {
     const recovery = checkpoint orelse return;
     try sendUserHistoryTurn(state, alloc, session_id, recovery.user);
-    var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
-    defer sources.deinit(alloc);
-    try sendExecutionHistory(state, alloc, session_id, &sources, recovery.execution);
+    try sendExecutionHistory(state, alloc, session_id, sources, recovery.execution);
     if (recovery.assistant_source.len > 0) {
         try sendAgentHistoryChunk(state, alloc, session_id, recovery.assistant_source);
     }
@@ -1887,10 +1894,13 @@ fn parseListCursor(raw: []const u8) !session_store.ResumableSessionContinuation 
     return .{ .updated_at_ms = updated_at_ms, .id = id };
 }
 
-fn sendActiveHistoryUpdates(state: *server.ServerState, alloc: Allocator, session_id: []const u8) !void {
+fn sendActiveHistoryUpdates(
+    state: *server.ServerState,
+    alloc: Allocator,
+    session_id: []const u8,
+    sources: *runtime_tool_presentation.ReplayedSavedOutputSources,
+) !void {
     const active = &state.active_session.?;
-    var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
-    defer sources.deinit(alloc);
     if (active.store) |store| {
         const Visitor = struct {
             state: *server.ServerState,
@@ -1902,7 +1912,7 @@ fn sendActiveHistoryUpdates(state: *server.ServerState, alloc: Allocator, sessio
                 try sendHistoryTurnAsUpdates(self.state, self.alloc, self.session_id, self.sources, turn);
             }
         };
-        var visitor = Visitor{ .state = state, .alloc = alloc, .session_id = session_id, .sources = &sources };
+        var visitor = Visitor{ .state = state, .alloc = alloc, .session_id = session_id, .sources = sources };
         return store.visitConversationHistory(alloc, session_id, &visitor);
     }
     // Every saved turn, as v1 replays it, not only those in memory.
@@ -1917,11 +1927,11 @@ fn sendActiveHistoryUpdates(state: *server.ServerState, alloc: Allocator, sessio
                 try sendHistoryTurnAsUpdates(self.state, self.alloc, self.session_id, self.sources, turn);
             }
         };
-        var visitor = Visitor{ .state = state, .alloc = alloc, .session_id = session_id, .sources = &sources };
+        var visitor = Visitor{ .state = state, .alloc = alloc, .session_id = session_id, .sources = sources };
         return v2.visitHistory(alloc, &visitor);
     }
     for (active.session_rt.agent.history.items) |turn| {
-        try sendHistoryTurnAsUpdates(state, alloc, session_id, &sources, turn);
+        try sendHistoryTurnAsUpdates(state, alloc, session_id, sources, turn);
     }
 }
 
@@ -3064,6 +3074,65 @@ test "execution replay titles reads with the call whose saved output they read" 
     var later_steps = [_]types.ToolExecutionStep{.{ .tool_calls = later_calls[0..] }};
     const later = try planExecutionReplay(arena, registry, null, null, replay_sources, .{ .tool_steps = later_steps[0..] });
     try std.testing.expectEqualStrings("Reading more output from zig build test", later[0].tool_call.title);
+}
+
+test "ACP load titles a recovered read with the call from an earlier turn" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(workspace);
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "history.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initAcpSessionTestState(arena, workspace, capture);
+    defer state.deinit();
+
+    const replay = "fx-command-replay-0123.bin";
+    var run_calls = [_]types.ToolCall{
+        .{ .id = "run", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"zig build test\"}" },
+    };
+    var run_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("run"),
+        .tool_name = @constCast("shell"),
+        .status = .success,
+        .output = @constCast("{\"exit_code\":0}"),
+        .output_bytes = 15,
+        .stored_output_bytes = 15,
+        .command_output_replay = .{ .available = .{ .handle = replay, .framed_bytes = 64 } },
+    }};
+    var run_steps = [_]types.ToolExecutionStep{.{ .tool_calls = run_calls[0..], .tool_results = run_results[0..] }};
+    var read_calls = [_]types.ToolCall{
+        .{ .id = "read", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"" ++ replay ++ "\",\"query\":\"error:\"}}" },
+    };
+    var read_steps = [_]types.ToolExecutionStep{.{ .tool_calls = read_calls[0..] }};
+
+    var sources: runtime_tool_presentation.ReplayedSavedOutputSources = .{};
+    defer sources.deinit(arena);
+    try sendHistoryTurnAsUpdates(&state, arena, "session-1", &sources, .{ .assistant = .{
+        .user = .{ .text = @constCast("run the tests") },
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = run_steps[0..] },
+    } });
+    try sendPendingRecoveryUpdate(&state, arena, "session-1", &sources, .{
+        .turn_id = 2,
+        .user = .{ .text = @constCast("find the failure") },
+        .assistant_source = @constCast(""),
+        .execution = .{ .tool_steps = read_steps[0..] },
+        .cause = .response_interrupted,
+        .action = .paused,
+        .authority = .{ .provider = .gateway, .model = @constCast("test-model") },
+        .requested_fast_mode = false,
+        .fast_mode = false,
+        .max_provider_attempts = 1,
+        .consumed_provider_attempts = 1,
+    });
+
+    const captured = try readCaptured(&capture, alloc);
+    defer alloc.free(captured);
+    try std.testing.expect(std.mem.find(u8, captured, "Searching zig build test output for \\\"error:\\\"") != null);
 }
 
 test "ACP load maps one-off child denial to invalid params" {
