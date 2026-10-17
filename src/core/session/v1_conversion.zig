@@ -636,7 +636,8 @@ const FrameReader = struct {
     /// it rather than be copied.
     fn readAll(reader: *FrameReader) !void {
         const io = io_mod.getIo();
-        var file = reader.dir.dir.openFile(io, "events.jsonl", .{ .follow_symlinks = false }) catch |err| switch (err) {
+        // Never waits on a FIFO or other special file put in its place.
+        var file = io_mod.openExistingReadOnlyRegularFile(reader.dir.dir, "events.jsonl", .no_follow) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return reader.problem.set("events.jsonl can't be opened ({s})", .{@errorName(err)}),
         };
@@ -977,7 +978,7 @@ pub fn fingerprintOf(a: Allocator, dir: *io_mod.VerifiedDir) ![64]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     var buffer: [64 * 1024]u8 = undefined;
     for (names.items) |name| {
-        var file = dir.dir.openFile(io, name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        var file = io_mod.openExistingReadOnlyRegularFile(dir.dir, name, .no_follow) catch |err| switch (err) {
             error.FileNotFound => continue,
             else => return err,
         };
@@ -1074,7 +1075,7 @@ pub fn emptyTrash(alloc: Allocator, store: *session_store.Store) void {
 // Helpers
 
 fn readFileIfPresent(a: Allocator, dir: *io_mod.VerifiedDir, name: []const u8, max_bytes: usize) !?[]u8 {
-    var file = dir.dir.openFile(io_mod.getIo(), name, .{ .follow_symlinks = false }) catch |err| switch (err) {
+    var file = io_mod.openExistingReadOnlyRegularFile(dir.dir, name, .no_follow) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };

@@ -311,18 +311,14 @@ const AcpContext = struct {
     ) !void {
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeModelRecoveryInfoUpdate(
-            &out.writer,
-            status,
-            self.state.active_session.?.writable != null,
-        );
+        try acp_types.writeModelRecoveryInfoUpdate(&out.writer, status);
         try self.sendUpdate(out.writer.buffered());
     }
 
     fn clearModelRecoveryStatus(self: *AcpContext) !void {
         var out: std.Io.Writer.Allocating = .init(self.alloc);
         defer out.deinit();
-        try acp_types.writeModelRecoveryInfoUpdate(&out.writer, null, false);
+        try acp_types.writeModelRecoveryInfoUpdate(&out.writer, null);
         try self.sendUpdate(out.writer.buffered());
     }
 
@@ -339,15 +335,8 @@ const AcpContext = struct {
     /// before its server reconnects. A failure costs only replay detail.
     fn rememberToolIdentity(self: *AcpContext, name: []const u8, identity: mcp_runtime.McpRuntime.ToolIdentity) void {
         const session = if (self.state.active_session) |*active| active else return;
-        // A v2 session keeps the record as a setting (D46).
-        const target: tool_call_identities.Target = if (session.v2) |v2| .{ .v2 = v2 } else blk: {
-            const writable = if (session.writable) |*value| value else break :blk .none;
-            const capability = writable.childCapability() catch |err| {
-                debug_trace.logf("acp", "tool identity kept in memory only tool={s} err={s}", .{ name, @errorName(err) });
-                break :blk .none;
-            };
-            break :blk .{ .capability = capability };
-        };
+        // The session keeps the record as a setting (D46).
+        const target: tool_call_identities.Target = if (session.v2) |v2| .{ .v2 = v2 } else .none;
         session.tool_identities.remember(self.state.alloc, target, name, identity) catch |err| {
             debug_trace.logf("acp", "tool identity not recorded for replay tool={s} err={s}", .{ name, @errorName(err) });
         };
@@ -859,11 +848,6 @@ pub fn handlePrompt(
     const session = if (state.active_session) |*active| active else return .{
         .rpc_error = no_active_session_rpc_error,
     };
-    {
-        session.session_write_mutex.lockUncancelable(io_mod.getIo());
-        defer session.session_write_mutex.unlock(io_mod.getIo());
-        if (session.writable) |*loaded| try loaded.requireWritable();
-    }
     if (!try server.selectCredentialForProvider(state, session.provider)) {
         return .{ .rpc_error = .{
             .code = ErrorCode.invalid_request,
@@ -891,13 +875,6 @@ pub fn handlePrompt(
 
     var prior_image_catalog = try session.session_rt.snapshotImageCatalog(alloc, &.{});
     defer types.freeImageAttachmentSlice(alloc, prior_image_catalog);
-    if (session.writable) |writable| {
-        if (writable.state.recovery_checkpoint) |checkpoint| {
-            const merged = try session_runtime.merge_image_catalog_history_turn(alloc, prior_image_catalog, checkpoint.interruptedTurn());
-            types.freeImageAttachmentSlice(alloc, prior_image_catalog);
-            prior_image_catalog = merged;
-        }
-    }
     // A journaled session's open turn carries the images it was given.
     if (session.journal) |journal| {
         if (journal.pending_resume) |pending| {
@@ -915,7 +892,7 @@ pub fn handlePrompt(
     ) catch |err| return promptInputFailure(err);
     defer prompt_input.deinit(alloc);
     if (prompt_input.pending_images.len > 0) {
-        if (session.store == null and session.wasm_state == null and session.v2 == null) {
+        if (session.wasm_state == null and session.v2 == null) {
             // libfx kernel session: images stay in memory and ride the kernel
             // checkpoint, so no filesystem snapshot backend is needed.
             if (!fitsLibfxPrompt(prompt_input.pending_images)) return promptInputFailure(error.PromptImagesTooLarge);
@@ -926,18 +903,13 @@ pub fn handlePrompt(
             if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
             var temporary_snapshot_dir: ?[]u8 = null;
             defer if (temporary_snapshot_dir) |path| alloc.free(path);
-            // A v2 session captures into a temporary folder, then keeps the
-            // bytes inside the turn (D44).
-            const snapshot_dir = try session_store.imageSnapshotStorageDir(
-                alloc,
-                if (session.v2 != null) null else if (session.store) |store| store.sessions_dir else null,
-                if (session.v2 == null and session.store != null) session.session_id else null,
-                &temporary_snapshot_dir,
-            );
+            // Captured into a temporary folder; the turn keeps the bytes
+            // (D44).
+            const snapshot_dir = try session_store.imageSnapshotStorageDir(alloc, null, null, &temporary_snapshot_dir);
             defer alloc.free(snapshot_dir);
             prompt_input.captureImages(alloc, snapshot_dir) catch |err|
                 return promptInputFailure(err);
-            if (session.v2 != null) image_attachments.inlineCapturedSnapshots(alloc, prompt_input.images) catch |err|
+            image_attachments.inlineCapturedSnapshots(alloc, prompt_input.images) catch |err|
                 return promptInputFailure(err);
         }
     }
@@ -1033,30 +1005,17 @@ pub fn handlePrompt(
             }, ctx.observer);
         };
     } else if (prompt_input.continue_recovery) {
-        const writable = if (session.writable) |*value| value else return .{
+        return .{
             .rpc_error = .{
                 .code = ErrorCode.invalid_params,
                 .message = "This session does not support durable recovery",
             },
         };
-        const checkpoint = writable.state.recovery_checkpoint orelse return .{
-            .rpc_error = .{
-                .code = ErrorCode.invalid_params,
-                .message = "No paused model response to continue",
-            },
-        };
-        recovery_checkpoint = try checkpoint.dupe(alloc);
     } else if (session.journal) |*journal| {
         // A new prompt instead of a resume ends the open turn as interrupted.
         if (journal.pending_resume) |pending| {
             try persistAcpHistoryTurn(alloc, session, pending.interruptedTurn(), null, null);
             journal.dropPendingResume(state.alloc);
-        }
-    } else if (session.writable) |*writable| {
-        if (writable.conversation_writer.turn_open) {
-            const checkpoint = writable.state.recovery_checkpoint orelse
-                return error.InvalidRecoveryCheckpoint;
-            try persistAcpHistoryTurn(alloc, session, checkpoint.interruptedTurn(), null, null);
         }
     }
 
@@ -1159,11 +1118,6 @@ pub fn handlePrompt(
     // A turn whose completions report no tokens sends no `usage_update`.
     session.context_used.store(0, .release);
     const deps = agentRuntimeDeps(&ctx);
-    const current_prompt_is_root_authority = if (session.writable) |writable|
-        writable.external_prompt_origin == .persistent_child and
-            recovery_checkpoint == null
-    else
-        false;
     var dynamic_tool_arena = std.heap.ArenaAllocator.init(alloc);
     defer dynamic_tool_arena.deinit();
     const initial_dynamic_tools = try initialDynamicTools(&ctx, dynamic_tool_arena.allocator());
@@ -1174,10 +1128,10 @@ pub fn handlePrompt(
         .advertised_tool_names = tool_projection.advertised_names,
         .advertised_functions = tool_projection.advertised_functions,
         .custom_tool_guidance = tool_projection.custom_guidance,
-    }, current_prompt_is_root_authority);
+    });
     agent_config.session_child_capability = sessionChildCapability(session);
     maybeStartAcpTitleTask(state, session, owned_prompt, recovery_checkpoint != null, ctx.observer);
-    defer if (session.title_task != null) completeAcpTitleTask(state, session, alloc);
+    defer if (session.title_task != null) completeAcpTitleTask(state, session);
     agent_runtime.processAgentPrompt(&session.session_rt.agent, &deps, null, .{
         .view = state.lifecycle_view,
         .scope = .{
@@ -1213,7 +1167,7 @@ pub fn handlePrompt(
     };
     try endJournalTurn(alloc, state.alloc, session);
     prompt_input.retainImageSnapshots();
-    completeAcpTitleTask(state, session, alloc);
+    completeAcpTitleTask(state, session);
     try sessions.sendActiveSessionInfoUpdate(state, alloc);
     try sessions.sendActiveSessionUsageUpdate(state, alloc);
 
@@ -1244,7 +1198,7 @@ fn maybeStartAcpTitleTask(
     if (!state.session_titles or recovery) return;
     if (session.title_task != null) return;
     if (session.session_rt.agent.history.items.len != 0) return;
-    const session_id = if (session.writable) |*value| value.active_id else if (session.v2) |v2| v2.id() else return;
+    const session_id = if (session.v2) |v2| v2.id() else return;
     const bundle = state.cfg.provider_set.select(session.provider);
     const title_model = bundle.title_model orelse return;
     const agent_stream = bundle.agent_stream orelse return;
@@ -1271,7 +1225,7 @@ fn maybeStartAcpTitleTask(
 
 /// Joins the bounded title task and installs the generated title unless the
 /// session already carries a user-set title. No-op without a pending task.
-fn completeAcpTitleTask(state: *server.ServerState, session: *server.ActiveSessionState, alloc: Allocator) void {
+fn completeAcpTitleTask(state: *server.ServerState, session: *server.ActiveSessionState) void {
     _ = state;
     const task = session.title_task orelse return;
     session.title_task = null;
@@ -1291,19 +1245,6 @@ fn completeAcpTitleTask(state: *server.ServerState, session: *server.ActiveSessi
             return;
         };
         if (installed) debug_trace.logf("session", "event=title_generation_apply result=installed session={s}", .{task.session_id});
-        return;
-    }
-    const writable = if (session.writable) |*value| value else return;
-    if (!std.mem.eql(u8, writable.active_id, task.session_id)) {
-        debug_trace.logf("session", "event=title_generation_apply result=dropped reason=session_changed session={s}", .{task.session_id});
-        return;
-    }
-    const installed = session_title_generation.installGeneratedTitle(alloc, writable, session.session_rt.agent.history.items, title) catch |err| {
-        debug_trace.logf("session", "event=title_generation_apply result=failed session={s} err={s}", .{ task.session_id, @errorName(err) });
-        return;
-    };
-    if (installed) {
-        debug_trace.logf("session", "event=title_generation_apply result=installed session={s}", .{task.session_id});
     }
 }
 
@@ -1454,7 +1395,6 @@ fn buildAgentConfig(
     state: *server.ServerState,
     session: *server.ActiveSessionState,
     sections: AgentConfigSections,
-    current_prompt_is_external: bool,
 ) agent_runtime.Config {
     return .{
         .system_prompt = state.cfg.prompt_policy.systemPromptFor(state.terminal_ui),
@@ -1478,23 +1418,6 @@ fn buildAgentConfig(
         .first_call_tool_choice = session.first_call_tool_choice,
         .workspace_root = state.workspace_root,
         .access_scope = state.workspace_access.scope(state.workspace_root),
-        .origin = if (session.writable) |writable|
-            if (writable.external_prompt_origin == .persistent_child) .subagent else .root
-        else
-            .root,
-        .root_user_messages = if (session.writable) |writable|
-            writable.external_root_user_messages
-        else
-            &.{},
-        .root_user_evidence_complete = if (session.writable) |writable|
-            writable.external_root_user_evidence_complete
-        else
-            false,
-        .current_prompt_is_root_authority = if (session.writable) |writable|
-            writable.external_prompt_origin == .persistent_child and
-                current_prompt_is_external
-        else
-            false,
         .enforce_response_language = !state.cfg.minimal_kernel,
         .context_limits = state.context_limits,
     };
@@ -1974,7 +1897,6 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .ctx = @ptrCast(ctx),
         .observer = ctx.observer,
         .agent_stream_provider = server.streamProviderFor(ctx.state, ctx.state.active_session.?.provider),
-        .confirm_session_writer = confirmSessionWriter,
         .report_usage = reportUsage,
         .flush_assistant_stream_per_content_chunk = host_target.is_wasm,
         .render_assistant_text = false,
@@ -2012,12 +1934,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         else
             null,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
-        .recovery_checkpoint = if (session.writable != null)
-            .{
-                .set = setRecoveryCheckpoint,
-                .clear = clearRecoveryCheckpoint,
-            }
-        else if (session.journal != null)
+        .recovery_checkpoint = if (session.journal != null)
             .{
                 .set = setJournalProgress,
                 .clear = clearJournalProgress,
@@ -2200,18 +2117,6 @@ fn refreshGatewayCredential(
 fn promptSession(ctx: *AcpContext) ?*server.ActiveSessionState {
     const active = if (ctx.state.active_session) |*session| session else return null;
     return if (std.mem.eql(u8, active.session_id, ctx.session_id)) active else null;
-}
-
-/// Fails when this process no longer owns the prompt's saved session,
-/// without writing. Sessions v2 hold the session's lock, and an unsaved
-/// session has no writer to lose.
-fn confirmSessionWriter(raw_ctx: *anyopaque) anyerror!void {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const active = promptSession(ctx) orelse return;
-    active.session_write_mutex.lockUncancelable(io_mod.getIo());
-    defer active.session_write_mutex.unlock(io_mod.getIo());
-    if (active.v2 != null) return;
-    if (active.writable) |*writable| try writable.confirmWriter();
 }
 
 fn reportUsage(raw_ctx: *anyopaque, usage: types.Usage) void {
@@ -2976,9 +2881,8 @@ fn commitCancelledJournalTurn(alloc: Allocator, session_alloc: Allocator, sessio
 }
 
 fn sessionChildCapability(session: *server.ActiveSessionState) ?*session_child_store.SessionChildCapability {
-    if (session.writable) |*writable| return writable.childCapability() catch null;
-    if (session.v2) |v2| return v2.childCapability() catch null;
-    return null;
+    const v2 = session.v2 orelse return null;
+    return v2.childCapability() catch null;
 }
 
 /// `hand_back_alloc`, set when the running turn ends, owns its queued
@@ -3021,32 +2925,11 @@ fn persistAcpHistoryTurn(
         if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
         return;
     }
-    const writable = if (session.writable) |*value| value else {
-        session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
-        prepared_owned = false;
-        if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
-        try keepImageWindow(alloc, session);
-        return;
-    };
-    try writable.prepareHistoryTurnForCommit(alloc, &prepared);
-    _ = writable.appendEvent(
-        alloc,
-        .{ .history_turn_committed = .{
-            .conversation_language = session.session_rt.languageSnapshot(),
-            .total_input_tokens = writable.state.total_input_tokens,
-            .total_output_tokens = writable.state.total_output_tokens,
-            .turn = prepared,
-        } },
-        io_mod.milliTimestamp(),
-    ) catch |err| {
-        if (err == error.SessionPersistenceUncertain) {
-            if (current_prompt_input) |input| input.retainImageSnapshots();
-        }
-        return err;
-    };
+    // No saved store: the turn lives in memory, within its image window.
     session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
     prepared_owned = false;
     if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
+    try keepImageWindow(alloc, session);
 }
 
 /// Keeps a libfx session within its image window once a turn enters its
@@ -3074,17 +2957,6 @@ fn commitContextCompaction(
     if (session.v2) |v2| {
         v2.commitCompaction(summary, active_prefix != null, retained_from) catch |err| {
             if (session_adapter.writeMayHaveLanded(err) and active_prefix != null) {
-                if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
-            }
-            return err;
-        };
-        if (active_prefix != null) {
-            if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
-        }
-    }
-    if (session.writable) |*writable| {
-        _ = writable.commitContextCompaction(ctx.alloc, summary, active_prefix, retained_from, io_mod.milliTimestamp()) catch |err| {
-            if (err == error.SessionPersistenceUncertain and active_prefix != null) {
                 if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
             }
             return err;
@@ -3128,50 +3000,6 @@ fn commitContextCompaction(
     if (session.journal) |*journal| try journal.append(ctx.alloc, session.session_id, .{ .history_replaced = prepared });
     session.session_rt.commitCompactedHistory(ctx.alloc, prepared);
     prepared_owned = false;
-}
-
-fn setRecoveryCheckpoint(
-    raw_ctx: *anyopaque,
-    checkpoint: session_codec.RecoveryCheckpoint,
-) !void {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    writeRecoveryCheckpoint(ctx, checkpoint) catch |err| {
-        if (err == error.SessionPersistenceUncertain) {
-            if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
-        }
-        return err;
-    };
-}
-
-fn writeRecoveryCheckpoint(ctx: *AcpContext, checkpoint: session_codec.RecoveryCheckpoint) !void {
-    const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
-    session.session_write_mutex.lockUncancelable(io_mod.getIo());
-    defer session.session_write_mutex.unlock(io_mod.getIo());
-    const writable = if (session.writable) |*value| value else return error.SessionPersistenceUnavailable;
-    const now_ms = io_mod.milliTimestamp();
-    _ = try writable.appendEvent(
-        ctx.alloc,
-        .{ .recovery_checkpoint_set = .{ .checkpoint = checkpoint } },
-        now_ms,
-    );
-    // The durable checkpoint references the prompt's captured image bytes, so
-    // the prompt's deinit must not delete them. A failed turn never reaches
-    // the success-path retain, making this the only retain on that path.
-    if (ctx.current_prompt_input) |input| input.retainImageSnapshots();
-}
-
-fn clearRecoveryCheckpoint(raw_ctx: *anyopaque) !void {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const session = if (ctx.state.active_session) |*value| value else return error.SessionPersistenceUnavailable;
-    session.session_write_mutex.lockUncancelable(io_mod.getIo());
-    defer session.session_write_mutex.unlock(io_mod.getIo());
-    const writable = if (session.writable) |*value| value else return error.SessionPersistenceUnavailable;
-    if (writable.state.recovery_checkpoint == null) return;
-    _ = try writable.appendEvent(
-        ctx.alloc,
-        .{ .recovery_checkpoint_cleared = .{} },
-        io_mod.milliTimestamp(),
-    );
 }
 
 /// `recovery_checkpoint.set` for a journaled libfx session: the open turn
@@ -4045,50 +3873,6 @@ test "provider terminal status maps only terminal outcomes" {
     try std.testing.expectEqual(acp_types.ToolCallStatus.failed, providerTerminalStatus(.denied).?);
     try std.testing.expectEqual(acp_types.ToolCallStatus.failed, providerTerminalStatus(.cancelled).?);
     try std.testing.expect(providerTerminalStatus(.deferred) == null);
-}
-
-test "ACP session writer checks honor the active session write boundary" {
-    const alloc = std.testing.allocator;
-
-    var active: server.ActiveSessionState = undefined;
-    active.v2 = null;
-    active.session_id = @constCast("session-test");
-    active.writable = null;
-    active.session_write_mutex = .init;
-    var state: server.ServerState = undefined;
-    state.active_session = active;
-    var ctx = AcpContext{
-        .alloc = alloc,
-        .state = &state,
-        .session_id = "session-test",
-    };
-
-    const Worker = struct {
-        ctx: *AcpContext,
-        started: std.atomic.Value(bool) = .init(false),
-        done: std.atomic.Value(bool) = .init(false),
-        failure: ?anyerror = null,
-
-        fn run(self: *@This()) void {
-            self.started.store(true, .seq_cst);
-            confirmSessionWriter(@ptrCast(self.ctx)) catch |err| {
-                self.failure = err;
-            };
-            self.done.store(true, .seq_cst);
-        }
-    };
-    var worker = Worker{ .ctx = &ctx };
-    state.active_session.?.session_write_mutex.lockUncancelable(io_mod.getIo());
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});
-    while (!worker.started.load(.seq_cst)) std.Thread.yield() catch {};
-    for (0..100) |_| std.Thread.yield() catch {};
-    const blocked_at_boundary = !worker.done.load(.seq_cst);
-    state.active_session.?.session_write_mutex.unlock(io_mod.getIo());
-    thread.join();
-
-    try std.testing.expect(blocked_at_boundary);
-    try std.testing.expect(worker.done.load(.seq_cst));
-    try std.testing.expectEqual(@as(?anyerror, null), worker.failure);
 }
 
 test "parsePromptInput extracts text blocks" {
@@ -5861,7 +5645,7 @@ test "ACP prompt agent config carries request options from active session" {
         .advertised_tool_names = &.{"read_file"},
         .advertised_functions = &.{builtin_tools.read_file.model_schema},
         .custom_tool_guidance = "acp custom tool guidance",
-    }, true);
+    });
 
     try std.testing.expect(config.fast_mode);
     try std.testing.expect(config.ultrafast_mode);

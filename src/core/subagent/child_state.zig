@@ -11,11 +11,8 @@ const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const schema_version: u64 = 2;
-const state_file = "children.json";
-const lock_file = "children.lock";
 const owner_marker_file = "owner.json";
 const legacy_control_file = "control.json";
-const lock_deadline_ms: u64 = 2_000;
 pub const max_state_bytes: usize = 512 * 1024;
 pub const max_children: usize = 256;
 
@@ -413,131 +410,34 @@ pub const Registry = struct {
     }
 };
 
-/// Where a parent keeps its children: v1's `children.json` beside its
-/// session, or its v2 log (D22). One backend per process.
-pub const Backend = union(enum) {
-    v1: *session_store.Store,
-    v2: *V2Children,
-};
-
 /// Held across a load, a change and its save.
-pub const Lock = union(enum) {
-    v1: io_mod.TimedAdvisoryLock,
-    v2: *std.Io.Mutex,
+pub const Lock = struct {
+    mutex: *std.Io.Mutex,
 
     pub fn release(self: *Lock) void {
-        switch (self.*) {
-            .v1 => |*lock| lock.release(),
-            .v2 => |mutex| mutex.unlock(io_mod.getIo()),
-        }
+        self.mutex.unlock(io_mod.getIo());
     }
 };
 
+/// A parent's children, kept in its log (D22).
 pub const Store = struct {
-    backend: Backend,
+    children: *V2Children,
     parent_id: []const u8,
-    options: session_child_store.Options = .{},
 
-    pub fn acquireLock(self: Store, alloc: Allocator) !Lock {
-        const sessions = switch (self.backend) {
-            .v2 => |children| {
-                children.lock.lockUncancelable(io_mod.getIo());
-                return .{ .v2 = &children.lock };
-            },
-            .v1 => |value| value,
-        };
-        var capability = try sessions.openSubagentControlCapabilityWritable(
-            alloc,
-            self.parent_id,
-            self.options,
-        );
-        defer capability.deinit();
-        return .{ .v1 = try capability.acquireTimedAdvisoryLock(
-            .subagent_control,
-            lock_file,
-            lock_deadline_ms,
-        ) };
+    pub fn acquireLock(self: Store) Lock {
+        self.children.lock.lockUncancelable(io_mod.getIo());
+        return .{ .mutex = &self.children.lock };
     }
 
     pub fn load(self: Store, alloc: Allocator) !Registry {
-        const sessions = switch (self.backend) {
-            .v2 => |children| return children.load(alloc),
-            .v1 => |value| value,
-        };
-        var capability = try sessions.openSubagentControlCapabilityReadOnly(
-            alloc,
-            self.parent_id,
-            self.options,
-        );
-        defer capability.deinit();
-        var file = capability.openFileReadOnly(
-            alloc,
-            .subagent_control,
-            state_file,
-        ) catch |err| {
-            if (err == error.FileNotFound) return Registry.init(alloc, self.parent_id);
-            return err;
-        };
-        defer file.deinit();
-        const bytes = try file.readToEnd(alloc, max_state_bytes);
-        defer alloc.free(bytes);
-        return parseRegistry(alloc, bytes, self.parent_id);
+        return self.children.load(alloc);
     }
 
     pub fn save(self: Store, alloc: Allocator, registry: Registry) !void {
         if (!std.mem.eql(u8, registry.parent_id, self.parent_id)) {
             return error.InvalidParentId;
         }
-        const sessions = switch (self.backend) {
-            .v2 => |children| return children.save(alloc, registry),
-            .v1 => |value| value,
-        };
-        const bytes = try renderRegistry(alloc, registry);
-        defer alloc.free(bytes);
-        if (bytes.len > max_state_bytes) return error.StateTooLarge;
-        var capability = try sessions.openSubagentControlCapabilityWritable(
-            alloc,
-            self.parent_id,
-            self.options,
-        );
-        defer capability.deinit();
-        var entry = try capability.atomicReplace(
-            alloc,
-            .subagent_control,
-            state_file,
-            bytes,
-        );
-        entry.deinit(alloc);
-    }
-
-    pub fn markChildSession(
-        self: Store,
-        alloc: Allocator,
-        child_id: []const u8,
-    ) !void {
-        // A v2 child's own first line says it is one (`role: child`).
-        const sessions = switch (self.backend) {
-            .v2 => return,
-            .v1 => |value| value,
-        };
-        var bytes: std.Io.Writer.Allocating = .init(alloc);
-        defer bytes.deinit();
-        try bytes.writer.writeAll("{\"schema_version\":1,\"parent_id\":");
-        try std.json.Stringify.value(self.parent_id, .{}, &bytes.writer);
-        try bytes.writer.writeAll("}");
-        var capability = try sessions.openSubagentControlCapabilityWritable(
-            alloc,
-            child_id,
-            self.options,
-        );
-        defer capability.deinit();
-        var entry = try capability.atomicReplace(
-            alloc,
-            .subagent_control,
-            owner_marker_file,
-            bytes.written(),
-        );
-        entry.deinit(alloc);
+        return self.children.save(alloc, registry);
     }
 };
 
@@ -633,6 +533,63 @@ pub const V2Children = struct {
             self.registry = try registryFromChildren(self.alloc, self.parent.id(), children);
         }
         return &self.registry.?;
+    }
+};
+
+/// A saved parent session and its children in a temporary home, for the
+/// subagent modules' tests. Initialized in place, since `children` points at
+/// `parent`.
+pub const TestParent = struct {
+    alloc: Allocator,
+    tmp: std.testing.TmpDir,
+    home: []u8,
+    store: session_adapter.Store,
+    parent: *session_adapter.Session,
+    children: V2Children,
+    model: [10]u8 = "test-model".*,
+
+    pub fn init(self: *TestParent, alloc: Allocator) !void {
+        self.* = .{ .alloc = alloc, .tmp = std.testing.tmpDir(.{}), .home = undefined, .store = undefined, .parent = undefined, .children = undefined };
+        errdefer self.tmp.cleanup();
+        self.home = try io_mod.dirRealpathAlloc(alloc, self.tmp.dir, ".");
+        errdefer alloc.free(self.home);
+        self.store = try session_adapter.Store.open(alloc, self.home);
+        errdefer self.store.deinit(alloc);
+        self.parent = try session_adapter.Session.create(alloc, &self.store, self.home, .ask, self.seed(""));
+        errdefer self.parent.close();
+        try self.parent.commitTurn(.{ .assistant = .{ .user = .{ .text = @constCast("delegate") }, .assistant = @constCast("ok") } }, types.ConversationLanguage.default());
+        self.children = V2Children.init(alloc, self.parent, self.home);
+    }
+
+    pub fn deinit(self: *TestParent) void {
+        self.children.deinit();
+        self.parent.close();
+        self.store.deinit(self.alloc);
+        self.alloc.free(self.home);
+        self.tmp.cleanup();
+    }
+
+    pub fn seed(self: *TestParent, instructions: []const u8) session_adapter.Seed {
+        return .{
+            .preferences = .{ .model = &self.model, .effort = .auto, .fast_mode = false },
+            .language = types.ConversationLanguage.default(),
+            .permission_state = .{},
+            .instructions = instructions,
+        };
+    }
+
+    pub fn stateStore(self: *TestParent) Store {
+        return .{ .children = &self.children, .parent_id = self.parent.id() };
+    }
+
+    /// Starts child `child_id` with `history` as its log, as its first work
+    /// would. Close it with `close`.
+    pub fn openChild(self: *TestParent, child_id: []const u8, history: []const types.HistoryTurn) !*session_adapter.Session {
+        try self.parent.appendChildLines(&.{.{ .spawned = .{ .child = child_id, .work_id = "test-work", .data = "{\"kind\":\"persistent\"}" } }});
+        const child = try session_adapter.Session.openChild(self.alloc, &self.store, self.parent.id(), child_id, self.home, self.seed(""));
+        errdefer child.close();
+        for (history) |turn| try child.commitTurn(turn, types.ConversationLanguage.default());
+        return child;
     }
 };
 
@@ -1584,8 +1541,8 @@ test "v2 children live in the parent's log and come back after a reopen (D22)" {
     {
         var children = V2Children.init(alloc, parent, "/w");
         defer children.deinit();
-        const state_store = Store{ .backend = .{ .v2 = &children }, .parent_id = parent_id };
-        var lock = try state_store.acquireLock(alloc);
+        const state_store = Store{ .children = &children, .parent_id = parent_id };
+        var lock = state_store.acquireLock();
         defer lock.release();
         var registry = try state_store.load(alloc);
         defer registry.deinit(alloc);
@@ -1596,8 +1553,6 @@ test "v2 children live in the parent's log and come back after a reopen (D22)" {
         try state_store.save(alloc, registry);
         try registry.finish(alloc, child_id, "work-1", .completed, null);
         try state_store.save(alloc, registry);
-        // A v2 child needs no marker file: its own first line says it is one.
-        try state_store.markChildSession(alloc, child_id);
 
         try children.rememberSeed(child_id, .{ .preferences = seed.preferences, .language = seed.language });
         var copy = (try children.seedFor(alloc, child_id)).?;
@@ -1612,7 +1567,7 @@ test "v2 children live in the parent's log and come back after a reopen (D22)" {
     defer reopened.close();
     var children = V2Children.init(alloc, reopened, "/w");
     defer children.deinit();
-    const state_store = Store{ .backend = .{ .v2 = &children }, .parent_id = parent_id };
+    const state_store = Store{ .children = &children, .parent_id = parent_id };
     var registry = try state_store.load(alloc);
     defer registry.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), registry.children.len);

@@ -1124,31 +1124,6 @@ pub const SessionChildCapability = struct {
         return .{ .impl = impl };
     }
 
-    /// Opens a capability restricted to the subagent control route. This does
-    /// not acquire or imply authority over the session transcript.
-    pub fn initSubagentControl(
-        alloc: Allocator,
-        session_dir: std.Io.Dir,
-        display_session_path: []const u8,
-        mode: Mode,
-        options: Options,
-    ) SubagentControlInitError!SessionChildCapability {
-        var capability = initWithOptions(
-            alloc,
-            session_dir,
-            display_session_path,
-            mode,
-            options,
-        ) catch |err| return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.SessionPathUnsafe => error.SessionPathUnsafe,
-            error.PrivateStatePermissionsUnsupported => error.PrivateStatePermissionsUnsupported,
-            else => error.SessionChildStoreFailed,
-        };
-        capability.impl.allowed_kind = .subagent_control;
-        return capability;
-    }
-
     /// Opens a capability restricted to host-owned terminal records and
     /// payloads. Holder proofs remain inaccessible through this route.
     pub fn initTerminalState(
@@ -2000,86 +1975,6 @@ test "read only capability leaves every missing fixed route absent" {
     }
 
     try std.testing.expectEqual(@as(usize, 0), try countEntries(session.dir));
-}
-
-test "subagent control capability is route restricted and rejects symlinks" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var session = try openTestSession(alloc, &tmp);
-    defer session.dir.close(io_mod.getIo());
-    defer alloc.free(session.display_path);
-    var capability = try SessionChildCapability.initSubagentControl(
-        alloc,
-        session.dir,
-        session.display_path,
-        .writable,
-        .{},
-    );
-    defer capability.deinit();
-
-    try std.testing.expectError(
-        error.SessionChildStoreFailed,
-        capability.createExclusiveFile(alloc, .background_records, "wrong-route.json"),
-    );
-    var entry = try capability.atomicReplace(
-        alloc,
-        .subagent_control,
-        "control.json",
-        "{}",
-    );
-    entry.deinit(alloc);
-    var lock = try capability.acquireTimedAdvisoryLock(
-        .subagent_control,
-        "subagent-control.lock",
-        10,
-    );
-    lock.release();
-
-    try session.dir.symLink(
-        io_mod.getIo(),
-        "../outside-control",
-        "subagent/linked.json",
-        .{},
-    );
-    try std.testing.expectError(
-        error.SessionPathUnsafe,
-        capability.openFileReadOnly(alloc, .subagent_control, "linked.json"),
-    );
-}
-
-test "subagent control capability rejects a symlinked route" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var session = try openTestSession(alloc, &tmp);
-    defer session.dir.close(io_mod.getIo());
-    defer alloc.free(session.display_path);
-    try tmp.dir.createDir(
-        io_mod.getIo(),
-        "outside",
-        std.Io.File.Permissions.fromMode(0o700),
-    );
-    try session.dir.symLink(
-        io_mod.getIo(),
-        "../outside",
-        "subagent",
-        .{ .is_directory = true },
-    );
-    var capability = try SessionChildCapability.initSubagentControl(
-        alloc,
-        session.dir,
-        session.display_path,
-        .writable,
-        .{},
-    );
-    defer capability.deinit();
-    try std.testing.expectError(
-        error.SessionPathUnsafe,
-        capability.iterate(alloc, .subagent_control),
-    );
 }
 
 test "terminal capabilities are private route restricted and reject symlinks" {

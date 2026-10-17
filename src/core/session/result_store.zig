@@ -391,25 +391,6 @@ pub fn diffContentHandleMatchesContentDigest(
         );
 }
 
-/// Persists one edit's previous/after snapshots as a single content-addressed
-/// artifact in the session result store and returns its handle. Keeping the
-/// snapshots out of the event log and recovery checkpoint keeps those records
-/// small; readers resolve the handle on demand.
-pub fn storeDiffContent(
-    alloc: Allocator,
-    result_dir: []const u8,
-    tool_call_id: []const u8,
-    previous_content: ?[]const u8,
-    after_content: ?[]const u8,
-) ![]u8 {
-    const pack = try encodeDiffContentPack(alloc, previous_content, after_content);
-    defer alloc.free(pack);
-    const handle = try makeDiffContentHandle(alloc, tool_call_id, pack);
-    errdefer alloc.free(handle);
-    try storeLargeResultAtHandle(alloc, result_dir, handle, pack);
-    return handle;
-}
-
 /// Loads and digest-verifies a pack written by storeDiffContent.
 pub fn loadDiffContentManaged(
     alloc: Allocator,
@@ -451,43 +432,6 @@ pub fn loadDiffContentManaged(
         pack.after_content = try alloc.dupe(u8, content);
     }
     return pack;
-}
-
-fn encodeDiffContentPack(
-    alloc: Allocator,
-    previous_content: ?[]const u8,
-    after_content: ?[]const u8,
-) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    out.writer.writeAll("{\"previous_content\":") catch return error.OutOfMemory;
-    writeOptionalPackString(&out.writer, previous_content) catch return error.OutOfMemory;
-    out.writer.writeAll(",\"after_content\":") catch return error.OutOfMemory;
-    writeOptionalPackString(&out.writer, after_content) catch return error.OutOfMemory;
-    out.writer.writeByte('}') catch return error.OutOfMemory;
-    if (out.written().len > diff_content_max_bytes) return error.DiffContentTooLarge;
-    return try out.toOwnedSlice();
-}
-
-fn writeOptionalPackString(writer: *std.Io.Writer, value: ?[]const u8) !void {
-    if (value) |text| {
-        try std.json.Stringify.value(text, .{}, writer);
-    } else {
-        try writer.writeAll("null");
-    }
-}
-
-fn makeDiffContentHandle(alloc: Allocator, tool_call_id: []const u8, pack: []const u8) ![]u8 {
-    var content_digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(pack, &content_digest, .{});
-    const content_hex = std.fmt.bytesToHex(content_digest[0..8].*, .lower);
-    var call_digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(tool_call_id, &call_digest, .{});
-    const call_hex = std.fmt.bytesToHex(call_digest[0..8].*, .lower);
-    return alloc.print(
-        "diff-{s}-{s}.json",
-        .{ &call_hex, &content_hex },
-    );
 }
 
 fn storeLargeResultAtHandleManaged(
@@ -1047,100 +991,6 @@ test "a v2 session's compactor records are blobs, replaced and listed by name (D
     defer read_only.deinit();
     try std.testing.expectEqualStrings("T1 shell", try compactorStore(&read_only).read(arena, "compacted-T1.txt", 8));
     try std.testing.expectError(error.StoreFailed, compactorStore(&read_only).write(alloc, "compacted-T2.txt", "x"));
-}
-
-test "diff content packs round trip, bound, and reject tampering" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(dir);
-
-    const handle = try storeDiffContent(alloc, dir, "call-edit-1", "line one\nline two\n", "line one\nline 2\n");
-    defer alloc.free(handle);
-    try std.testing.expect(isDiffContentHandle(handle));
-    try std.testing.expect(!isDiffContentHandle("result-shell.txt"));
-
-    var capability = try session_child_store.SessionChildCapability.initLegacyRoute(
-        alloc,
-        dir,
-        .tool_results,
-        .writable,
-    );
-    defer capability.deinit();
-    var pack = try loadDiffContentManaged(
-        alloc,
-        &capability,
-        "call-edit-1",
-        handle,
-    );
-    defer pack.deinit(alloc);
-    try std.testing.expectEqualStrings("line one\nline two\n", pack.previous_content.?);
-    try std.testing.expectEqualStrings("line one\nline 2\n", pack.after_content.?);
-    try std.testing.expectError(
-        error.InvalidResultHandle,
-        loadDiffContentManaged(alloc, &capability, "call-edit-2", handle),
-    );
-
-    // Null snapshots survive the round trip.
-    const partial = try storeDiffContent(alloc, dir, "call-edit-2", null, "created\n");
-    defer alloc.free(partial);
-    var partial_pack = try loadDiffContentManaged(
-        alloc,
-        &capability,
-        "call-edit-2",
-        partial,
-    );
-    defer partial_pack.deinit(alloc);
-    try std.testing.expect(partial_pack.previous_content == null);
-    try std.testing.expectEqualStrings("created\n", partial_pack.after_content.?);
-
-    // A tampered artifact fails the content digest check.
-    var rewritten = try capability.atomicReplace(alloc, .tool_results, handle, "{\"previous_content\":\"forged\",\"after_content\":null}");
-    rewritten.deinit(alloc);
-    try std.testing.expectError(
-        error.DiffContentArtifactChanged,
-        loadDiffContentManaged(alloc, &capability, "call-edit-1", handle),
-    );
-
-    // Handles from other artifact families are rejected before any read.
-    try std.testing.expectError(
-        error.InvalidResultHandle,
-        loadDiffContentManaged(
-            alloc,
-            &capability,
-            "call-edit-1",
-            "result-shell.txt",
-        ),
-    );
-}
-
-test "diff content encoding propagates every allocation failure" {
-    const backing = testing_allocator.no_resize;
-    const previous = text_utils.repeat("before\n", 800);
-    const after = text_utils.repeat("after\n", 800);
-    var probe = std.testing.FailingAllocator.init(backing, .{});
-    const encoded = try encodeDiffContentPack(
-        probe.allocator(),
-        previous,
-        after,
-    );
-    probe.allocator().free(encoded);
-    const allocation_count = probe.alloc_index;
-    try std.testing.expect(allocation_count > 1);
-
-    for (0..allocation_count) |fail_index| {
-        var failing = std.testing.FailingAllocator.init(
-            backing,
-            .{ .fail_index = fail_index },
-        );
-        try std.testing.expectError(
-            error.OutOfMemory,
-            encodeDiffContentPack(failing.allocator(), previous, after),
-        );
-        try std.testing.expect(failing.has_induced_failure);
-        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
-    }
 }
 
 test "saved preparation externalizes small results" {

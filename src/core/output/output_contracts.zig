@@ -1449,55 +1449,6 @@ pub const SessionDetailSnapshot = struct {
     }
 };
 
-pub const SessionMigrationSnapshot = struct {
-    result: session_store.SessionMigrationResult,
-
-    pub fn render(self: SessionMigrationSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
-        return switch (format) {
-            .text => self.renderText(alloc),
-            .json => self.renderJson(alloc),
-        };
-    }
-
-    pub fn renderText(self: SessionMigrationSnapshot, alloc: Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.print(
-            "[session migration] {s}\nstatus: {s}\nsource_schema_version: {d}\nsource_bytes: {d}\n",
-            .{
-                self.result.session_id,
-                sessionMigrationStatusLabel(self.result.status),
-                self.result.source_schema_version,
-                self.result.source_bytes,
-            },
-        );
-        return try out.toOwnedSlice();
-    }
-
-    pub fn renderJson(self: SessionMigrationSnapshot, alloc: Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.writeAll("{\"kind\":\"session_migration\",\"id\":");
-        try std.json.Stringify.value(self.result.session_id, .{}, &out.writer);
-        try out.writer.writeAll(",\"status\":");
-        try std.json.Stringify.value(sessionMigrationStatusLabel(self.result.status), .{}, &out.writer);
-        try out.writer.print(
-            ",\"source_schema_version\":{d},\"source_bytes\":{d}}}",
-            .{ self.result.source_schema_version, self.result.source_bytes },
-        );
-        return try out.toOwnedSlice();
-    }
-};
-
-fn sessionMigrationStatusLabel(status: session_store.SessionMigrationStatus) []const u8 {
-    return switch (status) {
-        .migrated => "migrated",
-        .already_current => "already_current",
-    };
-}
-
 pub const SessionRecoverySnapshot = struct {
     result: session_store.SessionRecoveryResult,
 
@@ -3153,29 +3104,6 @@ test "core session detail JSON includes assistant execution memory" {
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.find(u8, text, "started_at_ms") == null);
     try std.testing.expect(std.mem.find(u8, text, "input_tokens") == null);
-}
-
-test "core session migration snapshot text and json stay stable" {
-    const result = session_store.SessionMigrationResult{
-        .session_id = @constCast("session.v3"),
-        .source_schema_version = 2,
-        .source_bytes = 4096,
-        .status = .migrated,
-    };
-
-    const text = try (SessionMigrationSnapshot{ .result = result }).renderText(std.testing.allocator);
-    defer std.testing.allocator.free(text);
-    try std.testing.expectEqualStrings(
-        "[session migration] session.v3\nstatus: migrated\nsource_schema_version: 2\nsource_bytes: 4096\n",
-        text,
-    );
-
-    const json = try (SessionMigrationSnapshot{ .result = result }).renderJson(std.testing.allocator);
-    defer std.testing.allocator.free(json);
-    try std.testing.expectEqualStrings(
-        "{\"kind\":\"session_migration\",\"id\":\"session.v3\",\"status\":\"migrated\",\"source_schema_version\":2,\"source_bytes\":4096}",
-        json,
-    );
 }
 
 test "core session recovery snapshot text and json stay stable" {

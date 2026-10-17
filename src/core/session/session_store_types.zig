@@ -147,13 +147,6 @@ pub const ReadOnlyDetail = struct {
     summary: SessionSummary,
     state: session_codec.DurableSessionState,
     storage_format: StorageFormat,
-
-    /// Frees the owned summary and state and poisons the value.
-    pub fn deinit(self: *ReadOnlyDetail, alloc: Allocator) void {
-        self.summary.deinit(alloc);
-        self.state.deinit(alloc);
-        self.* = undefined;
-    }
 };
 
 /// A bounded, independently-owned chronological slice of canonical history.
@@ -164,13 +157,6 @@ pub const HistoryPage = struct {
     history_len: usize,
     turns: []session.HistoryTurn,
     next_cursor: ?[]u8 = null,
-
-    pub fn deinit(self: *HistoryPage, alloc: Allocator) void {
-        alloc.free(self.session_id);
-        session.freeHistoryTurnSlice(alloc, self.turns);
-        if (self.next_cursor) |cursor| alloc.free(cursor);
-        self.* = undefined;
-    }
 };
 
 /// Outcome of a migration request.
@@ -185,12 +171,6 @@ pub const SessionMigrationResult = struct {
     source_schema_version: u8,
     source_bytes: u64,
     status: SessionMigrationStatus,
-
-    /// Frees the owned session id and poisons the value.
-    pub fn deinit(self: *SessionMigrationResult, alloc: Allocator) void {
-        alloc.free(self.session_id);
-        self.* = undefined;
-    }
 };
 
 pub const SessionRecoveryStatus = enum {
@@ -244,12 +224,6 @@ pub const DoctorDiagnostic = struct {
     bytes: ?u64 = null,
     growth_bytes: ?u64 = null,
     growth_frames: ?u64 = null,
-
-    /// Frees the owned session id and poisons the value.
-    pub fn deinit(self: *DoctorDiagnostic, alloc: Allocator) void {
-        alloc.free(self.session_id);
-        self.* = undefined;
-    }
 };
 
 /// Bounded `doctor` inspection output. Owns `diagnostics`; caller frees with
@@ -258,12 +232,6 @@ pub const DoctorInspectionResult = struct {
     diagnostics: std.ArrayList(DoctorDiagnostic) = .empty,
     inspected_count: usize = 0,
     truncated: bool = false,
-
-    pub fn deinit(self: *DoctorInspectionResult, alloc: Allocator) void {
-        for (self.diagnostics.items) |*diagnostic| diagnostic.deinit(alloc);
-        self.diagnostics.deinit(alloc);
-        self.* = undefined;
-    }
 
     pub fn takeDiagnostics(self: *DoctorInspectionResult) std.ArrayList(DoctorDiagnostic) {
         const diagnostics = self.diagnostics;

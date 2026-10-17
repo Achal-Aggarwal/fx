@@ -33,7 +33,6 @@ const prompt_policy = @import("../config/prompt_policy.zig");
 const session_codec = @import("../session/session_codec.zig");
 const session_store = @import("../session/session_store.zig");
 const session_adapter = @import("../session/session_adapter.zig");
-const subagent_resume_admission = @import("../subagent/resume_admission.zig");
 const skill_contract = @import("../skills/skill_contract.zig");
 const types = @import("../shared/types.zig");
 const update_target = @import("../upgrade/update_target.zig");
@@ -100,7 +99,6 @@ const ResumeInvocation = struct {
 
 const resume_id_alias_prefix = "--resume-";
 pub const upgrade_relaunch_arg = "--upgrade-relaunch";
-pub const sessions_v2_arg = "--sessions-v2";
 
 pub const UpgradeRelaunch = struct {
     previous_revision: ?[]u8 = null,
@@ -141,8 +139,6 @@ pub const LaunchModifiers = struct {
     ultrafast_override: ?bool = null,
     provider_order_override: ?[][]const u8 = null,
     provider_strict_override: ?bool = null,
-    /// `--sessions-v2`: keep this process's sessions in the v2 store.
-    sessions_v2: bool = false,
 
     pub fn deinit(self: *LaunchModifiers, alloc: Allocator) void {
         if (self.context_limit_overrides.len > 0) alloc.free(self.context_limit_overrides);
@@ -321,17 +317,6 @@ const SessionDetailOptions = struct {
     }
 };
 
-const SessionMigrationOptions = struct {
-    format: output_contracts.OutputFormat = .text,
-    session_id: []u8,
-    allow_large: bool = false,
-
-    fn deinit(self: *SessionMigrationOptions, alloc: Allocator) void {
-        alloc.free(self.session_id);
-        self.* = undefined;
-    }
-};
-
 const SessionRecoveryOptions = struct {
     format: output_contracts.OutputFormat = .text,
     session_id: []u8,
@@ -428,14 +413,11 @@ fn parseGlobalLaunchArgs(
     var provider_order_override: ?[][]const u8 = null;
     errdefer if (provider_order_override) |order| freeProviderOrderOverride(alloc, order);
     var provider_strict_override: ?bool = null;
-    var sessions_v2 = false;
 
     var index: usize = 0;
     while (index < args.len) {
         const arg = args[index];
-        if (std.mem.eql(u8, arg, sessions_v2_arg)) {
-            sessions_v2 = true;
-        } else if (std.mem.eql(u8, arg, "--context-limit")) {
+        if (std.mem.eql(u8, arg, "--context-limit")) {
             index += 1;
             if (index >= args.len) return error.MissingContextLimitValue;
             try overrides.append(alloc, try config_runtime.context_limits.parseOverride(args[index]));
@@ -527,7 +509,6 @@ fn parseGlobalLaunchArgs(
             .ultrafast_override = ultrafast_override,
             .provider_order_override = provider_order_override,
             .provider_strict_override = provider_strict_override,
-            .sessions_v2 = sessions_v2,
         },
     };
 }
@@ -565,8 +546,7 @@ pub fn argsAfterGlobalLaunchArgs(args: []const [:0]const u8) []const [:0]const u
             !std.mem.eql(u8, arg, "--ultrafast") and
             !std.mem.eql(u8, arg, "--no-ultrafast") and
             !std.mem.eql(u8, arg, "--provider-strict") and
-            !std.mem.eql(u8, arg, "--no-provider-strict") and
-            !std.mem.eql(u8, arg, sessions_v2_arg))
+            !std.mem.eql(u8, arg, "--no-provider-strict"))
         {
             return args[index..];
         }
@@ -1088,7 +1068,6 @@ fn runNonInteractiveWithDeps(
     const global_args = &parsed_launch.global_args;
     const effective_args = parsed_launch.effective_args;
     const parsed_command = parsed_launch.command;
-    const sessions_v2 = session_adapter.enabled(global_args.modifiers.sessions_v2);
 
     if (global_args.modifiers.hasWorkspaceModifiers() and
         !commandSupportsWorkspaceModifiers(parsed_command))
@@ -1565,7 +1544,6 @@ fn runNonInteractiveWithDeps(
                 cfg.default_model,
                 cfg.default_agent_step_limit,
                 mcp_inspection.profile_diagnostic,
-                sessions_v2,
             );
             defer snapshot.deinit(alloc);
 
@@ -1599,77 +1577,7 @@ fn runNonInteractiveWithDeps(
                     return .handled_failure;
                 };
                 defer recovery.deinit(alloc);
-                if (sessions_v2) return runSessionRecoveryV2(alloc, deps, recovery);
-
-                const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-                defer alloc.free(workspace_root);
-                var store = session_store.Store.init(
-                    alloc,
-                    workspace_root,
-                ) catch |err| {
-                    try writeLookupFailure(
-                        alloc,
-                        deps,
-                        "session",
-                        err,
-                        recovery.format,
-                    );
-                    return .handled_failure;
-                };
-                defer store.deinit(alloc);
-                var result = store.recoverSessionCopy(
-                    alloc,
-                    recovery.session_id,
-                    .{},
-                ) catch |err| {
-                    try writeLookupFailure(
-                        alloc,
-                        deps,
-                        "session",
-                        err,
-                        recovery.format,
-                    );
-                    return .handled_failure;
-                };
-                defer result.deinit(alloc);
-                return writeSessionRecovery(alloc, deps, result, recovery.format);
-            }
-
-            if (rest.len > 0 and std.mem.eql(u8, rest[0], "migrate")) {
-                var migration = parseSessionMigrationArgs(alloc, rest[1..]) catch |err| {
-                    try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .session, "session", err, rest[1..]);
-                    return .handled_failure;
-                };
-                defer migration.deinit(alloc);
-                if (sessions_v2) {
-                    try writeLookupFailure(alloc, deps, "session", error.SessionMigrationUnavailable, migration.format);
-                    return .handled_failure;
-                }
-
-                const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-                defer alloc.free(workspace_root);
-
-                var store = session_store.Store.init(alloc, workspace_root) catch |err| {
-                    try writeLookupFailure(alloc, deps, "session", err, migration.format);
-                    return .handled_failure;
-                };
-                defer store.deinit(alloc);
-                var result = store.migrateLegacyStorageOnly(
-                    alloc,
-                    migration.session_id,
-                    .{ .allow_large = migration.allow_large },
-                ) catch |err| {
-                    try writeLookupFailure(alloc, deps, "session", err, migration.format);
-                    return .handled_failure;
-                };
-                defer result.deinit(alloc);
-
-                const text = try (output_contracts.SessionMigrationSnapshot{
-                    .result = result,
-                }).render(alloc, migration.format);
-                defer alloc.free(text);
-                try writeFormattedOutput(deps, text, migration.format);
-                return .handled_success;
+                return runSessionRecovery(alloc, deps, recovery);
             }
 
             var opts = parseSessionDetailArgs(alloc, rest) catch |err| {
@@ -1682,49 +1590,7 @@ fn runNonInteractiveWithDeps(
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .session, "session", error.InvalidSessionDetailArgs, rest);
                 return .handled_failure;
             };
-            if (sessions_v2) return runSessionDetailV2(alloc, deps, target, opts.format);
-
-            const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-            defer alloc.free(workspace_root);
-
-            var store = session_store.Store.initReadOnly(alloc, workspace_root) catch |err| {
-                try writeLookupFailure(alloc, deps, "session", err, opts.format);
-                return .handled_failure;
-            };
-            defer store.deinit(alloc);
-
-            switch (target) {
-                .last => {
-                    var summary = subagent_resume_admission.latestVisibleWorkspaceSummary(
-                        store,
-                        alloc,
-                    ) catch |err| {
-                        try writeLookupFailure(alloc, deps, "session", err, opts.format);
-                        return .handled_failure;
-                    };
-                    defer summary.deinit(alloc);
-                    return writeSessionSummary(alloc, deps, summary, opts.format);
-                },
-                .id => |id| {
-                    var detail = subagent_resume_admission.loadVisibleReadOnlyDetail(
-                        store,
-                        alloc,
-                        id,
-                        .{},
-                    ) catch |err| {
-                        try writeSessionDetailFailure(
-                            alloc,
-                            deps,
-                            id,
-                            err,
-                            opts.format,
-                        );
-                        return .handled_failure;
-                    };
-                    defer detail.deinit(alloc);
-                    return writeSessionDetail(alloc, deps, detail.state, opts.format);
-                },
-            }
+            return runSessionDetail(alloc, deps, target, opts.format);
         },
         .sessions => |rest| {
             if (rest.len > 0 and std.mem.eql(u8, rest[0], "convert")) {
@@ -1732,38 +1598,13 @@ fn runNonInteractiveWithDeps(
                     try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
                     return .handled_failure;
                 };
-                // It moves v1 sessions into the experimental store, where
-                // plain fx would no longer find them.
-                if (!sessions_v2) {
-                    try writeLookupFailure(alloc, deps, "sessions", error.SessionsV2Required, format);
-                    return .handled_failure;
-                }
                 return runSessionConvert(alloc, deps, format);
             }
             const opts = parseSessionListArgs(rest) catch |err| {
                 try writeUsageOrJsonError(alloc, cfg.command_catalog, deps, .sessions, "sessions", err, rest);
                 return .handled_failure;
             };
-            if (sessions_v2) return runSessionListV2(alloc, deps, opts);
-
-            const workspace_root = try io_mod.realpathAlloc(alloc, ".");
-            defer alloc.free(workspace_root);
-
-            var store = session_store.Store.initReadOnly(alloc, workspace_root) catch |err| {
-                try writeLookupFailure(alloc, deps, "sessions", err, opts.format);
-                return .handled_failure;
-            };
-            defer store.deinit(alloc);
-
-            var page = subagent_resume_admission.listVisiblePage(
-                store,
-                alloc,
-                opts.scope,
-                opts.continuation,
-                opts.limit,
-            ) catch |err| return err;
-            defer page.deinit(alloc);
-            return writeSessionList(alloc, deps, page, opts);
+            return runSessionList(alloc, deps, opts);
         },
         .workspace => |rest| {
             const opts = parseWorkspaceArgs(rest) catch |err| {
@@ -3284,7 +3125,7 @@ fn writeSessionRecovery(
 }
 
 /// `fx sessions` on v2: the page v1 shows, from the v2 catalog.
-fn runSessionListV2(alloc: Allocator, deps: RunDeps, opts: SessionListOptions) !RunResult {
+fn runSessionList(alloc: Allocator, deps: RunDeps, opts: SessionListOptions) !RunResult {
     var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
         try writeLookupFailure(alloc, deps, "sessions", session_adapter.commandError(err), opts.format);
         return .handled_failure;
@@ -3311,8 +3152,6 @@ fn parseSessionConvertArgs(args: []const [:0]const u8) !output_contracts.OutputF
 }
 
 /// Why `fx sessions convert` refuses without the v2 store switched on.
-const sessions_v2_required_message = "sessions convert moves v1 sessions into the experimental v2 store and needs --sessions-v2 or FX_SESSIONS_V2=1";
-
 /// `fx sessions convert`: converts every v1 session v2 does not hold yet,
 /// and fails when it skipped any (D61).
 fn runSessionConvert(alloc: Allocator, deps: RunDeps, format: output_contracts.OutputFormat) !RunResult {
@@ -3350,7 +3189,7 @@ fn runSessionConvert(alloc: Allocator, deps: RunDeps, format: output_contracts.O
 }
 
 /// `fx session last|{id}` on v2, read without the session's lock (D37).
-fn runSessionDetailV2(
+fn runSessionDetail(
     alloc: Allocator,
     deps: RunDeps,
     target: SessionDetailTarget,
@@ -3388,7 +3227,7 @@ fn runSessionDetailV2(
 }
 
 /// `fx session recover` on v2 (D15): a copy up to the last good turn.
-fn runSessionRecoveryV2(alloc: Allocator, deps: RunDeps, recovery: SessionRecoveryOptions) !RunResult {
+fn runSessionRecovery(alloc: Allocator, deps: RunDeps, recovery: SessionRecoveryOptions) !RunResult {
     var store = session_adapter.Store.openFromEnv(alloc) catch |err| {
         try writeLookupFailure(alloc, deps, "session", session_adapter.commandError(err), recovery.format);
         return .handled_failure;
@@ -3434,12 +3273,6 @@ fn writeLookupFailure(
         },
         error.SessionNotFound => {
             try writeStderr(deps, "fx session: record not found\n");
-        },
-        error.SessionMigrationUnavailable => {
-            try writeStderr(deps, "fx session: session migrate converts v1 sessions and is not available with sessions v2 yet\n");
-        },
-        error.SessionsV2Required => {
-            try writeStderr(deps, "fx sessions: " ++ sessions_v2_required_message ++ "\n");
         },
         error.InvalidSessionFormat,
         error.InvalidPermissionState,
@@ -3620,8 +3453,6 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
         error.NoSavedSessions => "no saved sessions for this workspace",
         error.NoReadableSessions => "saved sessions are unreadable; run `fx doctor` for recovery guidance",
         error.SessionNotFound => "record not found",
-        error.SessionMigrationUnavailable => "session migrate converts v1 sessions and is not available with sessions v2 yet",
-        error.SessionsV2Required => sessions_v2_required_message,
         error.InvalidSessionFormat,
         error.InvalidPermissionState,
         error.PermissionStateTooLarge,
@@ -3738,21 +3569,6 @@ test "session lookup failures preserve supporting-state errors in the requested 
     }
 }
 
-test "sessions convert without the v2 store names the switch it needs, in text and json" {
-    for ([_]output_contracts.OutputFormat{ .text, .json }) |format| {
-        var output = CaptureOutput.init(std.testing.allocator);
-        defer output.deinit();
-        try writeLookupFailure(std.testing.allocator, output.deps(), "sessions", error.SessionsV2Required, format);
-        const body = if (format == .json) output.stdout.written() else output.stderr.written();
-        try std.testing.expect(std.mem.find(u8, body, "--sessions-v2 or FX_SESSIONS_V2=1") != null);
-        if (format == .json) {
-            var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
-            defer parsed.deinit();
-            try std.testing.expectEqualStrings("SessionsV2Required", parsed.value.object.get("code").?.string);
-        }
-    }
-}
-
 test "session recovery boundary failures keep stable text and json guidance" {
     var text_output = CaptureOutput.init(std.testing.allocator);
     defer text_output.deinit();
@@ -3832,7 +3648,6 @@ fn workflowConfigWithLaunchModifiers(
     result.context_limit_overrides = modifiers.context_limit_overrides;
     result.additional_directories = modifiers.additional_directories;
     result.saved_directories_suppressed = modifiers.saved_directories_suppressed;
-    result.sessions_v2 = modifiers.sessions_v2;
     return result;
 }
 
@@ -4136,42 +3951,6 @@ fn parseSessionDetailArgs(
         options.target = .{ .id = try alloc.dupe(u8, trimmed) };
     }
     return options;
-}
-
-fn parseSessionMigrationArgs(
-    alloc: Allocator,
-    args: []const [:0]const u8,
-) !SessionMigrationOptions {
-    var format: output_contracts.OutputFormat = .text;
-    var allow_large = false;
-    var session_id: ?[]u8 = null;
-    errdefer if (session_id) |id| alloc.free(id);
-    var i: usize = 0;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--json")) {
-            format = .json;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--allow-large")) {
-            allow_large = true;
-            continue;
-        }
-        if (session_id != null) return error.InvalidSessionMigrationArgs;
-        const exact_id = std.mem.eql(u8, arg, "--id");
-        if (exact_id) {
-            i += 1;
-            if (i >= args.len) return error.InvalidSessionMigrationArgs;
-        }
-        const trimmed = std.mem.trim(u8, args[i], " \t\r\n");
-        if (trimmed.len == 0) return error.InvalidSessionMigrationArgs;
-        session_id = try alloc.dupe(u8, trimmed);
-    }
-    return .{
-        .format = format,
-        .session_id = session_id orelse return error.InvalidSessionMigrationArgs,
-        .allow_large = allow_large,
-    };
 }
 
 fn parseSessionRecoveryArgs(
@@ -4868,50 +4647,6 @@ test "parse session detail args treats last after id flag as exact id" {
         .last => return error.TestExpectedExactResumeId,
         .id => |id| try std.testing.expectEqualStrings("last", id),
     }
-}
-
-test "parse session migration args accepts positional and exact ids" {
-    var positional = try parseSessionMigrationArgs(std.testing.allocator, &.{
-        @constCast("session.v2"),
-        @constCast("--allow-large"),
-        @constCast("--json"),
-    });
-    defer positional.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("session.v2", positional.session_id);
-    try std.testing.expect(positional.allow_large);
-    try std.testing.expectEqual(output_contracts.OutputFormat.json, positional.format);
-
-    var exact = try parseSessionMigrationArgs(std.testing.allocator, &.{
-        @constCast("--id"),
-        @constCast("--allow-large"),
-        @constCast("--json"),
-    });
-    defer exact.deinit(std.testing.allocator);
-    try std.testing.expectEqualStrings("--allow-large", exact.session_id);
-    try std.testing.expect(!exact.allow_large);
-    try std.testing.expectEqual(output_contracts.OutputFormat.json, exact.format);
-}
-
-test "parse session migration args rejects missing repeated and mixed targets" {
-    try std.testing.expectError(
-        error.InvalidSessionMigrationArgs,
-        parseSessionMigrationArgs(std.testing.allocator, &.{@constCast("--id")}),
-    );
-    try std.testing.expectError(
-        error.InvalidSessionMigrationArgs,
-        parseSessionMigrationArgs(std.testing.allocator, &.{
-            @constCast("session.v2"),
-            @constCast("--id"),
-            @constCast("session.v3"),
-        }),
-    );
-    try std.testing.expectError(
-        error.InvalidSessionMigrationArgs,
-        parseSessionMigrationArgs(std.testing.allocator, &.{
-            @constCast("session.v2"),
-            @constCast("session.v3"),
-        }),
-    );
 }
 
 test "parse session recovery args accepts exact ids and rejects ambiguity" {

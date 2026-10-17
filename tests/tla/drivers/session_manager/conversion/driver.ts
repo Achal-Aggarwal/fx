@@ -59,8 +59,12 @@ function pathFaultLibrary(): string {
   return (pathFault = library);
 }
 
-export function fixture(label: string) {
-  const root = mkdtempSync(join(artifacts, label + "-"));
+// `at`, when given, is the root to use, made empty first: the fixtures'
+// generator keeps the paths v1 records the same on every run. `models`
+// replaces the gateway's model list.
+export function fixture(label: string, at?: string, models?: object[]) {
+  if (at) { rmSync(at, { recursive: true, force: true }); mkdirSync(at, { recursive: true }); }
+  const root = at ?? mkdtempSync(join(artifacts, label + "-"));
   const home = join(root, "home"), workspace = join(root, "workspace");
   mkdirSync(home, { mode: 0o700 }); mkdirSync(workspace, { mode: 0o700 });
   const v1Root = join(home, ".fx/sessions"), v2Root = join(v1Root, "v2");
@@ -73,7 +77,7 @@ export function fixture(label: string) {
   // A known window lets a long turn compact inside the turn.
   const gateway = startDynamicFakeGateway((body: string) => respond(body), {
     classifierDecision: "clear",
-    models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128_000, max_tokens: 8192 }],
+    models: models ?? [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use"], context_window: 128_000, max_tokens: 8192 }],
   });
 
   const env = (v2: boolean, homeDir = home) => {
