@@ -6,18 +6,17 @@
 //     [--harness fx|scripted] [--backend native|wasm]
 //
 // Each walk opens one agent and one session object, which makes the prompts
-// the walk chooses: text, or a prompt with an image to prepare. An image is
-// a file, whose read waits until the driver lets it finish or fail, or image
-// bytes, which the caller overwrites as soon as prompt() returns and whose
-// write to the session's image store waits for the driver. Every log write
+// the walk chooses: text, or a prompt with an image to prepare: base64 data
+// whose write to the session's image store waits until the driver lets it
+// land or fail. Every log write
 // of a prompt, or of a prompt's cancel, waits until the driver lets it land
 // or fail. With the fx harness each turn runs on a real fx engine, whose
 // model request the driver holds until it ends the turn; with the scripted
 // harness a turn is a stand-in the driver ends. After each step the driver
 // waits until the code is quiet, reads back what it shows, and moves to the
 // model states that show the same. Every stored prompt must name its image,
-// already in the image store with the caller's bytes; every model request
-// must carry its prompt's image unchanged; and a file is read at most once.
+// already in the image store with the caller's bytes; and every model
+// request must carry its prompt's image unchanged.
 //
 // `tests/tla/sdk/check.sh` writes graphs/intake.dot from PromptIntake-drive.cfg.
 import { mkdtemp, readFile, rm } from "node:fs/promises";
@@ -73,19 +72,6 @@ const deferred = () => {
 // so each prompt's image is its own.
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=", "base64");
 const imageOf = (walk, i) => new Uint8Array(Buffer.concat([png, Buffer.from(`walk-${walk}-prompt-${i}`.padEnd(24, "."))]));
-
-// A file whose read waits until the driver lets it finish or fail.
-class HeldFile extends Blob {
-  constructor(bytes) {
-    super([bytes], { type: "image/png" });
-    this.gate = deferred();
-    this.reads = 0;
-  }
-  arrayBuffer() {
-    this.reads += 1;
-    return this.gate.promise.then(() => super.arrayBuffer());
-  }
-}
 
 const nameOf = async (bytes) => Buffer.from(await crypto.subtle.digest("SHA-256", bytes)).toString("hex");
 // An image's stream on a World, as libfx names it.
@@ -229,7 +215,6 @@ async function harness(walk, n) {
   const expected = {};
   const names = {};
   const kinds = {};
-  const files = {};
   const imageGates = {};
   const controllers = {};
   const turnsRunning = new Map();
@@ -331,23 +316,13 @@ async function harness(walk, n) {
         kinds[i] = act.kind;
         early[i] = act.early;
         const blocks = [{ type: "text", text: `prompt-${i}` }];
-        // An image prompt is a file to read, or bytes whose image write the
-        // driver holds, chosen by the walk.
-        let bytes = null;
+        // An image prompt's image write is held until the driver lets it go.
         if (act.kind === "image") {
-          if (random() < 0.5) {
-            blocks.push({ type: "image", data: (files[i] = new HeldFile(image)) });
-          } else {
-            bytes = image.slice();
-            blocks.push({ type: "image", data: bytes, mimeType: "image/png" });
-            pendingNames.add(names[i]);
-            imageGates[i] = writes.holdImage(names[i]);
-          }
-          if (files[i]) pendingNames.add(names[i]);
+          blocks.push({ type: "image", data: expected[i], mimeType: "image/png" });
+          pendingNames.add(names[i]);
+          imageGates[i] = writes.holdImage(names[i]);
         }
         const turn = session.prompt(blocks, { messageId: `p${i}`, signal: controller.signal });
-        // The caller reuses its buffer as soon as prompt() returns.
-        bytes?.fill(0x55);
         controllers[i] = controller;
         made = i;
         acc[i] = "pending";
@@ -360,12 +335,10 @@ async function harness(walk, n) {
         return;
       }
       case "Prepared":
-        if (files[i]) files[i].gate.resolve();
-        else imageGates[i].go(true);
+        imageGates[i].go(true);
         return;
       case "PrepareFail":
-        if (files[i]) files[i].gate.reject(Object.assign(new Error("injected read failure"), { name: "NotReadableError" }));
-        else imageGates[i].go(false);
+        imageGates[i].go(false);
         return;
       case "Store": return writes.settle(`prompt:p${i}`, true);
       case "StoreFail": return writes.settle(`prompt:p${i}`, false);
@@ -408,7 +381,6 @@ async function harness(walk, n) {
       if (image?.data?.sha256 !== names[i] || Object.keys(image.data).length !== 1 || image?.mimeType !== "image/png" || image?.type !== "image") problems.push(`prompt ${i} stored ${JSON.stringify(image).slice(0, 120)}`);
       if (writes.images.get(names[i]) !== expected[i]) problems.push(`prompt ${i} was stored before its image, or with other bytes`);
     }
-    for (const [i, file] of Object.entries(files)) if (file.reads > 1) problems.push(`prompt ${i}'s file was read ${file.reads} times`);
     const order = stored.map((entry) => promptNumber(entry.input?.[0]?.text));
     const ph = [];
     for (let i = 1; i <= n; i += 1) {
@@ -451,7 +423,6 @@ async function harness(walk, n) {
   async function close() {
     writes.openAll();
     pendingNames.clear();
-    for (const file of Object.values(files)) file.gate.resolve();
     for (const turn of [...turnsRunning.values()]) turn.end();
     await Promise.race([(closing ?? agent.close()).catch(() => {}), sleep(3000)]);
     await closeAppWorlds?.();

@@ -57,7 +57,7 @@ agent.session(sessionId).prompt("Start with the schema.");
 - **Turns finish on their own.** A turn runs to the end whether or not anyone reads its events, and a turn nobody reads holds no connection open: its view starts reading only once you use its events, `readable` or `result`. Stop it with `session.cancel()`, or with the `signal` you passed to `prompt()`.
 - **Steering.** `session.steer(input)` steers the running turn the way the fx CLI does. While the model streams a reply, the steer cuts it short and the turn continues with it. While a tool runs, the steer waits for the tool. A steer sent while a turn waits to start joins that turn, and when no turn runs or waits, the steer becomes the next turn. A steer with images can't join a turn, so the running turn ends at its next safe point and the steer runs next.
 - **Retries are safe.** Give a prompt or a steer a `messageId`, and a repeated request with the same id runs nothing new. A repeated prompt follows the original turn, and its result has `repeated: true`. One id names one input, so a steer that reuses a prompt's id is rejected with `FX_MESSAGE_ID_IN_USE`. On a queue that keeps messages past the process, such as `vercel()`'s, the sender doesn't read the session first, so the worker drops that steer and emits a `session.error` with the same code. A steer's `user_message` event carries its id as `id` where it joined a turn.
-- **A refused prompt is never stored.** `prompt()` checks a prompt as the engine's `prompt()` does and throws a `TypeError` or `RangeError` for one libfx would refuse, such as an empty prompt, base64 that isn't canonical, an image whose bytes aren't its type, or more than 8 images. A `File` or `Blob` is checked by its size and type at once and by its bytes once read; if those are refused, `turn.accepted` rejects before anything is stored. A prompt whose `signal` aborts before the prompt is stored isn't stored either, and its turn ends `cancelled`.
+- **A refused prompt is never stored.** `prompt()` checks a prompt as the engine's `prompt()` does and throws a `TypeError` or `RangeError` for one libfx would refuse, such as an empty prompt, base64 that isn't canonical, an image whose bytes aren't its type, or more than 8 images. A prompt whose `signal` aborts before the prompt is stored isn't stored either, and its turn ends `cancelled`.
 
 Each conversation can bring its own settings, which apply to the turns that session object starts:
 
@@ -402,7 +402,7 @@ agent.session().prompt([
 ]);
 ```
 
-Image data can be a base64 string, bytes, a `Blob` or a `File`. A session saves each image once, named by its SHA-256, before it stores the prompt, and the saved conversation refers to it by that name, so images don't count toward the 4 MiB the session's own checkpoints hold. A session keeps its newest 4,096 images, up to 512 MiB of them; an older image leaves the conversation, and the model sees a note in its place. A checkpoint you take with `checkpoint()` carries the images' bytes, within its 4 MiB. libfx never deletes a saved image; it lasts as long as the session's storage. Each prompt takes up to 8 PNG, JPEG, GIF or WebP images, at most 3.75 MiB each and 6 MiB together. Pass `resizeImage` to downscale or convert prompt images before they're sent.
+A session stores each prompt as JSON before it runs, so a session prompt takes image data as a base64 string. `createFxEngine()` also takes bytes, a `Blob` or a `File`. A session saves each image once, named by its SHA-256, before it stores the prompt, and the saved conversation refers to it by that name, so images don't count toward the 4 MiB the session's own checkpoints hold. A session keeps its newest 4,096 images, up to 512 MiB of them; an older image leaves the conversation, and the model sees a note in its place. A checkpoint you take with `checkpoint()` carries the images' bytes, within its 4 MiB. libfx never deletes a saved image; it lasts as long as the session's storage. Each prompt takes up to 8 PNG, JPEG, GIF or WebP images, at most 3.75 MiB each and 6 MiB together. Pass `resizeImage` to downscale or convert prompt images before they're sent.
 
 ## Diagnostics
 
@@ -434,7 +434,7 @@ An engine differs from a session:
 - One prompt runs at a time, and breaking out of a turn's events cancels the turn.
 - The turn itself has `cancel()` and `steer()`. Like a session's steer, it cuts a streaming reply short and waits for a running tool, and it takes text only.
 
-To have the engine record the conversation as it runs, pass a `persistence` store instead of a checkpoint. A new engine on the same store can then `resume()` a turn the last process left open. A store needs two methods and can add the others, and the bytes are opaque, so it never has to understand them:
+To have the engine record the conversation as it runs, pass a `persistence` store instead of a checkpoint. A new engine on the same store can then `resume()` a turn the last process left open. A store needs two methods and can add a third, and the bytes are opaque, so it never has to understand them:
 
 ```ts
 interface Persistence {
@@ -445,8 +445,6 @@ interface Persistence {
   }>;
   append(input: { expected: string | null; idempotencyKey: string; data: Uint8Array; barrier: boolean; marks?: object[] }): Promise<{ cursor: string }>;
   saveCheckpoint?(input: { through: string; data: Uint8Array }): Promise<void>;
-  putImage?(name: string, bytes: Uint8Array): Promise<void>;
-  getImage?(name: string): Promise<Uint8Array | undefined>;
   marks?: boolean;
 }
 
@@ -463,8 +461,6 @@ The engine sends one `append()` at a time, and everything that happens while one
 `prompt()` and `resume()` take `yieldAt`, a time in milliseconds since the epoch: the turn stops before its next model request after that time, with the stop reason `yielded`, and the next `resume()` continues it without telling the model it was interrupted.
 
 A journal or `checkpoint` from a newer libfx fails with `FxJournalVersionError`. `createMemoryPersistence()` is a reference store for tests.
-
-Add `putImage()` and `getImage()` together, and the store keeps each prompt image once, under the lowercase hex SHA-256 of its bytes. Records and checkpoints then hold only that name, so images don't count toward the 4 MiB a checkpoint or a journal load holds. `putImage()` runs before any record names the image, and may run again for a name the store already holds. A prompt whose image can't be stored is rejected with `FX_IMAGE_STORE_FAILED` before anything is recorded. `getImage()` returns `undefined` for a name it doesn't hold, and the engine then fails to open with `FX_JOURNAL_IMAGE_MISSING`, as it does for bytes that don't match their name. An open reads only the images the session still keeps, its newest 4,096 or 512 MiB, and those of a turn it resumes, so an older image the store lost doesn't fail it. Without these methods, images stay inline as before.
 
 ## Runtimes
 

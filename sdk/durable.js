@@ -116,40 +116,24 @@ async function imageName(bytes) {
   return name;
 }
 const base64url = (text) => toBase64(encoder.encode(text)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+// The key a harness's store gives its image store under, `{ put, get }`:
+// `persistenceImages` in fx-sdk.js, which engines read it from.
+const persistenceImages = Symbol.for("libfx.persistenceImages");
 
 // A view of the bytes in an ArrayBuffer or typed array, or null.
 const byteView = (value) => (value instanceof ArrayBuffer ? new Uint8Array(value)
   : ArrayBuffer.isView(value) ? new Uint8Array(value.buffer, value.byteOffset, value.byteLength) : null);
-// A Blob's size, read through Blob.prototype so a value that only looks like
-// a Blob is not one; null for any other value.
-function blobSize(value) {
-  if (typeof Blob === "undefined" || value === null || typeof value !== "object") return null;
-  try {
-    return Object.getOwnPropertyDescriptor(Blob.prototype, "size").get.call(value);
-  } catch {
-    return null;
-  }
-}
-const validMimeType = (value) => typeof value === "string" && value.length > 0 && value.length <= 128;
 
-// A prompt's input as the queue and the log hold it: JSON, so image bytes
-// become base64 here, before `prompt()` returns, and the caller may reuse its
-// buffer at once. A Blob or File stays, with its type as the image's MIME
-// type, until `readPromptBlobs` reads it; `blobs` says whether one does.
-// Image data it cannot store throws a TypeError, by the engine's rules for
-// that form. Base64 text passes as given.
-//
-// With `named`, the session stores each image in its image store and the log
-// names it: bytes are copied instead, so the caller may still reuse its
-// buffer at once, and `storePromptImages` names them; `images` says whether
-// any image has data to store.
+// A prompt's input as the queue and the log hold it: JSON, so image data is
+// base64 text. With `named`, the session stores each image in its image
+// store and the log names it (`storePromptImages`); `images` says whether any
+// image has data to store.
 //
 // Each image block is copied once and only the copy is read, since an
 // accessor can return something else the next time it is read, and the log
 // must hold what was checked. The blocks are walked by index for the same
 // reason: an Array subclass can make map() return anything. Pure.
 function promptInputForLog(input, { named = false } = {}) {
-  let blobs = false;
   let images = false;
   const blocks = [];
   for (let index = 0; index < input.length; index += 1) {
@@ -159,46 +143,20 @@ function promptInputForLog(input, { named = false } = {}) {
       continue;
     }
     const image = { ...block };
-    if (image.data === undefined || typeof image.data === "string") {
-      if (typeof image.data === "string") images = named;
-      blocks.push(image);
-      continue;
-    }
-    images = named;
-    const name = `image prompt block ${index}`;
-    const size = blobSize(image.data);
-    if (size !== null) {
-      const mimeType = image.data.type;
-      if (image.mimeType !== undefined && image.mimeType !== mimeType) throw new TypeError(`${name} mimeType disagrees with Blob.type`);
-      if (!validMimeType(mimeType)) throw new TypeError(`${name} requires a mimeType`);
-      if (!Number.isSafeInteger(size) || size <= 0) throw new TypeError(`${name} requires a non-empty Blob with a valid size`);
-      blobs = true;
-      blocks.push({ ...image, mimeType });
-      continue;
-    }
-    const bytes = byteView(image.data);
-    if (!bytes || bytes.byteLength === 0) throw new TypeError(`${name} requires base64 data, bytes, or a Blob`);
-    if (!validMimeType(image.mimeType)) throw new TypeError(`${name} requires a mimeType`);
-    blocks.push({ ...image, data: named ? bytes.slice() : toBase64(bytes) });
+    if (image.data !== undefined && typeof image.data !== "string") throw new TypeError("a durable prompt carries image data as a base64 string");
+    if (typeof image.data === "string") images = named;
+    blocks.push(image);
   }
-  return { input: blocks, blobs, images };
-}
-
-// Reads each Blob `promptInputForLog` left in a prompt's input, as bytes for
-// `storePromptImages`.
-function readPromptBlobs(input) {
-  return Promise.all(input.map(async (block) => {
-    if (blobSize(block?.data) === null) return block;
-    return { ...block, data: new Uint8Array(await block.data.arrayBuffer()) };
-  }));
+  return { input: blocks, images };
 }
 
 // Stores each image a prompt's input holds in the session's image store,
 // before the input that names it is stored, and returns the input naming
 // them: `{ type: "image", mimeType, sourceRef?, data: { sha256 } }`. An older
 // libfx refuses data it can't read, so a worker that predates names fails
-// the turn rather than run it without its images. With `images` null it only
-// names them, for a prompt the log already holds.
+// the turn rather than run it without its images. A store that fails rejects
+// with its own error. With `images` null it only names them, for a prompt the
+// log already holds.
 async function storePromptImages(images, input) {
   const blocks = [];
   for (const block of input) {
@@ -207,18 +165,9 @@ async function storePromptImages(images, input) {
       continue;
     }
     const { data, ...rest } = block;
-    const bytes = typeof data === "string" ? fromBase64(data) : data;
+    const bytes = fromBase64(data);
     const sha256 = await imageName(bytes);
-    if (images) {
-      try {
-        await images.put(sha256, bytes);
-      } catch (cause) {
-        // As an engine reports a store that fails, with the store's error.
-        const error = new Error("libfx could not store a prompt image", { cause });
-        error.code = "FX_IMAGE_STORE_FAILED";
-        throw error;
-      }
-    }
+    if (images) await images.put(sha256, bytes);
     blocks.push({ ...rest, data: { sha256 } });
   }
   return blocks;
@@ -1708,15 +1657,17 @@ class SessionWorker {
       append: ({ idempotencyKey, data, marks }) => chained({ k: "record", key: idempotencyKey, data: toBase64(data), marks }).then((cursor) => ({ cursor })),
       // The engine stores each prompt image before it sends it; a prompt
       // from the log names images already here.
-      putImage: (name, bytes) => log.images.put(name, bytes),
-      getImage: async (name) => {
-        try {
-          return await log.images.get(name);
-        } catch (error) {
-          // The store failed to answer, which says nothing of the image.
-          imageReadFailed = error;
-          throw error;
-        }
+      [persistenceImages]: {
+        put: (name, bytes) => log.images.put(name, bytes),
+        get: async (name) => {
+          try {
+            return await log.images.get(name);
+          } catch (error) {
+            // The store failed to answer, which says nothing of the image.
+            imageReadFailed = error;
+            throw error;
+          }
+        },
       },
       saveCheckpoint: async ({ through, data }) => {
         // What a fold that starts at this checkpoint would otherwise miss:
@@ -2363,8 +2314,7 @@ function turnView({ messageId, resumeRequest = null, start }) {
  *   It throws a TypeError for options it refuses.
  * - `checkPrompt(input)` (optional): throws a TypeError or RangeError for
  *   a prompt input the harness would refuse. A session's `prompt()` calls it
- *   before it stores anything, and again on a file's bytes once they are
- *   read, so a prompt it refuses is never stored.
+ *   before it stores anything, so a prompt it refuses is never stored.
  *
  * A harness session has `prompt(input, { turnId, yieldAt })` and
  * `resume({ yieldAt, rerun })`, each returning a turn, where `rerun: false`
@@ -2547,9 +2497,9 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
         seeded = true;
       };
       // Settles once the latest prompt from this session object with images
-      // to read or store is stored or has failed; null while none has. Each
-      // later prompt waits for it, so they are stored in the order made.
-      let reading = null;
+      // to store is stored or has failed; null while none has. Each later
+      // prompt waits for it, so they are stored in the order made.
+      let storing = null;
       // `ready`, when given, resolves the input once it can be stored; only a
       // prompt that is stored calls it.
       // `aborted()` says whether the prompt's signal has aborted. One that
@@ -2635,12 +2585,10 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
          * With `messageId`, a retried call is the same turn: it continues a
          * turn still running and answers one that ended, without running it
          * again. Each image is stored once in the session's image store and
-         * the log names it; a Blob or File is read first. A later prompt from
-         * this session object waits for an earlier one's images. An input the
-         * harness would refuse throws here, or for a file's bytes, rejects
-         * `accepted` once read, and is never stored. A prompt whose signal
-         * aborts before it is stored is never stored either: it ends
-         * cancelled.
+         * the log names it. A later prompt from this session object waits for
+         * an earlier one's images. An input the harness would refuse throws
+         * here and is never stored. A prompt whose signal aborts before it is
+         * stored is never stored either: it ends cancelled.
          */
         prompt(input, promptOptions = {}) {
           if (closed) throw new Error(`${label} is closed`);
@@ -2656,15 +2604,15 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
           // them; a prompt aborted before the call stores nothing, so it
           // keeps them as base64.
           const named = !aborted;
-          const stored = Array.isArray(input) ? promptInputForLog(input, { named }) : { input, blobs: false, images: false };
+          const stored = Array.isArray(input) ? promptInputForLog(input, { named }) : { input, images: false };
           // The copy the log will hold is what is checked: a getter can't
           // show the check one value and the log another.
           plugged.checkPrompt?.(stored.input);
-          const before = reading;
-          const ready = before || stored.blobs || stored.images ? async () => {
-            // The prompt waits for an earlier one, its file and its image
-            // writes only until its signal aborts; what it waited for may
-            // still land, but the prompt is not stored.
+          const before = storing;
+          const ready = before || stored.images ? async () => {
+            // The prompt waits for an earlier one and its image writes only
+            // until its signal aborts; what it waited for may still land, but
+            // the prompt is not stored.
             let release = () => {};
             const abortion = signal === undefined ? null : new Promise((resolve) => {
               signal.addEventListener("abort", resolve, { once: true });
@@ -2678,10 +2626,7 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
             try {
               await unlessAborted(before ?? Promise.resolve());
               if (signal?.aborted) return null;
-              let read = stored.blobs ? await unlessAborted(readPromptBlobs(stored.input)) : stored.input;
-              if (signal?.aborted) return null;
-              // A file's bytes are checked once there are some.
-              if (stored.blobs) plugged.checkPrompt?.(read);
+              let read = stored.input;
               if (stored.images) {
                 const { created, id: sessionId } = await resolved;
                 const log = await created.session(sessionId);
@@ -2701,12 +2646,12 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
           } : null;
           const progress = { sent: false };
           const turn = startTurn("prompt", messageId, stored.input, retried, () => signal?.aborted === true, ready, progress);
-          if ((stored.blobs || stored.images) && !aborted) {
+          if (stored.images && !aborted) {
             // A later prompt waits for this one and every one before it: one
             // withdrawn while it waited settles before them.
             const settled = Promise.all([before, turn.accepted.then(() => {}, () => {})]).then(() => {});
-            reading = settled;
-            void settled.then(() => { if (reading === settled) reading = null; });
+            storing = settled;
+            void settled.then(() => { if (storing === settled) storing = null; });
           }
           if (signal !== undefined && !signal.aborted) {
             // The prompt's own cancel: it stops this turn whether it runs or
@@ -2836,8 +2781,10 @@ export function createDurableAgentFactory({ harness, defaultDurability, name = "
             append: async () => { throw new Error("a checkpoint reads the session without changing it"); },
             // The records name the session's images; the engine reads them
             // from its image store to export them.
-            getImage: (name) => log.images.get(name),
-            putImage: async () => { throw new Error("a checkpoint reads the session without changing it"); },
+            [persistenceImages]: {
+              get: (name) => log.images.get(name),
+              put: async () => { throw new Error("a checkpoint reads the session without changing it"); },
+            },
           };
           const harness = await agent.openHarness(sessionId, readOnly, null);
           try {

@@ -88,7 +88,6 @@ export type {
   FxSessionImageBlock,
   FxSessionOptions,
   FxSessionPromptInput,
-  FxSessionSteerInput,
   FxSessionTurnEvent,
   FxSharedOptions,
   FxSteer,
