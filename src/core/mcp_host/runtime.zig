@@ -71,10 +71,9 @@ pub fn waitRetired() void {
     while (retiring.load(.acquire) != 0) io_mod.sleep(5 * std.time.ns_per_ms);
 }
 
-/// FX_MCP_ENGINE=v2 selects MCP-v2.
+/// Every host runs its MCP servers through MCP-v2.
 pub fn selected() bool {
-    const value = io_mod.getenv("FX_MCP_ENGINE") orelse return false;
-    return std.mem.eql(u8, value, "v2");
+    return true;
 }
 
 pub const State = enum {

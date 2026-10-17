@@ -869,11 +869,9 @@ const allowlist_user_add_tool_completions = scopedAllowlistCompletions("user", a
 const allowlist_local_remove_tool_completions = scopedAllowlistCompletions("local", allowlist_remove_tool_completions);
 const allowlist_user_remove_tool_completions = scopedAllowlistCompletions("user", allowlist_remove_tool_completions);
 
-/// MCP-v2's `/mcp` completes its verbs and server names. The
-/// check goes with FX_MCP_ENGINE when v1 is removed.
+/// `/mcp` completes MCP-v2's verbs and server names.
 fn mcpVerbsOn() bool {
-    const value = io_mod.getenv("FX_MCP_ENGINE") orelse return false;
-    return std.mem.eql(u8, value, "v2");
+    return true;
 }
 
 fn runtimeArgCommand(registry: SlashRegistry) []const u8 {
