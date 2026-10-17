@@ -1689,7 +1689,7 @@ const withScreenshots = { ...visionCatalog, tools: [lookup, screenshot] };
 const toolDroppedNote = /\[1 image from this result is no longer in this session, which keeps only its newest images\.\]/;
 
 test("a store keeps each tool image once, and records and checkpoints only name it", async () => {
-  const store = createMemoryPersistence();
+  const store = createImagePersistence();
   const source = await createFxEngine(options(sourceBackend, undefined, { ...withScreenshots, persistence: store, checkpointAfterBytes: 0 }));
   for (const shot of [1, 2, 3]) assert.equal((await run(source, `screenshot ${shot}`)).text, `saw ${shot}`);
   await source.close();
@@ -1715,7 +1715,7 @@ test("a store keeps each tool image once, and records and checkpoints only name 
 });
 
 test("a tool image leaves the window oldest first, as a note, and stays out after a reopen", async () => {
-  const store = createMemoryPersistence();
+  const store = createImagePersistence();
   const window = { [imageWindow]: { images: 2 } };
   const shots = [1, 2, 3].map(screenshotOf);
   const source = await createFxEngine(options(sourceBackend, undefined, { ...withScreenshots, ...window, persistence: store, checkpointAfterBytes: 0 }));
@@ -1735,26 +1735,15 @@ test("a tool image leaves the window oldest first, as a note, and stays out afte
   assert.match(JSON.stringify(requests.at(-1)), toolDroppedNote);
 });
 
-test("a tool image the store refuses stays in the session inline, and the host hears why", async () => {
-  const store = createMemoryPersistence();
-  const refusing = {
-    load: () => store.load(),
-    append: (input) => store.append(input),
-    saveCheckpoint: (input) => store.saveCheckpoint(input),
-    putImage: async () => { throw new Error("store is full"); },
-    getImage: (name) => store.getImage(name),
-  };
-  const refusals = [];
-  const agent = await createFxEngine(options(sourceBackend, undefined, {
-    ...withScreenshots, persistence: refusing,
-    onEvent: (event) => { if (event.type === "image.store_error") refusals.push(event.message); },
-  }));
+test("a tool image the store refuses stays in the session inline", async () => {
+  const store = createImagePersistence();
+  store[persistenceImages].put = async () => { throw new Error("store is full"); };
+  const agent = await createFxEngine(options(sourceBackend, undefined, { ...withScreenshots, persistence: store }));
   requests.length = 0;
   const { text, result } = await run(agent, "screenshot 4");
   await agent.close();
   assert.equal(result.stopReason, "end_turn");
   assert.equal(text, "saw 4");
-  assert.deepEqual(refusals, ["store is full"]);
   // The tool ran, so its image is not lost: the model saw it, and the
   // records hold it inline.
   assert.deepEqual(requestImages(requests.at(-1)), [base64Of(screenshotOf(4))]);
@@ -1771,12 +1760,7 @@ test("a tool image the store refuses stays in the session inline, and the host h
 test("a turn that crashed after its screenshot's progress reopens with the screenshot", async () => {
   const journal = eventJournal();
   const images = new Map();
-  const withImages = (persistence) => ({
-    ...persistence,
-    putImage: async (name, bytes) => { images.set(name, new Uint8Array(bytes)); },
-    getImage: async (name) => images.get(name),
-  });
-  const source = await createFxEngine(options(sourceBackend, undefined, { ...withScreenshots, persistence: withImages(persisted(journal)) }));
+  const source = await createFxEngine(options(sourceBackend, undefined, { ...withScreenshots, persistence: withImageStore(persisted(journal), images) }));
   assert.equal((await run(source, "screenshot 5")).text, "saw 5");
   await source.close();
   // The progress after the tool step extends the first, and names the shot.
@@ -1784,7 +1768,7 @@ test("a turn that crashed after its screenshot's progress reopens with the scree
   assert.ok(stepped?.base !== undefined && stepped.v === 3 && JSON.stringify(stepped).includes("inline_ref"), "the delta names the screenshot");
   assert.ok(!JSON.stringify(stepped).includes(base64Of(screenshotOf(5)).slice(0, 400)), "and does not hold it");
   const survived = journal.events.slice(0, journal.events.indexOf(stepped) + 1);
-  const resumed = await createFxEngine(options(targetBackend, undefined, { ...withScreenshots, persistence: withImages(persisted(eventJournal(survived))) }));
+  const resumed = await createFxEngine(options(targetBackend, undefined, { ...withScreenshots, persistence: withImageStore(persisted(eventJournal(survived)), images) }));
   requests.length = 0;
   const turn = resumed.resume();
   for await (const _ of turn) {}
@@ -1796,15 +1780,10 @@ test("a turn that crashed after its screenshot's progress reopens with the scree
 test("a turn that crashed right after its screenshot's result reopens with the screenshot, without running the tool again", async () => {
   const journal = eventJournal();
   const images = new Map();
-  const withImages = (persistence) => ({
-    ...persistence,
-    putImage: async (name, bytes) => { images.set(name, new Uint8Array(bytes)); },
-    getImage: async (name) => images.get(name),
-  });
   let shots = 0;
   const counting = { ...screenshot, execute: async (input) => { shots += 1; return screenshot.execute(input); } };
   const withCounting = { ...visionCatalog, tools: [lookup, counting] };
-  const source = await createFxEngine(options(sourceBackend, undefined, { ...withCounting, persistence: withImages(persisted(journal)) }));
+  const source = await createFxEngine(options(sourceBackend, undefined, { ...withCounting, persistence: withImageStore(persisted(journal), images) }));
   assert.equal((await run(source, "screenshot 9")).text, "saw 9");
   await source.close();
   // The result names the screenshot as the call finished, before any
@@ -1814,7 +1793,7 @@ test("a turn that crashed right after its screenshot's result reopens with the s
   assert.ok(!JSON.stringify(result).includes(base64Of(screenshotOf(9)).slice(0, 400)), "and does not hold it");
   const survived = journal.events.slice(0, journal.events.indexOf(result) + 1);
   assert.ok(!survived.some((event) => event.type === "turn_progress" && event.steps === 1), "no progress holds the step yet");
-  const resumed = await createFxEngine(options(targetBackend, undefined, { ...withCounting, persistence: withImages(persisted(eventJournal(survived))) }));
+  const resumed = await createFxEngine(options(targetBackend, undefined, { ...withCounting, persistence: withImageStore(persisted(eventJournal(survived)), images) }));
   requests.length = 0;
   const turn = resumed.resume();
   for await (const _ of turn) {}
@@ -1825,20 +1804,15 @@ test("a turn that crashed right after its screenshot's result reopens with the s
 });
 
 test("a tool image the store refused leaves the window like any other, as a note", async () => {
-  const store = createMemoryPersistence();
+  const store = createImagePersistence();
   const refusedName = await nameOf(screenshotOf(6));
-  const refusing = {
-    load: () => store.load(),
-    append: (input) => store.append(input),
-    saveCheckpoint: (input) => store.saveCheckpoint(input),
-    putImage: async (name, bytes) => {
-      if (name === refusedName) throw new Error("store is full");
-      return store.putImage(name, bytes);
-    },
-    getImage: (name) => store.getImage(name),
+  const { put } = store[persistenceImages];
+  store[persistenceImages].put = async (name, bytes) => {
+    if (name === refusedName) throw new Error("store is full");
+    return put(name, bytes);
   };
   const window = { [imageWindow]: { images: 2 } };
-  const source = await createFxEngine(options(sourceBackend, undefined, { ...withScreenshots, ...window, persistence: refusing, checkpointAfterBytes: 0 }));
+  const source = await createFxEngine(options(sourceBackend, undefined, { ...withScreenshots, ...window, persistence: store, checkpointAfterBytes: 0 }));
   for (const shot of [6, 7, 8]) assert.equal((await run(source, `screenshot ${shot}`)).text, `saw ${shot}`);
   requests.length = 0;
   await run(source, "what is left");
@@ -1848,7 +1822,7 @@ test("a tool image the store refused leaves the window like any other, as a note
   assert.match(JSON.stringify(requests.at(-1)), toolDroppedNote);
   assert.ok(!holdsImage(store.checkpoint.data, screenshotOf(6)), "the checkpoint no longer holds it");
 
-  const target = await createFxEngine(options(targetBackend, undefined, { ...withScreenshots, ...window, persistence: refusing }));
+  const target = await createFxEngine(options(targetBackend, undefined, { ...withScreenshots, ...window, persistence: store }));
   requests.length = 0;
   await run(target, "and after reopening");
   await target.close();
@@ -1863,11 +1837,12 @@ test("a turn whose tools returned more images than a window and a prompt hold re
   const journal = eventJournal();
   const images = new Map();
   let staged = 0;
-  const withImages = (persistence) => ({
-    ...persistence,
-    putImage: async (name, bytes) => { images.set(name, new Uint8Array(bytes)); },
-    getImage: async (name) => { staged += 1; return images.get(name); },
-  });
+  const withImages = (persistence) => {
+    const counted = withImageStore(persistence, images);
+    const { get } = counted[persistenceImages];
+    counted[persistenceImages].get = async (name) => { staged += 1; return get(name); };
+    return counted;
+  };
   const withAlbum = { ...visionCatalog, tools: [album] };
   const source = await createFxEngine(options(sourceBackend, undefined, { ...withAlbum, persistence: withImages(persisted(journal)) }));
   assert.equal((await run(source, `album ${pages}`)).text, "saw the album");

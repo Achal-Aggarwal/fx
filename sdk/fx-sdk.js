@@ -2674,10 +2674,11 @@ export async function createFxEngine(options = {}) {
       try { bytes = base64ToBytes(image.data); } catch { continue; }
       const name = await imageName(bytes);
       try {
-        await persistence.putImage(name, bytes);
+        await imageStorage.put(name, bytes);
         stored.set(image.data, name);
-      } catch (error) {
-        emit("image.store_error", { error: error instanceof Error ? error.name : "Error", message: error?.message ?? "" });
+      } catch {
+        // Not stored: the result keeps the image, and the records hold it
+        // inline.
       }
     }
     return stored.size ? hostToolContent(value, stored) : normalized;

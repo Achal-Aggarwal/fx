@@ -282,8 +282,6 @@ export type FxEngineEvent = FxEventBase & (
   | { type: "journal.error"; error: string }
   | { type: "checkpoint.save"; through: string; bytes: number }
   | { type: "checkpoint.error"; error: string; message: string }
-  /** The image store refused an image a tool returned. The session keeps the image, and its records hold it inline. */
-  | { type: "image.store_error"; error: string; message: string }
   /** A checkpoint saved under a different libfx version, tool set, or model still loaded. */
   | { type: "checkpoint.mismatch"; sessionId: string; changed: Array<keyof FxCheckpointMeta>; saved: unknown; current: FxCheckpointMeta }
   | { type: "output.backpressure"; bufferedBytes: number; bufferedEvents: number }
