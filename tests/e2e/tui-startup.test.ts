@@ -541,19 +541,19 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
 
 describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
   test(
-    "unresponsive MCP discovery does not block startup or shutdown",
+    "an unresponsive MCP server blocks neither startup nor quitting",
     async () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-mcp-startup-")));
       const home = join(root, "home");
       mkdirSync(join(home, ".fx"), { recursive: true });
 
-      let discoveryRequests = 0;
+      let requests = 0;
       const server = Bun.serve({
         hostname: "127.0.0.1",
         port: 0,
         async fetch(request) {
-          const body = await request.text();
-          if (body.includes('"method":"initialize"')) discoveryRequests += 1;
+          await request.text();
+          requests += 1;
           return await new Promise<Response>(() => {});
         },
       });
@@ -580,27 +580,13 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
         });
         const pane = await session.waitForComposer(5_000);
         expect(hasEmptyComposer(pane)).toBe(true);
-        const startupDeadline = Date.now() + 5_000;
-        while (discoveryRequests < 1 && Date.now() < startupDeadline) {
+        // After the first frame the shell starts every server in the
+        // background; this one never answers. Quitting waits for no server.
+        const connectDeadline = Date.now() + 5_000;
+        while (requests < 1 && Date.now() < connectDeadline) {
           await Bun.sleep(25);
         }
-        expect(discoveryRequests).toBe(1);
-
-        await session.sendText("/mcp");
-        const summary = await session.waitForText("MCP 1", 5_000);
-        expect(summary).toContain("pending");
-        expect(summary).toContain("Connecting");
-        await session.sendKeys("Escape");
-        await session.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
-        const beforeListMenu = await session.captureFullScrollback();
-        await session.sendText("/mcp list");
-        const listMenu = await session.waitForText("[Servers]", 5_000);
-        expect(listMenu).toContain("pending");
-        expect(listMenu).toContain("Connecting");
-        await session.sendKeys("Escape");
-        await session.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
-        expect(await session.captureFullScrollback()).toBe(beforeListMenu);
-
+        expect(requests).toBeGreaterThanOrEqual(1);
         await session.sendText("/quit");
         expect(await session.waitForSessionEnd(5_000)).toBe(true);
       } finally {

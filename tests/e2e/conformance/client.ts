@@ -52,34 +52,6 @@ const scenarioContext = process.env.MCP_CONFORMANCE_CONTEXT
     toolCalls?: Array<{ name: string; arguments: Record<string, unknown> }>;
   }
   : {};
-if (scenario === "sep-2322-client-request-state") {
-  const repoRoot = resolve(import.meta.dirname, "../../..");
-  const child = Bun.spawn(
-    [
-      "zig",
-      "build",
-      "run-mcp-stdio-dispatcher-e2e",
-      "--",
-      "runtime-http-mrtr",
-      configuredServerUrl,
-    ],
-    {
-      cwd: repoRoot,
-      env: conformanceEnv,
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
-  const [stdout, stderr, exitCode] = await Promise.all([
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text(),
-    child.exited,
-  ]);
-  process.stdout.write(stdout);
-  process.stderr.write(stderr);
-  await legacyProbeProxy?.stop();
-  process.exit(exitCode);
-}
 const toolCalls = scenarioContext.toolCalls ?? scenarioToolCalls(scenario);
 const permission: Record<string, "allow"> = {};
 for (const call of toolCalls) {
@@ -140,45 +112,47 @@ if (toolCalls.length === 0) {
   ));
 }
 gatewaySteps.push(fakeGatewayFinalText("MCP conformance client finished."));
-const gateway = startFakeGateway(gatewaySteps);
 
-try {
-  const child = Bun.spawn(
-    [
-      fxBin,
-      "ask",
-      "--json",
-      "--auto",
-      "--no-save",
-      "Call the conformance add_numbers MCP tool with a=2 and b=3.",
-    ],
-    {
-      cwd: workspace,
-      env: {
-        ...conformanceEnv,
-        HOME: home,
-        AI_GATEWAY_API_KEY: "mcp-conformance-placeholder",
-        VERCEL_OIDC_TOKEN: "",
-        FX_AUTO_UPGRADE: "0",
-        FX_DISABLE_KEYCHAIN: "1",
-        FX_E2E_MCP_AUTH_AUTOMATE: "1",
-        ...(scenarioContext.client_secret
-          ? {
-              FX_MCP_CONFORMANCE_CLIENT_SECRET:
-                scenarioContext.client_secret,
-            }
-          : {}),
-        FX_GATEWAY_BASE_URL: gateway.baseUrl,
-        FX_GATEWAY_CHAT_URL: gateway.chatUrl,
-        FX_MODEL: FAKE_GATEWAY_MODEL,
-        FX_SKIP_ONBOARDING: "1",
-        FX_SOUND: "0",
-        NO_COLOR: "1",
-      },
-      stdout: "pipe",
-      stderr: "pipe",
-    },
-  );
+// fx signs in through the browser with fx mcp login. For the auth scenarios
+// this browser follows the authorization URL's redirects back to fx's
+// loopback callback, as a user approving it would.
+const authScenario = scenario.startsWith("auth/");
+const fakeBin = join(root, "bin");
+if (authScenario) {
+  mkdirSync(fakeBin, { recursive: true });
+  const opener =
+    '#!/bin/sh\nnohup curl --location --silent --show-error "$1" >/dev/null 2>&1 &\nexit 0\n';
+  for (const name of ["open", "xdg-open"]) {
+    writeFileSync(join(fakeBin, name), opener, { mode: 0o755 });
+  }
+}
+const fxEnv = {
+  ...conformanceEnv,
+  HOME: home,
+  PATH: authScenario ? `${fakeBin}:${process.env.PATH ?? ""}` : process.env.PATH,
+  AI_GATEWAY_API_KEY: "mcp-conformance-placeholder",
+  VERCEL_OIDC_TOKEN: "",
+  FX_AUTO_UPGRADE: "0",
+  FX_DISABLE_KEYCHAIN: "1",
+  ...(scenarioContext.client_secret
+    ? {
+        FX_MCP_CONFORMANCE_CLIENT_SECRET:
+          scenarioContext.client_secret,
+      }
+    : {}),
+  FX_MODEL: FAKE_GATEWAY_MODEL,
+  FX_SKIP_ONBOARDING: "1",
+  FX_SOUND: "0",
+  NO_COLOR: "1",
+};
+
+async function runFx(args: string[], extraEnv: Record<string, string> = {}) {
+  const child = Bun.spawn([fxBin, ...args], {
+    cwd: workspace,
+    env: { ...fxEnv, ...extraEnv },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(child.stdout).text(),
     new Response(child.stderr).text(),
@@ -186,9 +160,39 @@ try {
   ]);
   process.stdout.write(stdout);
   process.stderr.write(stderr);
-  process.exitCode = exitCode;
+  return { stdout, stderr, exitCode };
+}
+
+// Each ask gets its own scripted model.
+async function ask() {
+  const gateway = startFakeGateway(gatewaySteps);
+  try {
+    return await runFx(
+      [
+        "ask",
+        "--json",
+        "--auto",
+        "--no-save",
+        "Call the conformance add_numbers MCP tool with a=2 and b=3.",
+      ],
+      { FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    );
+  } finally {
+    gateway.stop();
+  }
+}
+
+try {
+  if (authScenario) await runFx(["mcp", "login", "conformance"]);
+  let result = await ask();
+  // A server that asks for more scope at call time: sign in again once,
+  // then ask once more.
+  if (authScenario && result.stdout.includes("needs a login")) {
+    await runFx(["mcp", "login", "conformance"]);
+    result = await ask();
+  }
+  process.exitCode = result.exitCode;
 } finally {
-  gateway.stop();
   await legacyProbeProxy?.stop();
   rmSync(root, { recursive: true, force: true });
 }

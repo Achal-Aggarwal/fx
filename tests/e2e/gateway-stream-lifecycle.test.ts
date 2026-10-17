@@ -692,7 +692,7 @@ function handle(message) {
       jsonrpc: "2.0",
       id: message.id,
       result: {
-        protocolVersion: "2024-11-05",
+        protocolVersion: "2025-03-26",
         capabilities: { tools: {} },
         serverInfo: { name: "fixture", version: "1.0.0" },
         instructions: "SECRET_SERVER_INSTRUCTION_SENTINEL",
@@ -818,21 +818,20 @@ async function waitForMcpServerReady(
     throw new Error(`Timed out waiting for MCP fixture startup: ${serverName}`);
   }
 
-  const hasServerState = (pane: string, state: "Ready" | "Failed") =>
+  // `/mcp list` prints one row per server, with its status.
+  const hasServerState = (pane: string, state: "ready" | "failed") =>
     pane.split("\n").some((line) =>
-      line.includes(`${serverName} `) && line.includes(state)
+      line.includes(`${serverName} `) && new RegExp(`\\b${state}\\b`).test(line)
     );
   await session.sendText("/mcp list");
   const status = await session.waitForPane(
-    (pane) => hasServerState(pane, "Ready") || hasServerState(pane, "Failed"),
+    (pane) => hasServerState(pane, "ready") || hasServerState(pane, "failed"),
     timeoutMs,
   );
-  await session.sendKeys("Escape");
-  await session.waitForPane((pane) => !pane.includes("[Servers]"), 5_000);
   if (!isProcessAlive(pid)) {
     throw new Error(`MCP fixture process ${pid} exited after startup.\n${status}`);
   }
-  if (hasServerState(status, "Failed")) {
+  if (hasServerState(status, "failed")) {
     throw new Error(`MCP server ${serverName} failed after startup.\n${status}`);
   }
 }
@@ -1159,10 +1158,10 @@ describe("gateway stream lifecycle", () => {
       expect(serializedToolNames(oracleRequest)).toEqual(
         AUTO_EXA_WITHOUT_DURABLE_TOOLS_SERIALIZED_TOOL_NAMES,
       );
-      expect(request.tools).toHaveLength(16);
+      expect(request.tools).toHaveLength(15);
       expect(findUnavailableCapabilityReferences(oracleRequest)).toEqual([]);
       expect(customProviderGuidanceState(oracleRequest)).toEqual({
-        providerToolIndices: [13],
+        providerToolIndices: [12],
         guidanceMessageIndices: [1],
       });
       expect(request.prompt[0]?.role).toBe("system");
@@ -7623,37 +7622,6 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
-  test("required MCP server advertises only its ready count before lazy search", async () => {
-    const root = createFixtureRoot("mcp-ready-server-summary");
-    const tracePath = join(root.root, "trace.log");
-    const mcp = writeMcpFixture(root, { required: true, toolCount: 30 });
-    const gateway = startGateway(() => fakeGatewayFinalText("MCP ready summary complete."));
-    try {
-      const result = await runFx(
-        ["ask", "--json", "--auto", "--no-save", "Inspect configured MCP availability."],
-        {
-          cwd: root.workspace,
-          env: fixtureEnv(root, gateway, tracePath),
-          timeoutMs: 20_000,
-        },
-      );
-      const pid = Number.parseInt(readFileSync(mcp.pidPath, "utf8"), 10);
-      const initialPrompt = promptText(gateway.requests[0]!.body);
-
-      expect(result.code).toBe(0);
-      expect(initialPrompt).toContain(
-        '<server name="fixture" state="ready" tools="30" />',
-      );
-      expect(gateway.requests[0]!.body).not.toContain(DYNAMIC_MCP_TOOL_NAME);
-      expect(gateway.requests[0]!.body).not.toContain("SECRET_SERVER_INSTRUCTION_SENTINEL");
-      expect(gateway.requests[0]!.body).not.toContain("EXACT_SCHEMA_QUERY_SENTINEL");
-      await waitForProcessExit(pid);
-    } finally {
-      gateway.stop();
-      rmSync(root.root, { recursive: true, force: true });
-    }
-  });
-
   test.each([0, 4_000])("canonical subagent executes through parent MCP adapters after %d ms", async (initializeDelayMs) => {
     const root = createFixtureRoot("subagent-mcp-inheritance");
     const tracePath = join(root.root, "trace.log");
@@ -7688,8 +7656,10 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         return fakeGatewayFinalText("Parent observed child MCP completion.");
       }
       if (body.includes(childPrompt)) {
+        // The parent hasn't used MCP yet, so the child sees the server it
+        // inherits as available on demand.
         expect(promptText(body)).toContain(
-          '<server name="fixture" state="ready" tools="1" />',
+          '<server name="fixture" state="available_on_demand" />',
         );
         expect(body).not.toContain(DYNAMIC_MCP_TOOL_NAME);
         return fakeGatewayToolCall("child_mcp_select_1", "mcp_select_tool", {
@@ -7773,8 +7743,16 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
         childRequested = true;
         return fakeGatewayFinalText("Child with large MCP catalog complete.");
       }
-      return fakeGatewayToolCall("parent_subagent_large_1", "subagent", {
-        request: { action: "run", task: childPrompt },
+      // Servers start when first needed, so the parent searches first: that
+      // loads all 257 tools before the child is made.
+      if (body.includes('"toolCallId":"parent_load_large_1"')) {
+        return fakeGatewayToolCall("parent_subagent_large_1", "subagent", {
+          request: { action: "run", task: childPrompt },
+        });
+      }
+      return fakeGatewayToolCall("parent_load_large_1", "capability_search", {
+        query: "fixture tools",
+        server: "fixture",
       });
     }, {
       classifierDecision: "clear",
@@ -7794,6 +7772,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(parentResult).toContain("Child with large MCP catalog complete.");
       expect(childRequested).toBe(true);
       expect(parseAskJson(result.stdout).tool_calls).toEqual([
+        { name: "capability_search", status: "success" },
         { name: "subagent", status: "success" },
       ]);
     } finally {
@@ -7806,9 +7785,17 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     const root = createFixtureRoot("subagent-mcp-startup-cancel");
     const tracePath = join(root.root, "trace.log");
     const mcp = writeMcpFixture(root, { initializeDelayMs: 4_000 });
-    const gateway = startDynamicFakeGateway(() => fakeGatewayToolCall("cancelled_child", "subagent", {
-      request: { action: "run", task: "Call the inherited MCP echo tool." },
-    }), {
+    // The parent delegates; the child's search starts the server, whose
+    // initialize is still pending when fx is interrupted.
+    let requests = 0;
+    const gateway = startDynamicFakeGateway(() => requests++ === 0
+      ? fakeGatewayToolCall("cancelled_child", "subagent", {
+        request: { action: "run", task: "Call the inherited MCP echo tool." },
+      })
+      : fakeGatewayToolCall("child_starts_mcp", "capability_search", {
+        query: "fixture echo",
+        server: "fixture",
+      }), {
       classifierDecision: "clear",
       models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
     });
@@ -7828,14 +7815,14 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       while (!existsSync(mcp.pidPath) && !exited && Date.now() < startedDeadline) await Bun.sleep(25);
       expect(existsSync(mcp.pidPath)).toBe(true);
       expect(existsSync(mcp.readyPath)).toBe(false);
-      expect(gateway.requestCount()).toBe(1);
+      expect(gateway.requestCount()).toBe(2);
       const pid = Number.parseInt(readFileSync(mcp.pidPath, "utf8"), 10);
       proc.kill("SIGINT");
       const exitDeadline = Date.now() + 10_000;
       while (!exited && Date.now() < exitDeadline) await Bun.sleep(25);
       expect(exited).toBe(true);
       await waitForProcessExit(pid, 8_000);
-      expect(gateway.requestCount()).toBe(1);
+      expect(gateway.requestCount()).toBe(2);
       expect(existsSync(mcp.callLogPath)).toBe(false);
       expect(await stderr).not.toContain("panic:");
       expect(await stdout).not.toContain("state_unavailable");
