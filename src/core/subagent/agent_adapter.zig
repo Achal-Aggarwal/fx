@@ -770,7 +770,6 @@ test "subagent model catalog counts the captured view's tools and offers servers
         .runtime_generation = 1,
         .owner_id = @constCast("child"),
         .parent_id = @constCast("parent"),
-        .features_visible = false,
         .servers = &servers,
         .tools = &tools,
     };

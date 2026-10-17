@@ -37,7 +37,7 @@ const agent_execution_memory = @import("../core/agent/execution_memory.zig");
 const diff_mod = @import("../core/output/diff.zig");
 const file_mutation = @import("../core/tooling/file_mutation.zig");
 const file_mutation_contract = @import("../core/tooling/file_mutation_contract.zig");
-const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
+const catalog_state = @import("../core/mcp/catalog_state.zig");
 const mcp_model_catalog = @import("../core/mcp/model_catalog.zig");
 const mcp_elicitation = @import("../core/mcp/elicitation.zig");
 const mrtr = @import("../core/mcp/mrtr.zig");
@@ -288,10 +288,11 @@ const AcpContext = struct {
         try self.sendUpdate(out.writer.buffered());
     }
 
-    fn mcpToolIdentity(self: *AcpContext, arena: Allocator, name: []const u8) ?mcp_runtime.McpRuntime.ToolIdentity {
+    fn mcpToolIdentity(self: *AcpContext, arena: Allocator, name: []const u8) ?catalog_state.ToolIdentity {
         if (comptime host_target.is_wasm) return null;
-        const mcp = activeMcp(self) orelse return null;
-        return mcp.toolIdentity(arena, name) catch |err| {
+        const session = if (self.state.active_session) |*active| active else return null;
+        const h = session.mcp_host orelse return null;
+        return h.catalog.toolIdentity(arena, name) catch |err| {
             debug_trace.logf("acp", "tool call MCP identity unavailable tool={s} err={s}", .{ name, @errorName(err) });
             return null;
         };
@@ -299,7 +300,7 @@ const AcpContext = struct {
 
     /// Keeps the identity shown for `name` so session/load can replay it
     /// before its server reconnects. A failure costs only replay detail.
-    fn rememberToolIdentity(self: *AcpContext, name: []const u8, identity: mcp_runtime.McpRuntime.ToolIdentity) void {
+    fn rememberToolIdentity(self: *AcpContext, name: []const u8, identity: catalog_state.ToolIdentity) void {
         const session = if (self.state.active_session) |*active| active else return;
         // A v2 session keeps the record as a setting (D46).
         const target: tool_call_identities.Target = if (session.v2) |v2| .{ .v2 = v2 } else blk: {
@@ -516,18 +517,7 @@ const AcpContext = struct {
             },
         };
         if (comptime !host_target.is_wasm) {
-            if (session.mcp_host) |h| {
-                h.catalog.wire(&tc);
-            } else if (session.mcp != null) {
-                tc.mcp_ctx = @ptrCast(self);
-                tc.mcp_has_tool = mcpHasTool;
-                tc.mcp_validate_tool = mcpValidateTool;
-                tc.mcp_call_tool = mcpCallTool;
-                tc.mcp_search_tools = mcpSearchTools;
-                tc.mcp_tool_schema = mcpToolSchemaJson;
-                tc.mcp_snapshot_tool = mcpSnapshotTool;
-                tc.mcp_call_feature = mcpCallFeature;
-            }
+            if (session.mcp_host) |h| h.catalog.wire(&tc);
         }
         return tc;
     }
@@ -1049,8 +1039,6 @@ pub fn handlePrompt(
         try v2.beginTurn();
     }
 
-    if (comptime !host_target.is_wasm) connectHostChannelServers(session);
-
     var tool_projection = try state.cfg.mode_registry.buildModelToolProjection(alloc, activeToolSet(state), captured_mode, .{
         .permission_mode = captured_permission_mode,
         .permission_rules = session.permission_rules,
@@ -1353,18 +1341,6 @@ fn refreshProjectContext(
     };
 }
 
-/// Connects MCP servers the client serves over this ACP connection. This runs
-/// on the prompt worker because each discovery request waits for a reply that
-/// only the connection reader can deliver. A server that fails to connect is
-/// reported in the model's server catalog.
-fn connectHostChannelServers(session: *server.ActiveSessionState) void {
-    const mcp = session.mcp orelse return;
-    if (!mcp.hasPendingHostChannelServers()) return;
-    mcp.connectHostChannelServers(builtin_tools.registry, &session.cancel_flag) catch |err| {
-        debug_trace.logf("mcp", "ACP host-channel MCP servers did not connect err={s}", .{@errorName(err)});
-    };
-}
-
 /// Host tools plus every tool of the session's always-loaded MCP servers, so
 /// client-provided tools stay callable on each turn without a search. The
 /// result is allocated in `arena`, which must outlive the turn.
@@ -1375,12 +1351,7 @@ fn initialDynamicTools(
     const host_tools = ctx.state.host_tools.dynamic_tools;
     if (comptime host_target.is_wasm) return host_tools;
     const session = if (ctx.state.active_session) |*active| active else return host_tools;
-    const loaded = if (session.mcp) |mcp| try mcp.snapshotAlwaysLoadedTools(
-        arena,
-        session.permission_rules,
-        ctx.state.context_limits,
-        .unrestricted,
-    ) else if (session.mcp_host) |h| try h.catalog.snapshotAlwaysLoadedTools(
+    const loaded = if (session.mcp_host) |h| try h.catalog.snapshotAlwaysLoadedTools(
         arena,
         session.permission_rules,
         ctx.state.context_limits,
@@ -2269,8 +2240,6 @@ fn appendStaticContext(raw_ctx: *anyopaque, arena: Allocator, project_context: ?
     var snapshot = if (active_session) |session|
         if (session.mcp_host) |h|
             try h.catalog.modelSnapshot(arena)
-        else if (session.mcp) |mcp|
-            try mcp.snapshotModelCatalog(arena, session.permission_rules, false)
         else
             try mcp_model_catalog.Snapshot.empty(arena)
     else
@@ -2517,7 +2486,7 @@ fn lifecycleDynamicMcpToolAvailable(ctx: *AcpContext, name: []const u8, advertis
         const capabilities = h.catalog.runtimeCapabilities();
         return dynamicMcpToolAvailable(ctx.toolRegistry(), name, advertised_dynamic_tool_names, capabilities.context, capabilities.has_tool, .unrestricted);
     };
-    return dynamicMcpToolAvailable(ctx.toolRegistry(), name, advertised_dynamic_tool_names, @ptrCast(ctx), mcpHasTool, .unrestricted);
+    return false;
 }
 
 fn dynamicMcpToolAvailable(registry: tool_dispatch.Registry, name: []const u8, advertised_dynamic_tool_names: []const []const u8, mcp_ctx: ?*anyopaque, has_tool: ?McpHasToolFn, access: tool_mcp_runtime.Access) bool {
@@ -3426,13 +3395,6 @@ fn requestAcpElicitation(
             responder.acp.session_id,
             responder.tool_call_id,
         )) return error.McpInputRequired;
-        if (activeMcp(responder.acp)) |runtime| {
-            runtime.reconcileLegacyUrlCompletion(
-                origin,
-                source_id,
-                server.legacyUrlCompletionSink(state),
-            );
-        }
     }
     defer if (legacy_source_id != null and !legacy_url_retained) {
         server.removeLegacyUrl(state, url_id.?);
@@ -3511,19 +3473,15 @@ fn requestAcpElicitation(
         .{},
     );
     var transition_state: mcp_elicitation.RequestState = .pending;
-    const live_witness = if (activeMcp(responder.acp)) |runtime|
-        runtime.inputIdentityWitness(origin.server_name)
-    else
-        null;
     // MCP-v2 ties an answer to the call that asked, and drops it once that
     // call has ended, so its server counts as live here.
     const host_session = if (responder.acp.state.active_session) |*active| active.mcp_host != null else false;
     const transition = mcp_elicitation.decideTransition(
         transition_state,
         bindingForAcpInput(responder, origin),
-        answerBindingForAcpInput(responder, origin, live_witness),
+        answerBindingForAcpInput(responder, origin, null),
         acpAwakeMillis(),
-        live_witness != null or host_session,
+        host_session,
     );
     switch (transition) {
         .consume => transition_state = .consumed,
@@ -3536,12 +3494,8 @@ fn requestAcpElicitation(
             const sink = server.legacyUrlCompletionSink(state);
             // MCP-v2's host has no generations to check: the sink takes the
             // consent itself.
-            const accept_result = if (activeMcp(responder.acp)) |runtime|
-                runtime.acceptLegacyUrlCompletion(origin, url_id.?, sink) orelse return error.McpInputRequired
-            else if (host_session)
-                sink.settleAccept(sink.accept(sink.context, origin, url_id.?)) orelse return error.McpInputRequired
-            else
-                return error.McpInputRequired;
+            if (!host_session) return error.McpInputRequired;
+            const accept_result = sink.settleAccept(sink.accept(sink.context, origin, url_id.?)) orelse return error.McpInputRequired;
             if (accept_result == .awaiting_completion) {
                 const retained_acp_id = try state.alloc.dupe(u8, url_id.?);
                 errdefer state.alloc.free(retained_acp_id);
@@ -3740,76 +3694,6 @@ fn finishAcpUrlElicitations(
     responder.accepted_legacy_urls.clearRetainingCapacity();
 }
 
-fn mcpHasTool(raw_ctx: *anyopaque, name: []const u8, access: tool_mcp_runtime.Access) bool {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activeMcp(ctx) orelse return false;
-    return mcp.hasToolWithAccess(name, access);
-}
-
-fn mcpValidateTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.ValidationResult {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const runtime = activeMcp(ctx) orelse return .not_available;
-    return runtime.validateToolArgumentsByNameWithAccess(
-        arena,
-        name,
-        arguments_json,
-        access,
-    );
-}
-
-fn mcpCallTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, arguments_json: []const u8, max_tool_result_bytes: usize, options: tool_mcp_runtime.CallOptions) anyerror!?tool_mcp_runtime.CallResult {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activeMcp(ctx) orelse return null;
-    return mcp.callToolByNameWithOptions(
-        arena,
-        name,
-        arguments_json,
-        max_tool_result_bytes,
-        options,
-    );
-}
-
-fn mcpSearchTools(raw_ctx: *anyopaque, arena: Allocator, request: tool_mcp_runtime.SearchRequest, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!tool_mcp_runtime.SearchResult {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activeMcp(ctx) orelse return error.McpServerNotFound;
-    return mcp.searchToolsPrepared(arena, request, permission_rules, limits, access, cancel_flag);
-}
-
-fn mcpSnapshotTool(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, known: tool_mcp_runtime.Binding, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access) anyerror!tool_mcp_runtime.DefinitionSnapshot {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const runtime = activeMcp(ctx) orelse return .unavailable;
-    return runtime.snapshotToolDefinition(arena, name, known, permission_rules, limits, access);
-}
-
-fn mcpToolSchemaJson(raw_ctx: *anyopaque, arena: Allocator, name: []const u8, permission_rules: types.PermissionRuleSet, limits: config_runtime.context_limits.Values, access: tool_mcp_runtime.Access, cancel_flag: ?*std.atomic.Value(bool)) anyerror!?tool_mcp_runtime.ToolSchemaResult {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activeMcp(ctx) orelse return null;
-    return mcp.toolSchemaJsonByNameWithAccess(
-        arena,
-        name,
-        permission_rules,
-        limits,
-        access,
-        cancel_flag,
-    );
-}
-
-fn mcpCallFeature(
-    raw_ctx: *anyopaque,
-    arena: Allocator,
-    request: tool_mcp_runtime.FeatureRequest,
-    options: tool_mcp_runtime.FeatureCallOptions,
-) anyerror!tool_mcp_runtime.FeatureResult {
-    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const mcp = activeMcp(ctx) orelse return error.McpRuntimeUnavailable;
-    return mcp.callFeatureForModel(arena, request, options);
-}
-
-fn activeMcp(ctx: *AcpContext) ?*mcp_runtime.McpRuntime {
-    const session = if (ctx.state.active_session) |*active| active else return null;
-    return session.mcp;
-}
-
 pub const mapToolKind = tool_call_presentation.mapToolKind;
 
 const acpToolName = tool_call_presentation.acpToolName;
@@ -3878,55 +3762,6 @@ test "ACP lifecycle action preserves dynamic MCP availability boundaries" {
     const builtin = dynamicMcpToolAvailable(builtin_tools.registry, "terminal", &.{"shell"}, @ptrCast(&fixture), Fixture.hasTool, .unrestricted);
     try std.testing.expect(!builtin);
     try std.testing.expectEqual(@as(usize, 1), fixture.calls);
-}
-
-test "ACP lifecycle resolves dynamic MCP availability through session context" {
-    const alloc = std.testing.allocator;
-    var state = try initTestAcpState(alloc, "/tmp/workspace", .auto);
-    defer state.deinit();
-
-    const runtime = try alloc.create(mcp_runtime.McpRuntime);
-    runtime.* = mcp_runtime.McpRuntime.init(alloc);
-    var runtime_owned = true;
-    defer if (runtime_owned) {
-        runtime.deinit();
-        alloc.destroy(runtime);
-    };
-    try runtime.addServer(.{
-        .name = try alloc.dupe(u8, "fixture"),
-    });
-    const mcp_server = runtime.servers.items[0];
-    mcp_server.state.store(.ready, .release);
-    try mcp_server.tool_catalog.tools.append(alloc, .{
-        .original_name = try alloc.dupe(u8, "echo"),
-        .prefixed_name = try alloc.dupe(u8, "mcp_fixture_echo"),
-        .description = try alloc.dupe(u8, "Echo input"),
-        .input_schema_json = try alloc.dupe(u8, "{\"type\":\"object\"}"),
-        .tags = &.{},
-    });
-    state.active_session.?.mcp = runtime;
-    runtime_owned = false;
-
-    var ctx = AcpContext{
-        .alloc = alloc,
-        .state = &state,
-        .session_id = "session_1",
-    };
-    try std.testing.expect(lifecycleDynamicMcpToolAvailable(
-        &ctx,
-        "mcp_fixture_echo",
-        &.{"mcp_fixture_echo"},
-    ));
-    try std.testing.expect(!lifecycleDynamicMcpToolAvailable(
-        &ctx,
-        "mcp_fixture_echo",
-        &.{},
-    ));
-    try std.testing.expect(!lifecycleDynamicMcpToolAvailable(
-        &ctx,
-        "mcp_missing",
-        &.{"mcp_missing"},
-    ));
 }
 
 test "mapToolKind maps common tools" {

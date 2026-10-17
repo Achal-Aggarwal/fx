@@ -22,7 +22,6 @@ const selected_schema = @import("../mcp/selected_schema.zig");
 const tool_names = @import("../mcp/tool_names.zig");
 const tool_result = @import("../mcp/tool_result.zig");
 const tool_search = @import("../mcp/tool_search.zig");
-const tool_snapshot = @import("../mcp/tool_snapshot.zig");
 const tools_feature = @import("../mcp/features/tools.zig");
 const elicitation = @import("../mcp/elicitation.zig");
 
@@ -132,7 +131,7 @@ pub const Catalog = struct {
         if (options.expected_binding) |b| if (b.runtime_generation != c.generation) return error.McpAdvertisedToolChanged;
         if (options.expected_runtime_generation) |g| if (g != c.generation) return error.McpAuthorityChanged;
         try c.ensure(name, options.cancel_flag);
-        const server, const tool, const transport = found: {
+        const server, const tool, const transport, const how = found: {
             c.mutex.lockUncancelable(c.io);
             defer c.mutex.unlock(c.io);
             const found = c.findLocked(name) orelse return null;
@@ -140,7 +139,8 @@ pub const Catalog = struct {
             if (options.expected_binding) |b| {
                 if (!b.sameDefinition(c.bindingLocked(found.server, found.tool.*))) return error.McpAdvertisedToolChanged;
             }
-            break :found .{ c.runtime.servers()[found.server].name, try arena.dupe(u8, found.tool.original_name), @tagName(c.runtime.servers()[found.server].transport) };
+            const s = c.runtime.servers()[found.server];
+            break :found .{ s.name, try arena.dupe(u8, found.tool.original_name), @tagName(s.transport), signIn(c.runtime.options.slash_commands, s.source) };
         };
         var asking: Asking = .{ .responder = options.input_responder orelse undefined, .tool = name, .cancel = options.cancel_flag, .io = c.io };
         const observed = if (options.observer) |observer| observer.beginMcp(.{ .call_id = options.call_id, .server = server, .tool = tool, .transport = transport }) else null;
@@ -153,7 +153,7 @@ pub const Catalog = struct {
         // The questions asked end with the call: an editor hears that a URL it
         // opened was used (ACP `elicitation/complete`).
         asking.finish(arena, if (answer == .result) .completed else .abandoned);
-        const result = render(arena, server, name, answer, max_tool_result_bytes, c.runtime.options.slash_commands) catch |err| {
+        const result = render(arena, server, name, answer, max_tool_result_bytes, how) catch |err| {
             if (observed) |call| call.end(.failure, @errorName(err));
             return err;
         };
@@ -216,7 +216,7 @@ pub const Catalog = struct {
             if (s.held != null) continue;
             try reasons.ensureUnusedCapacity(alloc, 1);
             reasons.appendAssumeCapacity(switch (l.state) {
-                .needs_login => try needsLoginText(alloc, s.name, c.runtime.options.slash_commands),
+                .needs_login => try needsLoginText(alloc, s.name, signIn(c.runtime.options.slash_commands, s.source)),
                 .failed => try alloc.print("MCP server '{s}' is unavailable: {s}", .{ s.name, l.failure orelse "it did not start" }),
                 .unknown, .loaded => continue,
             });
@@ -341,7 +341,6 @@ pub const Catalog = struct {
         owner_id: []const u8,
         parent_id: []const u8,
         permission_rules: types.PermissionRuleSet,
-        features_visible: bool,
     ) !access_policy.View {
         var servers: std.ArrayList(access_policy.ServerIdentity) = .empty;
         var tools: std.ArrayList(access_policy.ToolIdentity) = .empty;
@@ -392,7 +391,6 @@ pub const Catalog = struct {
             .runtime_generation = c.generation,
             .owner_id = owner,
             .parent_id = parent,
-            .features_visible = features_visible,
             .servers = server_slice,
             .tools = try tools.toOwnedSlice(alloc),
         };
@@ -478,6 +476,19 @@ pub const Catalog = struct {
         };
     }
 
+    /// Who serves `name`, for an editor's tool-call display; null when no
+    /// loaded list has it. Owned by the caller.
+    pub fn toolIdentity(c: *Catalog, alloc: Allocator, name: []const u8) Allocator.Error!?catalog_state.ToolIdentity {
+        c.mutex.lockUncancelable(c.io);
+        defer c.mutex.unlock(c.io);
+        const found = c.findLocked(name) orelse return null;
+        const server = try alloc.dupe(u8, c.runtime.servers()[found.server].name);
+        errdefer alloc.free(server);
+        const tool = try alloc.dupe(u8, found.tool.original_name);
+        errdefer alloc.free(tool);
+        return .{ .server = server, .tool = tool, .title = try catalog_state.displayTitle(alloc, found.tool.*) };
+    }
+
     /// `allowsLocked` for a tool in a loaded list; false when none has it.
     fn allows(c: *Catalog, access: Access, name: []const u8) bool {
         c.mutex.lockUncancelable(c.io);
@@ -501,7 +512,7 @@ pub const Catalog = struct {
             .connection_generation = generation,
             .catalog_generation = generation,
             .auth_generation = 0,
-            .definition_digest = tool_snapshot.definitionDigest(tool, null),
+            .definition_digest = catalog_state.definitionDigest(tool, null),
         };
     }
 
@@ -588,7 +599,7 @@ pub const Catalog = struct {
         for (c.runtime.servers(), c.lists) |s, l| {
             if (!tool_names.matchesServer(name, s.name)) continue;
             const text = switch (l.state) {
-                .needs_login => try needsLoginText(alloc, s.name, c.runtime.options.slash_commands),
+                .needs_login => try needsLoginText(alloc, s.name, signIn(c.runtime.options.slash_commands, s.source)),
                 .failed => try alloc.print("MCP server '{s}' is unavailable: {s}", .{ s.name, l.failure orelse "it did not start" }),
                 else => if (s.held == .missing_env)
                     try alloc.print("MCP server '{s}' needs {s} set before fx starts.", .{ s.name, s.missing orelse "a variable" })
@@ -602,7 +613,7 @@ pub const Catalog = struct {
         return null;
     }
 
-    /// v1's answers for a search that names a server needing a login, or one
+    /// The answer for a search that names a server needing a login, or one
     /// that is down.
     fn renderUnavailable(c: *Catalog, alloc: Allocator, request: tool_mcp_runtime.SearchRequest) !?[]u8 {
         const named = request.server orelse request.query.raw;
@@ -611,8 +622,10 @@ pub const Catalog = struct {
         for (c.runtime.servers(), c.lists) |s, l| {
             if (!tool_search.queryContainsCompleteIdentity(named, s.name)) continue;
             if (l.state == .needs_login) {
-                const login = loginCommand(c.runtime.options.slash_commands);
-                const guidance = try alloc.print("Run {s} {s}{s}, then search again.", .{ login.command, s.name, login.where });
+                const step = try signInStep(alloc, s.name, signIn(c.runtime.options.slash_commands, s.source));
+                defer alloc.free(step);
+                step[0] = std.ascii.toUpper(step[0]);
+                const guidance = try alloc.print("{s}, then search again.", .{step});
                 defer alloc.free(guidance);
                 return try tool_search.writeAuthenticationRequired(alloc, s.name, .{ .oauth = guidance });
             }
@@ -676,14 +689,14 @@ const Asking = struct {
 
 /// Turns the runtime's answer into the result the model sees, through fx's
 /// result projection: content, images, size limits, and errors.
-fn render(arena: Allocator, server: []const u8, name: []const u8, answer: runtime_mod.CallResult, max_bytes: usize, slash_commands: bool) !?tool_mcp_runtime.CallResult {
+fn render(arena: Allocator, server: []const u8, name: []const u8, answer: runtime_mod.CallResult, max_bytes: usize, how: SignIn) !?tool_mcp_runtime.CallResult {
     const response = switch (answer) {
         .result => |r| if (r.structured) |structured|
             try arena.print("{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"content\":{s},\"structuredContent\":{s},\"isError\":{s}}}}}", .{ r.content, structured, if (r.is_error) "true" else "false" })
         else
             try arena.print("{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"content\":{s},\"isError\":{s}}}}}", .{ r.content, if (r.is_error) "true" else "false" }),
         .failure => |f| try arena.print("{{\"jsonrpc\":\"2.0\",\"id\":0,\"error\":{{\"code\":{d},\"message\":{s}}}}}", .{ f.code, f.message }),
-        .ended => |e| return try ended(arena, server, name, e, max_bytes, slash_commands),
+        .ended => |e| return try ended(arena, server, name, e, max_bytes, how),
         .unknown_server => return null,
     };
     return try tool_result.extract(arena, .{
@@ -696,11 +709,11 @@ fn render(arena: Allocator, server: []const u8, name: []const u8, answer: runtim
 }
 
 /// A call that ended without an answer.
-fn ended(arena: Allocator, server: []const u8, name: []const u8, e: @FieldType(runtime_mod.CallResult, "ended"), max_bytes: usize, slash_commands: bool) !tool_mcp_runtime.CallResult {
+fn ended(arena: Allocator, server: []const u8, name: []const u8, e: @FieldType(runtime_mod.CallResult, "ended"), max_bytes: usize, how: SignIn) !tool_mcp_runtime.CallResult {
     if (e.outcome == .cancelled) return error.Cancelled;
     const why = switch (e.outcome) {
         .needs_auth => return .{
-            .model_output = try tool_result_limits.prepareModelOutput(arena, name, try needsLoginText(arena, server, slash_commands), max_bytes),
+            .model_output = try tool_result_limits.prepareModelOutput(arena, name, try needsLoginText(arena, server, how), max_bytes),
             .status = .tool_failure,
         },
         .lost => "the server went away",
@@ -721,15 +734,29 @@ fn ended(arena: Allocator, server: []const u8, name: []const u8, e: @FieldType(r
     return .{ .model_output = try tool_result_limits.prepareModelOutput(arena, name, text, max_bytes), .status = .protocol_failure };
 }
 
-fn needsLoginText(alloc: Allocator, server: []const u8, slash_commands: bool) ![]u8 {
-    const login = loginCommand(slash_commands);
-    return alloc.print("MCP server '{s}' needs a login. Ask the user to run {s} {s}{s}, then try again.", .{ server, login.command, server, login.where });
+fn needsLoginText(alloc: Allocator, server: []const u8, how: SignIn) ![]u8 {
+    const step = try signInStep(alloc, server, how);
+    defer alloc.free(step);
+    return alloc.print("MCP server '{s}' needs a login. Ask the user to {s}, then try again.", .{ server, step });
 }
 
-/// How the user signs in where they are: fx's shell takes `/mcp login`;
-/// `fx ask` and an editor have no slash commands, so it's a terminal.
-fn loginCommand(slash_commands: bool) struct { command: []const u8, where: []const u8 } {
-    return if (slash_commands) .{ .command = "/mcp login", .where = "" } else .{ .command = "fx mcp login", .where = " in a terminal" };
+/// Where the user signs in: fx's shell takes `/mcp login`; `fx ask` and an
+/// editor have no slash commands, so it's a terminal. A server the editor
+/// supplied isn't in fx's config, so its credentials go in the editor's.
+const SignIn = enum { shell, terminal, editor };
+
+fn signIn(slash_commands: bool, source: mcp_contract.ConfigSource) SignIn {
+    if (source == .acp) return .editor;
+    return if (slash_commands) .shell else .terminal;
+}
+
+/// What the user does, as the rest of a sentence. Caller owns the text.
+fn signInStep(alloc: Allocator, server: []const u8, how: SignIn) ![]u8 {
+    return switch (how) {
+        .shell => alloc.print("run /mcp login {s}", .{server}),
+        .terminal => alloc.print("run fx mcp login {s} in a terminal", .{server}),
+        .editor => alloc.print("add an Authorization header for {s} in the editor's MCP server settings", .{server}),
+    };
 }
 
 fn catalog(raw: *anyopaque) *Catalog {
@@ -784,7 +811,7 @@ test "a subagent made before its parent's server starts may use the server's too
     const a = arena.allocator();
 
     // Nothing has started `fake` yet; the disabled server stays out.
-    var view = try c.snapshotAccessView(testing.allocator, "child", "parent", .{}, false);
+    var view = try c.snapshotAccessView(testing.allocator, "child", "parent", .{});
     defer view.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), view.servers.len);
     try testing.expectEqualStrings("fake", view.servers[0].name);
@@ -823,6 +850,10 @@ test "an MCP-v2 server's tools reach the model under fx's names" {
     try testing.expect(c.hasTool("mcp_fake_echo", .unrestricted));
     try testing.expect(!c.hasTool("mcp_fake_nope", .unrestricted));
     try testing.expect(!c.hasTool("mcp_fake_echo", .disabled));
+    const identity = (try c.toolIdentity(a, "mcp_fake_echo")).?;
+    try testing.expectEqualStrings("fake", identity.server);
+    try testing.expectEqualStrings("echo", identity.tool);
+    try testing.expect((try c.toolIdentity(a, "mcp_fake_nope")) == null);
 
     const query = try lexical_relevance.prepare("echo");
     const found = try c.searchTools(a, .{ .query = &query, .kind = .mcp }, .{}, .{}, .unrestricted, null);
@@ -854,7 +885,7 @@ test "an MCP-v2 server's tools reach the model under fx's names" {
     try testing.expect((try c.callTool(a, "mcp_fake_nope", "{}", 4096, .{})) == null);
 
     try testing.expectEqual(@as(usize, 1), (try c.snapshotToolNames(a, .{})).len);
-    var view = try c.snapshotAccessView(testing.allocator, "child", "parent", .{}, false);
+    var view = try c.snapshotAccessView(testing.allocator, "child", "parent", .{});
     defer view.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), view.tools.len);
     try testing.expect(Access.allowsTool(.{ .scoped = .{ .captured = &view, .admission_authority_generation = 0, .live = undefined } }, c.generation, "mcp_fake_echo"));
@@ -893,18 +924,27 @@ test "a search says why a server it names has no tools, and calls that end say h
     const missing = try c.searchTools(a, .{ .query = &query, .kind = .mcp, .server = "nope" }, .{}, .{}, .unrestricted, null);
     try testing.expect(std.mem.find(u8, missing.model_output, "\"state\":\"server_not_found\"") != null);
 
-    const login = try ended(a, "linear", "mcp_linear_list", .{ .outcome = .needs_auth, .maybe_ran = false, .timed_out = false }, 4096, false);
+    const login = try ended(a, "linear", "mcp_linear_list", .{ .outcome = .needs_auth, .maybe_ran = false, .timed_out = false }, 4096, .terminal);
     try testing.expectEqual(tool_mcp_runtime.CallStatus.tool_failure, login.status);
     try testing.expect(std.mem.find(u8, login.model_output, "Ask the user to run fx mcp login linear in a terminal, then try again.") != null);
     // The shell takes slash commands, so the user signs in without leaving it.
-    const in_shell = try ended(a, "linear", "mcp_linear_list", .{ .outcome = .needs_auth, .maybe_ran = false, .timed_out = false }, 4096, true);
+    const in_shell = try ended(a, "linear", "mcp_linear_list", .{ .outcome = .needs_auth, .maybe_ran = false, .timed_out = false }, 4096, .shell);
     try testing.expect(std.mem.find(u8, in_shell.model_output, "Ask the user to run /mcp login linear, then try again.") != null);
     try testing.expect(std.mem.find(u8, in_shell.model_output, "terminal") == null);
-    const lost = try ended(a, "linear", "mcp_linear_list", .{ .outcome = .lost, .maybe_ran = true, .timed_out = false }, 4096, false);
+    // A server the editor supplied isn't in fx's config: its credentials go
+    // in the editor's settings, wherever the session runs.
+    try testing.expectEqual(SignIn.editor, signIn(true, .acp));
+    try testing.expectEqual(SignIn.editor, signIn(false, .acp));
+    try testing.expectEqual(SignIn.shell, signIn(true, .workspace));
+    try testing.expectEqual(SignIn.terminal, signIn(false, .profile));
+    const in_editor = try ended(a, "linear", "mcp_linear_list", .{ .outcome = .needs_auth, .maybe_ran = false, .timed_out = false }, 4096, .editor);
+    try testing.expect(std.mem.find(u8, in_editor.model_output, "Ask the user to add an Authorization header for linear in the editor's MCP server settings, then try again.") != null);
+    try testing.expect(std.mem.find(u8, in_editor.model_output, "fx mcp login") == null);
+    const lost = try ended(a, "linear", "mcp_linear_list", .{ .outcome = .lost, .maybe_ran = true, .timed_out = false }, 4096, .terminal);
     try testing.expectEqual(tool_mcp_runtime.CallStatus.protocol_failure, lost.status);
     try testing.expect(std.mem.find(u8, lost.model_output, "the server went away. The tool may have run.") != null);
-    const unrenewed = try ended(a, "slack", "mcp_slack_send", .{ .outcome = .auth_unavailable, .maybe_ran = false, .timed_out = false }, 4096, false);
+    const unrenewed = try ended(a, "slack", "mcp_slack_send", .{ .outcome = .auth_unavailable, .maybe_ran = false, .timed_out = false }, 4096, .terminal);
     try testing.expect(std.mem.find(u8, unrenewed.model_output, "its login couldn't be renewed because the sign-in server didn't answer. The tool didn't run; try again shortly.") != null);
     try testing.expect(std.mem.find(u8, unrenewed.model_output, "may have run") == null);
-    try testing.expectError(error.Cancelled, ended(a, "linear", "mcp_linear_list", .{ .outcome = .cancelled, .maybe_ran = false, .timed_out = false }, 4096, false));
+    try testing.expectError(error.Cancelled, ended(a, "linear", "mcp_linear_list", .{ .outcome = .cancelled, .maybe_ran = false, .timed_out = false }, 4096, .terminal));
 }

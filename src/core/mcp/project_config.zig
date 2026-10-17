@@ -6,10 +6,8 @@
 
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
-const mcp_auth = @import("mcp_auth.zig");
 const mcp_contract = @import("mcp_contract.zig");
-const startup_admission = @import("startup_admission.zig");
-const streamable_http = @import("streamable_http.zig");
+const http_config = @import("http_config.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
 
@@ -123,6 +121,8 @@ pub const WorkspaceDiagnosticCause = enum {
     missing_environment_variable,
     environment_expansion_limit_exceeded,
     approved_rejected_overlap,
+    /// Under "mcpServers" in a profile that also has "mcp".
+    ignored_alias,
 };
 
 pub const WorkspaceEnvironmentField = enum {
@@ -245,7 +245,10 @@ pub fn renderWorkspaceDiagnostic(
         .authorization => "fx won't send its Authorization header; put the token in \"bearer_token_env\", or sign in with login",
         .other => "fx can't read it",
         inline else => |field| "its \"" ++ @tagName(field) ++ "\" isn't valid",
-    } else @tagName(diagnostic.cause);
+    } else if (diagnostic.cause == .ignored_alias)
+        "the file has both \"mcp\" and \"mcpServers\", and fx reads only \"mcp\"; merge them into one"
+    else
+        @tagName(diagnostic.cause);
     return alloc.print(
         "{s} server '{s}' was skipped: {s}.",
         .{ diagnosticFile(diagnostic), encoded_server.bytes, why },
@@ -343,6 +346,7 @@ fn parseProfileDocumentInto(alloc: Allocator, json_text: []const u8, skipped: ?*
                     "mcpServers",
                     0,
                 );
+                if (skipped) |notes| try noteIgnoredAlias(alloc, notes, canonical.?, alias.?);
             },
             .found => |found| {
                 result.diagnostic = ProfileDiagnostic.init(
@@ -415,6 +419,23 @@ fn parseProfileServerMap(
         };
     }
     return configs;
+}
+
+/// One note per server under "mcpServers" when "mcp" is also set, since fx
+/// reads only "mcp"; a name under both loads from "mcp", so it gets none.
+fn noteIgnoredAlias(
+    alloc: Allocator,
+    notes: *std.ArrayList(WorkspaceDiagnostic),
+    canonical: std.json.Value,
+    alias: std.json.Value,
+) !void {
+    if (alias != .object) return;
+    for (alias.object.keys()) |name| {
+        if (canonical == .object and canonical.object.contains(name)) continue;
+        const owned = try alloc.dupe(u8, name);
+        errdefer alloc.free(owned);
+        try notes.append(alloc, .{ .profile = true, .server_name = owned, .cause = .ignored_alias });
+    }
 }
 
 fn profileAliasIsNonEmpty(value: std.json.Value) bool {
@@ -783,7 +804,7 @@ fn expandWorkspaceConfig(
             return failure;
         }
     }
-    streamable_http.validateStaticHeaders(config.headers) catch return .invalid;
+    http_config.validateStaticHeaders(config.headers) catch return .invalid;
     return null;
 }
 
@@ -981,53 +1002,6 @@ pub fn appendWorkspaceAfterAcpPrimary(
     }
 }
 
-pub fn authorityNames(
-    alloc: Allocator,
-    configs: []const McpServerConfig,
-    phase: startup_admission.Phase,
-) ![][]u8 {
-    var names: std.ArrayList([]u8) = .empty;
-    errdefer freeOwnedList(alloc, &names);
-    for (configs) |config| {
-        if (config.source != .workspace) continue;
-        if (startup_admission.decide(
-            config.enabled,
-            config.required,
-            config.workspace_admission,
-            phase,
-        ) != .connect) continue;
-        if (!containsName(names.items, config.name)) {
-            try appendOwnedName(alloc, &names, config.name);
-        }
-    }
-    return names.toOwnedSlice(alloc);
-}
-
-pub fn configRetainsWorkspaceAuthority(
-    current: McpServerConfig,
-    next: []const McpServerConfig,
-    phase: startup_admission.Phase,
-) bool {
-    if (current.source != .workspace or
-        startup_admission.decide(
-            current.enabled,
-            current.required,
-            current.workspace_admission,
-            phase,
-        ) != .connect) return true;
-    for (next) |candidate| {
-        if (candidate.source != .workspace or
-            !std.mem.eql(u8, current.name, candidate.name)) continue;
-        if (startup_admission.decide(
-            candidate.enabled,
-            candidate.required,
-            candidate.workspace_admission,
-            phase,
-        ) == .connect) return true;
-    }
-    return false;
-}
-
 inline fn failServerConfig(err: anytype) @TypeOf(err)!McpServerConfig {
     return @errorCast(failServerConfigDynamic(err));
 }
@@ -1097,7 +1071,7 @@ fn parseServerEntry(
     if (transport != .stdio) {
         const url_value = object.get("url") orelse return failServerConfig(error.McpConfigMissingUrl);
         if (url_value != .string) return failServerConfig(error.McpConfigInvalidUrl);
-        streamable_http.validateEndpoint(url_value.string) catch return failServerConfig(error.McpConfigInvalidUrl);
+        http_config.validateEndpoint(url_value.string) catch return failServerConfig(error.McpConfigInvalidUrl);
         const timeouts = try parseTimeouts(object);
         const env = try parseSelectedEnvironment(alloc, object);
         errdefer freeEnvVars(alloc, env);
@@ -1217,7 +1191,7 @@ fn parseRemoteHeaders(
         const owned_value = try alloc.dupe(u8, entry.value_ptr.*.string);
         headers.appendAssumeCapacity(.{ .name = owned_name, .value = owned_value });
     }
-    streamable_http.validateStaticHeaders(headers.items) catch return error.McpConfigInvalidHeaders;
+    http_config.validateStaticHeaders(headers.items) catch return error.McpConfigInvalidHeaders;
     return headers.toOwnedSlice(alloc);
 }
 
@@ -1246,7 +1220,7 @@ fn parseRemoteHeaderEnv(alloc: Allocator, object: std.json.ObjectMap) ![]McpHttp
     const validation = try alloc.alloc(McpHttpHeader, refs.items.len);
     defer alloc.free(validation);
     for (refs.items, 0..) |ref, index| validation[index] = .{ .name = ref.name, .value = @constCast("value") };
-    streamable_http.validateStaticHeaders(validation) catch return error.McpConfigInvalidHeaders;
+    http_config.validateStaticHeaders(validation) catch return error.McpConfigInvalidHeaders;
     return refs.toOwnedSlice(alloc);
 }
 
@@ -1269,11 +1243,8 @@ fn parseProfileAuth(alloc: Allocator, object: std.json.ObjectMap) !?McpAuthConfi
     if (auth.client_secret_env) |field| {
         if (!isValidEnvName(field) or auth.client_id == null) return error.McpConfigInvalidOAuth;
     }
-    if (auth.resource) |field| {
-        const canonical = mcp_auth.canonicalResource(alloc, field) catch return error.McpConfigInvalidOAuth;
-        alloc.free(canonical);
-    }
-    if (auth.client_metadata_url) |field| mcp_auth.validateClientMetadataUrl(field) catch return error.McpConfigInvalidOAuth;
+    if (auth.resource) |field| http_config.validateOAuthResource(field) catch return error.McpConfigInvalidOAuth;
+    if (auth.client_metadata_url) |field| http_config.validateClientMetadataUrl(field) catch return error.McpConfigInvalidOAuth;
     return auth;
 }
 
@@ -1535,6 +1506,33 @@ test "profile document keeps canonical mcp and reports ignored nonempty alias" {
     try std.testing.expectEqualStrings("canonical", result.configs.items[0].name);
     try std.testing.expectEqual(ProfileDiagnosticCause.ignored_mcp_servers_alias, result.diagnostic.?.cause);
     try std.testing.expect(result.mutation_allowed);
+}
+
+test "profile servers note each one ignored under mcpServers beside mcp" {
+    const alloc = std.testing.allocator;
+    var notes: std.ArrayList(WorkspaceDiagnostic) = .empty;
+    defer {
+        for (notes.items) |*note| note.deinit(alloc);
+        notes.deinit(alloc);
+    }
+    var configs = try parseProfileServers(
+        alloc,
+        "{\"mcp\":{\"alpha\":{\"command\":\"one\"},\"shared\":{\"command\":\"two\"}},\"mcpServers\":{\"beta\":{\"command\":\"three\"},\"shared\":{\"command\":\"four\"}}}",
+        &notes,
+    );
+    defer deinitConfigs(alloc, &configs);
+
+    try std.testing.expectEqual(@as(usize, 2), configs.items.len);
+    try std.testing.expectEqualStrings("alpha", configs.items[0].name);
+    try std.testing.expectEqualStrings("two", configs.items[1].command.?);
+    // "shared" loads from "mcp", so only "beta" was left out.
+    try std.testing.expectEqual(@as(usize, 1), notes.items.len);
+    const text = try renderWorkspaceDiagnostic(alloc, notes.items[0]);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "~/.fx/mcp.json server 'beta' was skipped: the file has both \"mcp\" and \"mcpServers\", and fx reads only \"mcp\"; merge them into one.",
+        text,
+    );
 }
 
 test "profile document blocks suspicious sibling keys beside canonical mcp" {
@@ -1969,23 +1967,6 @@ test "ACP primary duplicates remain ordered while workspace collisions are exclu
     try std.testing.expectEqualStrings("one", output.items[0].command.?);
     try std.testing.expectEqualStrings("two", output.items[1].command.?);
     try std.testing.expectEqualStrings("only", output.items[2].name);
-}
-
-test "authority projection detects only removed workspace names" {
-    const alloc = std.testing.allocator;
-    const configs = [_]McpServerConfig{
-        .{ .name = "approved", .source = .workspace, .scope = .workspace, .workspace_admission = .approved },
-        .{ .name = "pending", .source = .workspace, .scope = .workspace, .workspace_admission = .pending },
-        .{ .name = "profile", .source = .profile, .scope = .profile },
-    };
-    const interactive = try authorityNames(alloc, &configs, .all);
-    defer freeOwnedStrings(alloc, interactive);
-    try std.testing.expectEqual(@as(usize, 1), interactive.len);
-    try std.testing.expectEqualStrings("approved", interactive[0]);
-    const headless = try authorityNames(alloc, &configs, .acp_startup);
-    defer freeOwnedStrings(alloc, headless);
-    try std.testing.expectEqual(@as(usize, 1), headless.len);
-    try std.testing.expectEqualStrings("approved", headless[0]);
 }
 
 test "workspace parsing releases every partial allocation failure" {
