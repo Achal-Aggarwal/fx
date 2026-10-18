@@ -120,8 +120,9 @@ pub const CallResult = union(enum) {
     result: struct { content: []const u8, structured: ?[]const u8, is_error: bool },
     /// The server answered with a protocol error; `message` is a JSON string literal.
     failure: struct { code: i64, message: []const u8 },
-    /// The call ended without an answer.
-    ended: struct { outcome: engine.Outcome, maybe_ran: bool, timed_out: bool },
+    /// The call ended without an answer. `why`: the server's failure, when
+    /// the call ended because its start failed.
+    ended: struct { outcome: engine.Outcome, maybe_ran: bool, timed_out: bool, why: ?[]const u8 = null },
     unknown_server,
 };
 
@@ -909,6 +910,10 @@ pub const Runtime = struct {
                 const req = entry.value;
                 var result = copyCall(req.alloc, c) catch |err| return r.finish(req, .{ .failed = err });
                 if (req.declined and result == .ended and result.ended.outcome == .cancelled) result.ended.outcome = .unsupported_input;
+                if (result == .ended and result.ended.outcome == .transport_failed) {
+                    const down = if (r.enginePhase(i)) |p| p == .backoff or p == .failed else false;
+                    if (down) result.ended.why = r.failureText(req.alloc, i) catch null;
+                }
                 r.finish(req, .{ .call = result });
             },
             .input => |q| {
@@ -959,7 +964,7 @@ pub const Runtime = struct {
                         if (r.copyTools(w.request.alloc, name)) |list| .{ .tools = list } else |err| err
                     else if (t.needs_auth)
                         .needs_login
-                    else if (w.request.alloc.dupe(u8, r.lastError(i) orelse "the server is unavailable")) |why| .{ .failed = why } else |err| err;
+                    else if (r.lastError(w.request.alloc, i)) |why| .{ .failed = why } else |err| err;
                     r.finish(w.request, if (result) |ok| .{ .tools = ok } else |err| .{ .failed = err });
                 }
             },
@@ -1159,7 +1164,7 @@ pub const Runtime = struct {
             // The engine keeps its last failure; it explains a server that is
             // down, not one that is back or stopped to wait for a sign-in.
             o.last_error = switch (o.state) {
-                .failed, .retrying => if (st.last_error) |e| try a.dupe(u8, describeFailure(e)) else null,
+                .failed, .retrying => try r.failureText(a, i),
                 else => null,
             };
             o.needs_login = r.flags[i].needs_login;
@@ -1291,7 +1296,7 @@ pub const Runtime = struct {
                 r.finish(w.request, .{ .tools = .needs_login });
                 continue;
             }
-            const why = w.request.alloc.dupe(u8, r.lastError(i) orelse "the server is unavailable");
+            const why = r.lastError(w.request.alloc, i);
             r.finish(w.request, if (why) |text| .{ .tools = .{ .failed = text } } else |err| .{ .failed = err });
         }
     }
@@ -1301,9 +1306,23 @@ pub const Runtime = struct {
         return r.engine.status(k).phase;
     }
 
-    fn lastError(r: *const Runtime, i: usize) ?[]const u8 {
+    fn lastError(r: *const Runtime, alloc: Allocator, i: usize) Allocator.Error![]u8 {
+        return (try r.failureText(alloc, i)) orelse try alloc.dupe(u8, "the server is unavailable");
+    }
+
+    /// Why server `i` is down, in `alloc`, with what its process said when
+    /// it ran over stdio: how it ended, the stdout line it wrote instead of
+    /// MCP, and its last stderr lines. Null with no failure.
+    fn failureText(r: *const Runtime, alloc: Allocator, i: usize) Allocator.Error!?[]u8 {
         const k = std.mem.findScalar(usize, r.resolved.engine_server, i) orelse return null;
-        return describeFailure(r.engine.status(k).last_error orelse return null);
+        const st = r.engine.status(k);
+        const why = st.last_error orelse return null;
+        var tail_buf: [mcp.stdio.tail_max]u8 = undefined;
+        const tail = r.engine.stderrTail(k, &tail_buf);
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        writeFailure(&out.writer, why, st.exit, st.stray_line, tail) catch return error.OutOfMemory;
+        return try out.toOwnedSlice();
     }
 
     /// Why a held-back server has no tools, in `alloc`; null when the engine runs it.
@@ -1488,6 +1507,18 @@ test "a failed sign-in says why in words, with the server's own" {
     const said = signInFailure(&buffer, .redemption, long);
     try std.testing.expect(std.unicode.utf8ValidateSlice(said));
     try std.testing.expect(said.len < 340);
+}
+
+fn writeFailure(w: *std.Io.Writer, why: []const u8, exit: ?mcp.stdio.Exit, stray: ?[]const u8, tail: ?[]const u8) std.Io.Writer.Error!void {
+    try w.writeAll(describeFailure(why));
+    // "its process exited" says how; another failure adds it.
+    const own = std.mem.eql(u8, why, "process");
+    if (exit) |e| switch (e) {
+        .code => |c| try w.print("{s} with code {d}", .{ if (own) "" else "; its process exited", c }),
+        .signal => |n| try w.print("{s} on signal {d}", .{ if (own) "" else "; its process exited", n }),
+    };
+    if (stray) |line| try w.print("; it wrote \"{s}\" instead of MCP", .{line});
+    if (tail) |t| try w.print("; its last stderr lines: \"{s}\"", .{t});
 }
 
 fn describeFailure(why: []const u8) []const u8 {
@@ -1771,6 +1802,19 @@ test "an answer to a withdrawn 2025 question reaches no one, and the next questi
     try testing.expect(result == .result);
     try testing.expect(std.mem.find(u8, result.result.content, "e2=for-Q2") != null);
     try testing.expect(std.mem.find(u8, result.result.content, "e1 ") == null);
+}
+
+test "a failure says how the process ended, what it wrote instead of MCP, and its last stderr lines" {
+    var buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try writeFailure(&w, "process", .{ .code = 7 }, null, "npm error code E401 / npm error Incorrect or missing password.");
+    try testing.expectEqualStrings("its process exited with code 7; its last stderr lines: \"npm error code E401 / npm error Incorrect or missing password.\"", w.buffered());
+    w = .fixed(&buf);
+    try writeFailure(&w, "initialize_failed", .{ .signal = 15 }, "not json", null);
+    try testing.expectEqualStrings("it refused or never answered fx's initialize request; its process exited on signal 15; it wrote \"not json\" instead of MCP", w.buffered());
+    w = .fixed(&buf);
+    try writeFailure(&w, "FileNotFound", null, null, null);
+    try testing.expectEqualStrings("its command was not found", w.buffered());
 }
 
 test "a question no call can show is answered cancel, and the server goes on" {

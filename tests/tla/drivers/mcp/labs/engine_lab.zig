@@ -175,6 +175,12 @@ const Lab = struct {
         const list = try lab.arena.alloc(engine.Status, e.len());
         for (list, 0..) |*s, i| s.* = e.status(i);
         try lab.print("status", list);
+        const tails = try lab.arena.alloc(?[]const u8, e.len());
+        for (tails, 0..) |*t, i| {
+            const buf = try lab.arena.create([mcp.stdio.tail_max]u8);
+            t.* = if (e.stderrTail(i, buf)) |tail| try lab.arena.dupe(u8, tail) else null;
+        }
+        try lab.print("stderr_tails", tails);
     }
 
     fn run(lab: *Lab, line: []const u8) !bool {

@@ -727,7 +727,7 @@ fn ended(arena: Allocator, server: []const u8, name: []const u8, e: @FieldType(r
     };
     const text = try arena.print("MCP server '{s}' ended the call: {s}{s}{s}", .{
         server,
-        if (e.timed_out) "it did not answer in time" else why,
+        if (e.timed_out) "it did not answer in time" else e.why orelse why,
         if (e.maybe_ran) ". The tool may have run" else "",
         ".",
     });

@@ -156,6 +156,19 @@ pub const Incoming = union(enum) {
 
 pub const SpawnError = std.process.SpawnError || std.Io.ConcurrentError;
 
+/// How a process ended: its exit code, or the signal that ended it.
+pub const Exit = union(enum) { code: u8, signal: u8 };
+
+/// Bytes of the stderr tail a failure quotes: its last `tail_lines` lines.
+pub const tail_max = 240;
+const tail_lines = 3;
+
+fn exitOf(status: u32) ?Exit {
+    if (std.c.W.IFEXITED(status)) return .{ .code = std.c.W.EXITSTATUS(status) };
+    if (std.c.W.IFSIGNALED(status)) return .{ .signal = @truncate(@backingInt(std.c.W.TERMSIG(status))) };
+    return null;
+}
+
 pub const Error = core.StepError || std.Io.Cancelable || std.Io.ConcurrentError || std.mem.Allocator.Error || error{TraceFailed};
 
 const Posted = union(enum) {
@@ -232,6 +245,17 @@ pub const Process = struct {
     budget: Budget,
     /// Why the last start failed, for logs.
     spawn_error: ?SpawnError = null,
+    /// How the last process ended, once it has: set before `.exited` is
+    /// posted, so the owner reads it after the event.
+    exit: ?Exit = null,
+    /// The current process's last stderr lines, terminal-safe, each cut to
+    /// `tail_max`: written by its stderr reader under `tail_lock`, cleared at
+    /// each spawn.
+    tail_lock: std.Io.Mutex = .init,
+    tail: [tail_lines][tail_max]u8 = undefined,
+    tail_len: [tail_lines]u8 = @splat(0),
+    tail_next: u8 = 0,
+    tail_count: u8 = 0,
     /// This process in `everyone.list`.
     node: std.DoublyLinkedList.Node = .{},
 
@@ -385,6 +409,10 @@ pub const Process = struct {
             for (out.effects()) |effect| switch (effect) {
                 .spawn => |g| {
                     p.spawn_error = null;
+                    p.exit = null;
+                    p.tail_lock.lockUncancelable(p.io);
+                    p.tail_count = 0;
+                    p.tail_lock.unlock(p.io);
                     event = if (p.spawn(g)) |_| .spawned else |err| blk: {
                         p.spawn_error = err;
                         break :blk .spawn_failed;
@@ -578,6 +606,7 @@ pub const Process = struct {
             if (at_end and stream == .stdout) return;
             // Empty lines are skipped.
             const bytes = got.bytes;
+            if (bytes.len > 0 and stream == .stderr) p.keepTail(bytes);
             if (bytes.len > 0 and stream == .stderr and p.options.stderr != null) {
                 const sink = p.options.stderr.?;
                 sink.line(sink.context, bytes);
@@ -605,9 +634,11 @@ pub const Process = struct {
     fn watch(p: *Process, generation: core.Generation, pid: std.posix.pid_t) std.Io.Cancelable!void {
         while (true) {
             p.pid_lock.lockUncancelable(p.io);
-            const result = std.c.waitpid(pid, null, std.c.W.NOHANG);
+            var status: c_int = 0;
+            const result = std.c.waitpid(pid, &status, std.c.W.NOHANG);
             // -1 means the pid is no longer ours to wait for; treat it as gone.
             const gone = result == pid or result == -1;
+            if (result == pid) p.exit = exitOf(@bitCast(status));
             if (gone) {
                 // Told while its id can't yet come round.
                 helper.tell(p.io, '-', pid);
@@ -617,6 +648,42 @@ pub const Process = struct {
             if (gone) return p.post(.{ .exited = generation });
             try p.io.sleep(.fromMilliseconds(p.options.poll_ms), .awake);
         }
+    }
+
+    fn keepTail(p: *Process, line: []const u8) void {
+        var n: usize = @min(std.mem.trimEnd(u8, line, " \t\r").len, tail_max);
+        if (n < line.len) {
+            while (n > 0 and (line[n] & 0xC0) == 0x80) n -= 1;
+        }
+        p.tail_lock.lockUncancelable(p.io);
+        defer p.tail_lock.unlock(p.io);
+        const slot = p.tail_next;
+        for (line[0..n], p.tail[slot][0..n]) |c, *e| e.* = if (c < 0x20 or c == 0x7f) '?' else c;
+        p.tail_len[slot] = @intCast(n);
+        p.tail_next = (slot + 1) % tail_lines;
+        p.tail_count = @min(p.tail_count + 1, tail_lines);
+    }
+
+    /// The current process's last stderr lines, oldest first, joined with
+    /// " / ", and cut from the front to `tail_max`; in `out`.
+    pub fn stderrTail(p: *Process, out: *[tail_max]u8) []const u8 {
+        var all: [tail_lines * (tail_max + 3)]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&all);
+        p.tail_lock.lockUncancelable(p.io);
+        var k: u8 = 0;
+        while (k < p.tail_count) : (k += 1) {
+            const slot = (p.tail_next + tail_lines - p.tail_count + k) % tail_lines;
+            if (k > 0) w.writeAll(" / ") catch unreachable;
+            w.writeAll(p.tail[slot][0..p.tail_len[slot]]) catch unreachable;
+        }
+        p.tail_lock.unlock(p.io);
+        var text = w.buffered();
+        if (text.len > tail_max) {
+            text = text[text.len - tail_max ..];
+            while (text.len > 0 and (text[0] & 0xC0) == 0x80) text = text[1..];
+        }
+        @memcpy(out[0..text.len], text);
+        return out[0..text.len];
     }
 
     fn ring(p: *Process) void {
@@ -754,6 +821,16 @@ test "a crashing server backs off, restarts on demand, then fails at the limit" 
     try p.start();
     try expectState(&p, .failed);
     try testing.expectEqual(@as(u8, 2), p.conn.attempts);
+}
+
+test "how a server's process ended is kept until it starts again" {
+    const argv = shell("exit 3");
+    var p: Process = undefined;
+    initTest(&p, &argv);
+    defer p.deinit();
+    try p.start();
+    try expectState(&p, .backoff);
+    try testing.expectEqual(Exit{ .code = 3 }, p.exit.?);
 }
 
 test "a command that can't start counts as a failure" {

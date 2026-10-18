@@ -1522,7 +1522,7 @@ describe("modern MCP stdio compatibility", () => {
     await expectFixtureProcessesExited(wire);
   }, 30_000);
 
-  // A server that dies while starting is reported in its own words (N43).
+  // A server that dies while starting is reported in its own words.
   test("fx mcp show reports how a stdio server that exits during startup ended", async () => {
     const root = createRoot("startup-exit", LEGACY_FIXTURE, {
       mode: "startup_exit",
@@ -1596,7 +1596,7 @@ describe("modern MCP stdio compatibility", () => {
     await expectProcessesExited(launches);
   }, 60_000);
 
-  // A banner on stdout is a common server mistake; it's quoted (N43).
+  // A banner on stdout is a common server mistake; it's quoted.
   test("fx mcp show quotes the stdout line a 2026 stdio server wrote instead of answering", async () => {
     const root = createRoot("modern-startup-garbage", MODERN_FIXTURE, {
       mode: "startup_garbage",
@@ -1659,7 +1659,7 @@ describe("modern MCP stdio compatibility", () => {
     expect(JSON.parse(result.stdout).output).toContain("STARTUP_FAILURE_REPORTED");
     const searchResult = toolResultText(activeGateway.requests[1]?.body ?? "", "search_failed");
     expect(searchResult).toContain("MCP server 'fixture' is unavailable: ");
-    // The server's own words: its exit code and last stderr lines (N43).
+    // The server's own words: its exit code and last stderr lines.
     expect(searchResult).toContain("exited with code 7");
     expect(searchResult).toContain("npm error code E401");
     await expectProcessesExited(readAttemptedPids(root.launchLogPath));

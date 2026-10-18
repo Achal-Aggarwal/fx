@@ -18,6 +18,7 @@ const elicitation = @import("protocol/elicitation.zig");
 const elicit_core = @import("core/elicitation.zig");
 const auth_client = @import("auth/client.zig");
 const trace = @import("io/trace.zig");
+const process = @import("io/process.zig");
 const Bell = @import("io/bell.zig").Bell;
 const Host = @import("host.zig").Host;
 
@@ -75,6 +76,10 @@ pub const Status = struct {
     version: ?[]const u8,
     tools: usize,
     last_error: ?[]const u8,
+    /// How the last process ended, and the last stdout line that answered
+    /// nothing since the server was last ready, until it starts again.
+    exit: ?process.Exit,
+    stray_line: ?[]const u8,
 };
 
 pub const Error = server_mod.Error || error{ UnknownServer, UnknownCall, TooManyCalls };
@@ -187,7 +192,16 @@ pub const Engine = struct {
             .version = if (slot.server) |s| s.protocolVersion() else null,
             .tools = if (slot.server) |s| s.toolList().len() else 0,
             .last_error = slot.last_error,
+            .exit = if (slot.server) |s| s.exitStatus() else null,
+            .stray_line = if (slot.server) |s| s.strayLine() else null,
         };
+    }
+
+    /// The last stderr lines of server `index`'s current or last process,
+    /// in `out`, until it starts again.
+    pub fn stderrTail(e: *const Engine, index: usize, out: *[process.tail_max]u8) ?[]const u8 {
+        const s = e.slots.items[index].server orelse return null;
+        return s.stderrTail(out);
     }
 
     /// The server's tools as it advertised them, valid until the next `next`.

@@ -51,6 +51,22 @@ const auth_core = @import("core/auth.zig");
 const subscription = @import("core/subscription.zig");
 const subscriptions = @import("protocol/subscriptions.zig");
 
+/// Bytes of a line an excerpt keeps, before "...".
+const excerpt_max = 80;
+
+/// The start of `line`, terminal-safe, in `buf`: never a cut UTF-8
+/// sequence, control bytes as '?', and "..." when cut.
+fn excerptOf(buf: *[excerpt_max + 3]u8, line: []const u8) []const u8 {
+    var n: usize = @min(line.len, excerpt_max);
+    if (n < line.len) {
+        while (n > 0 and (line[n] & 0xC0) == 0x80) n -= 1;
+    }
+    for (line[0..n], buf[0..n]) |c, *e| e.* = if (c < 0x20 or c == 0x7f) '?' else c;
+    if (n == line.len) return buf[0..n];
+    @memcpy(buf[n..][0..3], "...");
+    return buf[0 .. n + 3];
+}
+
 pub const Link = union(enum) {
     http: http.Options,
     /// Its `config` is replaced: the process never backs off or gives up on
@@ -251,6 +267,10 @@ pub const Server = struct {
     /// The message of an invalid reply's answer, kept as long as the line it
     /// came from: until the process is read again.
     refused_reply: [512]u8 = undefined,
+    /// An excerpt of the last stdout line that answered nothing, since the
+    /// server was last ready: what a failed start wrote instead.
+    stray: [excerpt_max + 3]u8 = undefined,
+    stray_len: u8 = 0,
     /// What the last page added, for the warning about dropped tools.
     last_added: tools.Added = .{},
 
@@ -381,6 +401,28 @@ pub const Server = struct {
             },
         }
         try r.started();
+    }
+
+    /// How the server's last process ended, once it has.
+    pub fn exitStatus(r: *const Server) ?process.Exit {
+        return if (r.stdio) r.proc.exit else null;
+    }
+
+    /// An excerpt of the last stdout line that answered nothing since the
+    /// server was last ready.
+    pub fn strayLine(r: *const Server) ?[]const u8 {
+        return if (r.stray_len == 0) null else r.stray[0..r.stray_len];
+    }
+
+    /// The server's last stderr lines, in `out`, while it runs over stdio.
+    pub fn stderrTail(r: *Server, out: *[process.tail_max]u8) ?[]const u8 {
+        if (!r.stdio) return null;
+        const tail = r.proc.stderrTail(out);
+        return if (tail.len == 0) null else tail;
+    }
+
+    fn keepStray(r: *Server, line: []const u8) void {
+        r.stray_len = @intCast(excerptOf(&r.stray, line).len);
     }
 
     /// Why the last start of the process failed, if it did. The engine shows
@@ -706,8 +748,10 @@ pub const Server = struct {
     /// request's answer, an invalid one: the request fails with what was
     /// wrong and the start of the line. Any other is ignored.
     fn onRefusedLine(r: *Server, err: wire.DecodeError, line: []const u8) Error!void {
-        const id = wire.responseId(line) orelse return;
-        if (r.logicalFor(id) == null) return;
+        // Empty for a process that has gone since.
+        if (line.len == 0) return;
+        const id = wire.responseId(line) orelse return r.keepStray(line);
+        if (r.logicalFor(id) == null) return r.keepStray(line);
         const why = switch (err) {
             error.NotJsonRpc2 => "its jsonrpc isn't \"2.0\"",
             error.Ambiguous => "it has both a result and an error, or neither",
@@ -715,15 +759,9 @@ pub const Server = struct {
             error.InvalidErrorObject => "its error isn't an error object",
             else => "it isn't valid JSON-RPC",
         };
-        var excerpt: [80]u8 = undefined;
-        var n: usize = @min(line.len, excerpt.len);
-        // Never cut a UTF-8 sequence; control bytes become '?'.
-        if (n < line.len) {
-            while (n > 0 and (line[n] & 0xC0) == 0x80) n -= 1;
-        }
-        for (line[0..n], excerpt[0..n]) |c, *e| e.* = if (c < 0x20 or c == 0x7f) '?' else c;
+        var buf: [excerpt_max + 3]u8 = undefined;
         var text: [192]u8 = undefined;
-        const plain = std.mem.print(&text, "invalid reply ({s}): {s}{s}", .{ why, excerpt[0..n], if (n < line.len) "..." else "" }) catch unreachable;
+        const plain = std.mem.print(&text, "invalid reply ({s}): {s}", .{ why, excerptOf(&buf, line) }) catch unreachable;
         var w: std.Io.Writer = .fixed(&r.refused_reply);
         std.json.Stringify.value(plain, .{}, &w) catch unreachable;
         try r.onMessage(id, 200, .{ .response = .{ .id = id, .body = .{ .failure = .{ .code = wire.code.invalid_request, .message = w.buffered(), .data = null } } } });
@@ -1814,8 +1852,8 @@ pub const Server = struct {
     /// The gate gave up on `key`. Before the era is known that stops detection.
     /// Otherwise a request ends as the server's 401: the server never read
     /// it, whether it waited for a sign-in or for a renewal that got no usable
-    /// answer, so a call never counts as maybe run. Anything else, such as
-    /// the listening GET, ends as a broken stream when the refresh got no
+    /// answer, so a call never counts as maybe run. Anything else, such
+    /// as the listening GET, ends as a broken stream when the refresh got no
     /// answer.
     fn authGaveUp(r: *Server, key: u64, why: auth_core.GiveUp) Error!void {
         r.unkeep(key);
@@ -1952,6 +1990,7 @@ pub const Server = struct {
                 const first = r.catalog_generation != run;
                 r.catalog_generation = run;
                 if (r.stdio) r.proc.setEra(if (v == .legacy) .legacy else .modern) catch {};
+                r.stray_len = 0;
                 r.emit(.{ .ready = era.versionName(r.detector.config, v).? });
                 if (first) try r.stepCatalog(.{ .process_started = if (v == .legacy) .legacy else .modern });
                 // The listens a process exit ended go out again.

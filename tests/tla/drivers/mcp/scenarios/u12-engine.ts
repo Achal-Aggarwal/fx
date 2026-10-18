@@ -255,6 +255,34 @@ export const scenarios: Scenario[] = [
     check: (lines) => same(lines.filter((l) => l.status).at(-1)?.status?.[0]?.last_error, "FileNotFound", "last errors"),
   }),
   engineScenario({
+    name: "u12-start-failure-detail",
+    description: "A server that prints a banner instead of answering and exits: the status keeps its exit code and the banner, terminal-safe, until it starts again",
+    servers: { a: { rules: [{ method: "*", noReply: true }], flags: ["--banner", "Server started on stdio\u001b[31m", "--exit-after", "300"] } },
+    maxAttempts: 1,
+    script: ["call a echo", "expect a.called.1.transport_failed 10000", "expect a.phase.failed 5000", "status"],
+    machines: { a: ["engine", "stdio"] },
+    check: (lines) => {
+      const s = lines.filter((l) => l.status).at(-1)?.status?.[0];
+      return first(
+        same(s?.exit, { code: 1 }, "exit"),
+        same(s?.stray_line, "Server started on stdio?[31m", "stray line"),
+      );
+    },
+  }),
+  engineScenario({
+    name: "u12-start-failure-stderr",
+    description: "A server that writes errors to stderr and exits while starting: its last 3 stderr lines, terminal-safe and joined, are kept with its exit code, until it starts again",
+    servers: { a: { rules: [{ method: "*", noReply: true, stderr: ["first", "npm error code E401", "npm error Incorrect\u0007 or missing password.", "last  "] }], flags: ["--exit-after", "300"] } },
+    maxAttempts: 1,
+    script: ["call a echo", "expect a.called.1.transport_failed 10000", "expect a.phase.failed 5000", "status"],
+    machines: { a: ["engine", "stdio"] },
+    check: (lines) =>
+      first(
+        same(lines.filter((l) => l.status).at(-1)?.status?.[0]?.exit, { code: 1 }, "exit"),
+        same(lines.filter((l) => l.stderr_tails).at(-1)?.stderr_tails, ["npm error code E401 / npm error Incorrect? or missing password. / last"], "stderr tail"),
+      ),
+  }),
+  engineScenario({
     name: "u12-stderr-flood",
     description: "5000 stderr lines during a call all reach the host's sink, written by the reader task, with none dropped",
     servers: { a: { rules: modern({ ...ok("done"), stderr: ["noise"], stderrRepeat: 5000 }) } },
