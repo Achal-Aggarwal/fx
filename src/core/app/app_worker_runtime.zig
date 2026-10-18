@@ -173,9 +173,9 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
         defer app.session_persistence.deinit(alloc);
         defer app.worker.deinit(std.heap.c_allocator);
         defer app.pacer.deinit(alloc);
-        app.session_persistence.v2_store = try session_adapter.Store.open(alloc, root);
+        _ = try app.session_persistence.adoptStore(alloc, try session_adapter.Store.open(alloc, root));
         var model = "test-model".*;
-        app.session_persistence.v2 = try session_adapter.Session.create(alloc, &app.session_persistence.v2_store.?, root, .app, .{
+        app.session_persistence.v2 = try session_adapter.Session.create(alloc, app.session_persistence.v2_store.?, root, .app, .{
             .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
             .language = .literal("en"),
             .permission_state = .{},
@@ -223,7 +223,7 @@ test "shutdown settles queued and pacer-owned finishes exactly once" {
         defer alloc.free(id);
         app.session_persistence.v2.?.close();
         app.session_persistence.v2 = null;
-        const resumed = try session_adapter.Session.resumeSession(alloc, &app.session_persistence.v2_store.?, .{ .id = id }, root, .app);
+        const resumed = try session_adapter.Session.resumeSession(alloc, app.session_persistence.v2_store.?, .{ .id = id }, root, .app);
         defer resumed.close();
         var loaded = try resumed.restore(alloc);
         defer loaded.deinit(alloc);

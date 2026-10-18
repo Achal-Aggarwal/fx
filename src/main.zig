@@ -767,7 +767,7 @@ const App = struct {
     }
 
     pub fn rebindAfterInit(self: *App) void {
-        SessionAppRuntime.rebindSubagentHost(self);
+        SessionAppRuntime.rebindAfterMove(self);
     }
 
     pub fn setNotificationPreferences(

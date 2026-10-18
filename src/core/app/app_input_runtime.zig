@@ -5472,7 +5472,7 @@ test "app_input_runtime Tab toggles session picker scope before autocomplete" {
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
     app.workspace_root = workspace;
-    app.session_persistence.v2_store = try session_adapter.Store.open(alloc, home);
+    _ = try app.session_persistence.adoptStore(alloc, try session_adapter.Store.open(alloc, home));
     app.session_persistence.session_picker.active = true;
     app.session_persistence.session_picker.scope = .current_workspace;
     try app.input_runtime.textReplacementState().replace(alloc, "/sk");

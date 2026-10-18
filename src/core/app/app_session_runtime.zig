@@ -1213,7 +1213,9 @@ pub const Persistence = struct {
     pending_live_session_policy: ?BackgroundSessionPolicy = null,
     pending_live_session_wait: ?LiveSessionWait = null,
     shutdown_failure: ?anyerror = null,
-    v2_store: ?session_adapter.Store = null,
+    /// On the heap, so the pointer every session keeps survives `App.init`
+    /// copying the app after it opens the store (`adoptStore`).
+    v2_store: ?*session_adapter.Store = null,
     v2: ?*session_adapter.Session = null,
 
     /// Fieldwise initialization avoids retaining undefined optional payloads
@@ -1293,8 +1295,24 @@ pub const Persistence = struct {
         self.fork_menu.close(alloc);
         self.title_generation.deinit();
         // After the picker thread, which lists through it, has joined.
-        if (self.v2_store) |*store| store.deinit(alloc);
+        if (self.v2_store) |store| {
+            store.deinit(alloc);
+            alloc.destroy(store);
+        }
         self.* = undefined;
+    }
+
+    /// Takes `store` and keeps it at a stable address. Sessions point at
+    /// their store, and `App.init` copies the app after opening it.
+    pub fn adoptStore(self: *Persistence, alloc: Allocator, store: session_adapter.Store) !*session_adapter.Store {
+        var value = store;
+        const owned = alloc.create(session_adapter.Store) catch |err| {
+            value.deinit(alloc);
+            return err;
+        };
+        owned.* = value;
+        self.v2_store = owned;
+        return owned;
     }
 };
 
@@ -1404,7 +1422,7 @@ pub fn Runtime(comptime App: type) type {
         /// Caller owns it.
         pub fn conversionRefusal(app: *App, alloc: Allocator, err: anyerror) ?[]u8 {
             if (err != error.InvalidSessionFormat) return null;
-            const store = &(app.session_persistence.v2_store orelse return null);
+            const store = app.session_persistence.v2_store orelse return null;
             const problem = store.conversionProblem() orelse return null;
             return alloc.dupe(u8, problem) catch null;
         }
@@ -1426,11 +1444,12 @@ pub fn Runtime(comptime App: type) type {
             required: bool,
         ) !void {
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
-            app.session_persistence.v2_store = session_adapter.Store.openFromEnv(app.alloc) catch |err| {
+            const opened = session_adapter.Store.openFromEnv(app.alloc) catch |err| {
                 if (required) return err;
                 return;
             };
-            app.session_persistence.v2_store.?.notice = .{ .context = app, .emit = conversionNotice };
+            const store = try app.session_persistence.adoptStore(app.alloc, opened);
+            store.notice = .{ .context = app, .emit = conversionNotice };
         }
 
         pub fn enableSessionStores(app: *App) void {
@@ -1454,7 +1473,7 @@ pub fn Runtime(comptime App: type) type {
                 try beginFreshJsHostSession(app);
             }
             if (comptime !runtime_profile.allows(App, .durable_sessions)) return;
-            if (app.session_persistence.v2_store) |*v2_store| try beginFreshV2Session(app, v2_store);
+            if (app.session_persistence.v2_store) |v2_store| try beginFreshV2Session(app, v2_store);
         }
 
         /// A v2 session starts in memory; its folder appears with the first
@@ -1879,7 +1898,7 @@ pub fn Runtime(comptime App: type) type {
             app.requested_resume = null;
             defer target.deinit(app.alloc);
 
-            const v2_store = if (app.session_persistence.v2_store) |*value| value else return error.SessionStoreUnavailable;
+            const v2_store = app.session_persistence.v2_store orelse return error.SessionStoreUnavailable;
             const v2_target: session_adapter.Target = switch (target) {
                 .pick => return openSessionPicker(app),
                 .last => .last,
@@ -2038,7 +2057,7 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn resumeSelectedSession(app: *App) !bool {
             const selected_id = app.session_persistence.session_picker.selectedId() orelse return false;
-            const v2_store = if (app.session_persistence.v2_store) |*value| value else return false;
+            const v2_store = app.session_persistence.v2_store orelse return false;
             // A session open in another fx shows as busy at once (D38).
             const v2 = session_adapter.Session.resumeSessionWithoutWaiting(app.alloc, v2_store, .{ .id = selected_id }, app.workspace_root, .app) catch |err| {
                 noteConversionProblem(app, v2_store, err);
@@ -2222,7 +2241,7 @@ pub fn Runtime(comptime App: type) type {
 
         /// The picker lists from the backend this process runs on.
         fn pickerSource(app: *App) ?SessionPickerLoad.Source {
-            if (app.session_persistence.v2_store) |*store| {
+            if (app.session_persistence.v2_store) |store| {
                 return .{ .store = store, .workspace_root = app.workspace_root };
             }
             return null;
@@ -3123,7 +3142,12 @@ pub fn Runtime(comptime App: type) type {
             return app.session_persistence.subagent_host;
         }
 
-        pub fn rebindSubagentHost(app: *App) void {
+        /// Points what holds the app back at it after `App.init` copies it:
+        /// the store's notice and the subagent host.
+        pub fn rebindAfterMove(app: *App) void {
+            if (app.session_persistence.v2_store) |store| {
+                if (store.notice != null) store.notice = .{ .context = app, .emit = conversionNotice };
+            }
             const host = app.session_persistence.subagent_host orelse return;
             host.rebindHost(app, subagentAuthorityResolver(app));
         }
@@ -6341,7 +6365,7 @@ fn reopenSaved(app: anytype) !session_adapter.Restored {
     const id = try app.alloc.dupe(u8, app.session_persistence.v2.?.id());
     defer app.alloc.free(id);
     Runtime(@TypeOf(app.*)).closeWritableSession(app);
-    const resumed = try session_adapter.Session.resumeSession(app.alloc, &app.session_persistence.v2_store.?, .{ .id = id }, app.workspace_root, .app);
+    const resumed = try session_adapter.Session.resumeSession(app.alloc, app.session_persistence.v2_store.?, .{ .id = id }, app.workspace_root, .app);
     defer resumed.close();
     return resumed.restore(app.alloc);
 }
@@ -6394,7 +6418,7 @@ test "v2 ultrafast resume applies process overrides without persisting them" {
         } }, types.ConversationLanguage.default());
         const id = try alloc.dupe(u8, v2.id());
         defer alloc.free(id);
-        const store = &app.session_persistence.v2_store.?;
+        const store = app.session_persistence.v2_store.?;
         Runtime(TestApp).closeWritableSession(&app);
         const resumed = try session_adapter.Session.resumeSession(alloc, store, .{ .id = id }, paths.workspace, .app);
         try Runtime(TestApp).installResumedV2Session(&app, resumed, .session);
@@ -6442,6 +6466,42 @@ test "/fork waits for the turn and a prompt, then opens on the newest prompt (D5
     try std.testing.expectEqual(@as(usize, 3), menu.points.len);
     try std.testing.expectEqualStrings("first", menu.points[0].prompt);
     try std.testing.expectEqualStrings("third", menu.points[menu.selected].prompt);
+}
+
+test "the startup session keeps its store, and the store's notice the app, after App.init copies the app" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    // As `App.init` does: open the store and start the session, then
+    // return the app by value.
+    const Launch = struct {
+        fn open(a: Allocator, workspace: []const u8) !TestApp {
+            var app = try TestApp.init(a, workspace);
+            errdefer app.deinit();
+            try configureTestPreferences(&app);
+            try Runtime(TestApp).initializePersistence(&app, true);
+            try Runtime(TestApp).beginFreshPersistedSession(&app);
+            return app;
+        }
+    };
+    var app = try Launch.open(alloc, paths.workspace);
+    defer app.deinit();
+    Runtime(TestApp).rebindAfterMove(&app);
+
+    const store = app.session_persistence.v2_store.?;
+    try std.testing.expect(app.session_persistence.v2.?.store == store);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrCast(&app)), store.notice.?.context);
+    try app.session_persistence.v2.?.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("after the copy") },
+        .assistant = @constCast("saved"),
+    } }, types.ConversationLanguage.default());
 }
 
 test "beginFreshPersistedSession and enableSessionStores create per-session stores" {
@@ -6515,7 +6575,7 @@ test "resume handoff suppresses a missing session and one with no saved turn" {
     // Nothing durable happened, so closing leaves no empty session behind.
     try std.testing.expectError(
         error.SessionNotFound,
-        session_adapter.Session.resumeSession(alloc, &app.session_persistence.v2_store.?, .{ .id = pristine_id }, paths.workspace, .app),
+        session_adapter.Session.resumeSession(alloc, app.session_persistence.v2_store.?, .{ .id = pristine_id }, paths.workspace, .app),
     );
 }
 
@@ -8292,7 +8352,7 @@ test "resumeRequestedSession releases the writer when the startup replay anchor 
     try std.testing.expectEqual(@as(usize, 1), app.notices.items.len);
 
     // The session was let go: it opens again.
-    (try session_adapter.Session.resumeSession(alloc, &app.session_persistence.v2_store.?, .{ .id = anchor_failure_id }, paths.workspace, .app)).close();
+    (try session_adapter.Session.resumeSession(alloc, app.session_persistence.v2_store.?, .{ .id = anchor_failure_id }, paths.workspace, .app)).close();
 }
 
 test "requested pick target opens the session picker instead of loading a session" {
@@ -8668,7 +8728,7 @@ test "resumeRequestedSession cleans final owner after post-transfer failure" {
     try std.testing.expect(app.session_persistence.v2 == null);
 
     // The failed resume let the session go: it opens again.
-    const reopened = try session_adapter.Session.resumeSession(alloc, &app.session_persistence.v2_store.?, .{ .id = session_id }, paths.workspace, .app);
+    const reopened = try session_adapter.Session.resumeSession(alloc, app.session_persistence.v2_store.?, .{ .id = session_id }, paths.workspace, .app);
     defer reopened.close();
     try std.testing.expectEqualStrings(session_id, reopened.id());
 }
@@ -9333,7 +9393,7 @@ test "handle-free conversation result is externalized before live commit" {
     const session_id = try alloc.dupe(u8, app.session_persistence.v2.?.id());
     defer alloc.free(session_id);
     Runtime(TestApp).closeWritableSession(&app);
-    const resumed = try session_adapter.Session.resumeSession(alloc, &app.session_persistence.v2_store.?, .{ .id = session_id }, paths.workspace, .app);
+    const resumed = try session_adapter.Session.resumeSession(alloc, app.session_persistence.v2_store.?, .{ .id = session_id }, paths.workspace, .app);
     defer resumed.close();
     var restored = try resumed.restore(alloc);
     defer restored.deinit(alloc);
@@ -9611,7 +9671,7 @@ test "session picker reopen keeps the loaded page visible while refreshing" {
     defer alloc.free(external_session_id);
     {
         // Another fx renames the session.
-        const renamed = try session_adapter.Session.resumeSession(alloc, &app.session_persistence.v2_store.?, .{ .id = cached_session_id }, paths.workspace, .app);
+        const renamed = try session_adapter.Session.resumeSession(alloc, app.session_persistence.v2_store.?, .{ .id = cached_session_id }, paths.workspace, .app);
         defer renamed.close();
         try renamed.rename("renamed externally");
     }
@@ -9762,7 +9822,7 @@ test "session picker reuses a held catalog after resize and workspace switch" {
         const held = try createHeldSessionPickerTask(
             generation,
             app.session_persistence.v2.?.id(),
-            &app.session_persistence.v2_store.?,
+            app.session_persistence.v2_store.?,
         );
         loader.task = held;
         held.catalog = .{};
@@ -9852,7 +9912,7 @@ test "session picker keeps the visible scope when a stale catalog completes" {
     const stale = try createHeldSessionPickerTask(
         picker.generation,
         active_id,
-        &app.session_persistence.v2_store.?,
+        app.session_persistence.v2_store.?,
     );
     stale.catalog = .{};
     try stale.catalog.?.summaries.append(catalog_alloc, .{
@@ -10107,7 +10167,7 @@ test "session picker discards a held stale request after cancellation and reopen
     const held = try createHeldSessionPickerTask(
         picker.generation,
         app.session_persistence.v2.?.id(),
-        &app.session_persistence.v2_store.?,
+        app.session_persistence.v2_store.?,
     );
     held.failure = error.SessionStoreUnavailable;
     app.session_persistence.session_picker_load.task = held;
@@ -10163,7 +10223,7 @@ test "session picker source invalidation discards a finished catalog and pending
 
     const loader = &app.session_persistence.session_picker_load;
     const active_id = app.session_persistence.v2.?.id();
-    const held = try createHeldSessionPickerTask(loader.allocateGeneration(), active_id, &app.session_persistence.v2_store.?);
+    const held = try createHeldSessionPickerTask(loader.allocateGeneration(), active_id, app.session_persistence.v2_store.?);
     loader.task = held;
     held.catalog = .{};
     held.done.store(true, .release);
@@ -10198,7 +10258,7 @@ test "session picker reports worker failure when the shared stop flag is set" {
     const loader = &app.session_persistence.session_picker_load;
     const generation = loader.allocateGeneration();
     const active_id = app.session_persistence.v2.?.id();
-    const held = try createHeldSessionPickerTask(generation, active_id, &app.session_persistence.v2_store.?);
+    const held = try createHeldSessionPickerTask(generation, active_id, app.session_persistence.v2_store.?);
     loader.task = held;
     held.failure = error.OutOfMemory;
     held.cancel_requested.store(true, .release);
@@ -10276,7 +10336,7 @@ test "persistence shutdown cancels an active picker task before joining" {
     const task = try createHeldSessionPickerTask(
         1,
         "active-session",
-        &app.session_persistence.v2_store.?,
+        app.session_persistence.v2_store.?,
     );
     task.thread = try std.Thread.spawn(.{}, waitForPickerCancellation, .{task});
     app.session_persistence.session_picker_load.task = task;
@@ -10548,9 +10608,9 @@ const TitleGenerationFakeApp = struct {
 
 /// Opens a new session for the title tests, as a first prompt finds it.
 fn initTitleTestSession(app: *TitleGenerationFakeApp, alloc: Allocator, root: []const u8) !void {
-    app.session_persistence.v2_store = try session_adapter.Store.openFromEnv(alloc);
+    _ = try app.session_persistence.adoptStore(alloc, try session_adapter.Store.openFromEnv(alloc));
     var model = "test-model".*;
-    app.session_persistence.v2 = try session_adapter.Session.create(alloc, &app.session_persistence.v2_store.?, root, .app, .{
+    app.session_persistence.v2 = try session_adapter.Session.create(alloc, app.session_persistence.v2_store.?, root, .app, .{
         .preferences = .{ .model = &model, .effort = .auto, .fast_mode = false },
         .language = .literal("en"),
         .permission_state = .{},
