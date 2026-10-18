@@ -2661,13 +2661,15 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.sendKeys("C-p");
       await waitForModelsMenu(session, 2);
       await closePicker();
+      // Wait out the picker's reopen floor first, so a revalidation from a
+      // slow startup's first open has landed before the baseline is read.
+      await Bun.sleep(5_500);
       const requestsAfterStartup = gateway.modelRequests.length;
 
-      // The gateway ships a model while fx runs. Once the picker's reopen
-      // floor passes, opening it lists the cached models and revalidates in
-      // the background; the open menu then picks up the new model.
+      // The gateway ships a model while fx runs. Opening the picker lists the
+      // cached models and revalidates in the background; the open menu then
+      // picks up the new model.
       catalog.unshift({ id: releasedModel, type: "language", released: 200, tags: ["tool-use"] });
-      await Bun.sleep(5_500);
       await session.sendKeys("C-p");
       const grid = await waitForModelsMenu(session, 3);
       expect(grid.join("\n")).toContain(releasedModel);

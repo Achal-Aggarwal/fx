@@ -470,7 +470,7 @@ fn fetchGatewayJsonAtUrlCancellable(
         .clock = .awake,
         .raw = .fromMilliseconds(timeout_ms),
     });
-    return runCancellableGatewayJsonFetch(alloc, cancel_flag, deadline, &operation);
+    return runBoundedHttpOperation(GatewayJsonResult, alloc, cancel_flag, deadline, &operation);
 }
 
 const GatewayJsonFetchOperation = struct {
@@ -490,68 +490,6 @@ const GatewayJsonFetchOperation = struct {
         );
     }
 };
-
-fn runCancellableGatewayJsonFetch(
-    alloc: std.mem.Allocator,
-    cancel_flag: *std.atomic.Value(bool),
-    deadline: std.Io.Clock.Timestamp,
-    operation: *GatewayJsonFetchOperation,
-) !GatewayJsonResult {
-    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-
-    const Event = union(enum) {
-        request: anyerror!GatewayJsonResult,
-        watch: anyerror!BoundedRequestWatch.Outcome,
-    };
-    const Runner = struct {
-        fn run(value: *GatewayJsonFetchOperation) anyerror!GatewayJsonResult {
-            return value.run();
-        }
-    };
-    const Cleanup = struct {
-        fn drain(result_alloc: std.mem.Allocator, select: *std.Io.Select(Event), watch: *BoundedRequestWatch) void {
-            watch.stopped.set(select.io);
-            while (select.cancel()) |item| switch (item) {
-                .request => |request_result| {
-                    var late_result = request_result catch continue;
-                    late_result.deinit(result_alloc);
-                },
-                .watch => {},
-            };
-        }
-    };
-
-    var watch: BoundedRequestWatch = .{};
-    var select_buffer: [2]Event = undefined;
-    var select: std.Io.Select(Event) = .init(io_mod.getIo(), &select_buffer);
-    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, cancel_flag, deadline }) catch |err| return err;
-    select.concurrent(.request, Runner.run, .{operation}) catch |err| {
-        watch.finish(&select);
-        return err;
-    };
-
-    const event = select.await() catch |err| {
-        Cleanup.drain(alloc, &select, &watch);
-        return err;
-    };
-    switch (event) {
-        .request => |request_result| {
-            watch.finish(&select);
-            if (cancel_flag.load(.seq_cst)) {
-                var result = request_result catch return error.Cancelled;
-                result.deinit(alloc);
-                return error.Cancelled;
-            }
-            return request_result;
-        },
-        .watch => |watch_result| {
-            Cleanup.drain(alloc, &select, &watch);
-            const outcome = try watch_result;
-            if (outcome == .deadline and !cancel_flag.load(.seq_cst)) return error.Timeout;
-            return error.Cancelled;
-        },
-    }
-}
 
 fn fetchGatewayJsonAtUrlCore(
     alloc: std.mem.Allocator,
