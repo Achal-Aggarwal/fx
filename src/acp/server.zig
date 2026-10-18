@@ -3407,7 +3407,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 }
             }
         }
-        if (host_target.is_wasm and session.writable == null) {
+        if (host_target.is_wasm) {
             const next_model = alloc.dupe(u8, value) catch
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.internal_error,
@@ -3753,7 +3753,7 @@ fn commitActiveSessionEffort(
     session: *ActiveSessionState,
     effort: types.ReasoningEffort,
 ) !void {
-    if (host_target.is_wasm and session.writable == null) {
+    if (host_target.is_wasm) {
         const previous = session.effort;
         session.effort = effort;
         sessions.commitWasmSession(alloc, session) catch |err| {
