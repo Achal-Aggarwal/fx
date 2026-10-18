@@ -4784,15 +4784,18 @@ describe("acp: model-independent", () => {
               mode,
               ready: serverLine.includes('state="ready"'),
               unavailable: selected.includes("MCP server 'fixture' is unavailable"),
-              // A failed version retry probes twice; a result under 400 is
-              // refused at once.
-              ...(mode === "version_retry_error_status" || mode === "bad_request_result" ? { methods } : {}),
+              // The first start's requests: a failed version retry probes
+              // twice; a result under 400 is refused, so that 400 reads as a
+              // 2025 server's and initialize follows. Later starts depend on
+              // the backoff, so they aren't counted.
+              ...(mode === "version_retry_error_status" || mode === "bad_request_result" ? { methods: methods.slice(0, 2) } : {}),
             });
           } finally {
             httpFixture.stop();
           }
         }
-        // wrong_content_type and bad_request_result wait for N26 and N27.
+        // A JSON-RPC answer sent as text/plain, or a result under HTTP 400,
+        // is refused like the others.
         expect(observed).toEqual(modes.map((mode) => ({
           mode,
           ready: false,
@@ -4800,7 +4803,7 @@ describe("acp: model-independent", () => {
           ...(mode === "version_retry_error_status"
             ? { methods: ["server/discover", "server/discover"] }
             : mode === "bad_request_result"
-            ? { methods: ["server/discover"] }
+            ? { methods: ["server/discover", "initialize"] }
             : {}),
         })));
         expect(client.stderr).toBe("");

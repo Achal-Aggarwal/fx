@@ -59,8 +59,9 @@ pub const Incoming = union(enum) {
     /// Request `key` ended. Nothing more comes for it. A rejected one carries
     /// its `WWW-Authenticate` values, joined.
     ended: struct { key: u64, status: u16, how: Ending, challenge: ?[]const u8 },
-    /// The answer to `fetch` request `key`: status 0 when none came.
-    fetched: struct { key: u64, status: u16, body: []const u8, location: ?[]const u8 },
+    /// The answer to `fetch` request `key`: status 0 when none came. `media`
+    /// is its Content-Type, "" for none.
+    fetched: struct { key: u64, status: u16, body: []const u8, location: ?[]const u8, media: []const u8 },
     timeout,
 };
 
@@ -71,7 +72,7 @@ const Posted = union(enum) {
     session: struct { key: u64, id: []u8 },
     opened: u64,
     ended: struct { key: u64, status: u16, how: Ending, challenge: ?[]u8 = null },
-    fetched: struct { key: u64, status: u16 = 0, body: ?[]u8 = null, location: ?[]u8 = null },
+    fetched: struct { key: u64, status: u16 = 0, body: ?[]u8 = null, location: ?[]u8 = null, media: ?[]u8 = null },
 
     fn free(p: Posted, gpa: std.mem.Allocator) void {
         switch (p) {
@@ -84,6 +85,7 @@ const Posted = union(enum) {
             .fetched => |f| {
                 if (f.body) |b| gpa.free(b);
                 if (f.location) |l| gpa.free(l);
+                if (f.media) |m| gpa.free(m);
             },
             .opened => {},
         }
@@ -320,7 +322,7 @@ pub const Client = struct {
                 }
                 c.settle(f.key);
                 c.held = posted;
-                return .{ .fetched = .{ .key = f.key, .status = f.status, .body = f.body orelse "", .location = f.location } };
+                return .{ .fetched = .{ .key = f.key, .status = f.status, .body = f.body orelse "", .location = f.location, .media = f.media orelse "" } };
             },
         }
     }
@@ -442,9 +444,18 @@ pub const Client = struct {
             if (status / 100 == 2) try c.put(.{ .opened = key });
             return c.readEvents(key, status, reader);
         }
-        // A JSON body: a JSON-RPC answer, or, with no such body, an HTTP failure.
+        // A JSON-RPC answer comes as application/json; any other body is an
+        // HTTP failure, whatever it holds.
+        if (!isJson(content_type)) return .{ .status = status, .how = .http_failure };
         const bytes = reader.allocRemaining(c.gpa, .limited(c.options.max_message)) catch return .{ .status = status, .how = .broken };
-        if (wire.decode(bytes)) |_| {
+        if (wire.decode(bytes)) |message| {
+            // A result says it worked, so one under an error status
+            // contradicts itself. An error under one is read: a 400
+            // carries a version mismatch (VER-04).
+            if (status / 100 != 2 and message == .response and message.response.body == .result) {
+                c.gpa.free(bytes);
+                return .{ .status = status, .how = .http_failure };
+            }
             c.budget.take(c.io, bytes.len) catch |err| {
                 c.gpa.free(bytes);
                 return err;
@@ -489,6 +500,8 @@ pub const Client = struct {
             got.location = c.gpa.dupe(u8, h.value) catch null;
             break;
         };
+        // The head's bytes don't outlive reading the body.
+        if (response.head.content_type) |media| got.media = c.gpa.dupe(u8, media) catch null;
         var transfer: [64]u8 = undefined;
         got.body = response.reader(&transfer).allocRemaining(c.gpa, .limited(1 << 20)) catch null;
         return got;
@@ -531,7 +544,18 @@ fn now(io: Io) i64 {
     return Io.Clock.awake.now(io).toMilliseconds();
 }
 
+/// A Content-Type naming JSON, with any parameters such as `charset`.
+pub fn isJson(media: []const u8) bool {
+    const end = std.mem.findScalar(u8, media, ';') orelse media.len;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, media[0..end], " \t"), "application/json");
+}
+
 const testing = std.testing;
+
+test "only application/json, with or without parameters, is JSON" {
+    for ([_][]const u8{ "application/json", "Application/JSON", "application/json; charset=utf-8", "application/json;charset=UTF-8" }) |m| try testing.expect(isJson(m));
+    for ([_][]const u8{ "", "text/plain", "text/json", "application/json-rpc", "application/jsonx", "text/event-stream" }) |m| try testing.expect(!isJson(m));
+}
 
 test "a header that can't go out as it is never does, and the request ends refused" {
     // Nothing listens on port 1, so a request that does go out breaks.

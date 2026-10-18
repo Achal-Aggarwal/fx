@@ -1451,6 +1451,7 @@ fn signInFailure(buffer: []u8, why: mcp.auth.client.Failure, message: ?[]const u
         .refused => "fx has tried to sign in to it too many times; restart fx to try again",
         .insecure_endpoint => "its sign-in server uses plain HTTP, not HTTPS",
         .internal_endpoint => "its sign-in server points at an internal address fx won't contact",
+        .metadata_not_json => "its sign-in metadata isn't JSON",
     };
     var said = std.mem.trimEnd(u8, message orelse return what, ". \t\r\n");
     if (said.len == 0) return what;

@@ -61,6 +61,9 @@ pub const Failure = enum {
     refused,
     insecure_endpoint,
     internal_endpoint,
+    /// Its metadata came as something other than JSON; the message names
+    /// what (RFC 8414 §3.2, RFC 9728 §3.2).
+    metadata_not_json,
 };
 
 pub const Action = union(enum) {
@@ -158,7 +161,9 @@ pub const Auth = struct {
     /// Why the code wasn't redeemed, in the token endpoint's words.
     token_error: ?[]const u8 = null,
     /// Why this discovery passed over an authorization server, if it did.
-    discovery_refusal: ?discovery.Refusal = null,
+    discovery_refusal: ?enum { insecure, internal, not_json } = null,
+    /// The Content-Type of metadata refused as `not_json`, in the flow arena.
+    refused_media: []const u8 = "",
     pending_code: ?[]const u8 = null,
     flow_key: u64 = 0,
     refresh_key: u64 = 0,
@@ -439,6 +444,7 @@ pub const Auth = struct {
                 a.prm = null;
                 a.meta = null;
                 a.discovery_refusal = null;
+                a.refused_media = "";
                 a.candidates = try discovery.resourceMetadataUrls(a.flow_arena.allocator(), a.server_url, a.challenge_url);
                 a.candidate = 0;
                 try a.fetchCandidate(.resource_metadata);
@@ -464,12 +470,14 @@ pub const Auth = struct {
                     .response => if (f.show_error) .response else .mismatch,
                     inline else => |s| @field(Failure, @tagName(s)),
                 };
+                const refusal = if (why == .discovery) a.discovery_refusal else null;
                 try a.actions.append(a.gpa, .{ .sign_in_failed = .{
-                    .why = if (why != .discovery) why else if (a.discovery_refusal) |r| switch (r) {
+                    .why = if (refusal) |r| switch (r) {
                         .insecure => .insecure_endpoint,
                         .internal => .internal_endpoint,
-                    } else .discovery,
-                    .message = if (f.show_error) a.response_error else if (f.stage == .redemption) a.token_error else null,
+                        .not_json => .metadata_not_json,
+                    } else why,
+                    .message = if (f.show_error) a.response_error else if (f.stage == .redemption) a.token_error else if (refusal == .not_json) a.refused_media else null,
                 } });
             },
             .refused => try a.actions.append(a.gpa, .{ .sign_in_failed = .{ .why = .refused } }),
@@ -483,7 +491,10 @@ pub const Auth = struct {
             a.candidate += 1;
             // The authorization server's metadata only from hosts discovery may reach.
             if (stage == .server_metadata) if (discovery.refusal(url, a.server_url)) |r| {
-                a.discovery_refusal = r;
+                a.discovery_refusal = switch (r) {
+                    .insecure => .insecure,
+                    .internal => .internal,
+                };
                 continue;
             };
             a.stage = stage;
@@ -571,8 +582,9 @@ pub const Auth = struct {
 
     /// The answer to one of this module's requests. False when `key` isn't one.
     /// `answer` lasts only until the client's next `next`; what is read from it
-    /// is read from a copy kept as long as it's needed.
-    pub fn fetched(a: *Auth, key: u64, status: u16, answer: []const u8) Error!bool {
+    /// is read from a copy kept as long as it's needed. `media` is its
+    /// Content-Type: metadata must be JSON.
+    pub fn fetched(a: *Auth, key: u64, status: u16, media: []const u8, answer: []const u8) Error!bool {
         if (key == 0) return false;
         if (key == a.revoke_key) {
             a.revoke_key = 0;
@@ -587,6 +599,14 @@ pub const Auth = struct {
         const fa = a.flow_arena.allocator();
         // A registration outlives the sign-in; the rest lasts as long as it.
         const body = try (if (a.stage == .registration) a.keep.allocator() else fa).dupe(u8, answer);
+        // Metadata that came as something else isn't read; the sign-in
+        // names what came if no other candidate has JSON.
+        if ((a.stage == .resource_metadata or a.stage == .server_metadata) and status == 200 and !http.isJson(media)) {
+            a.discovery_refusal = .not_json;
+            a.refused_media = try fa.dupe(u8, media);
+            try a.fetchCandidate(a.stage);
+            return true;
+        }
         switch (a.stage) {
             .idle => {},
             .resource_metadata => {
@@ -822,7 +842,7 @@ test "a refresh the host decides waits for it, and ends however it does: replace
             .answered => {
                 a.refresh_due = false;
                 a.refresh_key = a.newKey();
-                _ = try a.fetched(a.refresh_key, 200, "{\"access_token\":\"at3\",\"token_type\":\"Bearer\",\"refresh_token\":\"rt3\",\"expires_in\":3600}");
+                _ = try a.fetched(a.refresh_key, 200, "application/json", "{\"access_token\":\"at3\",\"token_type\":\"Bearer\",\"refresh_token\":\"rt3\",\"expires_in\":3600}");
                 try testing.expectEqual(@as(usize, 3), actions.len);
                 try testing.expect(actions.*[0] == .save);
                 try testing.expect(actions.*[1] == .post and actions.*[1].post.key == 1);
@@ -833,7 +853,7 @@ test "a refresh the host decides waits for it, and ends however it does: replace
             .refused => {
                 a.refresh_due = false;
                 a.refresh_key = a.newKey();
-                _ = try a.fetched(a.refresh_key, 400, "{\"error\":\"invalid_grant\"}");
+                _ = try a.fetched(a.refresh_key, 400, "application/json", "{\"error\":\"invalid_grant\"}");
                 try testing.expect(actions.*[0] == .save);
                 try testing.expect(actions.*[actions.len - 1] == .refresh_ended);
                 try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
@@ -843,7 +863,7 @@ test "a refresh the host decides waits for it, and ends however it does: replace
             .refused_200 => {
                 a.refresh_due = false;
                 a.refresh_key = a.newKey();
-                _ = try a.fetched(a.refresh_key, 200, "{\"ok\":false,\"error\":\"bad_client_secret\"}");
+                _ = try a.fetched(a.refresh_key, 200, "application/json", "{\"ok\":false,\"error\":\"bad_client_secret\"}");
                 try testing.expect(actions.*[0] == .save);
                 try testing.expect(actions.*[actions.len - 1] == .refresh_ended);
                 try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
@@ -853,7 +873,7 @@ test "a refresh the host decides waits for it, and ends however it does: replace
             .failed_429 => {
                 a.refresh_due = false;
                 a.refresh_key = a.newKey();
-                _ = try a.fetched(a.refresh_key, 429, "{\"error\":\"slow_down\"}");
+                _ = try a.fetched(a.refresh_key, 429, "application/json", "{\"error\":\"slow_down\"}");
                 for (actions.*) |x| try testing.expect(x != .save);
                 try testing.expect(actions.*[actions.len - 1] == .refresh_ended);
                 try testing.expectEqualStrings("rt", a.refresh_token.?);
