@@ -186,7 +186,7 @@ pub const Store = struct {
 
     /// Refuses, before any session is asked for, a `~/.fx`, `~/.fx/sessions`
     /// or `v2` folder that is not a real folder, such as a file or a symlink
-    /// (D99): every write would fail on it. One that is missing is made by
+    /// (D67): every write would fail on it. One that is missing is made by
     /// the first write; one that others can read converts (D61).
     fn checkSessionsPath(home: []const u8) !void {
         var parent = openHome(home) catch |err| switch (err) {
@@ -453,11 +453,35 @@ pub fn readSession(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
 /// A v1 root v2 does not hold yet, read by v1's reader without converting
 /// it (D61). Caller owns the result.
 fn readV1Session(store: *Store, alloc: Allocator, id: []const u8) !Resumed {
-    var detail = (try v1_conversion.readDetail(alloc, store.home, id)) orelse return error.SessionNotFound;
+    store.problem = .{};
+    var detail = (v1_conversion.readDetail(alloc, store.home, id) catch |err| switch (err) {
+        error.OutOfMemory, error.SessionNotFound => return err,
+        else => return v1Unreadable(store, alloc, id, err),
+    }) orelse return error.SessionNotFound;
     defer detail.summary.deinit(alloc);
     errdefer detail.state.deinit(alloc);
     const title = if (detail.summary.title) |value| try alloc.dupe(u8, value) else null;
     return .{ .state = detail.state, .title = title };
+}
+
+/// A v1 root v1's reader refuses, however it fails: damage, with the file
+/// and the reason in `store.problem` when the converter's read names them
+/// (D78).
+fn v1Unreadable(store: *Store, alloc: Allocator, id: []const u8, err: anyerror) error{ OutOfMemory, InvalidSessionFormat } {
+    debug_trace.logf("session", "event=v1_detail_unreadable session={s} err={s}", .{ id, @errorName(err) });
+    const stuck = (checkV1(store, alloc, id) catch |check_err| switch (check_err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => null,
+    }) orelse {
+        store.problem = .{};
+        return error.InvalidSessionFormat;
+    };
+    defer {
+        alloc.free(stuck.id);
+        alloc.free(stuck.reason);
+    }
+    store.problem = .{};
+    return store.problem.set("{s}", .{stuck.reason});
 }
 
 /// A page of saved root sessions as v1 pages them: newest first, one
@@ -497,7 +521,16 @@ pub fn listPage(
         added += 1;
     }
     session_summary_codec.sortSummariesNewestFirst(candidates.items);
-    return session_summary_codec.sessionListPageFromSummaries(alloc, candidates.items, workspace, continuation, limit);
+    var page = try session_summary_codec.sessionListPageFromSummaries(alloc, candidates.items, workspace, continuation, limit);
+    // A workspace's page leaves out v1's roots that can't be read, whose
+    // workspace is unknown, and counts them as v1 did; the profile-wide
+    // listing shows them instead (D61).
+    if (workspace != null and continuation == null) {
+        for (v1_roots.summaries.items) |summary| {
+            if (summary.workspace_root == null) page.skipped_invalid += 1;
+        }
+    }
+    return page;
 }
 
 /// Appends v2's roots that follow `continuation` in v1's order to `out`,
@@ -554,6 +587,9 @@ pub const Recovered = struct {
     history_len: usize,
     /// False when a side file could not be copied.
     files_complete: bool,
+    /// True when the source's saved permission rules could not be read, so
+    /// the copy has none (D72).
+    permission_rules_dropped: bool = false,
 
     pub fn deinit(recovered: *Recovered, alloc: Allocator) void {
         alloc.free(recovered.id);
@@ -616,11 +652,29 @@ pub const Doctor = struct {
     removed: usize = 0,
     /// Side folders with no session that could not be removed.
     kept: usize = 0,
+    /// Roots an older fx saved that v2 does not hold yet; each converts
+    /// when it is first opened (D73).
+    unconverted: usize = 0,
+    /// Those of them that can't be converted, among the checked ones.
+    stuck: std.ArrayList(Stuck) = .empty,
+
+    pub const Stuck = struct {
+        id: []u8,
+        /// The file and the reason the conversion refuses it.
+        reason: []u8,
+        /// What `fx session recover` copies of it.
+        recover: enum { without_rules, good_turns, nothing },
+    };
 
     pub fn deinit(report: *Doctor, alloc: Allocator) void {
         if (report.latest) |id| alloc.free(id);
         for (report.damaged.items) |id| alloc.free(id);
         report.damaged.deinit(alloc);
+        for (report.stuck.items) |stuck| {
+            alloc.free(stuck.id);
+            alloc.free(stuck.reason);
+        }
+        report.stuck.deinit(alloc);
         report.* = undefined;
     }
 };
@@ -663,8 +717,101 @@ pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64) !Docto
         }
         cursor = page.next orelse break;
     }
+    try doctorV1(store, alloc, &report, limit);
     try store.sweepFiles(alloc, &report, now_ms);
     return report;
+}
+
+/// Counts the roots an older fx saved that v2 does not hold yet, and names
+/// each checked one that can't be converted with what `fx session recover`
+/// copies of it (D73). Reads only; a busy family is left out.
+fn doctorV1(store: *Store, alloc: Allocator, report: *Doctor, limit: usize) !void {
+    const roots = v1_conversion.rootIds(alloc, store.home) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            debug_trace.logf("session", "event=doctor_v1_unlisted err={s}", .{@errorName(err)});
+            return;
+        },
+    };
+    defer {
+        for (roots) |root| root.deinit(alloc);
+        alloc.free(roots);
+    }
+    for (roots) |root| {
+        if (store.manager.peek(alloc, root.id)) |peeked_value| {
+            var peeked = peeked_value;
+            peeked.deinit(alloc);
+            continue;
+        } else |err| switch (err) {
+            error.NotFound, error.InvalidArgument => {},
+            error.OutOfMemory => return err,
+            else => continue,
+        }
+        report.unconverted += 1;
+        if (report.checked == limit) continue;
+        report.checked += 1;
+        try report.stuck.ensureUnusedCapacity(alloc, 1);
+        if (root.unreadable) |why| {
+            report.stuck.appendAssumeCapacity(try stuckRoot(alloc, root.id, why, .nothing));
+            continue;
+        }
+        if (try checkV1(store, alloc, root.id)) |stuck| report.stuck.appendAssumeCapacity(stuck);
+    }
+}
+
+fn stuckRoot(alloc: Allocator, id: []const u8, reason: []const u8, recover_kind: @FieldType(Doctor.Stuck, "recover")) !Doctor.Stuck {
+    const owned_id = try alloc.dupe(u8, id);
+    errdefer alloc.free(owned_id);
+    return .{ .id = owned_id, .reason = try alloc.dupe(u8, reason), .recover = recover_kind };
+}
+
+/// Null when `root_id`'s family converts, or is busy.
+fn checkV1(store: *Store, alloc: Allocator, root_id: []const u8) !?Doctor.Stuck {
+    store.problem = .{};
+    var v1 = try session_store.Store.initReadOnlyFromHome(alloc, store.home, "/");
+    defer v1.deinit(alloc);
+    var locks = v1_conversion.lockFamily(alloc, &v1, root_id, 0, &store.problem) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.SessionBusy, error.SessionNotFound => return null,
+        error.InvalidSessionFormat => return try stuckRoot(alloc, root_id, store.problem.text(), .nothing),
+        else => return try stuckRoot(alloc, root_id, @errorName(err), .nothing),
+    };
+    defer locks.release();
+    for (locks.members.items) |*locked| {
+        var member = v1_conversion.readMember(alloc, &v1, locked, &store.problem, .required) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => break,
+        };
+        member.deinit();
+    } else return null;
+    var reason: [v1_conversion.Problem.capacity]u8 = undefined;
+    const why = if (store.problem.len > 0) store.problem.text() else "its folder can't be read";
+    @memcpy(reason[0..why.len], why);
+    // What `recover` would copy, read in the order its salvage reads: a
+    // root that reads whole is not salvaged at all.
+    const root = &locks.members.items[0];
+    const recover_kind: @FieldType(Doctor.Stuck, "recover") = kind: {
+        store.problem = .{};
+        if (v1_conversion.readMember(alloc, &v1, root, &store.problem, .required)) |whole| {
+            var read = whole;
+            read.deinit();
+            break :kind .nothing;
+        } else |err| if (err == error.OutOfMemory) return err;
+        store.problem = .{};
+        if (v1_conversion.readMember(alloc, &v1, root, &store.problem, .drop_unreadable)) |whole| {
+            var read = whole;
+            read.deinit();
+            break :kind .without_rules;
+        } else |err| if (err == error.OutOfMemory) return err;
+        store.problem = .{};
+        if (v1_conversion.readSalvage(alloc, &v1, root, &store.problem)) |salvaged| {
+            var read = salvaged;
+            read.deinit();
+            break :kind .good_turns;
+        } else |err| if (err == error.OutOfMemory) return err;
+        break :kind .nothing;
+    };
+    return try stuckRoot(alloc, root_id, reason[0..why.len], recover_kind);
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,7 +1340,7 @@ pub const Session = struct {
             // The newest of the listing, which holds v1's unconverted roots
             // too (D61).
             .last => {
-                const newest = (try newestListed(store, alloc, workspace)) orelse return error.NoSavedSessions;
+                const newest = (try newestListed(store, alloc, workspace)) orelse return noLatestError(store, alloc);
                 defer alloc.free(newest);
                 return openOrConvert(alloc, store, newest, workspace, host, lock_wait_ms, started);
             },
@@ -1415,6 +1562,35 @@ pub const Session = struct {
 
     /// Opens the turn on disk if it is not open yet, so a body stored for it
     /// is a blob of a session on disk (D44). Caller holds the mutex.
+    /// Keeps each inline prompt image as one of the session's blobs too and
+    /// saves the prompt naming that file, so after a resume the notice for
+    /// an image too large to send names a file the model can read (D79).
+    /// The bytes stay in the item (D44), and the item does not list the
+    /// blob, which only backs that path. Storing the same bytes again costs
+    /// one stat, so a streamed prompt encodes the same each time. The path
+    /// is the one `blobPath` gives once the session is published, so an
+    /// import's staged blobs (D59) get theirs too. The caller holds the
+    /// mutex.
+    fn keepPromptImages(self: *Session, a: Allocator, events: []Event) !void {
+        for (events) |*event| switch (event.*) {
+            .user => |*user| {
+                var kept: ?[]types.ImageAttachment = null;
+                for (user.images, 0..) |image, index| {
+                    const bytes = image.inline_data orelse continue;
+                    if (kept == null) {
+                        // A blob needs the turn on disk first (D44).
+                        try self.openTurnLocked();
+                        kept = try a.dupe(types.ImageAttachment, user.images);
+                    }
+                    const hash = try self.handle.putBlob(bytes);
+                    kept.?[index].snapshot_path = try std.Io.Dir.path.join(a, &.{ self.store.manager.root_path, self.id(), "blobs", &hash });
+                }
+                if (kept) |list| user.images = list;
+            },
+            else => {},
+        };
+    }
+
     fn openTurnLocked(self: *Session) !void {
         if (self.turn_open) return;
         _ = try self.write(&.{.turn_started});
@@ -1484,6 +1660,7 @@ pub const Session = struct {
         var events: std.ArrayList(Event) = .empty;
         try session_event.appendHistoryTurnConversationEvents(a, &events, turn);
         if (events.items.len < 2) return error.InvalidConversationFrame;
+        try self.keepPromptImages(a, events.items);
         const pieces = events.items[0 .. events.items.len - 1];
         const end = events.items[events.items.len - 1];
 
@@ -1551,6 +1728,7 @@ pub const Session = struct {
         const a = arena.allocator();
         var events: std.ArrayList(Event) = .empty;
         try events.append(a, .{ .user = .{ .text = user.text, .images = user.images, .work_id = user.work_id } });
+        try self.keepPromptImages(a, events.items);
         // A result's blob needs the turn on disk first (D44).
         if (storesBodies(execution)) try self.openTurnLocked();
         // On a missing handle the list keeps the pieces before it.
@@ -1650,11 +1828,33 @@ pub const Session = struct {
                 batch.clearRetainingCapacity();
             }
         }
-        for (events, encoded) |event, bytes| try batch.append(a, .{ .item = try self.item(a, std.meta.activeTag(event), bytes) });
+        for (events, encoded) |event, bytes| {
+            var piece = try self.item(a, std.meta.activeTag(event), bytes);
+            if (event == .user) piece.blobs = try self.promptImageBlobs(a, piece.blobs, event.user.images);
+            try batch.append(a, .{ .item = piece });
+        }
         try batch.appendSlice(a, tail);
         if (batch.items.len == 0) return;
         _ = try self.write(batch.items);
         if (!self.turn_open) self.startedTurn();
+    }
+
+    /// `blobs` and the blob each kept prompt image names, so every blob is
+    /// listed on an item of the turn that stored it (D44, D79).
+    fn promptImageBlobs(self: *Session, a: Allocator, blobs: []const []const u8, images: []const types.ImageAttachment) ![]const []const u8 {
+        const folder = try std.Io.Dir.path.join(a, &.{ self.store.manager.root_path, self.id(), "blobs" });
+        var list: std.ArrayList([]const u8) = .empty;
+        for (images) |image| {
+            const path = image.snapshot_path orelse continue;
+            if (path.len != folder.len + 1 + @sizeOf(sm.BlobHash) or !std.mem.startsWith(u8, path, folder) or path[folder.len] != '/') continue;
+            const hash = path[folder.len + 1 ..];
+            if (list.items.len == 0) try list.appendSlice(a, blobs);
+            const listed = for (list.items) |ref| {
+                if (std.mem.eql(u8, ref, hash)) break true;
+            } else false;
+            if (!listed) try list.append(a, hash);
+        }
+        return if (list.items.len == 0) blobs else list.items;
     }
 
     fn startedTurn(self: *Session) void {
@@ -1690,8 +1890,10 @@ pub const Session = struct {
     }
 
     /// `events`, a turn's pieces, ended by the last one.
-    fn importTurn(self: *Session, a: Allocator, events: []const Event) !void {
-        if (events.len < 2) return error.InvalidConversationFrame;
+    fn importTurn(self: *Session, a: Allocator, turn_events: []const Event) !void {
+        if (turn_events.len < 2) return error.InvalidConversationFrame;
+        const events = try a.dupe(Event, turn_events);
+        try self.keepPromptImages(a, events);
         const encoded = try a.alloc([]u8, events.len);
         for (events, encoded) |event, *bytes| bytes.* = try encodePiece(a, event);
         const end: sm.Event = switch (events[events.len - 1]) {
@@ -2264,6 +2466,15 @@ const SideFileLines = struct {
 /// and each of `stored` (results an older format kept inline), put as a
 /// blob and named in the moved map, which is one more blob, and the ACP
 /// client's files. In `a`.
+/// Whether `stored` holds the result body named `handle`.
+fn storedInline(stored: []const v1_conversion.Stored, handle: []const u8) bool {
+    const prefix = "tool-results/";
+    for (stored) |entry| {
+        if (entry.key.len == prefix.len + handle.len and std.mem.startsWith(u8, entry.key, prefix) and std.mem.endsWith(u8, entry.key, handle)) return true;
+    }
+    return false;
+}
+
 fn sideFileLines(a: Allocator, handle: sm.Session, side: *io_mod.VerifiedDir, folders: []const []const u8, stored: []const v1_conversion.Stored, left_out: []const []const u8) !SideFileLines {
     const io = io_mod.getIo();
     var bodies: std.ArrayList(Body) = .empty;
@@ -2477,6 +2688,9 @@ const Source = struct {
             };
             if (images == null) images = try pa.dupe(types.ImageAttachment, user.images);
             images.?[index].inline_data = bytes;
+            // The v1 file went with its folder; the blob is the original now
+            // (D79).
+            images.?[index].snapshot_path = try src.store.manager.blobPath(pa, src.id, &hash);
         }
         const list = images orelse return user;
         return .{ .text = user.text, .images = list, .work_id = user.work_id };
@@ -2670,15 +2884,25 @@ const Conversion = struct {
         const locked = &locks.members.items[0];
         // A session the converter reads whole needs no salvage, as v1's
         // recover finds once it has brought an older format up to date.
-        if (v1_conversion.readMember(c.alloc, &v1, locked, &store.problem)) |whole| {
+        if (v1_conversion.readMember(c.alloc, &v1, locked, &store.problem, .required)) |whole| {
             var read = whole;
             read.deinit();
             return error.SessionRecoveryNotNeeded;
         } else |err| if (err == error.OutOfMemory) return err;
         store.problem = .{};
-        var member = try v1_conversion.readSalvage(c.alloc, &v1, locked, &store.problem);
+        // A conversation that only its saved rules keep from converting is
+        // copied whole without them (D72); anything else is salvaged as v1
+        // salvaged it.
+        var member = v1_conversion.readMember(c.alloc, &v1, locked, &store.problem, .drop_unreadable) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => salvaged: {
+                store.problem = .{};
+                break :salvaged try v1_conversion.readSalvage(c.alloc, &v1, locked, &store.problem);
+            },
+        };
         defer member.deinit();
         try c.findLeftOut(root_id, locked);
+        try c.checkKeptFiles(root_id, locked, &member);
         var id: [sm.new_id_len]u8 = undefined;
         sm.newId(io_mod.getIo(), &id);
         const handle = store.manager.openImport(.{ .id = &id, .workspace = member.workspace, .host = c.host, .created_ms = member.created_ms }) catch |err|
@@ -2696,8 +2920,13 @@ const Conversion = struct {
         var registry = try child_state.Registry.init(arena.allocator(), &id);
         try c.writeMember(session, &member, locked, .{ .root = .{ .registry = &registry, .has_log = &.{} } });
         try session.handle.publishImport();
-        debug_trace.logf("convert", "action=Salvaged session={s} copy={s} turns={d}", .{ root_id, &id, member.turns });
-        return .{ .id = try c.alloc.dupe(u8, &id), .history_len = member.steps.len, .files_complete = c.left_out.items.len == 0 };
+        debug_trace.logf("convert", "action=Salvaged session={s} copy={s} turns={d} rules_dropped={}", .{ root_id, &id, member.turns, member.rules_dropped });
+        return .{
+            .id = try c.alloc.dupe(u8, &id),
+            .history_len = member.steps.len,
+            .files_complete = c.left_out.items.len == 0,
+            .permission_rules_dropped = member.rules_dropped,
+        };
     }
 
     fn traceHeld(root_id: []const u8) Outcome {
@@ -2752,7 +2981,7 @@ const Conversion = struct {
     }
 
     fn load(c: *Conversion, v1: *session_store.Store, locked: *v1_conversion.Locked, root_id: []const u8) !v1_conversion.Member {
-        return v1_conversion.readMember(c.alloc, v1, locked, &c.store.problem) catch |err| {
+        return v1_conversion.readMember(c.alloc, v1, locked, &c.store.problem, .required) catch |err| {
             if (err == error.InvalidSessionFormat) c.traceUnreadable(root_id, locked.id);
             return err;
         };
@@ -2783,6 +3012,73 @@ const Conversion = struct {
                 debug_trace.logf("convert", "action=LeftOut session={s} member={s} file={s} bytes={d} limit={d}", .{ root_id, locked.id, file, stat.size, sm.max_blob_bytes });
             }
         }
+    }
+
+    /// Leaves out each side file a kept result names that is missing, not
+    /// the size its record gives, or not the bytes the digest in its name
+    /// gives, which v1's recover would not copy (D74). The copy's result
+    /// then says its content is unavailable, and the recovery says so.
+    fn checkKeptFiles(c: *Conversion, root_id: []const u8, locked: *v1_conversion.Locked, member: *const v1_conversion.Member) !void {
+        for (member.steps) |step| switch (step) {
+            .framed => |framed| for (framed.events) |event| switch (event) {
+                .tool_result => |result| {
+                    try c.checkKeptFile(root_id, locked, "tool-results", result.artifact_ref, ".txt", result.stored_bytes);
+                    if (result.command_replay_ref) |ref| try c.checkKeptFile(root_id, locked, "logs/commands", ref, ".bin", result.command_replay_bytes);
+                },
+                else => {},
+            },
+            .whole => |whole| {
+                const execution = switch (whole.turn) {
+                    .assistant => |entry| entry.execution,
+                    .interrupted => |entry| entry.execution,
+                    .compacted_summary => continue,
+                };
+                for (execution.tool_steps) |tool_step| for (tool_step.tool_results) |result| {
+                    const handle = result.output_handle orelse continue;
+                    // An older format's inline result, which the conversion
+                    // writes itself.
+                    if (storedInline(member.stored, handle)) continue;
+                    try c.checkKeptFile(root_id, locked, "tool-results", handle, ".txt", result.stored_output_bytes);
+                };
+            },
+            .compacted => {},
+        };
+    }
+
+    fn checkKeptFile(c: *Conversion, root_id: []const u8, locked: *v1_conversion.Locked, folder: []const u8, name: []const u8, suffix: []const u8, expected_bytes: ?u64) !void {
+        if (name.len == 0) return;
+        for (c.left_out.items) |entry| {
+            if (std.mem.eql(u8, entry.member, locked.id) and entry.file.len == folder.len + 1 + name.len and
+                std.mem.startsWith(u8, entry.file, folder) and std.mem.endsWith(u8, entry.file, name)) return;
+        }
+        const io = io_mod.getIo();
+        const why: []const u8 = why: {
+            var dir = locked.dir.dir.openDir(io, folder, .{ .follow_symlinks = false }) catch break :why "missing";
+            defer dir.close(io);
+            var file = io_mod.openExistingReadOnlyRegularFile(dir, name, .no_follow) catch break :why "missing";
+            defer file.close(io);
+            const stat = file.stat(io) catch break :why "unreadable";
+            if (expected_bytes) |bytes| if (stat.size != bytes) break :why "not the size its result records";
+            if (!artifact_digest.hasContentDigest(name, suffix)) return;
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            var buffer: [16 * 1024]u8 = undefined;
+            var offset: u64 = 0;
+            while (offset < stat.size) {
+                const count: usize = @intCast(@min(buffer.len, stat.size - offset));
+                const read = file.readPositionalAll(io, buffer[0..count], offset) catch break :why "unreadable";
+                if (read != count) break :why "unreadable";
+                hash.update(buffer[0..count]);
+                offset += count;
+            }
+            if (artifact_digest.handleMatchesContentDigest(name, suffix, hash.finalResult())) return;
+            break :why "not the bytes its name records";
+        };
+        try c.left_out.ensureUnusedCapacity(c.alloc, 1);
+        const member_id = try c.alloc.dupe(u8, locked.id);
+        errdefer c.alloc.free(member_id);
+        const file = try c.alloc.print("{s}/{s}", .{ folder, name });
+        c.left_out.appendAssumeCapacity(.{ .member = member_id, .file = file, .bytes = 0 });
+        debug_trace.logf("convert", "action=LeftOut session={s} member={s} file={s} reason=\"{s}\"", .{ root_id, locked.id, file, why });
     }
 
     /// Reads a checked member again unless its read was kept, and writes it
@@ -3072,6 +3368,16 @@ fn leftFolder(store: *Store, id: []const u8) bool {
 
 /// The newest session of the merged listing in `workspace` (D61). Caller
 /// owns it.
+/// What a latest lookup that finds nothing says: that there are no saved
+/// sessions, or that only ones it can't read are left, as v1 said (D76).
+pub fn noLatestError(store: *Store, alloc: Allocator) error{ OutOfMemory, NoSavedSessions, NoReadableSessions } {
+    const unreadable = v1_conversion.hasUnreadable(alloc, store.home) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => false,
+    };
+    return if (unreadable) error.NoReadableSessions else error.NoSavedSessions;
+}
+
 fn newestListed(store: *Store, alloc: Allocator, workspace: []const u8) !?[]u8 {
     var page = try listPage(store, alloc, workspace, null, 1);
     defer page.deinit(alloc);
@@ -3559,10 +3865,10 @@ noinline fn replay(
                             try represented.append(ta, try ta.dupe(u8, value.call_id));
                         },
                         .steering => |value| try builder.appendSteering(value.text),
-                        .turn_completed => |value| try sink.turn(try presentStoredResults(alloc, try builder.finishAssistant(value)), lastStarted(entry)),
+                        .turn_completed => |value| try sink.turn(try presentStoredResults(src, alloc, try builder.finishAssistant(value)), lastStarted(entry)),
                         .interrupted => |value| {
                             interrupted_item = true;
-                            try sink.turn(try presentStoredResults(alloc, try builder.finishInterrupted(value)), lastStarted(entry));
+                            try sink.turn(try presentStoredResults(src, alloc, try builder.finishInterrupted(value)), lastStarted(entry));
                         },
                         .context_checkpoint => return error.InvalidConversationFrame,
                     }
@@ -3585,7 +3891,7 @@ noinline fn replay(
                         return err;
                     };
                     if (answered > 0) debug_trace.logf("session", "event=sessions_v2_replay_unfinished_tools session={s} turn={d} calls={d}", .{ src.id, ended.turn, answered });
-                    try sink.turn(try presentStoredResults(alloc, turn), ended.turn);
+                    try sink.turn(try presentStoredResults(src, alloc, turn), ended.turn);
                 },
                 .compacted => |line| try sink.summary(line.data),
                 .session_created, .turn_committed, .set, .child_spawned, .child_finished, .snapshot, .closed => {},
@@ -3596,11 +3902,13 @@ noinline fn replay(
     if (!builder.isIdle()) debug_trace.logf("session", "event=sessions_v2_replay_open_turn session={s} dropped=unfinished_pieces", .{src.id});
 }
 
-/// `turn` with each stored result that kept only a preview shown as v1
-/// shows it (`session_log.zig` `restoreExecutionResultBodies`): the preview
-/// wrapped with its handle and stored size, so the model knows where the
-/// rest is. Takes `turn`, freeing it on failure.
-fn presentStoredResults(alloc: Allocator, turn: types.HistoryTurn) !types.HistoryTurn {
+/// `turn` with each stored result shown as v1 showed it: one the model saw
+/// cut keeps its preview, wrapped with its handle and stored size so the
+/// model knows where the rest is; one it saw whole gets its whole body back
+/// from its blob, or a note that the body is unavailable. A converted
+/// session's result under its old name is left as saved when no open
+/// session can name its blob. Takes `turn`, freeing it on failure.
+fn presentStoredResults(src: Source, alloc: Allocator, turn: types.HistoryTurn) !types.HistoryTurn {
     var shown = turn;
     errdefer types.freeHistoryTurn(alloc, shown);
     const execution = switch (shown) {
@@ -3609,13 +3917,41 @@ fn presentStoredResults(alloc: Allocator, turn: types.HistoryTurn) !types.Histor
         .compacted_summary => return shown,
     };
     for (execution.tool_steps) |*step| for (step.tool_results) |*result| {
-        if (!result.truncated) continue;
         const handle = result.output_handle orelse continue;
-        const body = try result_store.formatStoredResultOutput(alloc, handle, result.preview orelse "", result.stored_output_bytes);
+        if (!result.truncated and result.output.len == result.stored_output_bytes) continue;
+        const body = if (result.truncated)
+            try result_store.formatStoredResultOutput(alloc, handle, result.preview orelse "", result.stored_output_bytes)
+        else
+            (storedBody(src, alloc, handle, result.stored_output_bytes) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => blk: {
+                    debug_trace.logf("session", "event=context_result_unavailable session={s} handle={s} err={s}; marking content unavailable", .{ src.id, handle, @errorName(err) });
+                    result.truncated = true;
+                    break :blk try alloc.dupe(u8, "Saved tool-result content is unavailable. The complete output could not be restored.");
+                },
+            }) orelse continue;
         alloc.free(result.output);
         result.output = body;
     };
     return shown;
+}
+
+/// A stored result's whole body, from the blob its handle names, or the
+/// blob a converted session's map names for its old handle (D47). Null for
+/// an old handle when no open session holds that map.
+fn storedBody(src: Source, alloc: Allocator, handle: []const u8, len: usize) !?[]u8 {
+    const hash: [artifact_digest.blob_hex_bytes]u8 = if (artifact_digest.blobHash(handle)) |named|
+        named[0..artifact_digest.blob_hex_bytes].*
+    else if (src.host) |host|
+        try BlobHost.resolve(host, .tool_results, handle)
+    else
+        return null;
+    const bytes = try src.store.manager.getBlob(alloc, src.id, &hash);
+    if (bytes.len != len) {
+        alloc.free(bytes);
+        return error.StoredSizeMismatch;
+    }
+    return bytes;
 }
 
 /// Whether a streamed piece is the final one. fx stamps a tool result's
@@ -3763,6 +4099,8 @@ pub fn listSummaries(
         } else list.appendAssumeCapacity(summary);
     }
     v1_roots.summaries.shrinkRetainingCapacity(kept);
+    // Newest first across both, as `listPage` orders them (D61).
+    session_summary_codec.sortSummariesNewestFirst(list.items);
     return list;
 }
 
@@ -3802,7 +4140,7 @@ pub fn writeMayHaveLanded(err: anyerror) bool {
     return false;
 }
 
-const ResumeError = error{ SessionNotFound, NoSavedSessions, NoRememberedSession, SessionBusy, InvalidSessionFormat, UnsupportedSessionFormat } || sm.OpenError;
+const ResumeError = error{ SessionNotFound, NoSavedSessions, NoRememberedSession, SessionBusy, InvalidSessionFormat, UnsupportedSessionFormat, OneOffSessionNotResumable } || sm.OpenError;
 
 fn resumeError(err: sm.OpenError, target: Target) ResumeError {
     return switch (err) {
@@ -3811,8 +4149,9 @@ fn resumeError(err: sm.OpenError, target: Target) ResumeError {
             .last => error.NoSavedSessions,
             .last_opened => error.NoRememberedSession,
         },
-        // A child is resumed only through its parent, as in v1.
-        error.ChildSession => error.SessionNotFound,
+        // A child is resumed only through its parent, and fx says so, as v1
+        // did (D71).
+        error.ChildSession => error.OneOffSessionNotResumable,
         error.Busy => error.SessionBusy,
         error.Corrupt => error.InvalidSessionFormat,
         error.UnsupportedVersion => error.UnsupportedSessionFormat,
@@ -4177,7 +4516,7 @@ const TestHome = struct {
     }
 };
 
-test "the store refuses a sessions folder that is a file or a symlink, and opens a missing one (D99)" {
+test "the store refuses a sessions folder that is a file or a symlink, and opens a missing one (D67)" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     const io = io_mod.getIo();
@@ -4243,6 +4582,84 @@ test "a new session commits turns, and resume gives them back with its settings"
     var st = try r.handle.state(testing.allocator);
     defer st.deinit(testing.allocator);
     try testing.expectEqualStrings("\"first question\"", st.title.?);
+}
+
+test "a result the model saw whole comes back whole after a resume, or says its body is unavailable" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const whole = try testing.allocator.alloc(u8, 100 * 1024);
+    defer testing.allocator.free(whole);
+    @memset(whole, 'x');
+    @memcpy(whole[whole.len - 4 ..], "TAIL");
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    var calls = [_]types.ToolCall{.{ .id = "call-1", .name = "read_file", .arguments_json = "{}" }};
+    var results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("call-1"),
+        .tool_name = @constCast("read_file"),
+        .status = .success,
+        .output = whole,
+        .output_bytes = whole.len,
+        .stored_output_bytes = whole.len,
+    }};
+    var steps = [_]types.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
+    const user: types.UserTurn = .{ .text = @constCast("read it") };
+    const execution: types.ExecutionMemory = .{ .tool_steps = &steps };
+    // As the app saves it: the result's file while the turn runs, then the
+    // commit, which keeps the body in that file and a preview in the turn.
+    try s.appendProgress(user, execution, .{});
+    var turn: types.HistoryTurn = .{ .assistant = .{ .user = user, .assistant = @constCast("read"), .execution = execution } };
+    try s.prepareTurn(&turn);
+    defer testing.allocator.free(results[0].output_handle.?);
+    defer testing.allocator.free(results[0].preview.?);
+    try s.commitTurn(turn, types.ConversationLanguage.default());
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    var handle: []u8 = &.{};
+    defer testing.allocator.free(handle);
+    for ([_]bool{ false, true }) |lost| {
+        if (lost) {
+            // Its blob gone, the result says so rather than show a preview.
+            const path = try std.mem.concat(testing.allocator, u8, &.{ ".fx/sessions/v2/", id, "/blobs/", artifact_digest.blobHash(handle).? });
+            defer testing.allocator.free(path);
+            try t.tmp.dir.deleteFile(io_mod.getIo(), path);
+        }
+        const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+        defer r.close();
+        var restored = try r.restore(testing.allocator);
+        defer restored.deinit(testing.allocator);
+        const result = restored.history[0].assistant.execution.tool_steps[0].tool_results[0];
+        if (!lost) {
+            handle = try testing.allocator.dupe(u8, result.output_handle.?);
+            try testing.expect(!result.truncated);
+            try testing.expectEqualStrings(whole, result.output);
+        } else {
+            try testing.expect(result.truncated);
+            try testing.expectEqualStrings("Saved tool-result content is unavailable. The complete output could not be restored.", result.output);
+        }
+    }
+}
+
+test "a converted session's whole result comes back whole under its old handle on a resume (D47)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    // A command result v1 kept under tool-results/, converted on open.
+    const id = (try v1.fixture("side", 1))[0];
+    (try openConverted(&t, id)).close();
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    const result = restored.history[0].assistant.execution.tool_steps[0].tool_results[0];
+    try testing.expect(!result.truncated);
+    try testing.expectEqual(result.stored_output_bytes, result.output.len);
+    try testing.expect(std.mem.find(u8, result.output, "12760") != null);
 }
 
 test "a child's prefs keep its instructions, and v1's decoder still reads the rest (D34)" {
@@ -5131,7 +5548,7 @@ test "a failed resume reports v1's error names" {
     try testing.expectError(error.NoSavedSessions, Session.resumeSession(testing.allocator, &t.store, .last, "/w", .ask));
     try testing.expectError(error.SessionNotFound, Session.resumeSession(testing.allocator, &t.store, .{ .id = "AAAAAAAAAAAA" }, "/w", .ask));
     try testing.expectEqual(error.SessionBusy, resumeError(error.Busy, .last));
-    try testing.expectEqual(error.SessionNotFound, resumeError(error.ChildSession, .{ .id = "AAAAAAAAAAAA" }));
+    try testing.expectEqual(error.OneOffSessionNotResumable, resumeError(error.ChildSession, .{ .id = "AAAAAAAAAAAA" }));
     try testing.expectEqual(error.InvalidSessionFormat, resumeError(error.Corrupt, .last));
     try testing.expectEqual(error.UnsupportedSessionFormat, resumeError(error.UnsupportedVersion, .last));
     try testing.expectEqual(error.Io, resumeError(error.Io, .last));
@@ -5721,7 +6138,20 @@ test "an ACP client's prompt and tool identities are settings, written only when
     try testing.expectEqual(@as(usize, 2), try countSettings(t.store.manager, id, .client_prompt));
 }
 
-test "a prompt image's bytes ride inside the user's item, and an image without them encodes as v1's (D44)" {
+/// Whether session `id`'s first user item lists blob `hash`.
+fn userItemLists(t: *TestHome, id: []const u8, hash: []const u8) !bool {
+    var page = try t.store.manager.read(testing.allocator, id, .start, .forward, 64);
+    defer page.deinit();
+    for (page.entries) |entry| {
+        const body = entry.body orelse continue;
+        if (body != .item or !std.mem.eql(u8, body.item.type, "user")) continue;
+        for (body.item.blobs) |ref| if (std.mem.eql(u8, ref, hash)) return true;
+        return false;
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "a prompt image's bytes ride inside the user's item, its saved path names its blob, and an image without them encodes as v1's (D44, D79)" {
     var t: TestHome = undefined;
     try t.init();
     defer t.deinit();
@@ -5760,7 +6190,16 @@ test "a prompt image's bytes ride inside the user's item, and an image without t
         try testing.expectEqualSlices(u8, &bytes, image.inline_data.?);
         try testing.expectEqualStrings(&digest_hex, image.snapshot_sha256.?);
         try testing.expectEqualStrings(images[0].path, image.path);
-        try testing.expectEqualStrings(images[0].snapshot_path.?, image.snapshot_path.?);
+        // The saved prompt names the session's blob of the image, which the
+        // notice for an image too large to send names after a resume (D79).
+        const blob_path = try t.store.manager.blobPath(testing.allocator, id, &digest_hex);
+        defer testing.allocator.free(blob_path);
+        try testing.expectEqualStrings(blob_path, image.snapshot_path.?);
+        const kept = try t.store.manager.getBlob(testing.allocator, id, &digest_hex);
+        defer testing.allocator.free(kept);
+        try testing.expectEqualSlices(u8, &bytes, kept);
+        // Every blob is listed on an item of its turn (D44).
+        try testing.expect(try userItemLists(&t, id, &digest_hex));
         if (source_ref) |value| {
             try testing.expectEqualStrings(value, image.source_ref.?);
         } else try testing.expectEqual(@as(?[]u8, null), image.source_ref);
@@ -5867,6 +6306,22 @@ const V1Home = struct {
                 }),
                 else => return error.UnexpectedFixtureEntry,
             }
+        }
+        // A copy's log gets the time v1 left on it, its `session.json`'s:
+        // v1 lists a session by the later of the two, and a copy's own time
+        // would order the copies by when they were made.
+        for (ids) |id| {
+            const folder = try std.Io.Dir.path.join(a, &.{ profile_paths.sessions_dir_name, id });
+            const saved_json = try fx.dir.readFileAlloc(io, try std.Io.Dir.path.join(a, &.{ folder, "session.json" }), a, .limited(1 << 20));
+            const Saved = struct { updated_at_ms: ?i64 = null };
+            const saved = (try std.json.parseFromSliceLeaky(Saved, a, saved_json, .{ .ignore_unknown_fields = true })).updated_at_ms orelse continue;
+            const at: std.Io.Timestamp = .{ .nanoseconds = @as(i96, saved) * std.time.ns_per_ms };
+            const log = try std.Io.Dir.path.join(a, &.{ folder, "events.jsonl" });
+            _ = fx.dir.statFile(io, log, .{}) catch |err| switch (err) {
+                error.FileNotFound => continue,
+                else => return err,
+            };
+            try fx.dir.setTimestamps(io, log, .{ .modify_timestamp = .{ .new = at } });
         }
         return ids;
     }
@@ -6056,7 +6511,7 @@ test "a converted v1 session keeps its title, permission rules and preferences (
     try testing.expectEqualStrings(saved.get("model").?.string, restored.preferences.?.model);
 }
 
-test "a converted v1 session's side files keep their old names, and its prompt images ride inside the prompt (D44, D47)" {
+test "a converted v1 session's side files keep their old names, and its prompt images ride inside the prompt and name their blob (D44, D47, D79)" {
     const alloc = testing.allocator;
     var t: TestHome = undefined;
     try t.init();
@@ -6080,7 +6535,13 @@ test "a converted v1 session's side files keep their old names, and its prompt i
     defer restored.deinit(alloc);
     const image = restored.history[0].assistant.user.images[0];
     try testing.expectEqualSlices(u8, image_bytes, image.inline_data.?);
-    try testing.expect(image.snapshot_path == null);
+    // Its v1 file went with the folder; it names its blob (D79).
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(image_bytes, &digest, .{});
+    const image_hash = std.fmt.bytesToHex(digest, .lower);
+    const blob_path = try t.store.manager.blobPath(alloc, id, &image_hash);
+    defer alloc.free(blob_path);
+    try testing.expectEqualStrings(blob_path, image.snapshot_path.?);
 }
 
 test "a converted v1 session keeps its ACP client's prompt and tool identities (D46)" {
@@ -6275,6 +6736,123 @@ test "recover salvages a damaged v1 session into a fresh v2 root and leaves its 
     try testing.expectError(error.SessionNotFound, recover(&t.store, alloc, "v1-none"));
 }
 
+test "recover copies a v1 conversation without saved rules it can't read and leaves its v1 folder as it was (D72)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("rules", 1))[0];
+    for ([_][]const u8{ "{broken", "" }) |rules| {
+        try v1.put(id, null, "permissions.json", rules);
+        // Resume still refuses to convert it.
+        try testing.expectError(error.InvalidSessionFormat, openConverted(&t, id));
+        var recovered = try recover(&t.store, alloc, id);
+        defer recovered.deinit(alloc);
+        try testing.expect(recovered.permission_rules_dropped);
+        try testing.expectEqual(@as(usize, 1), recovered.history_len);
+        try testing.expect(!std.mem.eql(u8, recovered.id, id));
+        var copy = try t.store.manager.peek(alloc, recovered.id);
+        defer copy.deinit(alloc);
+        try testing.expectEqual(sm.Role.root, copy.role);
+        const after = try V1Home.read(&t, try v1.sessionPath(id, "permissions.json"));
+        defer alloc.free(after);
+        try testing.expectEqualStrings(rules, after);
+    }
+}
+
+test "doctor counts sessions an older fx saved and names each that can't be converted with what recover copies (D73)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    _ = try v1.fixture("plain", 3);
+    const ruleless = (try v1.fixture("rules", 1))[0];
+    try v1.put(ruleless, null, "permissions.json", "{broken");
+    const torn = (try v1.fixture("cancelled", 1))[0];
+    const log = try V1Home.read(&t, try v1.sessionPath(torn, "events.jsonl"));
+    defer alloc.free(log);
+    const damaged = try std.mem.concat(alloc, u8, &.{ log, "{ not json\n" });
+    defer alloc.free(damaged);
+    try v1.put(torn, null, "events.jsonl", damaged);
+
+    var report = try doctor(&t.store, alloc, 100, io_mod.milliTimestamp());
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), report.sessions);
+    try testing.expectEqual(@as(usize, 5), report.unconverted);
+    try testing.expectEqual(@as(usize, 2), report.stuck.items.len);
+    for (report.stuck.items) |stuck| {
+        if (std.mem.eql(u8, stuck.id, ruleless)) {
+            try testing.expect(stuck.recover == .without_rules);
+            try testing.expect(std.mem.find(u8, stuck.reason, "permissions.json") != null);
+        } else {
+            try testing.expectEqualStrings(torn, stuck.id);
+            try testing.expect(stuck.recover == .good_turns);
+        }
+    }
+    // It converts nothing.
+    try testing.expectError(error.NotFound, t.store.manager.peek(alloc, ruleless));
+    try testing.expectError(error.NotFound, t.store.manager.peek(alloc, torn));
+}
+
+test "recover leaves out a kept side file that is gone or not the bytes its name records, and says so (D74)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    // One command result under tool-results/, then a torn line.
+    const id = (try v1.fixture("side", 1))[0];
+    const log = try V1Home.read(&t, try v1.sessionPath(id, "events.jsonl"));
+    defer alloc.free(log);
+    const torn = try std.mem.concat(alloc, u8, &.{ log, "{ not json\n" });
+    defer alloc.free(torn);
+    try v1.put(id, null, "events.jsonl", torn);
+    const artifact = "result-shell-70a192405eaee816-83e94389437f0489.txt";
+    const original = try V1Home.read(&t, try v1.sessionPath(id, "tool-results/" ++ artifact));
+    defer alloc.free(original);
+    {
+        var whole = try recover(&t.store, alloc, id);
+        defer whole.deinit(alloc);
+        try testing.expect(whole.files_complete);
+    }
+    const changed = try alloc.dupe(u8, original);
+    defer alloc.free(changed);
+    changed[0] ^= 1;
+    for ([_]bool{ false, true }) |gone| {
+        if (gone) {
+            const path = try std.mem.concat(alloc, u8, &.{ ".fx/sessions/", id, "/tool-results/", artifact });
+            defer alloc.free(path);
+            try t.tmp.dir.deleteFile(io_mod.getIo(), path);
+        } else try v1.put(id, "tool-results", artifact, changed);
+        var recovered = try recover(&t.store, alloc, id);
+        defer recovered.deinit(alloc);
+        try testing.expect(!recovered.files_complete);
+        const r = try Session.resumeSession(alloc, &t.store, .{ .id = recovered.id }, "/w", .ask);
+        defer r.close();
+        var restored = try r.restore(alloc);
+        defer restored.deinit(alloc);
+        const result = restored.history[0].assistant.execution.tool_steps[0].tool_results[0];
+        try testing.expectEqualStrings("Saved tool-result content is unavailable. The complete output could not be restored.", result.output);
+    }
+}
+
+test "latest resume says saved sessions are unreadable when only an unreadable v1 one exists (D76)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    try testing.expectError(error.NoSavedSessions, Session.resumeSession(testing.allocator, &t.store, .last, "/w", .ask));
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("plain", 1))[0];
+    try v1.put(id, null, "session.json", "{ not json");
+    try testing.expectError(error.NoReadableSessions, Session.resumeSession(testing.allocator, &t.store, .last, "/w", .ask));
+}
+
 test "a leftover v1 folder goes on a later open only while it is what was converted (D60)" {
     const alloc = testing.allocator;
     var t: TestHome = undefined;
@@ -6335,6 +6913,50 @@ test "-c opens the session v1 remembers while v2 has none, and --resume last the
             },
         }
     }
+}
+
+test "the picker's listing orders v2 sessions and v1's unconverted ones newest first together (D61)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const newer = (try v1.fixture("plain", 1))[0];
+    {
+        // A v2 session older than the v1 one.
+        const s = try t.store.manager.openImport(.{ .id = "v2-older", .workspace = v1.workspace, .host = .ask, .created_ms = 1000 });
+        defer s.release();
+        _ = try s.appendAt(&.{ .turn_started, .turn_committed }, 5000);
+        try s.publishImport();
+    }
+    var cancel = std.atomic.Value(bool).init(false);
+    var list = try listSummaries(&t.store, alloc, null, &cancel);
+    defer {
+        for (list.items) |*summary| summary.deinit(alloc);
+        list.deinit(alloc);
+    }
+    try testing.expectEqual(@as(usize, 2), list.items.len);
+    try testing.expectEqualStrings(newer, list.items[0].id);
+    try testing.expectEqualStrings("v2-older", list.items[1].id);
+}
+
+test "-c says the remembered session cannot be read when v1's bookmark is not a file (D86)" {
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    _ = try v1.fixture("remembered", 1);
+    // The bookmark becomes a folder, which v1's reader refuses as it does a FIFO.
+    var bookmarks = try t.tmp.dir.openDir(io, profile_paths.root_dir_name ++ "/continue", .{ .iterate = true });
+    defer bookmarks.close(io);
+    var entries = bookmarks.iterate();
+    const name = try v1.arena.allocator().dupe(u8, (try entries.next(io)).?.name);
+    try bookmarks.deleteFile(io, name);
+    try bookmarks.createDir(io, name, .fromMode(0o700));
+    try testing.expectError(error.RememberedSessionUnavailable, Session.resumeSession(testing.allocator, &t.store, .last_opened, v1.workspace, .app));
 }
 
 test "the listing shows v1 sessions not converted yet, and fx session reads one without converting it (D59, D61)" {
@@ -6456,7 +7078,7 @@ fn legacyFence(a: Allocator, id: []const u8) ![]const u8 {
     return std.mem.concat(a, u8, &.{ "{\"schema_version\":1,\"session_id\":\"", id, "\",\"operation_id\":\"11111111111111111111111111111111\",\"kind\":\"legacy_to_v3\",\"authority_id\":\"22222222222222222222222222222222\",\"prior\":{\"storage_format\":\"legacy_snapshot_v1\",\"primary_bytes\":1,\"primary_sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"},\"proposed\":{\"storage_format\":\"event_log_v1\",\"log_generation\":\"33333333333333333333333333333333\",\"through_seq\":1,\"through_event_id\":\"44444444444444444444444444444444\",\"through_event_log_bytes\":1}}" });
 }
 
-test "a FIFO in a v1 session never blocks the listing or its conversion, which refuses it and keeps v1 (D113)" {
+test "a FIFO in a v1 session never blocks the listing or its conversion, which refuses it and keeps v1 (D68)" {
     const alloc = testing.allocator;
     const io = io_mod.getIo();
     const C = struct {
@@ -6488,7 +7110,7 @@ test "a FIFO in a v1 session never blocks the listing or its conversion, which r
     }
 }
 
-test "a v1 side folder that links elsewhere is refused, never followed, and v1 is kept (D113)" {
+test "a v1 side folder that links elsewhere is refused, never followed, and v1 is kept (D68)" {
     const io = io_mod.getIo();
     var t: TestHome = undefined;
     try t.init();
@@ -6515,7 +7137,7 @@ test "a v1 side folder that links elsewhere is refused, never followed, and v1 i
     }
 }
 
-test "a legacy authority fence stops only an upgrade that never published, which keeps v1 (D115)" {
+test "a legacy authority fence stops only an upgrade that never published, which keeps v1 (D70)" {
     const alloc = testing.allocator;
     const session_json = @import("session_json.zig");
     var t: TestHome = undefined;
@@ -6539,7 +7161,44 @@ test "a legacy authority fence stops only an upgrade that never published, which
     try testing.expect(V1Home.exists(&t, "v1-fenced"));
 }
 
-test "images the oldest format saved without an id get the numbers v1's resume gave them (D114)" {
+test "an image the oldest format saved as only its path is captured from its file, or left out when it can't be (D82)" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const a = v1.arena.allocator();
+    const bytes = "\x89PNG\r\n\x1a\nkept";
+    try t.tmp.dir.writeFile(io, .{ .sub_path = "kept.png", .data = bytes });
+    const kept = try std.json.Stringify.valueAlloc(a, try io_mod.dirRealpathAlloc(a, t.tmp.dir, "kept.png"), .{});
+    const gone = try std.json.Stringify.valueAlloc(a, try std.Io.Dir.path.join(a, &.{ try io_mod.dirRealpathAlloc(a, t.tmp.dir, "."), "gone.png" }), .{});
+    try v1.put("v1-path-images", null, "session.json", try std.mem.concat(a, u8, &.{
+        "{\"schema_version\":2,\"id\":\"v1-path-images\",\"created_at_ms\":1,\"updated_at_ms\":2,\"workspace_root\":\"/w\",\"conversation_language\":\"en\",\"history_len\":1,\"history\":[",
+        "{\"kind\":\"assistant\",\"user\":{\"text\":\"look [Image #1] [Image #2]\",\"images\":[{\"id\":1,\"path\":",
+        kept,
+        ",\"media_type\":\"image/png\"},{\"id\":2,\"path\":",
+        gone,
+        ",\"media_type\":\"image/png\"}]},\"assistant\":\"seen\"}",
+        "],\"total_input_tokens\":0,\"total_output_tokens\":0}",
+    }));
+    const s = try openConverted(&t, "v1-path-images");
+    defer s.close();
+    var restored = try s.restore(alloc);
+    defer restored.deinit(alloc);
+    const user = restored.history[0].assistant.user;
+    // The prompt keeps its text; only the image whose file is gone is left out.
+    try testing.expectEqualStrings("look [Image #1] [Image #2]", user.text);
+    try testing.expectEqual(@as(usize, 1), user.images.len);
+    try testing.expectEqual(@as(usize, 1), user.images[0].id);
+    try testing.expectEqualSlices(u8, bytes, user.images[0].inline_data.?);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    try testing.expectEqualStrings(&std.fmt.bytesToHex(digest, .lower), user.images[0].snapshot_sha256.?);
+}
+
+test "images the oldest format saved without an id get the numbers v1's resume gave them (D69)" {
     const alloc = testing.allocator;
     const io = io_mod.getIo();
     var t: TestHome = undefined;

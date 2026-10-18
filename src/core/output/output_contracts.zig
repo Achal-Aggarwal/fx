@@ -1467,36 +1467,22 @@ pub const SessionRecoverySnapshot = struct {
         self: SessionRecoverySnapshot,
         alloc: Allocator,
     ) ![]u8 {
-        if (self.result.status == .indeterminate) {
-            return alloc.print(
-                "[session recovery] could not confirm target {s}\nsource: {s} (unchanged)\nresolve: fx --resume {s}\ninspect: fx doctor\n",
-                .{
-                    self.result.recovered_session_id,
-                    self.result.source_session_id,
-                    self.result.recovered_session_id,
-                },
-            );
+        const result = self.result;
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        defer out.deinit();
+        try out.writer.print("[session recovery] copied {s} to {s}\nhistory_turns: {d}\n", .{
+            result.source_session_id,
+            result.recovered_session_id,
+            result.history_len,
+        });
+        if (result.status == .recovered_with_unverified_artifacts) {
+            try out.writer.writeAll("warning: legacy command artifacts could not be authenticated\n");
         }
-        if (self.result.status == .recovered_with_unverified_artifacts) {
-            return alloc.print(
-                "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nwarning: legacy command artifacts could not be authenticated\nresume: fx --resume {s}\n",
-                .{
-                    self.result.source_session_id,
-                    self.result.recovered_session_id,
-                    self.result.history_len,
-                    self.result.recovered_session_id,
-                },
-            );
+        if (result.permission_rules_dropped) {
+            try out.writer.writeAll("warning: saved permission rules could not be read and were not copied\n");
         }
-        return alloc.print(
-            "[session recovery] copied {s} to {s}\nhistory_turns: {d}\nresume: fx --resume {s}\n",
-            .{
-                self.result.source_session_id,
-                self.result.recovered_session_id,
-                self.result.history_len,
-                self.result.recovered_session_id,
-            },
-        );
+        try out.writer.print("resume: fx --resume {s}\n", .{result.recovered_session_id});
+        return try out.toOwnedSlice();
     }
 
     pub fn renderJson(
@@ -1526,8 +1512,8 @@ pub const SessionRecoverySnapshot = struct {
             &out.writer,
         );
         try out.writer.print(
-            ",\"history_turns\":{d}",
-            .{self.result.history_len},
+            ",\"history_turns\":{d},\"permission_rules_dropped\":{}",
+            .{ self.result.history_len, self.result.permission_rules_dropped },
         );
         try out.writer.writeByte('}');
         return try out.toOwnedSlice();
@@ -3127,7 +3113,7 @@ test "core session recovery snapshot text and json stay stable" {
     );
     defer std.testing.allocator.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"session_recovery\",\"source_id\":\"source-session\",\"recovered_id\":\"recovered-session\",\"status\":\"recovered\",\"history_turns\":4}",
+        "{\"kind\":\"session_recovery\",\"source_id\":\"source-session\",\"recovered_id\":\"recovered-session\",\"status\":\"recovered\",\"history_turns\":4,\"permission_rules_dropped\":false}",
         json,
     );
 
@@ -3150,23 +3136,31 @@ test "core session recovery snapshot text and json stay stable" {
     }).renderJson(std.testing.allocator);
     defer std.testing.allocator.free(partial_json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"session_recovery\",\"source_id\":\"source-session\",\"recovered_id\":\"partial-session\",\"status\":\"recovered_with_unverified_artifacts\",\"history_turns\":4}",
+        "{\"kind\":\"session_recovery\",\"source_id\":\"source-session\",\"recovered_id\":\"partial-session\",\"status\":\"recovered_with_unverified_artifacts\",\"history_turns\":4,\"permission_rules_dropped\":false}",
         partial_json,
     );
 
-    const indeterminate = session_store.SessionRecoveryResult{
+    const without_rules = session_store.SessionRecoveryResult{
         .source_session_id = @constCast("source-session"),
-        .recovered_session_id = @constCast("target-session"),
+        .recovered_session_id = @constCast("ruleless-session"),
         .history_len = 4,
-        .status = .indeterminate,
+        .permission_rules_dropped = true,
     };
-    const warning = try (SessionRecoverySnapshot{
-        .result = indeterminate,
+    const without_rules_text = try (SessionRecoverySnapshot{
+        .result = without_rules,
     }).renderText(std.testing.allocator);
-    defer std.testing.allocator.free(warning);
+    defer std.testing.allocator.free(without_rules_text);
     try std.testing.expectEqualStrings(
-        "[session recovery] could not confirm target target-session\nsource: source-session (unchanged)\nresolve: fx --resume target-session\ninspect: fx doctor\n",
-        warning,
+        "[session recovery] copied source-session to ruleless-session\nhistory_turns: 4\nwarning: saved permission rules could not be read and were not copied\nresume: fx --resume ruleless-session\n",
+        without_rules_text,
+    );
+    const without_rules_json = try (SessionRecoverySnapshot{
+        .result = without_rules,
+    }).renderJson(std.testing.allocator);
+    defer std.testing.allocator.free(without_rules_json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"session_recovery\",\"source_id\":\"source-session\",\"recovered_id\":\"ruleless-session\",\"status\":\"recovered\",\"history_turns\":4,\"permission_rules_dropped\":true}",
+        without_rules_json,
     );
 }
 

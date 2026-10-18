@@ -905,7 +905,7 @@ pub fn handlePrompt(
             defer if (temporary_snapshot_dir) |path| alloc.free(path);
             // Captured into a temporary folder; the turn keeps the bytes
             // (D44).
-            const snapshot_dir = try session_store.imageSnapshotStorageDir(alloc, null, null, &temporary_snapshot_dir);
+            const snapshot_dir = try session_store.imageSnapshotTempDir(alloc, &temporary_snapshot_dir);
             defer alloc.free(snapshot_dir);
             prompt_input.captureImages(alloc, snapshot_dir) catch |err|
                 return promptInputFailure(err);

@@ -134,13 +134,6 @@ pub const ResumeOptions = struct {
     log: session_log.Options = .{},
 };
 
-/// Options controlling a storage-only migration.
-pub const MigrationOptions = struct {
-    allow_large: bool = false,
-    seed_preferences: ?session_codec.DurableSessionPreferences = null,
-    log: session_log.Options = .{},
-};
-
 /// A read-only load of a session: its summary, full durable state, and the
 /// format it was stored in. Owns both nested values.
 pub const ReadOnlyDetail = struct {
@@ -159,24 +152,9 @@ pub const HistoryPage = struct {
     next_cursor: ?[]u8 = null,
 };
 
-/// Outcome of a migration request.
-pub const SessionMigrationStatus = enum {
-    migrated,
-    already_current,
-};
-
-/// Result of a storage-only migration, including the source it migrated from.
-pub const SessionMigrationResult = struct {
-    session_id: []u8,
-    source_schema_version: u8,
-    source_bytes: u64,
-    status: SessionMigrationStatus,
-};
-
 pub const SessionRecoveryStatus = enum {
     recovered,
     recovered_with_unverified_artifacts,
-    indeterminate,
 };
 
 pub const SessionRecoveryResult = struct {
@@ -184,6 +162,9 @@ pub const SessionRecoveryResult = struct {
     recovered_session_id: []u8,
     history_len: usize,
     status: SessionRecoveryStatus = .recovered,
+    /// The source's saved permission rules could not be read, so the copy
+    /// has none (D72).
+    permission_rules_dropped: bool = false,
 
     pub fn deinit(self: *SessionRecoveryResult, alloc: Allocator) void {
         alloc.free(self.source_session_id);

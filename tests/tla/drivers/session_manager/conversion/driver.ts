@@ -87,10 +87,9 @@ export function fixture(label: string, at?: string, models?: object[]) {
       FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl,
       FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl, FX_E2E_GATEWAY_MODELS_URL: `${gateway.baseUrl}/coding-agent/v1/models`,
       FX_MODEL: FAKE_GATEWAY_MODEL, FX_PERMISSION_MODE: "full-access", FX_AUTO_UPGRADE: "0", FX_SOUND: "0", NO_COLOR: "1",
-      // The target of a build that still has the switch runs with it when the
-      // driver's own environment sets it, and nothing else does: tmux passes
-      // the driver's environment on.
-      FX_SESSIONS_V2: v2 && process.env.FX_SESSIONS_V2 ? process.env.FX_SESSIONS_V2 : "0",
+      // A v1 writer build that still has the store switch writes v1 even when
+      // the driver's own environment sets it; tmux passes that environment on.
+      ...(v2 ? {} : { FX_SESSIONS_V2: "0" }),
     };
     return { ...e, ...injected };
   };

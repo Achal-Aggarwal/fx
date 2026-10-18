@@ -928,17 +928,16 @@ fn writeWithheldAttachmentNotice(
         try image_data.writeHostImageRecoveryNotice(writer, source_ref, max_dimension);
         return;
     }
-    if (attachment.inline_data == null) {
-        if (attachment.snapshot_path) |path| {
-            try writer.print("The original is saved at {s}. Use an available image tool to save a smaller copy to a new file", .{path});
-            // Snapshots are named .bin, which hides the type from tools
-            // that choose a decoder by file name.
-            if (mediaTypeExtension(attachment.media_type)) |extension| {
-                try writer.print(" ending in {s}", .{extension});
-            }
-            try writer.writeAll(", then read_file the copy. If no image tool is available, ask the user before installing one.]\n");
-            return;
+    // The captured copy, or once saved the session's blob (D79).
+    if (attachment.snapshot_path) |path| {
+        try writer.print("The original is saved at {s}. Use an available image tool to save a smaller copy to a new file", .{path});
+        // Snapshots are named .bin and blobs by their hash, which hides the
+        // type from tools that choose a decoder by file name.
+        if (mediaTypeExtension(attachment.media_type)) |extension| {
+            try writer.print(" ending in {s}", .{extension});
         }
+        try writer.writeAll(", then read_file the copy. If no image tool is available, ask the user before installing one.]\n");
+        return;
     }
     try writer.writeAll("No local image file is available; ask the user for a smaller copy.]\n");
 }

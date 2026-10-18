@@ -137,9 +137,8 @@ fn withhold(arena: Allocator, messages: []const ChatMessage, withheld: usize, to
 
 fn writeAttachmentNotice(writer: *std.Io.Writer, image: types.ImageAttachment) std.Io.Writer.Error!void {
     try writer.print("[Image #{d} not sent to keep the request under the provider's size limit.", .{image.id});
-    if (image.inline_data == null) {
-        if (image.snapshot_path) |path| try writer.print(" The original is saved at {s}; read_file it to see it again.", .{path});
-    }
+    // The captured copy, or once saved the session's blob (D79).
+    if (image.snapshot_path) |path| try writer.print(" The original is saved at {s}; read_file it to see it again.", .{path});
     try writer.writeAll("]\n");
 }
 

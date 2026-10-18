@@ -65,31 +65,19 @@ pub const DoctorInspectionResult = store_types.DoctorInspectionResult;
 const DoctorInspectionOptions = store_types.DoctorInspectionOptions;
 pub const DoctorIssueKind = store_types.DoctorIssueKind;
 pub const LoadedWritableSession = store_types.LoadedWritableSession;
-pub const MigrationOptions = store_types.MigrationOptions;
 pub const ProjectionState = store_types.ProjectionState;
 
-pub fn imageSnapshotStorageDir(
-    alloc: Allocator,
-    sessions_dir: ?[]const u8,
-    session_id: ?[]const u8,
-    temp_dir: *?[]u8,
-) ![]u8 {
-    if ((sessions_dir == null) != (session_id == null)) return error.InvalidSessionSnapshotOwner;
-    if (sessions_dir) |root| {
-        const durable_dir = try sessionDirPath(alloc, root, session_id.?);
-        defer alloc.free(durable_dir);
-        return std.Io.Dir.path.join(alloc, &.{ durable_dir, "images" });
-    }
-    if (temp_dir.* == null) {
-        temp_dir.* = try image_attachments.createTempSnapshotDir(alloc);
-    }
+/// The process's temporary folder for captured prompt images, made on first
+/// use. The turn keeps the bytes (D44); until the prompt is saved, a
+/// withheld image's notice names the copy here (D79). The caller frees the
+/// result; `temp_dir` keeps the folder's path.
+pub fn imageSnapshotTempDir(alloc: Allocator, temp_dir: *?[]u8) ![]u8 {
+    if (temp_dir.* == null) temp_dir.* = try image_attachments.createTempSnapshotDir(alloc);
     return alloc.dupe(u8, temp_dir.*.?);
 }
 pub const ReadOnlyDetail = store_types.ReadOnlyDetail;
 pub const ResumeOptions = store_types.ResumeOptions;
 pub const ResumeTarget = store_types.ResumeTarget;
-pub const SessionMigrationResult = store_types.SessionMigrationResult;
-pub const SessionMigrationStatus = store_types.SessionMigrationStatus;
 pub const SessionRecoveryResult = store_types.SessionRecoveryResult;
 pub const SessionSummary = store_types.SessionSummary;
 pub const HistoryPage = store_types.HistoryPage;
@@ -1239,7 +1227,7 @@ pub const Store = struct {
         );
         errdefer state.deinit(alloc);
         // The oldest format saved some images without an id; number them as
-        // v1's resume did (D114).
+        // v1's resume did (D69).
         _ = try session.repair_legacy_zero_image_ids(alloc, state.history);
         try resolveSessionSnapshotLocators(
             alloc,

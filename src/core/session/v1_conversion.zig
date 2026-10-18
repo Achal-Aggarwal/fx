@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const debug_trace = @import("../shared/debug_trace.zig");
+const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
@@ -157,14 +158,18 @@ pub fn rootIds(alloc: Allocator, home: []const u8) ![]Root {
     return roots.toOwnedSlice(alloc);
 }
 
-/// The session v1 remembered for `workspace` (`-c`), or null. Reads only.
-/// Caller owns it.
+/// The session v1 remembered for `workspace` (`-c`), or null when it
+/// remembers none. A bookmark fx cannot read is `RememberedSessionUnavailable`,
+/// so `-c` says so, as v1 did (D86). Reads only. Caller owns it.
 pub fn rememberedId(alloc: Allocator, home: []const u8, workspace: []const u8) !?[]u8 {
     var store = try session_store.Store.initReadOnlyFromHome(alloc, home, workspace);
     defer store.deinit(alloc);
     return store.readRememberedSessionId(alloc) catch |err| switch (err) {
-        error.InvalidRememberedSession => null,
-        else => err,
+        error.OutOfMemory => error.OutOfMemory,
+        else => {
+            debug_trace.logf("convert", "action=RememberedUnreadable err={s}", .{@errorName(err)});
+            return error.RememberedSessionUnavailable;
+        },
     };
 }
 
@@ -217,6 +222,14 @@ pub fn listRoots(alloc: Allocator, home: []const u8, active_id: ?[]const u8) !se
         };
     }
     return catalog;
+}
+
+/// Whether v1's folder holds a session its listing could not read, which a
+/// latest resume reports as unreadable rather than absent, as v1 did (D76).
+pub fn hasUnreadable(alloc: Allocator, home: []const u8) !bool {
+    var catalog = try listRoots(alloc, home, null);
+    defer catalog.deinit(alloc);
+    return catalog.invalid_ids.items.len > 0;
 }
 
 fn openMemberDir(store: *session_store.Store, id: []const u8) !?io_mod.VerifiedDir {
@@ -421,7 +434,8 @@ const Step = union(enum) {
 
 const Framed = struct {
     events: []const Event,
-    /// No end piece: v1 closes it as failed on its next writable open.
+    /// No end piece: converted as an interrupted, failed turn, as v2's own
+    /// reopen keeps one (D1, D77). v1's next writable open discarded it.
     open: bool,
     ts_ms: u64,
 };
@@ -453,6 +467,9 @@ pub const Member = struct {
     preferences: session_codec.DurableSessionPreferences,
     title: ?[]const u8,
     permissions: session_permission_state.State,
+    /// True when `permissions.json` could not be read and `permissions`
+    /// holds no rules in its place (`Rules.drop_unreadable`).
+    rules_dropped: bool,
     steps: []const Step,
     turns: usize,
     /// Results an older format kept inline, which v1's migration stores as
@@ -473,14 +490,20 @@ pub const Stored = struct {
     bytes: []const u8,
 };
 
+/// What a read does with saved permission rules it can't read: a
+/// conversion refuses the session, and a salvage copies the conversation
+/// without them (D72).
+pub const Rules = enum { required, drop_unreadable };
+
 /// Reads a locked member read-only. `error.InvalidSessionFormat` with
 /// `problem` set when v1 could not read it either.
-pub fn readMember(gpa: Allocator, store: *session_store.Store, locked: *Locked, problem: *Problem) !Member {
+pub fn readMember(gpa: Allocator, store: *session_store.Store, locked: *Locked, problem: *Problem, rules: Rules) !Member {
     var member: Member = undefined;
     member.arena = .init(gpa);
     errdefer member.arena.deinit();
     const a = member.arena.allocator();
     member.stored = &.{};
+    member.rules_dropped = false;
     member.fingerprint = fingerprintOf(a, &locked.dir) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return problem.set("its folder can't be read ({s})", .{@errorName(err)}),
@@ -496,7 +519,7 @@ pub fn readMember(gpa: Allocator, store: *session_store.Store, locked: *Locked, 
         .bytes => |bytes| {
             if (!(std.json.validate(a, bytes) catch false)) return problem.set("session.json is not valid JSON", .{});
             if (isConversationMetadata(a, bytes)) {
-                try readConversation(a, locked, bytes, &member, problem);
+                try readConversation(a, locked, bytes, &member, problem, rules);
             } else try readOlderFormat(a, store, locked, &member, problem);
         },
     }
@@ -523,6 +546,7 @@ pub fn readSalvage(gpa: Allocator, store: *session_store.Store, locked: *Locked,
     errdefer member.arena.deinit();
     const a = member.arena.allocator();
     member.stored = &.{};
+    member.rules_dropped = false;
     member.fingerprint = fingerprintOf(a, &locked.dir) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return problem.set("its folder can't be read ({s})", .{@errorName(err)}),
@@ -555,7 +579,7 @@ fn isConversationMetadata(a: Allocator, bytes: []const u8) bool {
 
 /// The current format: `session.json` and `events.jsonl` frames, read as
 /// v1's state load reads them.
-fn readConversation(a: Allocator, locked: *Locked, metadata_bytes: []const u8, member: *Member, problem: *Problem) !void {
+fn readConversation(a: Allocator, locked: *Locked, metadata_bytes: []const u8, member: *Member, problem: *Problem, rules: Rules) !void {
     const metadata = session_codec.decodeSessionMetadata(a, metadata_bytes) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => return problem.set("session.json {s}", .{describe(a, metadata_bytes, err)}),
@@ -574,7 +598,14 @@ fn readConversation(a: Allocator, locked: *Locked, metadata_bytes: []const u8, m
         .ultrafast_mode = value.ultrafast_mode orelse false,
     };
     member.title = value.title;
-    member.permissions = try readPermissions(a, &locked.dir, problem);
+    member.permissions = readPermissions(a, &locked.dir, problem) catch |err| switch (rules) {
+        .required => return err,
+        .drop_unreadable => if (err == error.OutOfMemory) return err else dropped: {
+            problem.* = .{};
+            member.rules_dropped = true;
+            break :dropped .{};
+        },
+    };
 
     var frames: FrameReader = .{ .arena = a, .dir = &locked.dir, .id = locked.id, .problem = problem, .builder = .init(a) };
     defer frames.builder.deinit();
@@ -912,12 +943,19 @@ fn turnTime(turn: types.HistoryTurn) u64 {
 /// them (D44), since its v1 folder goes once the conversion lands. One
 /// whose file is gone keeps its path, as v1 shows a lost snapshot; one that
 /// cannot be read refuses the member, `problem` set, so its v1 folder
-/// stays. In `a`.
+/// stays. One the oldest format saved as only its file's path is captured
+/// from that file, or left out (D82). In `a`.
 fn withImages(a: Allocator, dir: *io_mod.VerifiedDir, id: []const u8, images: []const types.ImageAttachment, problem: *Problem) ![]types.ImageAttachment {
-    const copy = try a.dupe(types.ImageAttachment, images);
-    for (copy) |*image| {
+    var kept: std.ArrayList(types.ImageAttachment) = try .initCapacity(a, images.len);
+    for (images) |source| {
+        var image = source;
+        if (image.inline_data == null and image.snapshot_path == null) {
+            if (try capturePathOnly(a, id, &image)) kept.appendAssumeCapacity(image);
+            continue;
+        }
+        defer kept.appendAssumeCapacity(image);
         if (image.inline_data != null) continue;
-        const leaf = snapshotLeaf(image.snapshot_path orelse continue, id) orelse continue;
+        const leaf = snapshotLeaf(image.snapshot_path.?, id) orelse continue;
         const bytes = blk: {
             var images_dir = (io_mod.openRealDirIfPresent(dir, "images") catch |err|
                 return problem.set("images can't be opened ({s})", .{@errorName(err)})) orelse break :blk null;
@@ -933,7 +971,27 @@ fn withImages(a: Allocator, dir: *io_mod.VerifiedDir, id: []const u8, images: []
         };
         image.snapshot_path = null;
     }
-    return copy;
+    return kept.items;
+}
+
+/// An image the oldest format saved as only its file's path, captured from
+/// that file once as v1's resume did (`repair_legacy_image_snapshots`):
+/// false when it can't be, and the prompt goes on without it, as in v1
+/// (D82). In `a`.
+fn capturePathOnly(a: Allocator, id: []const u8, image: *types.ImageAttachment) !bool {
+    const folder = try image_attachments.createTempSnapshotDir(a);
+    defer std.Io.Dir.cwd().deleteTree(io_mod.getIo(), folder) catch |err|
+        debug_trace.logf("convert", "action=ImageCaptureLeftover session={s} err={s}", .{ id, @errorName(err) });
+    image_attachments.captureImageSnapshot(a, image, folder) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            debug_trace.logf("convert", "action=ImageDropped session={s} image={d} err={s}", .{ id, image.id, @errorName(err) });
+            return false;
+        },
+    };
+    try image_attachments.inlineCapturedSnapshot(a, image);
+    image.snapshot_path = null;
+    return true;
 }
 
 const max_image_bytes = 64 * 1024 * 1024;

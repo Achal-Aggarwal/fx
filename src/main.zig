@@ -733,6 +733,9 @@ const App = struct {
                     return err;
                 };
                 SessionAppRuntime.syncTerminalTitle(&app);
+            } else if (launch.upgrade_relaunch) |relaunch| {
+                SessionAppRuntime.writeUpgradeNotice(&app, app_version, build_update_channel, relaunch.previous_revision orelse "", build_revision) catch |err|
+                    debug_trace.logf("session", "event=upgrade_notice_unavailable err={s}", .{@errorName(err)});
             }
         }
         const env_disabled = if (io_mod.getenv("FX_AUTO_UPGRADE")) |val|

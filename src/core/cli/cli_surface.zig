@@ -3210,14 +3210,14 @@ fn runSessionDetail(
             };
             defer page.deinit(alloc);
             if (page.summaries.items.len == 0) {
-                try writeLookupFailure(alloc, deps, "session", error.NoSavedSessions, format);
+                try writeLookupFailure(alloc, deps, "session", session_adapter.noLatestError(&store, alloc), format);
                 return .handled_failure;
             }
             return writeSessionSummary(alloc, deps, page.summaries.items[0], format);
         },
         .id => |id| {
             var resumed = session_adapter.readSession(&store, alloc, id) catch |err| {
-                try writeSessionDetailFailure(alloc, deps, id, session_adapter.commandError(err), format);
+                try writeSessionDetailFailure(alloc, deps, id, session_adapter.commandError(err), store.problem.text(), format);
                 return .handled_failure;
             };
             defer resumed.deinit(alloc);
@@ -3248,6 +3248,7 @@ fn runSessionRecovery(alloc: Allocator, deps: RunDeps, recovery: SessionRecovery
         .recovered_session_id = recovered_id,
         .history_len = recovered.history_len,
         .status = if (recovered.files_complete) .recovered else .recovered_with_unverified_artifacts,
+        .permission_rules_dropped = recovered.permission_rules_dropped,
     };
     defer result.deinit(alloc);
     return writeSessionRecovery(alloc, deps, result, recovery.format);
@@ -3274,12 +3275,7 @@ fn writeLookupFailure(
         error.SessionNotFound => {
             try writeStderr(deps, "fx session: record not found\n");
         },
-        error.InvalidSessionFormat,
-        error.InvalidPermissionState,
-        error.PermissionStateTooLarge,
-        error.InvalidRecoveryCheckpoint,
-        error.InvalidUsageSidecar,
-        => {
+        error.InvalidSessionFormat => {
             try writeStderr(
                 deps,
                 "fx session: record is corrupt; run `fx doctor` for recovery guidance\n",
@@ -3294,52 +3290,10 @@ fn writeLookupFailure(
         error.InvalidSessionId => {
             try writeStderr(deps, "fx session: invalid session id\n");
         },
-        error.LegacySessionTooLarge => {
-            try writeStderr(
-                deps,
-                "fx session: legacy session is too large for automatic loading; run `fx session migrate <id> --allow-large`\n",
-            );
-        },
-        error.LegacySessionReadResourceExhausted => {
-            try writeStderr(
-                deps,
-                "fx session: legacy session could not be loaded with available resources\n",
-            );
-        },
-        error.LegacySessionMigrationResourceExhausted => {
-            try writeStderr(
-                deps,
-                "fx session: migration did not complete because resources were exhausted; the original session remains authoritative\n",
-            );
-        },
-        error.LegacySessionMigrationFailed, error.LegacySessionChanged => {
-            try writeStderr(
-                deps,
-                "fx session: migration did not complete; the original session remains authoritative\n",
-            );
-        },
-        error.LegacySessionMigrationIndeterminate => {
-            try writeStderr(
-                deps,
-                "fx session: migration outcome is indeterminate and will be resolved by the next exact writable load\n",
-            );
-        },
         error.SessionRecoveryNotNeeded => {
             try writeStderr(
                 deps,
                 "fx session: recovery was refused because the session has a valid commit boundary; resume it normally\n",
-            );
-        },
-        error.SessionRecoveryRequiresCurrentSchema => {
-            try writeStderr(
-                deps,
-                "fx session: recovery supports conversation logs and schema-v3 event logs; migrate snapshot sessions first\n",
-            );
-        },
-        error.SessionRecoveryUnsupportedSchema => {
-            try writeStderr(
-                deps,
-                "fx session: recovery is unavailable for this unsupported session version\n",
             );
         },
         error.SessionRecoveryBoundaryInvalid => {
@@ -3348,42 +3302,19 @@ fn writeLookupFailure(
                 "fx session: no exact trustworthy recovery boundary was found; the source was left unchanged\n",
             );
         },
-        error.SessionRecoveryIndeterminate => {
-            try writeStderr(
-                deps,
-                "fx session: the recovery copy could not be confirmed; the source was left unchanged\n",
-            );
-        },
-        error.SessionAuthorityBoundaryUnavailable,
-        error.SessionCommitBoundaryUnavailable,
-        => {
-            try writeStderr(
-                deps,
-                "fx session: session authority is temporarily unavailable while an incomplete commit is resolved\n",
-            );
-        },
-        error.SessionAuthorityIntentCleanupPending => {
-            try writeStderr(
-                deps,
-                "fx session: session authority is confirmed but transition cleanup is still pending\n",
-            );
-        },
-        error.SessionBusy, error.SessionLockUnsupported => {
+        error.SessionBusy => {
             try writeStderr(
                 deps,
                 "fx session: session is busy or the filesystem cannot provide the required lock\n",
             );
         },
-        error.SessionPathUnsafe,
-        error.DurablePathUnsafe,
-        error.PrivateStatePermissionsUnsupported,
-        => {
+        error.DurablePathUnsafe => {
             try writeStderr(
                 deps,
                 "fx session: durable session storage is unsafe or does not support required private permissions\n",
             );
         },
-        error.DurableLayoutFailed, error.SessionStoreUnavailable => {
+        error.SessionStoreUnavailable => {
             try writeStderr(deps, "fx session: durable session store is unavailable\n");
         },
         error.HomeNotSet => {
@@ -3395,15 +3326,21 @@ fn writeLookupFailure(
     }
 }
 
+/// `reason` names the file and the problem of a v1 session v1's reader
+/// refuses (D78), and is empty otherwise.
 fn writeSessionDetailFailure(
     alloc: Allocator,
     deps: RunDeps,
     session_id: []const u8,
     err: anyerror,
+    reason: []const u8,
     format: output_contracts.OutputFormat,
 ) !void {
     const message = switch (err) {
-        error.InvalidSessionFormat => try alloc.print(
+        error.InvalidSessionFormat => if (reason.len > 0) try alloc.print(
+            "session {s} can't be read: {s}; run `fx doctor`",
+            .{ session_id, reason },
+        ) else try alloc.print(
             "session {s} is corrupt; run `fx session recover {s}`",
             .{ session_id, session_id },
         ),
@@ -3453,37 +3390,35 @@ fn lookupFailureMessage(err: anyerror) ?[]const u8 {
         error.NoSavedSessions => "no saved sessions for this workspace",
         error.NoReadableSessions => "saved sessions are unreadable; run `fx doctor` for recovery guidance",
         error.SessionNotFound => "record not found",
-        error.InvalidSessionFormat,
-        error.InvalidPermissionState,
-        error.PermissionStateTooLarge,
-        error.InvalidRecoveryCheckpoint,
-        error.InvalidUsageSidecar,
-        => "record is corrupt; run `fx doctor` for recovery guidance",
+        error.InvalidSessionFormat => "record is corrupt; run `fx doctor` for recovery guidance",
         error.UnsupportedSessionSchema => "record uses an unsupported session version",
         error.InvalidSessionId => "invalid session id",
-        error.LegacySessionTooLarge => "legacy session is too large for automatic loading; run `fx session migrate <id> --allow-large`",
-        error.LegacySessionReadResourceExhausted => "legacy session could not be loaded with available resources",
-        error.LegacySessionMigrationResourceExhausted => "migration did not complete because resources were exhausted; the original session remains authoritative",
-        error.LegacySessionMigrationFailed, error.LegacySessionChanged => "migration did not complete; the original session remains authoritative",
-        error.LegacySessionMigrationIndeterminate => "migration outcome is indeterminate and will be resolved by the next exact writable load",
         error.SessionRecoveryNotNeeded => "recovery was refused because the session has a valid commit boundary; resume it normally",
-        error.SessionRecoveryRequiresCurrentSchema => "recovery supports conversation logs and schema-v3 event logs; migrate snapshot sessions first",
-        error.SessionRecoveryUnsupportedSchema => "recovery is unavailable for this unsupported session version",
         error.SessionRecoveryBoundaryInvalid => "no exact trustworthy recovery boundary was found; the source was left unchanged",
-        error.SessionRecoveryIndeterminate => "the recovery copy could not be confirmed; the source was left unchanged",
-        error.SessionAuthorityBoundaryUnavailable,
-        error.SessionCommitBoundaryUnavailable,
-        => "session authority is temporarily unavailable while an incomplete commit is resolved",
-        error.SessionAuthorityIntentCleanupPending => "session authority is confirmed but transition cleanup is still pending",
-        error.SessionBusy, error.SessionLockUnsupported => "session is busy or the filesystem cannot provide the required lock",
+        error.SessionBusy => "session is busy or the filesystem cannot provide the required lock",
         error.SessionPathUnsafe,
         error.DurablePathUnsafe,
         error.PrivateStatePermissionsUnsupported,
         => "durable session storage is unsafe or does not support required private permissions",
-        error.DurableLayoutFailed, error.SessionStoreUnavailable => "durable session store is unavailable",
+        error.SessionStoreUnavailable => "durable session store is unavailable",
         error.HomeNotSet => "HOME is not set",
         else => null,
     };
+}
+
+test "session detail failure names an older fx's damaged file and points at doctor (D78)" {
+    var text = CaptureOutput.init(std.testing.allocator);
+    defer text.deinit();
+    try writeSessionDetailFailure(std.testing.allocator, text.deps(), "old-session", error.InvalidSessionFormat, "events.jsonl can't be read (AccessDenied)", .text);
+    try std.testing.expectEqualStrings(
+        "fx session: session old-session can't be read: events.jsonl can't be read (AccessDenied); run `fx doctor`\n",
+        text.stderr.written(),
+    );
+    var json = CaptureOutput.init(std.testing.allocator);
+    defer json.deinit();
+    try writeSessionDetailFailure(std.testing.allocator, json.deps(), "old-session", error.InvalidSessionFormat, "events.jsonl can't be read (AccessDenied)", .json);
+    try std.testing.expect(std.mem.find(u8, json.stdout.written(), "\"code\":\"InvalidSessionFormat\"") != null);
+    try std.testing.expect(std.mem.find(u8, json.stdout.written(), "run `fx doctor`") != null);
 }
 
 test "session detail failures separate corruption from unsupported schema" {
@@ -3494,6 +3429,7 @@ test "session detail failures separate corruption from unsupported schema" {
         corrupt_text.deps(),
         "broken-session",
         error.InvalidSessionFormat,
+        "",
         .text,
     );
     try std.testing.expectEqualStrings("", corrupt_text.stdout.written());
@@ -3509,6 +3445,7 @@ test "session detail failures separate corruption from unsupported schema" {
         corrupt_json.deps(),
         "broken-session",
         error.InvalidSessionFormat,
+        "",
         .json,
     );
     try std.testing.expectEqualStrings("", corrupt_json.stderr.written());
@@ -3534,6 +3471,7 @@ test "session detail failures separate corruption from unsupported schema" {
         unsupported_text.deps(),
         "future-session",
         error.UnsupportedSessionSchema,
+        "",
         .text,
     );
     try std.testing.expectEqualStrings("", unsupported_text.stdout.written());
@@ -3541,32 +3479,6 @@ test "session detail failures separate corruption from unsupported schema" {
         "fx session: session future-session uses an unsupported session version\n",
         unsupported_text.stderr.written(),
     );
-}
-
-test "session lookup failures preserve supporting-state errors in the requested format" {
-    const cases = [_]struct { err: anyerror, code: []const u8 }{
-        .{ .err = error.InvalidPermissionState, .code = "InvalidPermissionState" },
-        .{ .err = error.PermissionStateTooLarge, .code = "PermissionStateTooLarge" },
-        .{ .err = error.InvalidRecoveryCheckpoint, .code = "InvalidRecoveryCheckpoint" },
-        .{ .err = error.InvalidUsageSidecar, .code = "InvalidUsageSidecar" },
-    };
-    for (cases) |case| {
-        for ([_]output_contracts.OutputFormat{ .text, .json }) |format| {
-            var output = CaptureOutput.init(std.testing.allocator);
-            defer output.deinit();
-            try writeLookupFailure(std.testing.allocator, output.deps(), "session", case.err, format);
-            const body = if (format == .json) output.stdout.written() else output.stderr.written();
-            const unused = if (format == .json) output.stderr.written() else output.stdout.written();
-            try std.testing.expectEqual(@as(usize, 0), unused.len);
-            try std.testing.expect(std.mem.find(u8, body, "fx doctor") != null);
-            try std.testing.expect(std.mem.find(u8, body, "resume it normally") == null);
-            if (format == .json) {
-                var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body, .{});
-                defer parsed.deinit();
-                try std.testing.expectEqualStrings(case.code, parsed.value.object.get("code").?.string);
-            }
-        }
-    }
 }
 
 test "session recovery boundary failures keep stable text and json guidance" {

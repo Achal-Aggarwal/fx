@@ -9,6 +9,8 @@
 // and ~/.fx/continue (what -c resumes), and manifest.json, which names each
 // kind's session ids, root first, and the workspace they were saved in. Every
 // kind is made in the same fixed home, so the paths v1 records stay the same.
+// FX_FIXTURE_KINDS=a,b makes only those kinds and keeps the others as they
+// are, folders and manifest entries.
 process.env.FX_TLA_V1_WRITER ??= "v0.0.14";
 process.env.FX_TLA_CASE ??= "v1-fixtures";
 
@@ -108,6 +110,22 @@ const KINDS: Record<string, Kind | { models: object[]; make: Kind }> = {
     assert(existsSync(join(f.v1Root, id, "images")), "v1 kept no prompt image");
     return [id];
   },
+  // One prompt with twenty images, ids 1 to 20, which v1 keeps under
+  // images/. A model with image input reads them without the vision tool.
+  "many-images": {
+    models: [{ id: FAKE_GATEWAY_MODEL, type: "language", tags: ["tool-use", "vision", "file-input"] }],
+    make: async f => {
+      f.setRespond(() => fakeGatewayFinalText("CONV_IMAGES_SEEN"));
+      const args = Array.from({ length: 20 }, (_, index) => {
+        const path = join(f.workspace, `shot-${index + 1}.png`);
+        writeFileSync(path, pixel);
+        return ["--image", path];
+      }).flat();
+      const id = (await f.v1Ask([...args, "CONV_FIRST look at all"])).session_id;
+      assert(readdirSync(join(f.v1Root, id, "images")).length === 20, "v1 kept fewer than twenty prompt images");
+      return [id];
+    },
+  },
   // Two roots: the app last opened the first, which -c resumes, and the
   // second was saved after that, so it is the newest.
   remembered: async f => {
@@ -176,10 +194,14 @@ const KINDS: Record<string, Kind | { models: object[]; make: Kind }> = {
   },
 };
 
-const manifest: { writer: string; workspace: string; kinds: Record<string, string[]> } = {
-  writer: process.env.FX_TLA_V1_WRITER, workspace: "", kinds: {},
-};
+const only = process.env.FX_FIXTURE_KINDS?.split(",").filter(Boolean);
+const manifest: { writer: string; workspace: string; kinds: Record<string, string[]> } = only
+  ? JSON.parse(readFileSync(join(out, "manifest.json"), "utf8"))
+  : { writer: process.env.FX_TLA_V1_WRITER, workspace: "", kinds: {} };
+assert(manifest.writer === process.env.FX_TLA_V1_WRITER, `the other kinds were made by ${manifest.writer}`);
+for (const name of only ?? []) assert(name in KINDS, `no fixture kind ${name}`);
 for (const [kind, entry] of Object.entries(KINDS)) {
+  if (only && !only.includes(kind)) continue;
   const { models, make } = typeof entry === "function" ? { models: undefined, make: entry } : entry;
   const f = fixture(kind, root, models);
   try {
@@ -191,7 +213,9 @@ for (const [kind, entry] of Object.entries(KINDS)) {
     const remembered = join(f.home, ".fx/continue");
     if (existsSync(remembered)) cpSync(remembered, join(target, "continue"), { recursive: true });
     manifest.kinds[kind] = ids;
-    manifest.workspace = realpathSync(f.workspace);
+    const workspace = realpathSync(f.workspace);
+    assert(!only || manifest.workspace === workspace, `kind ${kind} was saved in ${workspace}, the others in ${manifest.workspace}`);
+    manifest.workspace = workspace;
     console.log(`${kind}: ${ids.join(" ")}`);
   } finally { await f.finish(); }
 }

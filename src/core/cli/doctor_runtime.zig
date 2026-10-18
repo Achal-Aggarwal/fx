@@ -271,7 +271,9 @@ fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator) !void {
         const detail = try alloc.print("session {s} has a damaged log; `fx session recover {s}` copies its good turns", .{ id, id });
         try appendCheckOwned(checks, alloc, "session", .warn, detail);
     }
-    if (report.checked < report.sessions) try appendSessionDiagnosticsTruncatedCheck(checks, alloc, report.checked);
+    for (report.stuck.items) |stuck| try appendStuckCheck(checks, alloc, stuck);
+    // The limit covers v1's unconverted sessions too (D73).
+    if (report.checked < report.sessions + report.unconverted) try appendSessionDiagnosticsTruncatedCheck(checks, alloc, report.checked);
     if (report.removed > 0) {
         const detail = try alloc.print("removed {d} terminal or side folder(s) whose session is gone", .{report.removed});
         try appendCheckOwned(checks, alloc, "session", .ok, detail);
@@ -280,7 +282,32 @@ fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator) !void {
         const detail = try alloc.print("{d} terminal or side folder(s) whose session is gone could not be removed", .{report.kept});
         try appendCheckOwned(checks, alloc, "session", .warn, detail);
     }
-    try appendSessionsCountCheck(checks, alloc, report.sessions, report.latest orelse "");
+    const convertible = report.unconverted - report.stuck.items.len;
+    if (convertible > 0) {
+        const detail = try alloc.print("{d} session(s) saved by an older fx will be converted when first opened", .{convertible});
+        try appendCheckOwned(checks, alloc, "sessions", .ok, detail);
+    }
+    try appendSessionsCountCheck(checks, alloc, report.sessions, report.latest orelse "", report.unconverted > 0);
+}
+
+/// A session an older fx saved that can't be converted, with what
+/// `fx session recover` copies of it (D73). Its v1 folder is kept.
+fn appendStuckCheck(checks: *std.ArrayList(Check), alloc: Allocator, stuck: session_adapter.Doctor.Stuck) !void {
+    const detail = switch (stuck.recover) {
+        .without_rules => try alloc.print(
+            "session {s} saved by an older fx can't be converted: {s}; `fx session recover {s}` copies its conversation without its saved permission rules",
+            .{ stuck.id, stuck.reason, stuck.id },
+        ),
+        .good_turns => try alloc.print(
+            "session {s} saved by an older fx can't be converted: {s}; `fx session recover {s}` copies its good turns",
+            .{ stuck.id, stuck.reason, stuck.id },
+        ),
+        .nothing => try alloc.print(
+            "session {s} saved by an older fx can't be converted: {s}; nothing in it can be copied, so it is kept as it is",
+            .{ stuck.id, stuck.reason },
+        ),
+    };
+    try appendCheckOwned(checks, alloc, "session", .warn, detail);
 }
 
 fn appendSessionDiagnosticsTruncatedCheck(
@@ -300,9 +327,11 @@ fn appendSessionsCountCheck(
     alloc: Allocator,
     count: usize,
     latest_id: []const u8,
+    older_saved: bool,
 ) !void {
     if (count == 0) {
-        try appendCheck(checks, alloc, "sessions", .warn, "no saved sessions yet");
+        // Sessions only an older fx saved are not "no sessions" (D73).
+        if (!older_saved) try appendCheck(checks, alloc, "sessions", .warn, "no saved sessions yet");
         return;
     }
 
@@ -605,8 +634,10 @@ test "session count check preserves empty and latest details" {
         checks.deinit(alloc);
     }
 
-    try appendSessionsCountCheck(&checks, alloc, 0, "");
-    try appendSessionsCountCheck(&checks, alloc, 2, "session-2");
+    try appendSessionsCountCheck(&checks, alloc, 0, "", false);
+    try appendSessionsCountCheck(&checks, alloc, 2, "session-2", false);
+    // Sessions only an older fx saved are not "no sessions" (D73).
+    try appendSessionsCountCheck(&checks, alloc, 0, "", true);
 
     try std.testing.expectEqual(@as(usize, 2), checks.items.len);
     try std.testing.expectEqualStrings("sessions", checks.items[0].name);

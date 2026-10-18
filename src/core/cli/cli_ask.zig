@@ -863,7 +863,7 @@ const AskContext = struct {
     fn imageSnapshotStorageDir(self: *AskContext) ![]u8 {
         // Captured into the process's temporary folder; the turn keeps the
         // bytes (D44).
-        return session_store.imageSnapshotStorageDir(self.alloc, null, null, &self.image_snapshot_temp_dir);
+        return session_store.imageSnapshotTempDir(self.alloc, &self.image_snapshot_temp_dir);
     }
 
     fn captureImageAttachment(self: *AskContext, attachment: *ImageAttachment) !void {

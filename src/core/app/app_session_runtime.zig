@@ -1333,12 +1333,7 @@ pub fn Runtime(comptime App: type) type {
         fn imageSnapshotStorageDir(app: *App) ![]u8 {
             // Captured into the process's temporary folder; the turn keeps
             // the bytes (D44).
-            return session_store.imageSnapshotStorageDir(
-                app.alloc,
-                null,
-                null,
-                &app.session_persistence.image_snapshot_temp_dir,
-            );
+            return session_store.imageSnapshotTempDir(app.alloc, &app.session_persistence.image_snapshot_temp_dir);
         }
 
         pub fn configureStartupPreferences(
@@ -1834,6 +1829,26 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn resumeRequestedSession(app: *App) !void {
             return resumeRequestedSessionWithNotice(app, .session);
+        }
+
+        /// The update's notice, in the fresh session an update relaunch
+        /// opens when the session it handed over had no turn to resume (D81).
+        pub fn writeUpgradeNotice(
+            app: *App,
+            version: []const u8,
+            channel: update_target.Channel,
+            previous_revision: []const u8,
+            revision: []const u8,
+        ) !void {
+            var body: std.Io.Writer.Allocating = .init(app.alloc);
+            defer body.deinit();
+            try writeUpgradeNoticeBody(&body.writer, .{
+                .version = version,
+                .channel = channel,
+                .previous_revision = previous_revision,
+                .revision = revision,
+            });
+            try app.writeDomainNotice(.{ .topic = "", .tone = .success, .body = body.written() }, true);
         }
 
         pub fn resumeRequestedSessionAfterUpgrade(
