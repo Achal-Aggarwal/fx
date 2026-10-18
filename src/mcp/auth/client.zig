@@ -238,6 +238,9 @@ pub const Auth = struct {
                     // A refresh brings no new scopes; this needs a sign-in.
                     try a.stepFlow(.{ .challenged = try a.challengeScopes(c.scope) });
                     try a.stepGate(.{ .accepted = key });
+                    // Kept with the login, so a sign-in in another process
+                    // asks for these too.
+                    try a.actions.append(a.gpa, .save);
                     try a.announce(true);
                     try a.actions.append(a.gpa, .{ .give_up = .{ .key = key, .why = .needs_sign_in } });
                     return true;
@@ -418,6 +421,10 @@ pub const Auth = struct {
         const cred = a.cred orelse return false;
         const access = a.access orelse return false;
         var json: std.json.Stringify = .{ .writer = w };
+        // The scopes the token was asked with, and those a step-up still
+        // owes, for the next sign-in.
+        var granted: [oauth.max_scopes][]const u8 = undefined;
+        var owed: [oauth.max_scopes][]const u8 = undefined;
         try json.write(.{
             .access = access,
             .refresh = a.refresh_token,
@@ -429,6 +436,8 @@ pub const Auth = struct {
             .client_id = cred.client.id,
             .client_secret = cred.client.secret,
             .method = @tagName(cred.client.method),
+            .scope = a.scopes.namesOf(a.flow.granted, &granted),
+            .step_up = a.scopes.namesOf(a.flow.challenge & ~a.flow.granted, &owed),
         });
         return true;
     }
@@ -438,7 +447,7 @@ pub const Auth = struct {
     /// read, whose access token isn't valid, or whose endpoints
     /// discovery may not reach for this server, is ignored.
     pub fn restore(a: *Auth, saved: []const u8) Error!void {
-        const names = [_][]const u8{ "access", "refresh", "expires_at_ms", "skew_ms", "token_endpoint", "revocation_endpoint", "resource", "client_id", "client_secret", "method" };
+        const names = [_][]const u8{ "access", "refresh", "expires_at_ms", "skew_ms", "token_endpoint", "revocation_endpoint", "resource", "client_id", "client_secret", "method", "scope", "step_up" };
         var raw: [names.len]?[]const u8 = undefined;
         wire.objectFields(saved, &names, &raw) catch return;
         // Checked before the credential in use is replaced, so an ignored one
@@ -467,6 +476,9 @@ pub const Auth = struct {
         try a.storeTokens(.{ .access = access, .refresh = text[1], .expires_in = null });
         a.expires_at_ms = if (raw[2]) |v| std.fmt.parseInt(i64, v, 10) catch null else null;
         if (raw[3]) |v| a.skew_ms = std.fmt.parseInt(i64, v, 10) catch a.skew_ms;
+        // Before any sign-in step, as the model's Init.
+        a.flow.granted = if (raw[10]) |v| try a.scopes.ofArray(a.keep.allocator(), v) else 0;
+        a.flow.challenge = if (raw[11]) |v| try a.scopes.ofArray(a.keep.allocator(), v) else 0;
         try a.stepGate(.{ .signed_in = .{ .refreshable = a.refresh_token != null } });
     }
 
@@ -652,7 +664,9 @@ pub const Auth = struct {
                 // well-known places.
                 if (status == 401 or status == 403) if (challenge) |raw| {
                     const c = try a.takeChallenge(raw);
-                    try a.stepFlow(.{ .challenged = try a.challengeScopes(c.scope) });
+                    // The probe's challenge is for the probe: a step-up
+                    // still owed is asked for with it.
+                    try a.stepFlow(.{ .challenged = try a.challengeScopes(c.scope) | a.flow.challenge });
                 };
                 try a.stepFlow(.sign_in);
             },
@@ -845,7 +859,17 @@ test "a saved credential comes back whole: requests carry its token, and it save
     try testing.expectEqualStrings("Bearer at/1", a.authorization(a.gate.gen).?);
     try testing.expect(a.gate.refreshable);
     try testing.expect(try a.save(&out.writer));
-    try testing.expectEqualStrings("{\"access\":\"at/1\",\"refresh\":\"rt\"" ++ fields, out.written());
+    const none = ",\"scope\":[],\"step_up\":[]}";
+    try testing.expectEqualStrings("{\"access\":\"at/1\",\"refresh\":\"rt\"" ++ fields[0 .. fields.len - 1] ++ none, out.written());
+    // The scopes granted and those a step-up owes come back in the flow,
+    // for the next sign-in, and are saved again.
+    const scoped = "{\"access\":\"at2\",\"refresh\":\"rt\"" ++ fields[0 .. fields.len - 1] ++ ",\"scope\":[\"a\",\"b\"],\"step_up\":[\"c\"]}";
+    try a.restore(scoped);
+    try testing.expectEqual(try a.scopeBits("a b"), a.flow.granted);
+    try testing.expectEqual(try a.scopeBits("c"), a.flow.challenge);
+    out.clearRetainingCapacity();
+    try testing.expect(try a.save(&out.writer));
+    try testing.expectEqualStrings(scoped, out.written());
 }
 
 test "a refresh the host decides waits for it, and ends however it does: replaced, signed out of, answered, refused, or failed" {
@@ -957,6 +981,36 @@ test "a request a sign-in is needed for gives up only after the sign-in is annou
         else => {},
     };
     try testing.expect(announced.? < gave_up.?);
+}
+
+test "a step-up is saved with the login, so a sign-in in a new process asks for it with the scopes held" {
+    const testing = std.testing;
+    var client: http.Client = undefined;
+    try client.init(testing.io, testing.allocator, .{ .url = "http://127.0.0.1:9/mcp" });
+    defer client.deinit();
+    var a: Auth = .init(testing.io, testing.allocator, &client, "http://127.0.0.1:9/mcp", .{}, null);
+    defer a.deinit();
+    const login = "{\"access\":\"at\",\"refresh\":\"rt\",\"expires_at_ms\":4102444800000,\"skew_ms\":30000,\"token_endpoint\":\"https://as/token\"," ++
+        "\"revocation_endpoint\":null,\"resource\":\"http://127.0.0.1:9/mcp\",\"client_id\":\"c1\",\"client_secret\":null,\"method\":\"none\",\"scope\":[\"a\"],\"step_up\":[]}";
+    try a.restore(login);
+    try a.beforeSend(1);
+    a.actions.clearRetainingCapacity();
+    _ = try a.ended(1, .{ .rejected = .{ .status = 403, .challenge = "Bearer error=\"insufficient_scope\", scope=\"b\"" } });
+    var saves: usize = 0;
+    for (a.actions.items) |x| saves += @intFromBool(x == .save);
+    try testing.expectEqual(@as(usize, 1), saves);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try testing.expect(try a.save(&out.writer));
+
+    var b: Auth = .init(testing.io, testing.allocator, &client, "http://127.0.0.1:9/mcp", .{}, null);
+    defer b.deinit();
+    try b.restore(out.written());
+    try testing.expectEqual(try b.scopeBits("a"), b.flow.granted);
+    try testing.expectEqual(try b.scopeBits("b"), b.flow.challenge);
+    var step: core.FlowOutput = .{};
+    b.flow.step(.sign_in, &step);
+    try testing.expectEqual(try b.scopeBits("a b"), b.flow.flow_scopes);
 }
 
 test "a saved credential whose endpoints discovery may not reach is ignored" {

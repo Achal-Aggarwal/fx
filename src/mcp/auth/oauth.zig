@@ -380,6 +380,16 @@ pub const ScopeSet = struct {
         return mask;
     }
 
+    /// The names in `mask`, kept in `buf`.
+    pub fn namesOf(s: *const ScopeSet, mask: u32, buf: *[max_scopes][]const u8) []const []const u8 {
+        var n: usize = 0;
+        for (s.names[0..s.count], 0..) |name, i| if (mask & (@as(u32, 1) << @intCast(i)) != 0) {
+            buf[n] = name;
+            n += 1;
+        };
+        return buf[0..n];
+    }
+
     /// The names in `mask`, space-separated, with `offline_access` added when
     /// `offline`. Null when that leaves none.
     pub fn list(s: *const ScopeSet, a: Allocator, mask: u32, offline: bool) Allocator.Error!?[]const u8 {

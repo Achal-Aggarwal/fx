@@ -95,23 +95,27 @@ writeFileSync(
   }),
 );
 
-const gatewaySteps = toolCalls.flatMap((call, index) => {
-  const name = `mcp_conformance_${call.name}`;
-  return [
-    fakeGatewayToolCall(`select_conformance_tool_${index}`, "mcp_select_tool", {
-      name,
-    }),
-    fakeGatewayToolCall(`call_conformance_tool_${index}`, name, call.arguments),
-  ];
-});
-if (toolCalls.length === 0) {
-  gatewaySteps.push(fakeGatewayToolCall(
-    "search_conformance_server",
-    "capability_search",
-    { query: "conformance" },
-  ));
+// A scripted model for one ask: a Response can be read only once.
+function gatewaySteps() {
+  const steps = toolCalls.flatMap((call, index) => {
+    const name = `mcp_conformance_${call.name}`;
+    return [
+      fakeGatewayToolCall(`select_conformance_tool_${index}`, "mcp_select_tool", {
+        name,
+      }),
+      fakeGatewayToolCall(`call_conformance_tool_${index}`, name, call.arguments),
+    ];
+  });
+  if (toolCalls.length === 0) {
+    steps.push(fakeGatewayToolCall(
+      "search_conformance_server",
+      "capability_search",
+      { query: "conformance" },
+    ));
+  }
+  steps.push(fakeGatewayFinalText("MCP conformance client finished."));
+  return steps;
 }
-gatewaySteps.push(fakeGatewayFinalText("MCP conformance client finished."));
 
 // fx signs in through the browser with fx mcp login. For the auth scenarios
 // this browser follows the authorization URL's redirects back to fx's
@@ -165,9 +169,9 @@ async function runFx(args: string[], extraEnv: Record<string, string> = {}) {
 
 // Each ask gets its own scripted model.
 async function ask() {
-  const gateway = startFakeGateway(gatewaySteps);
+  const gateway = startFakeGateway(gatewaySteps());
   try {
-    return await runFx(
+    const result = await runFx(
       [
         "ask",
         "--json",
@@ -177,6 +181,10 @@ async function ask() {
       ],
       { FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
     );
+    // What fx told the model: a call ended because the server needs a
+    // login. The --json result carries only each call's status.
+    const needsLogin = gateway.requests.some((r) => r.body.includes("needs a login"));
+    return { ...result, needsLogin };
   } finally {
     gateway.stop();
   }
@@ -187,7 +195,7 @@ try {
   let result = await ask();
   // A server that asks for more scope at call time: sign in again once,
   // then ask once more.
-  if (authScenario && result.stdout.includes("needs a login")) {
+  if (authScenario && result.needsLogin) {
     await runFx(["mcp", "login", "conformance"]);
     result = await ask();
   }
