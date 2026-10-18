@@ -6,7 +6,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -27,6 +26,7 @@ import {
   TmuxSession,
   tmuxAvailable,
 } from "./tmux-helpers";
+import { savedSessionIds } from "./saved-sessions";
 
 const SKIP = !tmuxAvailable();
 const TIMEOUT = 30_000;
@@ -858,11 +858,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       await session.kill();
       session = null;
 
-      const sessionIds = readdirSync(join(home, ".fx", "sessions"), {
-        withFileTypes: true,
-      })
-        .filter((entry) => entry.name !== "latest" && entry.isDirectory())
-        .map((entry) => entry.name);
+      const sessionIds = savedSessionIds(home);
       expect(sessionIds).toHaveLength(1);
 
       // A resumed session keeps its title in the tab, even in a new folder.
@@ -953,11 +949,7 @@ describe.skipIf(SKIP)("tui: slash menu", () => {
       session = null;
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
-      const sessionIds = readdirSync(join(home, ".fx", "sessions"), {
-        withFileTypes: true,
-      })
-        .filter((entry) => entry.name !== "latest" && entry.isDirectory())
-        .map((entry) => entry.name);
+      const sessionIds = savedSessionIds(home);
       expect(sessionIds).toHaveLength(1);
       gateway.stop();
       gateway = startFakeGateway([]);
