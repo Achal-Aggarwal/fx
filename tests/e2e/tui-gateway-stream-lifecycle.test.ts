@@ -1712,7 +1712,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await Bun.sleep(5_500);
       await session.sendText("First prompt.");
       await session.waitForText("FIRST_PROMPT_OK", 10_000);
-      expect(catalogGateway.modelRequests).toHaveLength(2);
+      await waitForCondition(() => catalogGateway.modelRequests.length === 2, "background catalog retry");
 
       // A second prompt joins the retry already in flight instead of starting one.
       await session.waitForStableComposer(TIMEOUT);

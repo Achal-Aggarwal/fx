@@ -405,7 +405,7 @@ pub const Runtime = struct {
             return;
         };
 
-        self.thread = std.Thread.spawn(.{}, preloadThreadMain, .{ self, provider, owned_access }) catch {
+        const thread = std.Thread.spawn(.{}, preloadThreadMain, .{ self, provider, owned_access }) catch {
             var failed_access = owned_access;
             const failure = model_catalog.FailedOutcome{
                 .access = .init(failed_access.access),
@@ -416,6 +416,9 @@ pub const Runtime = struct {
             self.completeFetch(.{ .failed = failure });
             return;
         };
+        self.mutex.lockUncancelable(io_mod.getIo());
+        self.thread = thread;
+        self.mutex.unlock(io_mod.getIo());
     }
 
     /// Loads the catalog inline for cooperative single-threaded hosts.
@@ -449,8 +452,13 @@ pub const Runtime = struct {
             (self.requested_access == null or
                 !std.meta.eql(self.requested_access.?, requested_access));
         var reused_public_catalog = false;
+        // A fetch started or staged under the old access would overwrite the
+        // reused provenance, so only an idle ready catalog is reused; anything
+        // else resets below.
         if (access_changed and
             self.state == .ready and
+            !self.fetch_in_flight and
+            self.staged == null and
             requested_access.level == .public_only)
         {
             if (self.outcome.loaded) |*loaded| {
@@ -479,7 +487,9 @@ pub const Runtime = struct {
         const retry_due = if (self.outcome.last_failure) |failed| failed.failure.retryable else false;
         const backoff_over = now < self.last_attempt_ms or now >= self.retry_not_before_ms;
         // A staged revalidation is newer than anything a fetch would start now.
-        const should_load = !self.fetch_in_flight and self.staged == null and backoff_over and switch (self.state) {
+        // A fetch that finished after the join above still holds its thread;
+        // the next trigger joins it before starting another.
+        const should_load = !self.fetch_in_flight and self.staged == null and self.thread == null and backoff_over and switch (self.state) {
             .idle, .failed => true,
             .ready => expired or picker_due or retry_due,
             .loading => false,
@@ -858,10 +868,13 @@ pub const Runtime = struct {
 
     fn cancelAndJoin(self: *Self) void {
         self.cancel_requested.store(true, .seq_cst);
-        if (self.thread) |thread| {
-            self.thread = null;
-            thread.join();
-        }
+        // The worker thread can join through `finishThreadIfDone`, so the
+        // handle changes hands only under the mutex.
+        self.mutex.lockUncancelable(io_mod.getIo());
+        const thread = self.thread;
+        self.thread = null;
+        self.mutex.unlock(io_mod.getIo());
+        if (thread) |handle| handle.join();
     }
 
     fn finishThreadIfDone(self: *Self) void {
@@ -1243,10 +1256,15 @@ const GatedCatalog = struct {
     calls: std.atomic.Value(usize) = .init(0),
     open: std.atomic.Value(bool) = .init(true),
 
-    fn fetch(raw: ?*anyopaque, alloc: Allocator, _: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
+    fn fetch(raw: ?*anyopaque, alloc: Allocator, input: model_catalog.FetchInput) Allocator.Error!model_catalog.ProviderResult {
         const self: *GatedCatalog = @ptrCast(@alignCast(raw.?));
         _ = self.calls.fetchAdd(1, .seq_cst);
-        while (!self.open.load(.seq_cst)) io_mod.sleep(std.time.ns_per_ms);
+        while (!self.open.load(.seq_cst)) {
+            if (input.cancel_flag) |flag| {
+                if (flag.load(.seq_cst)) return .{ .failure = .{ .category = .cancellation } };
+            }
+            io_mod.sleep(std.time.ns_per_ms);
+        }
         if (self.fail) return .{ .failure = .{
             .category = .gateway_unavailable,
             .http_status = .service_unavailable,
@@ -1419,6 +1437,29 @@ test "model catalog failures back off every trigger until a success or access ch
     try std.testing.expectEqual(@as(usize, 4), source.calls.load(.seq_cst));
     try std.testing.expectEqual(@as(u32, 0), runtime.failure_streak);
     try std.testing.expectEqual(@as(i64, 0), runtime.retry_not_before_ms);
+}
+
+test "model cache reloads a public catalog whose public reason changes while a refresh runs" {
+    var runtime = Runtime.init(std.testing.allocator, "/v1/models");
+    defer runtime.deinit();
+    var source = GatedCatalog{};
+    runtime.startWarmup(source.provider(), .{ .public_only = .fx_login_refresh_required }, .activity);
+    try waitForWarmup(&runtime);
+
+    source.open.store(false, .seq_cst);
+    runtime.last_attempt_ms -= picker_revalidate_floor_ms;
+    runtime.startWarmup(source.provider(), .{ .public_only = .fx_login_refresh_required }, .picker_open);
+    try std.testing.expect(fetchInFlight(&runtime));
+
+    // The refresh started under the old reason must not land over the new one.
+    runtime.startWarmup(source.provider(), credentials.catalogAccessAfterRefreshFailure(.fx_login), .activity);
+    source.open.store(true, .seq_cst);
+    try waitForWarmup(&runtime);
+    try std.testing.expectEqual(@as(usize, 3), source.calls.load(.seq_cst));
+    try std.testing.expectEqual(
+        credentials.CatalogPublicOnlyReason.credential_refresh_failed,
+        runtime.outcome.loaded.?.access.public_only_reason.?,
+    );
 }
 
 test "open model menu keeps its provider tab and selection when a revalidated catalog lands" {

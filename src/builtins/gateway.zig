@@ -2443,7 +2443,8 @@ fn catalogRequestFailure(err: anyerror) model_catalog.Failure {
     if (isInvalidGatewayResponse(err)) return .{ .category = .malformed_response };
     return .{
         .category = .transport,
-        .retryable = gateway_client.isRetryableGatewayError(err),
+        // A request that hit the fetch deadline is worth retrying.
+        .retryable = err == error.Timeout or gateway_client.isRetryableGatewayError(err),
     };
 }
 
@@ -2469,6 +2470,10 @@ test "catalog request failures preserve transport and cancellation facts" {
     try std.testing.expectEqual(model_catalog.FailureCategory.transport, network.category);
     try std.testing.expect(network.http_status == null);
     try std.testing.expect(network.retryable);
+
+    const timed_out = catalogRequestFailure(error.Timeout);
+    try std.testing.expectEqual(model_catalog.FailureCategory.transport, timed_out.category);
+    try std.testing.expect(timed_out.retryable);
 
     const cancelled = catalogRequestFailure(error.Cancelled);
     try std.testing.expectEqual(model_catalog.FailureCategory.cancellation, cancelled.category);
