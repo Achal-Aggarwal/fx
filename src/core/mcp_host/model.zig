@@ -50,6 +50,8 @@ pub const Catalog = struct {
         digest: ?[32]u8 = null,
         /// Bumped when the list changes; bindings carry it.
         generation: u64 = 0,
+        /// The server's `toolsEpoch` when this list was asked for.
+        epoch: u64 = 0,
         state: enum { unknown, loaded, needs_login, failed } = .unknown,
         /// Why the list couldn't be had; owned by the catalog.
         failure: ?[]u8 = null,
@@ -130,7 +132,7 @@ pub const Catalog = struct {
         if (!c.mayAllow(options.access)) return error.McpAccessDenied;
         if (options.expected_binding) |b| if (b.runtime_generation != c.generation) return error.McpAdvertisedToolChanged;
         if (options.expected_runtime_generation) |g| if (g != c.generation) return error.McpAuthorityChanged;
-        try c.ensure(name, options.cancel_flag);
+        try c.ensureCurrent(name, options.cancel_flag);
         const server, const tool, const transport, const how = found: {
             c.mutex.lockUncancelable(c.io);
             defer c.mutex.unlock(c.io);
@@ -440,6 +442,19 @@ pub const Catalog = struct {
     /// Loads the lists that could hold `name`, until one does.
     fn ensure(c: *Catalog, name: []const u8, cancel: Cancel) !void {
         if (c.known(name)) return;
+        try c.load(name, cancel);
+    }
+
+    /// `ensure` before a call: a list its server may have changed since is
+    /// loaded again first, so a tool the server took away is refused unsent.
+    /// Only calls wait for this; showing the model a list a moment old is
+    /// harmless, as its calls come here.
+    fn ensureCurrent(c: *Catalog, name: []const u8, cancel: Cancel) !void {
+        if (c.upToDate(name)) return;
+        try c.load(name, cancel);
+    }
+
+    fn load(c: *Catalog, name: []const u8, cancel: Cancel) !void {
         for (c.runtime.servers(), 0..) |s, i| {
             if (s.held != null or !tool_names.matchesServer(name, s.name)) continue;
             try c.refresh(i, cancel);
@@ -451,6 +466,17 @@ pub const Catalog = struct {
         c.mutex.lockUncancelable(c.io);
         defer c.mutex.unlock(c.io);
         return c.findLocked(name) != null;
+    }
+
+    /// `name` is in a loaded list its server hasn't changed since.
+    fn upToDate(c: *Catalog, name: []const u8) bool {
+        const server, const epoch = found: {
+            c.mutex.lockUncancelable(c.io);
+            defer c.mutex.unlock(c.io);
+            const found = c.findLocked(name) orelse return false;
+            break :found .{ found.server, c.lists[found.server].epoch };
+        };
+        return epoch == c.runtime.toolsEpoch(server);
     }
 
     /// False when `access` can allow nothing here: no MCP, or a subagent's
@@ -522,6 +548,9 @@ pub const Catalog = struct {
         if (server.held != null) return;
         var scratch: std.heap.ArenaAllocator = .init(c.gpa);
         defer scratch.deinit();
+        // Read first: a change that comes while the list is on its way
+        // leaves this list out of date.
+        const epoch = c.runtime.toolsEpoch(i);
         const result = try c.runtime.tools(scratch.allocator(), server.name, cancel);
         switch (result) {
             .tools => |listed| {
@@ -537,6 +566,7 @@ pub const Catalog = struct {
                 l.arena = arena;
                 l.tools = tools;
                 l.digest = digest;
+                l.epoch = epoch;
                 c.setStateLocked(l, .loaded, null);
             },
             .needs_login => {

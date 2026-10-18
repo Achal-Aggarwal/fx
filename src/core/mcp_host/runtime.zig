@@ -301,6 +301,11 @@ pub const Runtime = struct {
     engine: engine.Engine,
     /// Per server in `resolved.servers`; owner thread only.
     flags: []Flags,
+    /// Each server's count of `tools_stale` events, so the catalog can tell
+    /// a list it holds from one the server may have changed since. Apart
+    /// from `flags`, which a sign-in or sign-out resets, so a count never
+    /// comes back to a value the catalog already saw.
+    tools_epochs: []std.atomic.Value(u64),
     thread: ?std.Thread = null,
     /// Set by `retire`; read by the owner thread.
     retired: std.atomic.Value(bool) = .init(false),
@@ -371,6 +376,7 @@ pub const Runtime = struct {
             .resolved = undefined,
             .engine = undefined,
             .flags = &.{},
+            .tools_epochs = &.{},
             .snapshot_arena = .init(gpa),
         };
         errdefer r.arena.deinit();
@@ -379,6 +385,8 @@ pub const Runtime = struct {
         r.resolved = try config.resolve(arena, configs, inherited, .{ .context = r, .get = savedCredential }, r.options.workspace_root);
         r.flags = try arena.alloc(Flags, r.resolved.servers.len);
         for (r.flags) |*f| f.* = .{};
+        r.tools_epochs = try arena.alloc(std.atomic.Value(u64), r.resolved.servers.len);
+        for (r.tools_epochs) |*e| e.* = .init(0);
         for (r.resolved.engine, r.resolved.engine_server) |c, i| {
             r.flags[i].signed_in = c.auth.saved != null;
             if (c.auth.saved) |saved| r.flags[i].tried = credentials.digest(saved);
@@ -461,6 +469,13 @@ pub const Runtime = struct {
         if (index >= r.snapshot.len) return null;
         const text = r.snapshot[index].instructions orelse return null;
         return try alloc.dupe(u8, text);
+    }
+
+    /// Server `index`'s count of the times its tools may have changed (in
+    /// `servers()` order). Read before asking for a list: a list asked for
+    /// under an older count is out of date.
+    pub fn toolsEpoch(r: *const Runtime, index: usize) u64 {
+        return r.tools_epochs[index].load(.acquire);
     }
 
     /// The resolved servers, in config order; they don't change while the
@@ -1029,6 +1044,7 @@ pub const Runtime = struct {
                 r.endLogin(i);
                 r.notify(.{ .sign_in_failed = .{ .server = name, .reason = reason } });
             },
+            .tools_stale => _ = r.tools_epochs[i].fetchAdd(1, .release),
             .credential => try r.saveCredential(i),
             .refresh_due => try r.refreshDue(i),
             .refresh_ended => r.endRefresh(i),

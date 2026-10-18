@@ -123,6 +123,10 @@ pub const Event = union(enum) {
     /// A listing ended (or a need was served from the cache). Read the list
     /// with `toolList`.
     tools: struct { ok: bool, fresh: bool, dropped: tools.Added = .{}, needs_auth: bool = false },
+    /// The tool list may have changed: `list_changed`, a call answer that
+    /// suggests so, a new process, or a fresh list's TTL ran out. A host
+    /// that keeps its own copy lists again before its next call (CAT-05).
+    tools_stale,
     /// A call ended. `answer` is set when the server answered, valid until the next `next`.
     called: struct { handle: Handle, outcome: CallOutcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call },
     /// A call's server reported progress that the request core accepted.
@@ -2035,8 +2039,14 @@ pub const Server = struct {
 
     fn stepCatalog(r: *Server, event: catalog.Event) Error!void {
         var out: catalog.Output = .{};
+        const generation = r.catalog.generation;
+        const was_fresh = r.catalog.cache == .fresh;
         r.catalog.step(event, &out) catch return;
         if (r.tracer()) |t| try catalog.writeTrace(t, "remote", &out);
+        // A host has nothing to drop before the first list, unless one is
+        // being listed: what that listing brings is already old.
+        const changed = r.catalog.generation != generation and (r.catalog.cache != .none or r.catalog.listing);
+        if (changed or (was_fresh and r.catalog.cache != .fresh)) r.emit(.tools_stale);
         for (out.effects()) |effect| switch (effect) {
             .send_page => {
                 const l = try r.newLogical(.list, .idempotent);
@@ -2061,6 +2071,9 @@ pub const Server = struct {
                 r.emit(.{ .tools = .{ .ok = !r.page_needs_auth, .fresh = false, .needs_auth = r.page_needs_auth } });
                 r.page_needs_auth = false;
                 try r.relisted(false);
+                // Still stale: a host that keeps its copy asks again next
+                // time.
+                r.emit(.tools_stale);
             },
             .serve => r.emit(.{ .tools = .{ .ok = true, .fresh = true } }),
             .arm_expiry => |a| try r.timers.append(r.gpa, .{ .kind = .{ .expiry = a.generation }, .due_ms = r.now() + a.after_ms }),

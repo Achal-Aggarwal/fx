@@ -181,6 +181,29 @@ export const scenarios: Scenario[] = [
     },
   }),
   engineScenario({
+    name: "u12-tools-stale",
+    description: "The host hears when a server's tools may have changed, so it can list them again before its next call: once for a 2025 list_changed, once when a fresh list's TTL runs out, again after a failed re-list hands over the last list, never for a list that was never fresh, and never before the first list (CAT-05)",
+    servers: {
+      b: { rules: [initialize, list25("add"), { ...ok25("fine"), before: [{ jsonrpc: "2.0", method: "notifications/tools/list_changed" }] }] },
+      t: { rules: [discover, listen, { method: "tools/list", result: { resultType: "complete", tools: [tool("echo")], ttlMs: 300 } }, ok("fine")] },
+      z: { rules: modern() },
+      f: { rules: [initialize, { ...list25("add"), times: 1 }, { ...ok25("fine"), before: [{ jsonrpc: "2.0", method: "notifications/tools/list_changed" }] }, { method: "tools/list", error: { code: -32603, message: "Internal error" } }] },
+    },
+    script: ["tools b", "tools t", "tools z", "tools f", "expect b.tools.ok", "expect t.tools.ok", "expect z.tools.ok", "expect f.tools.ok", "call b add", "expect b.called.1.result", "expect b.tools_stale", "call f add", "expect f.called.2.result", "expect f.tools_stale", "tools f", "expect f.tools.ok", "expect f.tools_stale", "expect t.tools_stale 3000", "drain 500"],
+    machines: { b: [...BASE, "catalog"], t: [...BASE, "catalog", "subscription"], z: [...BASE, "catalog", "subscription"], f: [...BASE, "catalog"] },
+    check(lines) {
+      const all = tags(lines);
+      const stale = (s: string) => all.filter((t) => t === `${s}.tools_stale`).length;
+      const before = (s: string) => all.indexOf(`${s}.tools_stale`) >= 0 && all.indexOf(`${s}.tools_stale`) < all.indexOf(`${s}.tools.ok`);
+      return first(
+        // f: its list_changed, then the failed re-list that hands over the
+        // last list, still stale.
+        same([stale("b"), stale("t"), stale("z"), stale("f")], [1, 1, 0, 2], "tools_stale events for b, t, z, f"),
+        expectThat(!before("b") && !before("t"), "a tools_stale came before the first list"),
+      );
+    },
+  }),
+  engineScenario({
     name: "u12-lazy",
     description: "A server nothing needs never starts: listing one server's tools leaves the other idle, with no process (LazyConnect)",
     servers: { a: { rules: modern() }, b: { rules: modern() } },

@@ -643,11 +643,12 @@ describe("version-scoped legacy MCP remote transports", () => {
       recovered: true,
       initializeCalls: 2,
       // A 404 means the server didn't take the call, so it goes again in the
-      // new session (LHTTP-02); the next call uses that session too.
+      // new session (LHTTP-02); the next call uses that session too, after
+      // the new session's tools are listed again (id 6, CAT-05).
       calls: [
         ["expired", `session-${version}-1`, 4],
         ["expired", `session-${version}-2`, 4],
-        ["recovered", `session-${version}-2`, 6],
+        ["recovered", `session-${version}-2`, 7],
       ],
     });
     const reinitialize = streamable.requests.filter(
