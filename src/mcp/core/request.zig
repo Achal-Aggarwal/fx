@@ -190,6 +190,12 @@ pub const Table = struct {
         return if (table.indexOf(id) != null) .inflight else .done;
     }
 
+    /// The progress notifications accepted for `id` while it is in flight.
+    pub fn progressCount(table: *const Table, id: Id) u32 {
+        const index = table.indexOf(id) orelse return 0;
+        return table.slots[index].progress_count;
+    }
+
     pub fn inFlightCount(table: *const Table) usize {
         var count: usize = 0;
         for (table.slots) |slot| count += @intFromBool(slot.used);

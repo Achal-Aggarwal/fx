@@ -60,6 +60,9 @@ pub const Event = struct {
         /// A call ended. `answer` is set when the server answered, valid
         /// until the next `next`.
         called: struct { call: Handle, outcome: Outcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call },
+        /// A call's server reported progress; `message` is terminal-safe and
+        /// valid until the next `next`.
+        progress: struct { call: Handle, progress: f64, total: ?f64, message: ?[]const u8 },
         /// A call needs the host's answers to its input requests:
         /// `respond`, or `cancel`. Valid until then.
         input: struct { call: Handle, requests: []const mrtr.Request },
@@ -433,6 +436,9 @@ pub const Engine = struct {
             },
             .input => |q| for (slot.calls.items) |x| if (x.sent != null and x.sent.? == q.handle) {
                 return e.emit(slot, .{ .input = .{ .call = x.handle, .requests = q.requests } });
+            },
+            .progress => |p| for (slot.calls.items) |x| if (x.sent != null and x.sent.? == p.handle) {
+                return e.emit(slot, .{ .progress = .{ .call = x.handle, .progress = p.progress, .total = p.total, .message = p.message } });
             },
             .timeout => unreachable, // `poll` never says it
             else => e.emit(slot, .{ .server = event }),

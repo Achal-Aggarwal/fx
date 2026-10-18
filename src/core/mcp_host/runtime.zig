@@ -210,6 +210,10 @@ const Request = struct {
     owned_url: ?[]u8 = null,
     /// A call's way to ask the user, on the caller's thread.
     asker: ?Asker = null,
+    /// Where the call's progress notes go, on the caller's thread.
+    progress: ?mcp_contract.ProgressSink = null,
+    /// The latest note the owner left for the caller; its message is r.gpa's.
+    note: ?mcp_contract.Progress = null,
     /// Guarded by `Runtime.mutex`: a question waiting for the caller to ask.
     question: ?Pending = null,
     /// Owner thread only: fx declined the server's question, so the call's
@@ -500,11 +504,11 @@ pub const Runtime = struct {
         cancel: ?*const std.atomic.Value(bool),
         asker: ?Asker,
     ) Error!CallResult {
-        return r.callObserved(alloc, server, tool, arguments, cancel, asker, null);
+        return r.callObserved(alloc, server, tool, arguments, cancel, asker, null, null);
     }
 
-    pub fn callObserved(r: *Runtime, alloc: Allocator, server: []const u8, tool: []const u8, arguments: ?[]const u8, cancel: ?*const std.atomic.Value(bool), asker: ?Asker, observed: ?observation.McpCall) Error!CallResult {
-        var req: Request = .{ .kind = .{ .call = .{ .server = server, .tool = tool, .arguments = arguments } }, .alloc = alloc, .asker = asker, .observation = observed };
+    pub fn callObserved(r: *Runtime, alloc: Allocator, server: []const u8, tool: []const u8, arguments: ?[]const u8, cancel: ?*const std.atomic.Value(bool), asker: ?Asker, progress: ?mcp_contract.ProgressSink, observed: ?observation.McpCall) Error!CallResult {
+        var req: Request = .{ .kind = .{ .call = .{ .server = server, .tool = tool, .arguments = arguments } }, .alloc = alloc, .asker = asker, .progress = progress, .observation = observed };
         try r.submit(&req, cancel);
         return switch (req.result) {
             .call => |c| c,
@@ -563,6 +567,7 @@ pub const Runtime = struct {
         while (!req.done.isSet()) {
             req.done.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
             if (req.asker) |asker| r.askWaiting(req, asker);
+            if (req.progress) |sink| r.reportProgress(req, sink);
             if (!cancel_tried) if (cancel) |flag| if (flag.load(.acquire)) {
                 cancel_tried = true;
                 // When stopping, the owner ends the request itself.
@@ -570,6 +575,22 @@ pub const Runtime = struct {
             };
         }
         if (cancel_sent) cancel_req.done.waitUncancelable(io);
+        // A note that came with the end is shown too, and freed.
+        if (req.progress) |sink| r.reportProgress(req, sink);
+    }
+
+    /// On the caller's thread: passes the latest note the owner left, if
+    /// any, to the call's progress sink.
+    fn reportProgress(r: *Runtime, req: *Request, sink: mcp_contract.ProgressSink) void {
+        r.mutex.lockUncancelable(r.io);
+        const note = req.note orelse {
+            r.mutex.unlock(r.io);
+            return;
+        };
+        req.note = null;
+        r.mutex.unlock(r.io);
+        defer if (note.message) |m| r.gpa.free(m);
+        sink.callback(sink.context, note);
     }
 
     /// On the caller's thread: asks the question the owner left, if any, and
@@ -915,6 +936,16 @@ pub const Runtime = struct {
                     if (down) result.ended.why = r.failureText(req.alloc, i) catch null;
                 }
                 r.finish(req, .{ .call = result });
+            },
+            .progress => |p| {
+                const req = r.calls.get(p.call) orelse return;
+                if (req.progress == null) return;
+                const message = if (p.message) |m| try r.gpa.dupe(u8, m) else null;
+                r.mutex.lockUncancelable(r.io);
+                defer r.mutex.unlock(r.io);
+                // Only the latest waits for the caller.
+                if (req.note) |old| if (old.message) |m| r.gpa.free(m);
+                req.note = .{ .progress = p.progress, .total = p.total, .message = message };
             },
             .input => |q| {
                 const req = r.calls.get(q.call) orelse return r.engine.cancel(q.call);

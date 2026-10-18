@@ -255,6 +255,30 @@ export const scenarios: Scenario[] = [
     check: (lines) => same(lines.filter((l) => l.status).at(-1)?.status?.[0]?.last_error, "FileNotFound", "last errors"),
   }),
   engineScenario({
+    name: "u12-progress-note",
+    description: "A call's accepted progress reaches the host with its message, terminal-safe: a value that doesn't grow and another token's note never do",
+    servers: {
+      a: {
+        rules: modern({
+          method: "tools/call",
+          before: [
+            { jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: "$id", progress: 1, total: 4, message: "halfway\u0007 there" } },
+            { jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: "$id", progress: 1, message: "again" } },
+            { jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: "$id", progress: 2 } },
+            { jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: 999, progress: 3, message: "not ours" } },
+          ],
+          result: { resultType: "complete", content: [{ type: "text", text: "done" }] },
+        }),
+      },
+    },
+    script: ["call a echo", "expect a.called.1.result 10000"],
+    machines: { a: [...BASE, "subscription"] },
+    check: (lines) => {
+      const notes = lines.filter((l) => l.event?.tag === "a.progress.1").map((l) => [l.event.progress, l.event.total, l.event.message]);
+      return same(notes, [[1, 4, "halfway? there"], [2, null, null]], "progress events");
+    },
+  }),
+  engineScenario({
     name: "u12-start-failure-detail",
     description: "A server that prints a banner instead of answering and exits: the status keeps its exit code and the banner, terminal-safe, until it starts again",
     servers: { a: { rules: [{ method: "*", noReply: true }], flags: ["--banner", "Server started on stdio\u001b[31m", "--exit-after", "300"] } },

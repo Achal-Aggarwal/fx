@@ -118,6 +118,7 @@ const Lab = struct {
             .phase => |p| lab.arena.print("{s}.phase.{s}", .{ s, @tagName(p) }),
             .called => |c| lab.arena.print("{s}.called.{d}.{s}", .{ s, lab.number(c.call), @tagName(c.outcome) }),
             .input => |q| lab.arena.print("{s}.input.{d}", .{ s, lab.number(q.call) }),
+            .progress => |p| lab.arena.print("{s}.progress.{d}", .{ s, lab.number(p.call) }),
             .server => |v| switch (v) {
                 .tools => |t| lab.arena.print("{s}.tools.{s}", .{ s, if (t.ok) "ok" else "fail" }),
                 else => lab.arena.print("{s}.{s}", .{ s, @tagName(v) }),
@@ -140,6 +141,7 @@ const Lab = struct {
                 try lab.print("event", .{ .tag = t, .maybe_ran = c.maybe_ran, .timed_out = c.timed_out, .answer = answer });
             },
             .input => |q| try lab.print("event", .{ .tag = t, .requests = q.requests.len }),
+            .progress => |p| try lab.print("event", .{ .tag = t, .progress = p.progress, .total = p.total, .message = p.message }),
             .server => |v| switch (v) {
                 .tools => {
                     const list = try e.toolList(event.server);

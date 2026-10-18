@@ -2105,7 +2105,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
 
       await tui.waitForComposer(15_000);
       await tui.sendText("Call the modern MCP fixture.");
-      // The server's progress note shows on the working line (N46).
+      // The server's progress note shows on the working line.
       await tui.waitForText("MCP fixture halfway", 20_000);
       await tui.waitForText("Modern MCP TUI complete.", 20_000);
 
@@ -3281,7 +3281,7 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
     35_000,
   );
 
-  // A long tool's progress notes show while it runs (N46).
+  // A long tool's progress notes show while it runs.
   test("fx ask shows a 2026 server's progress notes", async () => {
     const progressRoot = createRoot("ask-progress", MODERN_FIXTURE, {
       mode: "progress",

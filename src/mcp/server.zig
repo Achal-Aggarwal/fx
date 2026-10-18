@@ -53,11 +53,13 @@ const subscriptions = @import("protocol/subscriptions.zig");
 
 /// Bytes of a line an excerpt keeps, before "...".
 const excerpt_max = 80;
+/// Bytes of a progress note the host is shown, before "...".
+const note_max = 160;
 
-/// The start of `line`, terminal-safe, in `buf`: never a cut UTF-8
-/// sequence, control bytes as '?', and "..." when cut.
-fn excerptOf(buf: *[excerpt_max + 3]u8, line: []const u8) []const u8 {
-    var n: usize = @min(line.len, excerpt_max);
+/// The start of `line`, at most `max` bytes, terminal-safe, in `buf`: never
+/// a cut UTF-8 sequence, control bytes as '?', and "..." when cut.
+fn excerptOf(comptime max: usize, buf: *[max + 3]u8, line: []const u8) []const u8 {
+    var n: usize = @min(line.len, max);
     if (n < line.len) {
         while (n > 0 and (line[n] & 0xC0) == 0x80) n -= 1;
     }
@@ -123,6 +125,10 @@ pub const Event = union(enum) {
     tools: struct { ok: bool, fresh: bool, dropped: tools.Added = .{}, needs_auth: bool = false },
     /// A call ended. `answer` is set when the server answered, valid until the next `next`.
     called: struct { handle: Handle, outcome: CallOutcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call },
+    /// A call's server reported progress that the request core accepted.
+    /// `message` is terminal-safe and cut to 160 bytes, valid until the
+    /// next `next`.
+    progress: struct { handle: Handle, progress: f64, total: ?f64, message: ?[]const u8 },
     /// A call needs the host's answers to its input requests: `respond` with
     /// one value per request, in order, or `cancel`. The requests stay
     /// valid until then.
@@ -271,6 +277,8 @@ pub const Server = struct {
     /// server was last ready: what a failed start wrote instead.
     stray: [excerpt_max + 3]u8 = undefined,
     stray_len: u8 = 0,
+    /// The message of the last progress event, until the next `next`.
+    note: [note_max + 3]u8 = undefined,
     /// What the last page added, for the warning about dropped tools.
     last_added: tools.Added = .{},
 
@@ -422,7 +430,7 @@ pub const Server = struct {
     }
 
     fn keepStray(r: *Server, line: []const u8) void {
-        r.stray_len = @intCast(excerptOf(&r.stray, line).len);
+        r.stray_len = @intCast(excerptOf(excerpt_max, &r.stray, line).len);
     }
 
     /// Why the last start of the process failed, if it did. The engine shows
@@ -761,7 +769,7 @@ pub const Server = struct {
         };
         var buf: [excerpt_max + 3]u8 = undefined;
         var text: [192]u8 = undefined;
-        const plain = std.mem.print(&text, "invalid reply ({s}): {s}", .{ why, excerptOf(&buf, line) }) catch unreachable;
+        const plain = std.mem.print(&text, "invalid reply ({s}): {s}", .{ why, excerptOf(excerpt_max, &buf, line) }) catch unreachable;
         var w: std.Io.Writer = .fixed(&r.refused_reply);
         std.json.Stringify.value(plain, .{}, &w) catch unreachable;
         try r.onMessage(id, 200, .{ .response = .{ .id = id, .body = .{ .failure = .{ .code = wire.code.invalid_request, .message = w.buffered(), .data = null } } } });
@@ -1103,11 +1111,26 @@ pub const Server = struct {
                 // One without a subscriptionId still refreshes the list.
                 if (std.mem.eql(u8, n.method, "notifications/tools/list_changed")) return r.stepCatalog(.invalidated);
                 if (std.mem.eql(u8, n.method, "notifications/progress")) {
-                    var found: [2]?[]const u8 = undefined;
-                    wire.objectFields(n.params orelse "{}", &.{ "progressToken", "progress" }, &found) catch return;
+                    var found: [4]?[]const u8 = undefined;
+                    wire.objectFields(n.params orelse "{}", &.{ "progressToken", "progress", "total", "message" }, &found) catch return;
                     const token = wire.decimal(found[0] orelse return) orelse return;
                     const value = std.fmt.parseFloat(f64, found[1] orelse return) catch return;
-                    return r.stepRequest(.{ .progress_received = .{ .token = token, .value = value } });
+                    const before = r.table.progressCount(token);
+                    try r.stepRequest(.{ .progress_received = .{ .token = token, .value = value } });
+                    // Accepted progress on a call reaches the host.
+                    if (r.table.progressCount(token) == before) return;
+                    const l = r.logicalFor(token) orelse return;
+                    if (l.what != .call) return;
+                    var text: [1024]u8 = undefined;
+                    var fixed: std.heap.FixedBufferAllocator = .init(&text);
+                    const said = if (found[3]) |raw| wire.decodeString(fixed.allocator(), raw) catch null else null;
+                    r.emit(.{ .progress = .{
+                        .handle = l.handle,
+                        .progress = value,
+                        .total = if (found[2]) |t| std.fmt.parseFloat(f64, t) catch null else null,
+                        .message = if (said) |m| excerptOf(note_max, &r.note, m) else null,
+                    } });
+                    return;
                 }
             },
             // A 2026 server sends no requests; they are dropped. A 2025
