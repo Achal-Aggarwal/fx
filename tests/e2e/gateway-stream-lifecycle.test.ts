@@ -6333,9 +6333,12 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
           expect(readFileSync(compactionRecordPath(root.home, sessionId, "compacted-T1.txt")!, "utf8")).toContain(sourceHandle);
           const resumed = await runFx(["ask", "--json", "--resume-id", sessionId, "Recover the clipped tail from the saved retrieval without rerunning the command."], { cwd: root.workspace, env, timeoutMs: 30000 });
           expect(resumed.code).toBe(0);
-          // Compaction folded the command into T1, so the read has no call
-          // left to name.
-          expect(resumed.stderr).toBe("Reading more command output\n");
+          // Automatic compaction folded the command into T1, so the read has no
+          // call left to name. The manual one ran after the recovered turn,
+          // which still holds the call, and kept that turn, so the read names it.
+          expect(resumed.stderr).toBe(trigger === "automatic"
+            ? "Reading more command output\n"
+            : "Reading more output from printf 'once\\n' >> effects.txt; cat source.txt\n");
           expect(JSON.parse(resumed.stdout).final_output).toBe("RETRIEVAL_RESTART_COMPLETE");
           expect(gateway.requests).toHaveLength(8);
           expect(readFileSync(join(root.workspace, "effects.txt"), "utf8")).toBe("once\n");
