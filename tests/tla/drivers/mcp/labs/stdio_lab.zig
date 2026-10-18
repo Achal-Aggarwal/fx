@@ -255,6 +255,10 @@ const Lab = struct {
                 lab.store.discard();
                 try lab.print("tools", .{ .event = "fail" });
             },
+            .serve_last => {
+                lab.store.discard();
+                try lab.printTools("serve_last", false);
+            },
             .serve => try lab.printTools("serve", true),
             .arm_expiry => |a| lab.addTimer(.expiry, a.generation, a.after_ms),
         };
@@ -279,7 +283,7 @@ const Lab = struct {
                 if (added.invalid + added.duplicate > 0) {
                     try lab.print("tools", .{ .event = "dropped", .invalid = added.invalid, .duplicate = added.duplicate });
                 }
-                return .{ .page_received = .{ .more = page.next_cursor != null, .ttl_ms = page.ttl_ms } };
+                return .{ .page_received = .{ .more = page.next_cursor != null, .ttl_ms = page.ttl_ms, .now_ms = lab.now() } };
             },
         }
     }

@@ -1247,7 +1247,7 @@ pub const Server = struct {
                 r.store.check_headers = !r.legacyEra();
                 const added = r.store.addPage(r.gpa, page) catch return .page_failed;
                 r.last_added = added;
-                return .{ .page_received = .{ .more = page.next_cursor != null, .ttl_ms = page.ttl_ms } };
+                return .{ .page_received = .{ .more = page.next_cursor != null, .ttl_ms = page.ttl_ms, .now_ms = r.now() } };
             },
         }
     }
@@ -2051,6 +2051,14 @@ pub const Server = struct {
             .fail => {
                 r.store.discard();
                 r.emit(.{ .tools = .{ .ok = false, .fresh = false, .needs_auth = r.page_needs_auth } });
+                r.page_needs_auth = false;
+                try r.relisted(false);
+            },
+            // The last list goes out unless the page needs a sign-in, which
+            // every call from that list would need too.
+            .serve_last => {
+                r.store.discard();
+                r.emit(.{ .tools = .{ .ok = !r.page_needs_auth, .fresh = false, .needs_auth = r.page_needs_auth } });
                 r.page_needs_auth = false;
                 try r.relisted(false);
             },
