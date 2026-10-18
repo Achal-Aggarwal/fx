@@ -1566,7 +1566,9 @@ describe("MCP login", () => {
   // localhost redirect, so fx's Slack app signs in with one.
   test("Slack signs in as fx's Slack app at Slack's own page, with a localhost redirect on its port and the app's scopes, and refreshes without a secret", async () => {
     upstream = startModernMcpHttpFixture("json");
-    auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID, slackLocalhostRedirect: true });
+    // Slack's 401 names one of its own scopes; the login asks for it with
+    // the app's, so it adds nothing here.
+    auth = startAuthFixture(upstream.url, { slackBridgeClientId: FX_SLACK_CLIENT_ID, slackLocalhostRedirect: true, challengeScope: "chat:write" });
     const root = createRoot(auth, true, "http", auth.url, true, FX_SLACK_CLIENT_ID);
     // fx's Slack app with no scopes of the config's own, on a free port.
     const probe = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });

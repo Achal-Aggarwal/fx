@@ -60,8 +60,9 @@ pub const Incoming = union(enum) {
     /// its `WWW-Authenticate` values, joined.
     ended: struct { key: u64, status: u16, how: Ending, challenge: ?[]const u8 },
     /// The answer to `fetch` request `key`: status 0 when none came. `media`
-    /// is its Content-Type, "" for none.
-    fetched: struct { key: u64, status: u16, body: []const u8, location: ?[]const u8, media: []const u8 },
+    /// is its Content-Type, "" for none; `challenge` its `WWW-Authenticate`
+    /// values, joined.
+    fetched: struct { key: u64, status: u16, body: []const u8, location: ?[]const u8, media: []const u8, challenge: ?[]const u8 },
     timeout,
 };
 
@@ -72,7 +73,7 @@ const Posted = union(enum) {
     session: struct { key: u64, id: []u8 },
     opened: u64,
     ended: struct { key: u64, status: u16, how: Ending, challenge: ?[]u8 = null },
-    fetched: struct { key: u64, status: u16 = 0, body: ?[]u8 = null, location: ?[]u8 = null, media: ?[]u8 = null },
+    fetched: struct { key: u64, status: u16 = 0, body: ?[]u8 = null, location: ?[]u8 = null, media: ?[]u8 = null, challenge: ?[]u8 = null },
 
     fn free(p: Posted, gpa: std.mem.Allocator) void {
         switch (p) {
@@ -86,6 +87,7 @@ const Posted = union(enum) {
                 if (f.body) |b| gpa.free(b);
                 if (f.location) |l| gpa.free(l);
                 if (f.media) |m| gpa.free(m);
+                if (f.challenge) |c| gpa.free(c);
             },
             .opened => {},
         }
@@ -322,7 +324,7 @@ pub const Client = struct {
                 }
                 c.settle(f.key);
                 c.held = posted;
-                return .{ .fetched = .{ .key = f.key, .status = f.status, .body = f.body orelse "", .location = f.location, .media = f.media orelse "" } };
+                return .{ .fetched = .{ .key = f.key, .status = f.status, .body = f.body orelse "", .location = f.location, .media = f.media orelse "", .challenge = f.challenge } };
             },
         }
     }
@@ -495,11 +497,18 @@ pub const Client = struct {
         } else req.sendBodiless() catch return none;
         var response = req.receiveHead(&.{}) catch return none;
         var got: @FieldType(Posted, "fetched") = .{ .key = key, .status = @backingInt(response.head.status) };
+        var challenge: std.ArrayList(u8) = .empty;
+        defer challenge.deinit(c.gpa);
         var it = response.head.iterateHeaders();
-        while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "location")) {
-            got.location = c.gpa.dupe(u8, h.value) catch null;
-            break;
-        };
+        while (it.next()) |h| {
+            if (got.location == null and std.ascii.eqlIgnoreCase(h.name, "location")) {
+                got.location = c.gpa.dupe(u8, h.value) catch null;
+            } else if (std.ascii.eqlIgnoreCase(h.name, "www-authenticate")) {
+                if (challenge.items.len > 0) challenge.appendSlice(c.gpa, ", ") catch {};
+                challenge.appendSlice(c.gpa, h.value) catch {};
+            }
+        }
+        if (challenge.items.len > 0) got.challenge = challenge.toOwnedSlice(c.gpa) catch null;
         // The head's bytes don't outlive reading the body.
         if (response.head.content_type) |media| got.media = c.gpa.dupe(u8, media) catch null;
         var transfer: [64]u8 = undefined;

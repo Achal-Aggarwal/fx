@@ -106,7 +106,8 @@ pub const Ending = union(enum) {
 /// Keys of this module's own requests: above `server.zig`'s auxiliary keys.
 pub const fetch_base: u64 = 3 << 62;
 
-const Stage = enum { idle, resource_metadata, server_metadata, registration, token };
+/// `probe`: the request a sign-in sends first, for the server's challenge.
+const Stage = enum { idle, probe, resource_metadata, server_metadata, registration, token };
 
 /// What a refresh needs, from the sign-in that brought the tokens.
 const Credential = struct {
@@ -228,18 +229,14 @@ pub const Auth = struct {
             },
             .forgotten => try a.stepGate(.{ .forget = key }),
             .rejected => |r| {
-                const c = (try discovery.parseChallenge(a.flow_arena.allocator(), r.challenge)) orelse discovery.Challenge{};
-                if (c.resource_metadata) |url| {
-                    if (a.challenge_url) |old| a.gpa.free(old);
-                    a.challenge_url = try a.gpa.dupe(u8, url);
-                }
+                const c = try a.takeChallenge(r.challenge);
                 if (r.status == 403) {
                     if (!c.insufficient_scope) {
                         try a.stepGate(.{ .accepted = key });
                         return false;
                     }
                     // A refresh brings no new scopes; this needs a sign-in.
-                    try a.stepFlow(.{ .challenged = try a.scopeBits(c.scope) });
+                    try a.stepFlow(.{ .challenged = try a.challengeScopes(c.scope) });
                     try a.stepGate(.{ .accepted = key });
                     try a.announce(true);
                     try a.actions.append(a.gpa, .{ .give_up = .{ .key = key, .why = .needs_sign_in } });
@@ -247,11 +244,28 @@ pub const Auth = struct {
                 }
                 // The challenge's scopes, or none, which leaves the
                 // resource metadata's.
-                try a.stepFlow(.{ .challenged = try a.scopeBits(c.scope) });
+                try a.stepFlow(.{ .challenged = try a.challengeScopes(c.scope) });
                 try a.stepGate(.{ .rejected = key });
             },
         }
         return true;
+    }
+
+    /// Reads a challenge, keeping its resource_metadata for discovery.
+    fn takeChallenge(a: *Auth, raw: []const u8) Error!discovery.Challenge {
+        const c = (try discovery.parseChallenge(a.flow_arena.allocator(), raw)) orelse discovery.Challenge{};
+        if (c.resource_metadata) |url| {
+            if (a.challenge_url) |old| a.gpa.free(old);
+            a.challenge_url = try a.gpa.dupe(u8, url);
+        }
+        return c;
+    }
+
+    /// The scopes a challenge has the next sign-in ask for: its own, which
+    /// the spec makes authoritative, with the configured ones.
+    fn challengeScopes(a: *Auth, list: ?[]const u8) Allocator.Error!u32 {
+        const configured = a.options.scopes orelse return a.scopeBits(list);
+        return try a.scopeBits(configured) | try a.scopeBits(list);
     }
 
     fn scopeBits(a: *Auth, list: ?[]const u8) Allocator.Error!u32 {
@@ -328,12 +342,27 @@ pub const Auth = struct {
     pub fn signIn(a: *Auth, redirect_uri: []const u8) Error!void {
         if (!discovery.secureOrLoopback(redirect_uri)) return error.InvalidRedirect;
         if (a.flow.phase == .idle) {
+            if (a.stage == .probe) return;
             _ = a.flow_arena.reset(.retain_capacity);
             a.token_error = null;
             a.redirect_uri = try a.flow_arena.allocator().dupe(u8, redirect_uri);
+            // With no challenge seen, one request without a token asks the
+            // server where its metadata is and what scope it wants, so the
+            // sign-in starts knowing both.
+            if (a.challenge_url == null) {
+                a.stage = .probe;
+                a.flow_key = a.newKey();
+                a.client.fetch(a.flow_key, .post, a.server_url, probe_body, "application/json", &.{.{ .name = "accept", .value = "application/json, text/event-stream" }}) catch {
+                    a.stage = .idle;
+                    return a.stepFlow(.sign_in);
+                };
+                return;
+            }
         }
         try a.stepFlow(.sign_in);
     }
+
+    const probe_body = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"server/discover\",\"params\":{}}";
 
     /// The URL the browser came back to after the authorization request.
     pub fn finishSignIn(a: *Auth, callback: []const u8) Error!void {
@@ -351,6 +380,12 @@ pub const Auth = struct {
     }
 
     pub fn cancelSignIn(a: *Auth) Error!void {
+        if (a.stage == .probe) {
+            a.client.cancel(a.flow_key);
+            a.flow_key = 0;
+            a.stage = .idle;
+            return a.actions.append(a.gpa, .{ .sign_in_failed = .{ .why = .cancelled } });
+        }
         if (a.flow.phase != .idle) try a.stepFlow(.cancel);
     }
 
@@ -583,8 +618,9 @@ pub const Auth = struct {
     /// The answer to one of this module's requests. False when `key` isn't one.
     /// `answer` lasts only until the client's next `next`; what is read from it
     /// is read from a copy kept as long as it's needed. `media` is its
-    /// Content-Type: metadata must be JSON.
-    pub fn fetched(a: *Auth, key: u64, status: u16, media: []const u8, answer: []const u8) Error!bool {
+    /// Content-Type: metadata must be JSON; `challenge` its
+    /// `WWW-Authenticate`, which only a sign-in's probe reads.
+    pub fn fetched(a: *Auth, key: u64, status: u16, media: []const u8, challenge: ?[]const u8, answer: []const u8) Error!bool {
         if (key == 0) return false;
         if (key == a.revoke_key) {
             a.revoke_key = 0;
@@ -609,6 +645,17 @@ pub const Auth = struct {
         }
         switch (a.stage) {
             .idle => {},
+            .probe => {
+                a.stage = .idle;
+                // A 401, or a 403 asking for scopes, says where the metadata
+                // is and what to ask for; anything else leaves the
+                // well-known places.
+                if (status == 401 or status == 403) if (challenge) |raw| {
+                    const c = try a.takeChallenge(raw);
+                    try a.stepFlow(.{ .challenged = try a.challengeScopes(c.scope) });
+                };
+                try a.stepFlow(.sign_in);
+            },
             .resource_metadata => {
                 if (status == 200) if (discovery.parseResourceMetadata(fa, body, a.server_url)) |prm| {
                     a.prm = prm;
@@ -842,7 +889,7 @@ test "a refresh the host decides waits for it, and ends however it does: replace
             .answered => {
                 a.refresh_due = false;
                 a.refresh_key = a.newKey();
-                _ = try a.fetched(a.refresh_key, 200, "application/json", "{\"access_token\":\"at3\",\"token_type\":\"Bearer\",\"refresh_token\":\"rt3\",\"expires_in\":3600}");
+                _ = try a.fetched(a.refresh_key, 200, "application/json", null, "{\"access_token\":\"at3\",\"token_type\":\"Bearer\",\"refresh_token\":\"rt3\",\"expires_in\":3600}");
                 try testing.expectEqual(@as(usize, 3), actions.len);
                 try testing.expect(actions.*[0] == .save);
                 try testing.expect(actions.*[1] == .post and actions.*[1].post.key == 1);
@@ -853,7 +900,7 @@ test "a refresh the host decides waits for it, and ends however it does: replace
             .refused => {
                 a.refresh_due = false;
                 a.refresh_key = a.newKey();
-                _ = try a.fetched(a.refresh_key, 400, "application/json", "{\"error\":\"invalid_grant\"}");
+                _ = try a.fetched(a.refresh_key, 400, "application/json", null, "{\"error\":\"invalid_grant\"}");
                 try testing.expect(actions.*[0] == .save);
                 try testing.expect(actions.*[actions.len - 1] == .refresh_ended);
                 try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
@@ -863,7 +910,7 @@ test "a refresh the host decides waits for it, and ends however it does: replace
             .refused_200 => {
                 a.refresh_due = false;
                 a.refresh_key = a.newKey();
-                _ = try a.fetched(a.refresh_key, 200, "application/json", "{\"ok\":false,\"error\":\"bad_client_secret\"}");
+                _ = try a.fetched(a.refresh_key, 200, "application/json", null, "{\"ok\":false,\"error\":\"bad_client_secret\"}");
                 try testing.expect(actions.*[0] == .save);
                 try testing.expect(actions.*[actions.len - 1] == .refresh_ended);
                 try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
@@ -873,7 +920,7 @@ test "a refresh the host decides waits for it, and ends however it does: replace
             .failed_429 => {
                 a.refresh_due = false;
                 a.refresh_key = a.newKey();
-                _ = try a.fetched(a.refresh_key, 429, "application/json", "{\"error\":\"slow_down\"}");
+                _ = try a.fetched(a.refresh_key, 429, "application/json", null, "{\"error\":\"slow_down\"}");
                 for (actions.*) |x| try testing.expect(x != .save);
                 try testing.expect(actions.*[actions.len - 1] == .refresh_ended);
                 try testing.expectEqualStrings("rt", a.refresh_token.?);

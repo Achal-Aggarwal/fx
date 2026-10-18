@@ -681,7 +681,7 @@ pub const Server = struct {
             .opened => |key| if (r.legacy != null and key == r.listen_key) try r.listenSettled(),
             .ended => |e| try r.onEnded(e.key, e.status, e.how, e.challenge),
             .fetched => |f| {
-                _ = try r.auth.fetched(f.key, f.status, f.media, f.body);
+                _ = try r.auth.fetched(f.key, f.status, f.media, f.challenge, f.body);
                 try r.runAuth(null);
             },
             .timeout => unreachable,
@@ -2056,7 +2056,7 @@ pub const Server = struct {
                 // tokens stay, and what waits for it fails.
                 .refresh => |key| if (r.auth.refresh_key == key) {
                     r.client.cancel(key);
-                    _ = try r.auth.fetched(key, 0, "", "");
+                    _ = try r.auth.fetched(key, 0, "", null, "");
                     try r.runAuth(null);
                 },
             }
