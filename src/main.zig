@@ -1214,6 +1214,7 @@ const App = struct {
         defer if (context_targets.len > 0) self.alloc.free(context_targets);
 
         try AgentAppRuntime.refreshProjectContext(self, context_targets);
+        self.noteModelCatalogActivity();
         self.session.setConversationLanguageFromUserMessage(prompt);
 
         debug_trace.logf(
@@ -1237,6 +1238,15 @@ const App = struct {
         return true;
     }
 
+    /// A prompt the user submitted is activity, so a stale or failed model
+    /// catalog refetches in the background. Only these submission paths call
+    /// it: a recovery continuation can queue during startup, before the App
+    /// reaches the address a fetch thread may hold. Cooperative hosts fetch
+    /// inline and skip it.
+    fn noteModelCatalogActivity(self: *App) void {
+        if (comptime !host_profile.cooperative_agent) self.startModelCacheWarmup();
+    }
+
     pub fn adoptPendingUserPrompt(
         self: *App,
         draft: *const input_submit_runtime.PendingPromptDraft,
@@ -1258,6 +1268,7 @@ const App = struct {
             &.{};
         defer if (context_targets.len > 0) self.alloc.free(context_targets);
         try AgentAppRuntime.refreshProjectContext(self, context_targets);
+        self.noteModelCatalogActivity();
         self.session.setConversationLanguageFromUserMessage(draft.prompt);
 
         const skill_tokens = try promptCardSkillTokensFromDisplaySpans(
@@ -1469,9 +1480,6 @@ const App = struct {
         turn_id: u64,
         user_prompt_already_presented: bool,
     ) !bool {
-        // A queued prompt is user activity, so a stale or failed model catalog
-        // refetches in the background. Cooperative hosts fetch inline and skip this.
-        if (comptime !host_profile.cooperative_agent) self.startModelCacheWarmup();
         const queued = try self.snapshotPrompt(
             prompt,
             skill_tokens,
