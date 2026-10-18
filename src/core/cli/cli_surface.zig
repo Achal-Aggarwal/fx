@@ -3151,7 +3151,6 @@ fn parseSessionConvertArgs(args: []const [:0]const u8) !output_contracts.OutputF
     return error.InvalidLocalSurfaceArgs;
 }
 
-/// Why `fx sessions convert` refuses without the v2 store switched on.
 /// `fx sessions convert`: converts every v1 session v2 does not hold yet,
 /// and fails when it skipped any (D61).
 fn runSessionConvert(alloc: Allocator, deps: RunDeps, format: output_contracts.OutputFormat) !RunResult {

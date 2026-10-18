@@ -1,10 +1,11 @@
-//! The one door between fx and the session manager (sessions v2).
+//! The one door between fx and the session manager (sessions v2), fx's only
+//! session store.
 //!
-//! Behind `--sessions-v2` or FX_SESSIONS_V2=1, with one backend per process.
 //! Hosts call this file; it is the only fx file that imports
 //! `session_manager`, and the boundary test at the bottom keeps it so. v1
 //! code is never called from here except for its encoders and its turn
-//! builder, so both backends store the same bytes for the same history.
+//! builder, so a session converted from v1 holds the same bytes for the same
+//! history as one fx started here.
 //!
 //! What goes where:
 //! - each completed piece of a turn is one `item` whose `type` is the v1
