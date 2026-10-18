@@ -7677,8 +7677,14 @@ test.skipIf(!tmuxAvailable())(
         await active.waitForStableComposer(TIMEOUT);
         await active.sendText("Continue the saved conversation without tools.");
         await active.waitForPane((pane) => pane.includes(reply) && hasEmptyComposer(pane), TIMEOUT);
-        const events = readFileSync(eventsPath, "utf8").trim().split("\n").map((line) => JSON.parse(line).event);
-        expect(events.filter((event) => event.assistant?.text === reply)).toHaveLength(1);
+        // The reply shows as it streams, before the turn saves it.
+        const savedReplies = () => readFileSync(eventsPath, "utf8").trim().split("\n")
+          .map((line) => JSON.parse(line).event)
+          .filter((event) => event.assistant?.text === reply);
+        await waitForCondition(() => {
+          try { return savedReplies().length > 0; } catch { return false; }
+        }, `the saved ${reply}`);
+        expect(savedReplies()).toHaveLength(1);
         expect(readFileSync(eventsPath).subarray(0, before.length).equals(before)).toBe(true);
         expect(await active.captureFullScrollback()).not.toContain("FileNotFound");
         await active.sendText("/quit");

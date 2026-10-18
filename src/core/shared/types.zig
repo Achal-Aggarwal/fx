@@ -337,6 +337,9 @@ pub const ModelRecoveryAction = enum {
     /// Silence detected; checking liveness before doing anything else.
     checking_liveness,
     paused,
+    /// The final reply finished before its turn was saved as done; recovery
+    /// delivers that saved reply without another model request.
+    delivering_response,
 };
 
 pub const ModelRecoveryRequiredAction = enum {
@@ -555,6 +558,7 @@ pub const RouteRecoveryStatus = struct {
             .waiting_for_connectivity => "waiting for connection",
             .checking_liveness => "checking the connection",
             .paused => "recovery paused",
+            .delivering_response => "delivering saved response",
         };
         // Connectivity waits and liveness probes are un-budgeted: no attempt
         // counter and no raw error names, just the honest current state.

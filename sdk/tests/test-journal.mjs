@@ -31,6 +31,12 @@ const toolResults = (prompt) => prompt
 const encodeRecord = (events) => new TextEncoder().encode(JSON.stringify({ format: "libfx-journal-v1", events }));
 const decodeRecord = (data) => JSON.parse(new TextDecoder().decode(data)).events;
 const storedEvents = (store) => store.records.flatMap((record) => decodeRecord(record.data));
+// A crash during the last turn's model request: the store kept only the
+// progress written before that request.
+const crashDuringRequest = (events) => {
+  const last = events.at(-1).turn;
+  return events.slice(0, events.findIndex((event) => event.turn === last && event.type === "turn_progress") + 1);
+};
 
 // The tests shape sessions as event lists, such as a crash that lost the last
 // events. `persisted` keeps such a list behind the persistence interface: each
@@ -526,9 +532,10 @@ test("resume continues a crashed turn and tells the model", async () => {
   await run(agent, "first");
   await run(agent, "remember plums");
   await agent.close();
-  // The process died after the response, before the turn's commit.
-  const crashed = eventJournal(journal.events.slice(0, -1));
+  // The process died during the model request, before its response.
+  const crashed = eventJournal(crashDuringRequest(journal.events));
   assert.equal(crashed.events.at(-1).type, "turn_progress");
+  assert.equal(crashed.events.at(-1).data.assistant_source, "");
 
   const events = [];
   const resumed = await createFxEngine(options(targetBackend, crashed, { onEvent: (event) => events.push(event) }));
@@ -551,6 +558,141 @@ test("resume continues a crashed turn and tells the model", async () => {
   assert.equal(commits.at(-1).data.kind, "assistant");
   assert.equal(commits.at(-1).data.user.text, "remember plums");
   assertContiguous(crashed.events);
+});
+
+test("a crash after the final reply, before its turn ends, delivers the saved reply without asking the model again", async () => {
+  const journal = eventJournal();
+  const agent = await createFxEngine(options(sourceBackend, journal));
+  await run(agent, "first");
+  await run(agent, "remember plums");
+  await agent.close();
+  // The process died after the reply was stored, before the turn's end.
+  const crashed = eventJournal(journal.events.slice(0, -1));
+  const saved = crashed.events.at(-1);
+  assert.equal(saved.type, "turn_progress");
+  assert.equal(saved.data.assistant_source, "answer to remember plums");
+  assert.equal(saved.data.action, "delivering_response");
+
+  const resumed = await createFxEngine(options(targetBackend, crashed));
+  requests.length = 0;
+  const turn = resumed.resume();
+  let text = "";
+  for await (const update of turn) if (update.type === "text_delta") text += update.delta;
+  assert.equal((await turn.result).stopReason, "end_turn");
+  assert.equal(resumed.resume(), null, "the turn resumes once");
+  assert.equal(requests.length, 0, "the saved reply is delivered without a model request");
+  // The new engine's host holds none of the turn, so the resumed turn sends
+  // the saved reply as its text, with no restart notice.
+  assert.equal(text, "answer to remember plums", "the resumed turn sends the saved reply as its text");
+  // The next turn's history holds the delivered reply once.
+  await run(resumed, "and then");
+  await resumed.close();
+  const replies = requests[0].filter((message) => message.role === "assistant" && textOf(message) === "answer to remember plums");
+  assert.equal(replies.length, 1);
+  const commits = crashed.events.filter((event) => event.type === "turn_committed");
+  assert.equal(commits.length, 3);
+  assert.equal(commits[1].data.kind, "assistant");
+  assert.equal(commits[1].data.user.text, "remember plums");
+  assertContiguous(crashed.events);
+
+  // A durable session's stream already holds what the turn sent, so its
+  // worker resumes saying so: the turn ends with the saved reply and sends
+  // nothing again.
+  const again = await createFxEngine(options(targetBackend, eventJournal(journal.events.slice(0, -1))));
+  requests.length = 0;
+  const shown = again.resume({ [Symbol.for("libfx.resumeOutputShown")]: true });
+  let shownText = "";
+  for await (const update of shown) if (update.type === "text_delta") shownText += update.delta;
+  assert.equal((await shown.result).stopReason, "end_turn");
+  await again.close();
+  assert.equal(requests.length, 0);
+  assert.equal(shownText, "", "a host that holds the reply is not sent it again");
+});
+
+test("a resume that restarts a reply the last process had started sends that start first", async () => {
+  const journal = eventJournal();
+  const agent = await createFxEngine(options(sourceBackend, journal));
+  await run(agent, "remember plums");
+  await agent.close();
+  // The process died after the response's checkpoint, before the turn
+  // accepted the response as its reply: the reply is held for a restart.
+  const crashed = eventJournal(journal.events.slice(0, -2));
+  const held = crashed.events.at(-1);
+  assert.equal(held.type, "turn_progress");
+  assert.equal(held.data.assistant_source, "answer to remember plums");
+  assert.notEqual(held.data.action, "delivering_response");
+
+  const resumed = await createFxEngine(options(targetBackend, crashed));
+  requests.length = 0;
+  const turn = resumed.resume();
+  let text = "";
+  for await (const update of turn) if (update.type === "text_delta") text += update.delta;
+  assert.equal((await turn.result).stopReason, "end_turn");
+  await resumed.close();
+  assert.equal(requests.length, 1, "the restarted reply asks the model again");
+  // The new engine's host saw none of the turn: it gets what the last
+  // process had sent of the reply, then the restart.
+  assert.ok(text.startsWith("answer to remember plums"), JSON.stringify(text));
+  assert.ok(text.includes("[Response interrupted. Restarting.]"), JSON.stringify(text));
+});
+
+test("a turn's result waits until its end is stored", async () => {
+  const journal = eventJournal();
+  const store = persisted(journal);
+  let holding = false;
+  let endBarrier = null;
+  let release;
+  const held = new Promise((resolveHeld) => { release = resolveHeld; });
+  const holdingEnd = {
+    ...store,
+    async append(input) {
+      if (decodeRecord(input.data).some((event) => event.type === "turn_committed")) {
+        holding = true;
+        endBarrier = input.barrier;
+        await held;
+      }
+      return store.append(input);
+    },
+  };
+  const agent = await createFxEngine(options(sourceBackend, undefined, { persistence: holdingEnd }));
+  const turn = agent.prompt("hold the end");
+  let drained = false;
+  const updates = (async () => { for await (const _ of turn) {} drained = true; })();
+  let resolved = false;
+  void turn.result.then(() => { resolved = true; });
+  for (let waited = 0; !holding && waited < 5_000; waited += 10) await sleepMs(10);
+  assert.ok(holding, "the turn's end reached the store");
+  // A store may acknowledge other records before they are durable, but not
+  // a barrier, so the record that ends the turn is one.
+  assert.equal(endBarrier, true, "the record holding the turn's end is a barrier");
+  await sleepMs(100);
+  assert.equal(resolved, false, "the result waits while the turn's end is being stored");
+  assert.equal(drained, false, "the turn's updates end with its result");
+  release();
+  await updates;
+  assert.equal((await turn.result).stopReason, "end_turn");
+  assert.equal(journal.events.at(-1).type, "turn_committed");
+  await agent.close();
+});
+
+test("a turn whose end fails to store rejects its result", async () => {
+  const journal = eventJournal();
+  const store = persisted(journal);
+  const failingEnd = {
+    ...store,
+    async append(input) {
+      if (decodeRecord(input.data).some((event) => event.type === "turn_committed")) throw new Error("disk full");
+      return store.append(input);
+    },
+  };
+  const agent = await createFxEngine(options(sourceBackend, undefined, { persistence: failingEnd }));
+  const turn = agent.prompt("lose the end");
+  const failed = (error) => error.code === "FX_JOURNAL_APPEND_FAILED" && error.cause.message === "disk full";
+  // The reply streamed, but the turn never counted as done: its updates and
+  // its result end with the store's error.
+  await assert.rejects((async () => { for await (const _ of turn) {} })(), failed);
+  await assert.rejects(turn.result, failed);
+  await agent.close().catch(() => {});
 });
 
 test("a resumed turn answers a call a crash left running instead of running it again", async () => {
@@ -1577,7 +1719,9 @@ test("a turn that crashed with a full image window reopens with all of its image
   assert.equal(images.size, 4096 + 8);
   // A crash after the last turn's tool step leaves it open, with the window
   // full of the turns before it.
-  const stepped = journal.events.findLast((event) => event.type === "turn_progress" && event.steps === 1);
+  // The last progress before the saved final reply, which a resume would
+  // deliver without asking the model.
+  const stepped = journal.events.findLast((event) => event.type === "turn_progress" && event.steps === 1 && event.data.action !== "delivering_response");
   const survived = journal.events.slice(0, journal.events.indexOf(stepped) + 1);
   const read = new Set();
   const reading = withImageStore(persisted(eventJournal(survived)), images);
@@ -1965,8 +2109,8 @@ test("a retried prompt with the same turn id continues its open turn instead of 
   await turn.result;
   await agent.close();
   assert.ok(journal.events.some((event) => event.type === "turn_progress" && event.turnId === "turn-7"), "the turn's first progress records its id");
-  // The crash: the turn's commit was lost.
-  const crashed = eventJournal(journal.events.slice(0, -1));
+  // The crash: the process died during the turn's model request.
+  const crashed = eventJournal(crashDuringRequest(journal.events));
   const retried = await createFxEngine(options(targetBackend, crashed));
   requests.length = 0;
   const again = retried.prompt("remember plums", { turnId: "turn-7" });

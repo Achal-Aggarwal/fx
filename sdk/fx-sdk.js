@@ -357,6 +357,11 @@ const resumeTurn = Symbol("libfx.resume");
 const followUpInput = Symbol("libfx.followUp");
 // Carries the ids of the calls a resumed turn runs again.
 const rerunCallIds = Symbol("libfx.rerun");
+// Marks a resume whose host already holds what the turn sent before it
+// stopped, as a durable session's stream does, so the turn does not send it
+// again. Any other resume runs in a host that saw none of it. Never a
+// caller-visible option; `fx-harness.js` sets it.
+export const resumeOutputShown = Symbol.for("libfx.resumeOutputShown");
 
 function journalAppendError(cause) {
   const error = new Error("libfx journal append failed", { cause });
@@ -499,6 +504,10 @@ async function loadPersistence(persistence) {
   }
   return { checkpoint, events, head, tailBytes: bytes, lastSeq: events.at(-1)?.seq ?? covered };
 }
+
+// Events someone waits on, so the record holding one is a barrier: a steer
+// or withdrawal its caller awaits, and the end or yield a turn's result does.
+const waitedForEvents = new Set(["input_accepted", "input_withdrawn", "turn_committed", "turn_progress_cleared", "turn_yielded"]);
 
 // What a record's events say about turns, in order, for a store that tracks
 // them without reading records: a turn started, ended, or yielded, an input
@@ -2545,8 +2554,9 @@ export async function createFxEngine(options = {}) {
       return;
     }
     journalQueue.push(...events);
-    // A caller waits for its steer or withdrawal to be stored.
-    if (barrier || events.some((event) => event?.type === "input_accepted" || event?.type === "input_withdrawn")) journalBarrier = true;
+    // A caller waits for its steer or withdrawal to be stored, and a turn's
+    // result for the turn's end or yield.
+    if (barrier || events.some((event) => waitedForEvents.has(event?.type))) journalBarrier = true;
     // A turn notes a new config right before its first progress, a barrier:
     // the two go out in one write instead of two in a row.
     if (events.every((event) => event?.type === "session_config")) return;
@@ -2880,12 +2890,12 @@ export async function createFxEngine(options = {}) {
     }
     return named;
   }
-  const sendPrompt = (blocks, resuming = false, followUp = null, turnId = null, rerun = [], yieldAt = undefined) => {
+  const sendPrompt = (blocks, resuming = false, followUp = null, turnId = null, rerun = [], yieldAt = undefined, outputShown = false) => {
     // A journaled turn given a time to stop at yields before its first model
     // request after it, keeping the turn open.
     const stopAt = journal && yieldAt !== undefined ? { yieldAt } : {};
     if (resuming) {
-      return request("session/prompt", { sessionId, prompt: [], _meta: { fx: { continueRecovery: true, ...(rerun.length ? { rerun } : {}), ...stopAt } } });
+      return request("session/prompt", { sessionId, prompt: [], _meta: { fx: { continueRecovery: true, ...(outputShown ? {} : { freshOutput: true }), ...(rerun.length ? { rerun } : {}), ...stopAt } } });
     }
     const images = blocks.filter((block) => block.type === "image" && block.bytes !== undefined);
     const ids = images.length ? attachBytes(images.map((block) => block.bytes)) : [];
@@ -3612,12 +3622,15 @@ export async function createFxEngine(options = {}) {
         return sendPrompt(prepared, false, followUp, turn.id, [], yieldAt);
       });
     } else {
-      try { response = sendPrompt(prompt, resuming, followUp, turn.id, promptOptions[rerunCallIds] ?? [], yieldAt); } catch (error) { response = Promise.reject(error); }
+      try { response = sendPrompt(prompt, resuming, followUp, turn.id, promptOptions[rerunCallIds] ?? [], yieldAt, promptOptions[resumeOutputShown] === true); } catch (error) { response = Promise.reject(error); }
     }
-    // Appends after a turn's first progress are lazy, so the result does not
-    // wait for them; `close()` does. A failure already seen fails the turn.
+    // Appends after a turn's first progress are lazy, so the turn runs ahead
+    // of them, but its result waits until every record it wrote is stored:
+    // a turn counts as done only once its end is durable, and a failure
+    // among those records fails the turn.
     turn.result = response
-      .then((value) => {
+      .then(async (value) => {
+        if (journal) await journalSettled().catch(() => {});
         if (journalFailure) throw reportJournalFailure();
         if (value.stopReason === "yielded" && !cancelled) {
           // The core keeps the turn open: `resume()` continues it here, or
