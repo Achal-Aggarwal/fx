@@ -144,8 +144,9 @@ pub const Incoming = union(enum) {
     message: struct { bytes: []const u8, message: wire.Message },
     /// A line the server wrote to stderr, for logs only.
     stderr: []const u8,
-    /// A stdout line that isn't a valid MCP message was dropped.
-    dropped: wire.DecodeError,
+    /// A stdout line that isn't a valid MCP message was dropped. `line` is
+    /// empty for one from an earlier process.
+    dropped: struct { err: wire.DecodeError, line: []const u8 },
     /// The connection changed state. `lost` means the process is gone and
     /// requests in flight on it are lost (`transport_lost` in `core/request.zig`).
     changed: struct { state: core.State, lost: bool },
@@ -330,8 +331,12 @@ pub const Process = struct {
         const lost = switch (posted) {
             .line => |line| {
                 const message = wire.decode(line.bytes) catch |err| {
-                    p.gpa.free(line.bytes);
-                    return .{ .dropped = err };
+                    if (line.generation != p.conn.generation) {
+                        p.gpa.free(line.bytes);
+                        return .{ .dropped = .{ .err = err, .line = "" } };
+                    }
+                    p.held = line.bytes;
+                    return .{ .dropped = .{ .err = err, .line = line.bytes } };
                 };
                 const result = p.apply(.{ .line_received = line.generation }) catch |err| {
                     p.gpa.free(line.bytes);
@@ -786,7 +791,7 @@ test "lines that aren't MCP messages are dropped, and CRLF and empty lines are h
     initTest(&p, &argv);
     defer p.deinit();
     try p.start();
-    try testing.expectEqual(wire.DecodeError.InvalidJson, (try p.next(5_000)).dropped);
+    try testing.expectEqual(wire.DecodeError.InvalidJson, (try p.next(5_000)).dropped.err);
     const message = (try p.next(5_000)).message;
     try testing.expectEqualStrings("{\"jsonrpc\":\"2.0\",\"method\":\"m\"}", message.bytes);
 }

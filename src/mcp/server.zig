@@ -201,7 +201,7 @@ const Kept = struct {
 };
 
 const Timer = struct {
-    kind: union(enum) { request: request.Timer, probe: u32, expiry: catalog.Generation, resume_stream: request.Id, listen, listen_wait, backoff: Handle, relisten: struct { sub: u8, generation: u32 }, initialized: u64 },
+    kind: union(enum) { request: request.Timer, probe: u32, expiry: catalog.Generation, resume_stream: request.Id, listen, listen_wait, backoff: Handle, relisten: struct { sub: u8, generation: u32 }, initialized: u64, refresh: u64 },
     due_ms: i64,
 };
 
@@ -229,6 +229,10 @@ pub const Server = struct {
     /// Stdio: the process the era was last detected for, and a start asked
     /// for while the last process was still stopping.
     era_generation: stdio_conn.Generation = 0,
+    /// When the current start's time runs out.
+    start_due_ms: i64 = 0,
+    /// The refresh whose deadline is armed.
+    refresh_timed: u64 = 0,
     catalog_generation: stdio_conn.Generation = 0,
     start_pending: bool = false,
     table: request.Table,
@@ -244,6 +248,9 @@ pub const Server = struct {
     event_count: usize = 0,
     /// The answer an event points into, kept until the next `next`.
     held_answer: ?tools.Call = null,
+    /// The message of an invalid reply's answer, kept as long as the line it
+    /// came from: until the process is read again.
+    refused_reply: [512]u8 = undefined,
     /// What the last page added, for the warning about dropped tools.
     last_added: tools.Added = .{},
 
@@ -687,11 +694,39 @@ pub const Server = struct {
         switch (incoming) {
             // On stdio a response names its request only by its id.
             .message => |m| try r.onMessage(if (m.message == .response) m.message.response.id orelse 0 else 0, 200, m.message),
-            // With no sink for stderr, and a line that isn't MCP.
-            .stderr, .dropped => {},
+            // With no sink for stderr.
+            .stderr => {},
+            .dropped => |d| try r.onRefusedLine(d.err, d.line),
             .changed => |c| try r.onProcessChanged(c.state, c.lost),
             .timeout => unreachable,
         }
+    }
+
+    /// A line `decode` refused that names a request in flight is that
+    /// request's answer, an invalid one: the request fails with what was
+    /// wrong and the start of the line. Any other is ignored.
+    fn onRefusedLine(r: *Server, err: wire.DecodeError, line: []const u8) Error!void {
+        const id = wire.responseId(line) orelse return;
+        if (r.logicalFor(id) == null) return;
+        const why = switch (err) {
+            error.NotJsonRpc2 => "its jsonrpc isn't \"2.0\"",
+            error.Ambiguous => "it has both a result and an error, or neither",
+            error.InvalidResult => "its result isn't an object",
+            error.InvalidErrorObject => "its error isn't an error object",
+            else => "it isn't valid JSON-RPC",
+        };
+        var excerpt: [80]u8 = undefined;
+        var n: usize = @min(line.len, excerpt.len);
+        // Never cut a UTF-8 sequence; control bytes become '?'.
+        if (n < line.len) {
+            while (n > 0 and (line[n] & 0xC0) == 0x80) n -= 1;
+        }
+        for (line[0..n], excerpt[0..n]) |c, *e| e.* = if (c < 0x20 or c == 0x7f) '?' else c;
+        var text: [192]u8 = undefined;
+        const plain = std.mem.print(&text, "invalid reply ({s}): {s}{s}", .{ why, excerpt[0..n], if (n < line.len) "..." else "" }) catch unreachable;
+        var w: std.Io.Writer = .fixed(&r.refused_reply);
+        std.json.Stringify.value(plain, .{}, &w) catch unreachable;
+        try r.onMessage(id, 200, .{ .response = .{ .id = id, .body = .{ .failure = .{ .code = wire.code.invalid_request, .message = w.buffered(), .data = null } } } });
     }
 
     fn onProcessChanged(r: *Server, state: stdio_conn.State, lost: bool) Error!void {
@@ -859,11 +894,18 @@ pub const Server = struct {
         var id: request.Id = 0;
         for (out.effects()) |effect| switch (effect) {
             .write_request => |w| id = w.id,
-            .arm_timer => |a| try r.armRequestTimer(a.timer, a.after_ms),
+            .arm_timer => |a| try r.armRequestTimer(a.timer, if (kind == .initialize and a.timer.kind == .hard) r.startLeft(a.after_ms) else a.after_ms),
             else => {},
         };
         if (r.questionsHeld() > 0) try r.stepRequest(.{ .idle_paused = id });
         return id;
+    }
+
+    /// What is left of the start's time, at most `after_ms`. An initialize
+    /// that renews a ready 2025 session isn't a start.
+    fn startLeft(r: *const Server, after_ms: u32) u32 {
+        if (r.detector.ready()) return after_ms;
+        return @intCast(std.math.clamp(r.start_due_ms - r.now(), 0, after_ms));
     }
 
     /// 2025 questions the host holds and hasn't answered.
@@ -1749,6 +1791,12 @@ pub const Server = struct {
                 .refresh_ended => r.emit(.refresh_ended),
             }
         }
+        // A refresh that went out gets `refresh_ms` to be answered.
+        const key = r.auth.refresh_key;
+        if (key != 0 and key != r.refresh_timed) {
+            r.refresh_timed = key;
+            try r.timers.append(r.gpa, .{ .kind = .{ .refresh = key }, .due_ms = r.now() + r.options.timeouts.refresh_ms });
+        }
     }
 
     /// Posts a kept request with the token's `Authorization`, in
@@ -1874,8 +1922,10 @@ pub const Server = struct {
     }
 
     fn stepEra(r: *Server, event: era.Event) Error!void {
+        const was = r.detector.state;
         var out: era.Output = .{};
         r.detector.step(event, &out) catch return;
+        if (was == .unknown and r.detector.state != .unknown) r.start_due_ms = r.now() + r.options.timeouts.start_ms;
         if (r.tracer()) |t| try era.writeTrace(t, r.era_instance, &out);
         for (out.effects()) |effect| switch (effect) {
             .send_discover => |i| {
@@ -1894,7 +1944,7 @@ pub const Server = struct {
                 try era.writeInitialized(&body.writer);
                 r.proc.send(.notification, body.written()) catch {};
             },
-            .arm_probe_timer => |a| try r.timers.append(r.gpa, .{ .kind = .{ .probe = a.probe }, .due_ms = r.now() + a.after_ms }),
+            .arm_probe_timer => |a| try r.timers.append(r.gpa, .{ .kind = .{ .probe = a.probe }, .due_ms = r.now() + r.startLeft(a.after_ms) }),
             .ready => |v| {
                 // The catalog starts over for each new process or detection
                 // run; a new 2025 session in a run does that too.
@@ -2002,6 +2052,13 @@ pub const Server = struct {
                 .backoff => |handle| if (r.logicalByHandle(handle)) |l| try r.stepChain(l, .backoff_elapsed),
                 .relisten => |x| try r.stepSubs(.{ .retry_due = .{ .sub = x.sub, .generation = x.generation } }),
                 .initialized => |key| if (r.initialized_key == key) r.onInitializedTimedOut(),
+                // No answer in time is no answer: the refresh fails, the
+                // tokens stay, and what waits for it fails.
+                .refresh => |key| if (r.auth.refresh_key == key) {
+                    r.client.cancel(key);
+                    _ = try r.auth.fetched(key, 0, "");
+                    try r.runAuth(null);
+                },
             }
             i = 0;
         }

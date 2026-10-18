@@ -677,10 +677,8 @@ pub const Runtime = struct {
                 const i = r.serverIndex(name) orelse return r.finish(req, .{ .tools = .unknown_server });
                 if (r.heldReason(req.alloc, i)) |why| return r.finish(req, .{ .tools = .{ .failed = try why } });
                 if (r.flags[i].needs_login and r.loginFor(i) == null and !try r.pickUpLogin(i)) return r.finish(req, .{ .tools = .needs_login });
-                if (r.enginePhase(i) == .backoff) {
-                    try r.engine.needTools(r.resolved.servers[i].name);
-                    return r.finish(req, .{ .tools = .{ .failed = try req.alloc.dupe(u8, r.lastError(i) orelse "the server is unavailable") } });
-                }
+                // Between tries too, it waits for the next start, and a
+                // failed start ends it with the reason, as a call waits.
                 try r.tool_waiters.ensureUnusedCapacity(r.gpa, 1);
                 try r.engine.needTools(r.resolved.servers[i].name);
                 r.tool_waiters.appendAssumeCapacity(.{ .server = i, .request = req });

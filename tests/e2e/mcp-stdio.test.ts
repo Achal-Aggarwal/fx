@@ -1557,8 +1557,9 @@ describe("modern MCP stdio compatibility", () => {
     await expectProcessesExited(launches);
   }, 30_000);
 
-  // A 2025 server's initialize has a deadline (N44), and its answer is
-  // quoted when it isn't MCP (N43).
+  // A start gets 30 s from launch, so a 2025 server that never answers
+  // initialize fails then instead of after the 60 s request timeout. What it
+  // wrote instead of an answer is quoted.
   test("fx mcp show ends the start of a 2025 stdio server that answers with a line that isn't JSON, and quotes it", async () => {
     const root = createRoot("startup-garbage", LEGACY_FIXTURE, {
       mode: "startup_garbage",
@@ -1581,17 +1582,19 @@ describe("modern MCP stdio compatibility", () => {
         FX_TRACE_LOG: root.traceLogPath,
         FX_TRACE_SCOPES: "mcp",
       },
-      timeoutMs: 20_000,
+      timeoutMs: 45_000,
     });
 
     expect(result.code).toBe(1);
-    expect(Date.now() - started).toBeLessThan(15_000);
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeGreaterThan(29_000);
+    expect(elapsed).toBeLessThan(40_000);
     const status = JSON.parse(result.stdout);
     expect(status.error).toContain("not json");
     const launches = readAttemptedPids(root.launchLogPath);
     expect(launches).toHaveLength(1);
     await expectProcessesExited(launches);
-  }, 30_000);
+  }, 60_000);
 
   // A banner on stdout is a common server mistake; it's quoted (N43).
   test("fx mcp show quotes the stdout line a 2026 stdio server wrote instead of answering", async () => {
@@ -1722,12 +1725,12 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
 
     expect(sawFirstExit, "fx never saw the first server exit").toBe(true);
     expect(result.code).toBe(0);
-    // The second call ends when the relaunch fails, not after every
-    // restart the backoff allows (N45).
+    // The second call fails with the relaunch it waited for, not after
+    // every try the backoff allows.
     expect(Date.now() - started).toBeLessThan(15_000);
     expect(JSON.parse(result.stdout).output).toContain("RESTART_FAILURE_REPORTED");
     expect(activeGateway.requests[2]?.body).toContain("MODERN_MCP_TOOL_RESULT:first");
-    // The relaunch's own words reach the model (N43).
+    // The relaunch's own words reach the model: its exit code and stderr.
     const secondResult = toolResultText(activeGateway.requests[3]?.body ?? "", "second_call");
     expect(secondResult).toContain("exited with code 5");
     expect(secondResult).toContain("relaunch blocked by test");
@@ -1744,8 +1747,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       { mode: "response_ambiguous_payload", label: "result and error together" },
     ] as const
   ) {
-    // A reply to a pending request that isn't valid JSON-RPC fails that
-    // request at once rather than at the 10 s probe (N42).
+    // A reply with a pending request's id that isn't valid JSON-RPC fails
+    // that request at once, here the start's discover, not at its timeout.
     test(`malformed stdio response with ${malformed.label} fails deferred activation and reaps the child`, async () => {
       const root = createRoot(`malformed-${malformed.mode}`, MODERN_FIXTURE, {
         mode: malformed.mode,
@@ -3440,8 +3443,8 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       }
       expect(isProcessAlive(firstPid)).toBe(false);
 
-      // The call waits for the restart under way (N45), so the stalled
-      // relaunch is what Esc cancels.
+      // The call waits for the restart under way, even during the pause
+      // before it, so the stalled relaunch is what Esc cancels.
       await tui.sendText("Call the recovering MCP fixture.");
       const readyPath = join(root.root, "mcp-recovery-ready");
       const recoveryDeadline = Date.now() + 15_000;

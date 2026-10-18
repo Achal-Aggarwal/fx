@@ -795,6 +795,13 @@ function startRefreshRecoveryGateway(delayMs: number) {
         text: "cancelled",
       });
     },
+    fakeGatewayToolCall("select_retry", "mcp_select_tool", {
+      name: TOOL_NAME,
+    }),
+    fakeGatewayToolCall("call_retry", TOOL_NAME, {
+      text: "retried",
+    }),
+    fakeGatewayFinalText("Retry ended."),
     fakeGatewayToolCall("select_recovery", "mcp_select_tool", {
       name: TOOL_NAME,
     }),
@@ -2215,7 +2222,10 @@ describe("MCP login", () => {
     }, 30_000);
   }
 
-  test.skipIf(!tmuxAvailable())("Esc while a login is being renewed cancels the call before it's sent, and the next call renews it", async () => {
+  // Esc stops only the call: the renewal runs on, so a server that swaps its
+  // refresh token on each renewal never sees an old one. A renewal gets 30 s;
+  // the call waiting when it runs out fails, and the next call renews afresh.
+  test.skipIf(!tmuxAvailable())("Esc while a login is being renewed cancels the call before it's sent, and a renewal that never answers ends after 30 s", async () => {
     upstream = startModernMcpHttpFixture("json");
     // The first renewal never answers.
     auth = startAuthFixture(upstream.url, { stallRefresh: true });
@@ -2237,23 +2247,39 @@ describe("MCP login", () => {
     while (auth.refreshes === 0 && Date.now() < refreshDeadline) await Bun.sleep(25);
     expect(auth.refreshes).toBe(1);
 
+    const renewalStarted = Date.now();
+
     await tui.sendInterruptEscapePair(10_000);
     await tui.waitForText(`Cancelled ${TOOL_NAME}`, 10_000);
-    const cancelDeadline = Date.now() + 5_000;
-    while (auth.refreshCancellations === 0 && Date.now() < cancelDeadline) await Bun.sleep(25);
-    expect(auth.refreshCancellations).toBe(1);
     expect(auth.protectedToolCalls).toBe(0);
     expect(upstream.requests.some((entry) => entry.message.method === "tools/call")).toBe(false);
     expect(readFileSync(store, "utf8")).toContain(ACCESS_INITIAL);
     expect(readFileSync(store, "utf8")).not.toContain(ACCESS_REFRESHED);
     await tui.waitForComposer(10_000);
+    // The renewal is still open.
+    expect(auth.refreshCancellations).toBe(0);
 
+    // The retry waits for that renewal, which fx drops after its 30 s.
     await tui.sendText("Retry the protected MCP fixture.");
+    await tui.waitForText("Retry ended.", 45_000);
+    const waited = Date.now() - renewalStarted;
+    expect(waited).toBeGreaterThan(28_000);
+    expect(waited).toBeLessThan(40_000);
+    expect(auth.refreshes).toBe(1);
+    expect(auth.refreshCancellations).toBe(1);
+    expect(auth.protectedToolCalls).toBe(0);
+    const retried = gateway.requests.find((r) => r.body.includes('"toolCallId":"call_retry"'))?.body ?? "{}";
+    expect(toolResultText(retried, "call_retry", "error-text")).toContain("couldn't be renewed because the sign-in server didn't answer");
+    expect(readFileSync(store, "utf8")).toContain(ACCESS_INITIAL);
+    await tui.waitForComposer(10_000);
+
+    // The login was kept, so the next call renews it afresh.
+    await tui.sendText("Call the protected MCP fixture again.");
     await tui.waitForText("Refresh recovery complete.", 20_000);
     expect(auth.refreshes).toBe(2);
     expect(auth.protectedToolCalls).toBe(1);
     expect(readFileSync(store, "utf8")).toContain(ACCESS_REFRESHED);
-  }, 60_000);
+  }, 120_000);
 
   test("a pinned callback port is bound again for each of several sign-ins in a row", async () => {
     upstream = startModernMcpHttpFixture("json");

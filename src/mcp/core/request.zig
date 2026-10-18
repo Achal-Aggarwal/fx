@@ -65,6 +65,12 @@ pub const Timeouts = struct {
     idle_ms: u32 = 60_000,
     hard_ms: u32 = 600_000,
     reset_idle_on_progress: bool = true,
+    /// A start, from detection to ready, gets this long: the server cuts
+    /// the probe and initialize's hard timeout to what is left.
+    start_ms: u32 = 30_000,
+    /// A token refresh gets this long; one with no answer by then fails
+    /// and keeps the tokens.
+    refresh_ms: u32 = 30_000,
 };
 
 /// Reconnect delays double from 1 s up to 30 s.

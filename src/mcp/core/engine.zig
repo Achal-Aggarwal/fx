@@ -1,8 +1,9 @@
 //! The engine's core for one server: its phase and tries in a row, the host's tool list need, and the
 //! tool calls the host made to it. A call goes nowhere without the host's
 //! permission. A call to a ready server goes out at once; one to any
-//! other server waits, goes out the moment the server is ready, and ends when
-//! it gives up. A server first starts only when the host needs its tool list
+//! other server waits, goes out the moment the server is ready, and fails
+//! with the first start that fails while it waits. A server first
+//! starts only when the host needs its tool list
 //! or a call waits for it (LazyConnect). After a failure it starts again by
 //! itself once its backoff is over, at most `max_attempts` times in a
 //! row; the tries start over once it has stayed up for `stable_ms`. A step
@@ -194,7 +195,9 @@ pub const Gate = struct {
                 if (s.phase != .connecting and s.phase != .ready) return ignore(out);
                 const gave_up = s.attempts >= s.config.max_attempts;
                 s.retry = !gave_up;
-                for (&s.calls) |*c| if (c.used and (c.sent or gave_up)) {
+                // A call waits for one start: it fails with this one, and
+                // later tries are for later calls.
+                for (&s.calls) |*c| if (c.used) {
                     out.emit(.{ .end = .{ .call = c.handle, .end = if (c.sent) .lost else .failed } });
                     c.* = .{};
                 };
@@ -354,6 +357,8 @@ const World = struct {
         const p = s.project(0);
         if (p.sent > 0) try testing.expectEqual(Phase.ready, s.phase);
         if (s.phase == .failed or s.phase == .ready) try testing.expect(!s.need and p.waiting == 0);
+        // WaitsForOneStart: a failed start leaves no call waiting.
+        if ((before.phase == .connecting or before.phase == .ready) and (s.phase == .backoff or s.phase == .failed)) try testing.expectEqual(@as(u32, 0), p.waiting);
         // Where the model has no choice, the core must act: Connect is enabled.
         try testing.expect(!(s.phase == .idle and (s.demand() or s.retry) and s.attempts < s.config.max_attempts));
         // Ignored steps change nothing.
@@ -486,16 +491,19 @@ test "a call waits for its server, which starts for it, and goes out when it is 
     try testing.expectEqualSlices(Effect, &.{.list}, out.effects());
 }
 
-test "failures back off, then the server gives up and ends what waits" {
+test "a call fails with the start it waited for; the server backs off, then gives up" {
     var s: Gate = .init(.{ .max_attempts = 2 });
     _ = try run(&s, .{ .asked = .{ .call = 1, .allowed = true } });
     var out = try run(&s, .down);
-    try testing.expectEqualSlices(Effect, &.{.{ .arm_backoff = 1000 }}, out.effects());
+    // The call waited for that start, not for every try.
+    try testing.expectEqualSlices(Effect, &.{ .{ .end = .{ .call = 1, .end = .failed } }, .{ .arm_backoff = 1000 } }, out.effects());
     out = try run(&s, .backoff_over);
     try testing.expectEqualSlices(Effect, &.{.connect}, out.effects());
+    // A call made during that try waits for it, and fails with it.
+    _ = try run(&s, .{ .asked = .{ .call = 4, .allowed = true } });
     _ = try run(&s, .need);
     out = try run(&s, .down);
-    try testing.expectEqualSlices(Effect, &.{ .{ .end = .{ .call = 1, .end = .failed } }, .refuse_need }, out.effects());
+    try testing.expectEqualSlices(Effect, &.{ .{ .end = .{ .call = 4, .end = .failed } }, .refuse_need }, out.effects());
     try testing.expectEqual(Phase.failed, s.phase);
     out = try run(&s, .{ .asked = .{ .call = 2, .allowed = true } });
     try testing.expectEqualSlices(Effect, &.{.{ .end = .{ .call = 2, .end = .failed } }}, out.effects());
