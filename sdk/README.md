@@ -55,8 +55,10 @@ agent.session(sessionId).prompt("Start with the schema.");
 
 - **One turn at a time.** A prompt sent while a turn runs waits behind it, even when it reaches a different server.
 - **Turns finish on their own.** A turn runs to the end whether or not anyone reads its events, and a turn nobody reads holds no connection open: its view starts reading only once you use its events, `readable` or `result`. Stop it with `session.cancel()`, or with the `signal` you passed to `prompt()`.
-- **Steering.** `session.steer(input)` steers the running turn the way the fx CLI does. While the model streams a reply, the steer cuts it short and the turn continues with it. While a tool runs, the steer waits for the tool. A steer sent while a turn waits to start joins that turn, and when no turn runs or waits, the steer becomes the next turn. A steer with images can't join a turn, so the running turn ends at its next safe point and the steer runs next.
-- **Retries are safe.** Give a prompt or a steer a `messageId`, and a repeated request with the same id runs nothing new. A repeated prompt follows the original turn, and its result has `repeated: true`. One id names one input, so a steer that reuses a prompt's id is rejected with `FX_MESSAGE_ID_IN_USE`. On a queue that keeps messages past the process, such as `vercel()`'s, the sender doesn't read the session first, so the worker drops that steer and emits a `session.error` with the same code. A steer's `user_message` event carries its id as `id` where it joined a turn.
+- **Steering.** `session.steer(input)` steers the running turn the way the fx CLI does. While the model streams a reply, the steer cuts it short and the turn continues with it. While a tool runs, the steer waits for the tool. A steer sent while a turn waits to start joins that turn, and when no turn runs or waits, the steer becomes the next turn. A steer with images can't join a turn, so the running turn ends at its next safe point and the steer runs next. Its images are saved once with the session before the steer is sent, as a prompt's are, and a steer whose image can't be saved throws the store's error.
+- **Retries are safe.** Give a prompt or a steer a `messageId`, and a repeated request with the same id runs nothing new. A repeated prompt follows the original turn, and its result has `repeated: true`. One id names one input, so a steer that reuses a prompt's id is rejected with `FX_MESSAGE_ID_IN_USE`. A steer's `user_message` event carries its id as `id` where it joined a turn.
+- **Inputs have a size limit.** A prompt or steer whose input, with the session's `context` and settings, comes to more than 8 MiB of JSON is rejected with `FX_INPUT_TOO_LARGE` before anything is stored. The model can't take a larger one.
+- **A refused prompt is never stored.** `prompt()` checks a prompt as the engine's `prompt()` does and throws a `TypeError` or `RangeError` for one libfx would refuse, such as an empty prompt, base64 that isn't canonical, an image whose bytes aren't its type, or more than 8 images. A prompt whose `signal` aborts before the prompt is stored isn't stored either, and its turn ends `cancelled`.
 
 Each conversation can bring its own settings, which apply to the turns that session object starts:
 
@@ -126,7 +128,9 @@ createFxAgent({ durability: memory() }); // nothing outlives the process
 
 On `local()`, `vercel()` and `world()`, a session id is a Workflow run id, `wrun_` followed by letters and digits. Take it from `turn.accepted` or `await agent.newSessionId()` instead of making one up. On `memory()`, any 1 to 128 letters, digits, `.`, `_` or `-` work.
 
-A session stores the conversation and nothing else. Every process passes its own model, credentials, tools, MCP clients and skills when it creates the agent. If a session's saved checkpoint came from a different libfx version, tool set or model, the session still loads, and `onEvent` gets a `checkpoint.mismatch` event naming what changed.
+A session stores the conversation, and with each prompt and steer the caller's `context` and the session object's settings. Every process passes its own model, credentials, tools, MCP clients and skills when it creates the agent.
+
+libfx doesn't know who is calling. Anyone with a session's id can prompt, steer, cancel, stream or checkpoint it, so your app must check that the caller may use a session before it opens it. A queue message only names an input libfx already stored: a delivery that names one the session's log doesn't hold runs nothing, and the agent's `onEvent` gets a `session.refused` event. If a session's saved checkpoint came from a different libfx version, tool set or model, the session still loads, and `onEvent` gets a `checkpoint.mismatch` event naming what changed.
 
 ### Several agents
 
@@ -139,10 +143,11 @@ export const coding = createFxAgent({ name: "coding", model: "anthropic/claude-o
 
 A session belongs to the agent that created it, and its turns run only on an agent with that name. A prompt sent through another agent, such as `coding.session(supportSessionId).prompt()`, still runs on `support`, and the sending agent's `onEvent` gets a `session.forwarded` event. An agent created without a name is named `default`.
 
-- Agents with the same name are copies of one agent, such as one on each server, and take turns running its sessions.
+- Agents with the same name are copies of one agent, such as one on each server, and take turns running its sessions. In one process, every agent with a name on a store must have the same configuration: creating one with different options throws `FX_AGENT_NAME_IN_USE`. Agents created without a name or a durability share the name `default` and the default store, so an app that serves several customers gives each customer's agent its own name. Create an agent once, at module scope, or close it when you're done with it.
 - Keep names stable. A session keeps the name it was created with, so renaming an agent leaves its sessions with no agent to run them.
 - A process that gets a turn for a name it has no agent for refuses it with an `FX_NO_AGENT` error naming the agent, and the queue delivers it again.
 - Agents share sessions through their durability. Give agents that share sessions the same durability, or none: agents created without one share the default.
+- One route takes the deliveries for every World in the process and hands each to the agent of its name on the store it names. A World's store is its `store` option, or its name. An app that serves several customers gives each customer a store of its own, with `world()`'s `store`, and never shares one store between customers who must not reach each other's sessions.
 
 ### On Vercel
 
@@ -169,6 +174,8 @@ Then subscribe it to libfx's topic in `vercel.json`:
   }
 }
 ```
+
+The trigger makes the route private: it has no public URL, and only Vercel Queues can call it. Keep `wakeHandler()` on that route only. An app whose own World queues to a route the internet can reach must check that each request comes from its queue before it calls `wakeHandler()`. libfx runs only inputs its sessions already stored, but a forged request can still wake a session.
 
 That's all. When no other invocation holds the session, `prompt()` runs the turn in the request that called it, so the first model request goes out without a queue hop, and the function stays alive for the turn after the route responds. Vercel Queues keeps the prompt until after that request's time limit, and if the request dies mid-turn, that delivery continues the turn. Other turns go through Vercel Queues to this route:
 
@@ -257,7 +264,7 @@ const agent = createFxAgent({
 | `signal` | Aborts when the turn is cancelled |
 | `executionId` | The call's id, the same if the call runs again after a crash |
 | `sessionId` | The session the call belongs to |
-| `context` | The JSON passed as `context` to `agent.session()` |
+| `context` | A copy of the JSON passed as `context` to `agent.session()`, taken when you call it |
 
 Return a string to send it as is, or any other value to send it as JSON. A thrown error reaches the model as a failed tool result. To return images, return `{ type: "libfx.tool-result", text, images }`, with base64 image data.
 
@@ -401,7 +408,7 @@ agent.session().prompt([
 ]);
 ```
 
-A session stores each prompt as JSON before it runs, so a session prompt takes image data as a base64 string. `createFxEngine()` also takes bytes, a `Blob` or a `File`. Each prompt takes up to 8 PNG, JPEG, GIF or WebP images, at most 3.75 MiB each and 6 MiB together. Pass `resizeImage` to downscale or convert prompt images before they're sent.
+A session stores each prompt as JSON before it runs, so a session prompt takes image data as a base64 string. `createFxEngine()` also takes bytes, a `Blob` or a `File`. A session saves each image once, named by its SHA-256, before it stores the prompt, and the saved conversation refers to it by that name, so images don't count toward the 4 MiB the session's own checkpoints hold. Images a host tool returns are saved the same way; one that can't be saved stays in the tool's result, held inline. A session keeps its newest 4,096 images, up to 512 MiB of them; an older image leaves the conversation, and the model sees a note in its place. A checkpoint you take with `checkpoint()` carries the images' bytes, within its 4 MiB. An engine with a `persistence` store of its own keeps images inside its records and checkpoints, so they count toward that 4 MiB; for a conversation with many images, use a session with [durability](#durability). libfx never deletes a saved image; it lasts as long as the session's storage. Each prompt takes up to 8 PNG, JPEG, GIF or WebP images, at most 3.75 MiB each and 6 MiB together. Pass `resizeImage` to downscale or convert prompt images before they're sent.
 
 ## Diagnostics
 

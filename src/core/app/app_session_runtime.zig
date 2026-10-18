@@ -67,6 +67,7 @@ const shell_runtime = @import("../../ui/shell_runtime.zig");
 const transcript_runtime = @import("../../ui/transcript/runtime.zig");
 const resume_projection = @import("../../ui/transcript/resume_projection.zig");
 const question_ui = @import("../../ui/footer/question_ui.zig");
+const render_input = @import("../../ui/footer/render_input.zig");
 const ui_input = @import("../../ui/input/runtime.zig");
 const ui_render = @import("../../ui/render.zig");
 const update_notes = @import("../upgrade/update_notes.zig");
@@ -318,6 +319,8 @@ const UpgradeNotice = struct {
 const ResumeNotice = union(enum) {
     session,
     upgrade: UpgradeNotice,
+    /// The id of the session this one was forked from.
+    fork: []const u8,
 };
 
 fn writeUpgradeNoticeBody(writer: *std.Io.Writer, upgrade: UpgradeNotice) !void {
@@ -584,6 +587,35 @@ pub const SessionPicker = struct {
             }
         }
         for (summaries) |*summary| try self.appendSummary(alloc, summary);
+    }
+};
+
+/// `/fork`'s menu: the open session's prompts, oldest first (D58).
+pub const ForkMenu = struct {
+    points: []const session_adapter.Session.ForkPoint = &.{},
+    selected: usize = 0,
+    /// The first menu line shown. It starts past the end, which shows the
+    /// newest prompts, and moves only as far as keeps the selection whole.
+    window_start: usize = std.math.maxInt(usize),
+
+    pub fn active(self: *const ForkMenu) bool {
+        return self.points.len > 0;
+    }
+
+    pub fn projection(self: *const ForkMenu) render_input.ForkMenuProjection {
+        return .{ .points = self.points, .selected = self.selected, .window_start = self.window_start };
+    }
+
+    /// Moves the selection, stopping at the oldest and the newest prompt.
+    pub fn move(self: *ForkMenu, delta: i32) void {
+        if (self.points.len == 0) return;
+        const next = @as(i64, @intCast(self.selected)) + delta;
+        self.selected = @intCast(std.math.clamp(next, 0, @as(i64, @intCast(self.points.len - 1))));
+    }
+
+    pub fn close(self: *ForkMenu, alloc: Allocator) void {
+        session_adapter.Session.freeForkPoints(alloc, self.points);
+        self.* = .{};
     }
 };
 
@@ -1301,6 +1333,7 @@ pub const Persistence = struct {
     session_picker: SessionPicker = .{},
     session_picker_load: SessionPickerLoad = .{},
     session_picker_cache: SessionPickerCatalogCache = .{},
+    fork_menu: ForkMenu = .{},
     title_generation: TitleGenerationLoad = .{},
     degraded_warning_emitted: bool = false,
     pending_cancelled_command: ?PendingCancelledCommand = null,
@@ -1319,7 +1352,7 @@ pub const Persistence = struct {
     /// in a static release-binary template.
     pub fn initInto(storage: *Persistence) void {
         comptime {
-            if (@typeInfo(Persistence).@"struct".field_names.len != 30) {
+            if (@typeInfo(Persistence).@"struct".field_names.len != 31) {
                 @compileError("update Persistence.initInto for the changed field set");
             }
         }
@@ -1343,6 +1376,7 @@ pub const Persistence = struct {
         storage.session_picker = .{};
         storage.session_picker_load = .{};
         storage.session_picker_cache = .{};
+        storage.fork_menu = .{};
         storage.title_generation = .{};
         storage.degraded_warning_emitted = false;
         storage.pending_cancelled_command = null;
@@ -1394,6 +1428,7 @@ pub const Persistence = struct {
         self.session_picker.deinit(alloc);
         self.session_picker_load.deinit();
         if (catalog == .free) self.session_picker_cache.deinit();
+        self.fork_menu.close(alloc);
         self.title_generation.deinit();
         // After the picker thread, which lists through it, has joined.
         if (self.v2_store) |*store| store.deinit(alloc);
@@ -2038,6 +2073,7 @@ pub fn Runtime(comptime App: type) type {
             }
             app.question_prompt.discard(app.alloc, "session_reset");
             cancelSessionPicker(app);
+            app.session_persistence.fork_menu.close(app.alloc);
             invalidateSessionPickerCaches(app);
         }
 
@@ -2301,6 +2337,64 @@ pub fn Runtime(comptime App: type) type {
             try app.finishLiveSessionResume();
             rememberSelectedSession(app);
             return true;
+        }
+
+        /// Opens `/fork`'s menu of the session's prompts, newest selected,
+        /// or says why it cannot (D58).
+        pub fn openForkMenu(app: *App) !void {
+            const v2 = app.session_persistence.v2 orelse return app.writeDomainNotice(.{
+                .topic = "session",
+                .tone = .warning,
+                .body = "forking needs --sessions-v2",
+            }, true);
+            if (app.stream.active) return app.writeDomainNotice(.{
+                .topic = "session",
+                .tone = .neutral,
+                .body = "/fork is available once the current turn finishes",
+            }, true);
+            const points = try v2.forkPoints(app.alloc);
+            if (points.len == 0) {
+                session_adapter.Session.freeForkPoints(app.alloc, points);
+                return app.writeDomainNotice(.{
+                    .topic = "session",
+                    .tone = .neutral,
+                    .body = "nothing to fork yet",
+                }, true);
+            }
+            const menu = &app.session_persistence.fork_menu;
+            menu.close(app.alloc);
+            menu.* = .{ .points = points, .selected = points.len - 1 };
+            app.shell.render_requests.request(.footer);
+        }
+
+        /// Forks the session before the fork menu's selected prompt and
+        /// switches to the fork, which opens before the source closes (D58).
+        /// Returns that prompt's text for the composer; caller owns it.
+        pub fn forkBeforeSelectedPrompt(app: *App) ![]u8 {
+            const menu = &app.session_persistence.fork_menu;
+            const points = menu.points;
+            const point = points[menu.selected];
+            menu.* = .{};
+            defer session_adapter.Session.freeForkPoints(app.alloc, points);
+            const source = app.session_persistence.v2 orelse return error.SessionStoreUnavailable;
+            const source_id = try app.alloc.dupe(u8, source.id());
+            defer app.alloc.free(source_id);
+            const prompt = try app.alloc.dupe(u8, point.prompt);
+            errdefer app.alloc.free(prompt);
+            const fork = try source.fork(app.alloc, .{
+                .before_turn = point.turn,
+                .workspace = app.workspace_root,
+                .host = .app,
+                .title = cachedSessionTitle(app),
+            });
+            var fork_owned = true;
+            errdefer if (fork_owned) fork.close();
+            try app.prepareLiveSessionResume();
+            fork_owned = false;
+            try installResumedV2Session(app, fork, .{ .fork = source_id });
+            startResumedSessionWarmup(app);
+            try app.finishLiveSessionResume();
+            return prompt;
         }
 
         fn loadResumeTargetForWrite(
@@ -4436,6 +4530,9 @@ pub fn Runtime(comptime App: type) type {
 
             workspace_root: []const u8,
             map: std.StringHashMapUnmanaged(Label) = .empty,
+            /// Calls whose saved output later `read_tool_result` rows read, so
+            /// those rows name them as the live session did.
+            saved_output_sources: tool_presentation.ReplayedSavedOutputSources = .{},
 
             fn deinit(self: *HistoricalSessionLabels, alloc: Allocator) void {
                 var it = self.map.iterator();
@@ -4445,6 +4542,7 @@ pub fn Runtime(comptime App: type) type {
                     if (entry.value_ptr.reflow) |value| alloc.free(value);
                 }
                 self.map.deinit(alloc);
+                self.saved_output_sources.deinit(alloc);
             }
         };
 
@@ -4667,6 +4765,18 @@ pub fn Runtime(comptime App: type) type {
                         .tone = .success,
                         .body = owned_body,
                     });
+                },
+                .fork => |source_id| {
+                    try sink.appendNotice(.{
+                        .topic = "session forked",
+                        .tone = .neutral,
+                        .body = display.title,
+                    });
+                    // A plain line, so the command copies as it is. Forks
+                    // exist only on v2, so the command always names it.
+                    const line = try app.alloc.print("original session fx --sessions-v2 --resume {s}\n", .{source_id});
+                    defer app.alloc.free(line);
+                    try sink.appendRaw(line);
                 },
             }
         }
@@ -4960,6 +5070,13 @@ pub fn Runtime(comptime App: type) type {
             result: types.PersistedToolResult,
             labels: *HistoricalSessionLabels,
         ) !void {
+            try labels.saved_output_sources.record(
+                app.alloc,
+                app.toolAdvertisementSet().registry,
+                labels.workspace_root,
+                call,
+                result,
+            );
             if (try writeAnsweredQuestionResult(app, sink, call, result)) return;
             if (try writeCommittedFilePresentation(app, sink, call, result)) return;
 
@@ -4974,7 +5091,13 @@ pub fn Runtime(comptime App: type) type {
 
             var action_arena = std.heap.ArenaAllocator.init(app.alloc);
             defer mem_utils.deinit_arena(action_arena);
-            const session_target = historicalSessionTarget(action_arena.allocator(), labels, call);
+            const action_target = historicalSessionTarget(action_arena.allocator(), labels, call) orelse
+                try tool_presentation.readToolResultDisplayTarget(
+                    action_arena.allocator(),
+                    app.toolAdvertisementSet().registry,
+                    call,
+                    &labels.saved_output_sources,
+                );
             const command_decision = if (is_command)
                 try tool_presentation.commandOutcomeDecision(
                     action_arena.allocator(),
@@ -4994,7 +5117,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.describeToolActionDeniedWithAdvertised(
                     action_arena.allocator(),
                     call,
-                    session_target,
+                    action_target,
                     if (context_deferred)
                         types.context_deferred_tool_status_label
                     else
@@ -5005,7 +5128,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.describeToolActionDeniedWithAdvertised(
                     action_arena.allocator(),
                     call,
-                    session_target,
+                    action_target,
                     tool_admission.permissionDeniedStatusLabel(reason),
                     &.{},
                 )
@@ -5013,7 +5136,7 @@ pub fn Runtime(comptime App: type) type {
                 try app.describeToolActionDeniedWithAdvertised(
                     action_arena.allocator(),
                     call,
-                    session_target,
+                    action_target,
                     decision.label,
                     &.{},
                 )
@@ -5037,13 +5160,13 @@ pub fn Runtime(comptime App: type) type {
                 break :success try app.describeToolActionCompletedWithAdvertised(
                     action_arena.allocator(),
                     call,
-                    display_target orelse session_target,
+                    display_target orelse action_target,
                     &.{},
                 );
             } else try app.describeToolActionDeniedWithAdvertised(
                 action_arena.allocator(),
                 call,
-                session_target,
+                action_target,
                 try tooling_presentation.subagentFailureLabel(action_arena.allocator(), call, result.output),
                 &.{},
             );
@@ -7494,6 +7617,56 @@ test "v2 ultrafast resume applies process overrides without persisting them" {
     }
 }
 
+test "/fork needs v2, waits for the turn and a prompt, then opens on the newest prompt (D58)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+    const home = try TestHome.install(alloc, paths.home);
+    defer home.deinit();
+    {
+        var app = try TestApp.init(alloc, paths.workspace);
+        defer app.deinit();
+        try configureTestPreferences(&app);
+        try Runtime(TestApp).initializePersistence(&app, true);
+        try Runtime(TestApp).beginFreshPersistedSession(&app);
+        try Runtime(TestApp).openForkMenu(&app);
+        try std.testing.expectEqualStrings("! session: forking needs --sessions-v2", app.notices.last().?);
+        try std.testing.expect(!app.session_persistence.fork_menu.active());
+    }
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+    try configureTestPreferences(&app);
+    app.session_persistence.sessions_v2 = true;
+    try Runtime(TestApp).initializePersistence(&app, true);
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+    try Runtime(TestApp).openForkMenu(&app);
+    try std.testing.expectEqualStrings("* session: nothing to fork yet", app.notices.last().?);
+
+    for ([_][]const u8{ "first", "second", "third" }) |prompt| {
+        try app.session_persistence.v2.?.commitTurn(.{ .assistant = .{
+            .user = .{ .text = @constCast(prompt) },
+            .assistant = @constCast("answer"),
+        } }, types.ConversationLanguage.default());
+    }
+    app.stream.active = true;
+    try Runtime(TestApp).openForkMenu(&app);
+    try std.testing.expectEqualStrings("* session: /fork is available once the current turn finishes", app.notices.last().?);
+    try std.testing.expect(!app.session_persistence.fork_menu.active());
+
+    app.stream.active = false;
+    try Runtime(TestApp).openForkMenu(&app);
+    const menu = &app.session_persistence.fork_menu;
+    try std.testing.expectEqual(@as(usize, 3), menu.points.len);
+    try std.testing.expectEqualStrings("first", menu.points[0].prompt);
+    try std.testing.expectEqualStrings("third", menu.points[menu.selected].prompt);
+}
+
 test "beginFreshPersistedSession and enableSessionStores create per-session stores" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -8101,6 +8274,86 @@ test "execution replay records session labels for tty-launched sessions" {
         "● Completed shell npm run dev\n",
         app.completed_tool_statuses.items[1],
     );
+}
+
+test "execution replay names the call whose saved output a later read opens" {
+    const alloc = std.testing.allocator;
+    var app = try TestApp.init(alloc, "/workspace");
+    defer app.deinit();
+
+    const replay = "fx-command-replay-0123.bin";
+    const run_output = "{\"exit_code\":0,\"full_output_handle\":\"" ++ replay ++ "\"}";
+    const file_output = "<path>src/main.zig</path>";
+    var source_calls = [_]types.ToolCall{
+        .{ .id = "call_run", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"zig build test\"}" },
+        .{ .id = "call_file", .name = "read_file", .arguments_json = "{\"path\":\"src/main.zig\"}" },
+    };
+    var source_results = [_]types.PersistedToolResult{
+        .{
+            .tool_call_id = @constCast("call_run"),
+            .tool_name = @constCast("shell"),
+            .status = .success,
+            .output = @constCast(run_output),
+            .output_bytes = run_output.len,
+            .stored_output_bytes = run_output.len,
+            .command_output_replay = .{ .available = .{ .handle = replay, .framed_bytes = 64 } },
+        },
+        .{
+            .tool_call_id = @constCast("call_file"),
+            .tool_name = @constCast("read_file"),
+            .status = .success,
+            .output = @constCast(file_output),
+            .output_handle = @constCast("result-read_file-1.txt"),
+            .output_bytes = file_output.len,
+            .stored_output_bytes = file_output.len,
+        },
+    };
+    var source_steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = source_calls[0..],
+        .tool_results = source_results[0..],
+    }};
+    var read_calls = [_]types.ToolCall{
+        .{ .id = "page", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"" ++ replay ++ "\",\"start_byte\":9}}" },
+        .{ .id = "query", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"" ++ replay ++ "\",\"query\":\"error:\"}}" },
+        .{ .id = "file", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"result-read_file-1\"}}" },
+        .{ .id = "unknown", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"result-gone.txt\"}}" },
+    };
+    var read_results: [read_calls.len]types.PersistedToolResult = undefined;
+    for (&read_results, read_calls) |*result, call| {
+        result.* = .{
+            .tool_call_id = @constCast(call.id),
+            .tool_name = @constCast(call.name),
+            .status = .success,
+            .output = @constCast("page"),
+            .output_bytes = 4,
+            .stored_output_bytes = 4,
+        };
+    }
+    var read_steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = read_calls[0..],
+        .tool_results = read_results[0..],
+    }};
+    const history = [_]types.HistoryTurn{
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("run the tests") },
+            .assistant = @constCast(""),
+            .execution = .{ .tool_steps = source_steps[0..] },
+        } },
+        .{ .assistant = .{
+            .user = .{ .text = @constCast("find the failure") },
+            .assistant = @constCast(""),
+            .execution = .{ .tool_steps = read_steps[0..] },
+        } },
+    };
+
+    try Runtime(TestApp).replayHistory(&app, &history);
+
+    const statuses = app.completed_tool_statuses.items;
+    try std.testing.expectEqual(@as(usize, 6), statuses.len);
+    try std.testing.expectEqualStrings("● Completed read_tool_result more output from zig build test\n", statuses[2]);
+    try std.testing.expectEqualStrings("● Completed read_tool_result zig build test output for \"error:\"\n", statuses[3]);
+    try std.testing.expectEqualStrings("● Completed read_tool_result more output from src/main.zig\n", statuses[4]);
+    try std.testing.expectEqualStrings("● Completed read_tool_result\n", statuses[5]);
 }
 
 test "resume projection stores reflow metadata for session action rows" {

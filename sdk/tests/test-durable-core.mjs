@@ -5,7 +5,7 @@
 //
 //   node sdk/tests/test-durable-core.mjs [memory|local|world|queue]
 import { strict as assert } from "node:assert";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createDurableAgentFactory, foldSessionLog, memory, wakeHandler } from "../durable.js";
@@ -964,6 +964,48 @@ if (durabilityKind === "queue") {
       await agent.close();
     }
   });
+
+  test("an image prompt run in the request reads its image from the store, and no queued copy holds it", async () => {
+    const internals = (agent) => agent[Symbol.for("libfx.durableInternals")];
+    for (const maxDurationMs of [60_000, 300]) {
+      const dir = await mkdtemp(join(tmpdir(), "libfx-in-request-image-"));
+      dirs.push(dir);
+      const waited = [];
+      const { durability, broker } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs, reserveMs: 100, waitUntil: (work) => waited.push(work) });
+      const { agent, seen } = recordingAgent(durability);
+      const session = agent.session();
+      // With the short deadline, a step outlasts the request.
+      if (maxDurationMs < 1000) {
+        const slow = holdStep("image-1");
+        void slow.holding.then(() => setTimeout(slow.release, 600));
+      }
+      const messageId = `turn-image-${maxDurationMs}`;
+      const turn = session.prompt([{ type: "text", text: "look" }, image], { messageId });
+      assert.equal((await turn.result).stopReason, "end_turn");
+      assert.equal(waited.length, 1, "the request ran the turn");
+      assert.deepEqual(seen, [[{ type: "text", text: "look" }, image]], "with its image, read once");
+      const sent = broker.sent.filter((message) => message.payload?.input?.messageId === messageId);
+      assert.equal(sent[0].attempt, 0, "the backstop waited");
+      if (maxDurationMs < 1000) assert.ok(sent.length > 1, "a turn longer than the request went on in a fresh message");
+      for (const message of sent) {
+        const payload = JSON.stringify(message.payload);
+        assert.ok(!payload.includes(png), "a queued copy holds none of the image");
+      }
+      await waited[0];
+      for (let tries = 0; internals(agent).liveWorkers() > 0; tries += 1) {
+        assert.ok(tries < 200, "the request's worker never let go");
+        await sleep(10);
+      }
+      // The backstop, delivered at last, runs nothing.
+      broker.lapse(sent[0]);
+      for (let tries = 0; broker.held(() => true).some((message) => message.id === sent[0].id); tries += 1) {
+        assert.ok(tries < 200, "the backstop was never acknowledged");
+        await sleep(10);
+      }
+      assert.equal(seen.length, 1, "the backstop ran nothing");
+      await agent.close();
+    }
+  });
 }
 
 test("a reconnect reads the stream from its cursor's line, not its start", async () => {
@@ -1050,6 +1092,421 @@ test("each prompt's turn runs with its session object's settings, resumed or not
   assert.throws(() => strict.session(undefined, { model: "nope" }), /^TypeError: no such model$/);
   await strict.close();
   await agent.close();
+});
+
+// A real 1x1 PNG, as a caller would send it.
+const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jP0cAAAAASUVORK5CYII=";
+const pngBytes = Uint8Array.from(atob(png), (char) => char.charCodeAt(0));
+const image = { type: "image", data: png, mimeType: "image/png" };
+// An image block of its own: the PNG with byte `n` after it, so its name is
+// new and storing it writes it.
+const imageOf = (n) => ({ type: "image", data: Buffer.from([...pngBytes, n]).toString("base64"), mimeType: "image/png" });
+// An agent whose harness records each prompt input it is handed, and runs an
+// image prompt as the word "image"; with `refuseFirst`, its first prompt
+// throws, as a harness that cannot run a turn does.
+function recordingAgent(durability, { refuseFirst = false } = {}) {
+  const seen = [];
+  let refusals = refuseFirst ? 1 : 0;
+  const agent = createDurableAgentFactory({
+    harness: () => {
+      const base = scriptedHarness()();
+      return {
+        open: async (options) => {
+          const session = await base.open(options);
+          return {
+            ...session,
+            prompt: (input, opts) => {
+              seen.push(input);
+              if (refusals > 0) {
+                refusals -= 1;
+                throw new Error("the harness stopped");
+              }
+              return session.prompt(typeof input === "string" ? input : "image", opts);
+            },
+            get openTurn() { return session.openTurn; },
+          };
+        },
+      };
+    },
+    defaultDurability: async () => memory(),
+  })({ durability });
+  return { agent, seen };
+}
+const kinds = (seen) => seen.map((input) => (typeof input === "string" ? input : "image"));
+
+test("a durable prompt carries image data as base64: bytes and files throw from prompt(), and nothing is queued", async () => {
+  const { agent, seen } = recordingAgent(await durabilityFor());
+  const session = agent.session();
+  const refused = [
+    { type: "image", data: 42, mimeType: "image/png" },
+    { type: "image", data: new Uint8Array(pngBytes), mimeType: "image/png" },
+    { type: "image", data: new Uint8Array(pngBytes).buffer, mimeType: "image/png" },
+    { type: "image", data: new Blob([pngBytes], { type: "image/png" }) },
+    { type: "image", data: new File([pngBytes], "shot.png", { type: "image/png" }) },
+  ];
+  for (const block of refused) {
+    assert.throws(
+      () => session.prompt([{ type: "text", text: "look" }, block]),
+      (error) => error instanceof TypeError && /^a durable prompt carries image data as a base64 string$/.test(error.message),
+    );
+  }
+  const turn = session.prompt([{ type: "text", text: "look" }, image, { ...image, sourceRef: "uploads:shot" }]);
+  assert.equal((await turn.result).stopReason, "end_turn");
+  assert.deepEqual(seen, [[{ type: "text", text: "look" }, image, { ...image, sourceRef: "uploads:shot" }]], "base64 passes as given");
+  await agent.close();
+});
+
+test("a prompt storing its image is stored before the prompts made after it, and a failed image write stores nothing", async () => {
+  const fault = { writeMs: 150 };
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), fault));
+  const session = agent.session();
+  const first = session.prompt([imageOf(1)]);
+  const second = session.prompt("second");
+  assert.deepEqual([(await first.result).stopReason, (await second.result).stopReason], ["end_turn", "end_turn"]);
+  assert.deepEqual(kinds(seen), ["image", "second"]);
+  fault.failWrites = 1;
+  const failing = session.prompt([imageOf(2)]);
+  const after = session.prompt("after");
+  await assert.rejects(failing.accepted, /^Error: the store is full$/);
+  await assert.rejects(failing.result, /^Error: the store is full$/);
+  assert.equal((await after.result).stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["image", "second", "after"], "the failed write stored no turn, and the prompt behind it ran");
+  await agent.close();
+});
+
+test("a prompt's signal or the agent closing while its image is stored keeps its turn from running", async () => {
+  const fault = { writeMs: 400 };
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), fault));
+  const session = agent.session();
+  const controller = new AbortController();
+  const cancelled = session.prompt([imageOf(3)], { messageId: "turn-store", signal: controller.signal });
+  await sleep(20);
+  const aborted = Date.now();
+  controller.abort();
+  await cancelled.accepted;
+  assert.equal((await cancelled.result).stopReason, "cancelled");
+  assert.ok(Date.now() - aborted < 300, "the prompt stopped waiting for its image write at once");
+  // Neither the prompt nor a cancel naming it was stored: its id runs anew.
+  assert.equal((await session.prompt("after", { messageId: "turn-store" }).result).stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["after"]);
+  fault.writeMs = 150;
+  const closing = session.prompt([imageOf(4)]);
+  await agent.close();
+  await assert.rejects(closing.accepted, /agent is closed/);
+  await assert.rejects(closing.result, /agent is closed/);
+  assert.deepEqual(kinds(seen), ["after"]);
+});
+
+test("a prompt withdrawn while it waits keeps the prompts behind it waiting for the ones before it", async () => {
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), { writeMs: 300 }));
+  const session = agent.session();
+  const first = session.prompt([imageOf(5)], { messageId: "turn-first" });
+  const controller = new AbortController();
+  const second = session.prompt([imageOf(6)], { messageId: "turn-second", signal: controller.signal });
+  const third = session.prompt("third", { messageId: "turn-third" });
+  await sleep(20);
+  controller.abort();
+  assert.equal((await second.result).stopReason, "cancelled");
+  assert.equal((await first.result).stopReason, "end_turn");
+  assert.equal((await third.result).stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["image", "third"], "the prompt behind the withdrawn one still came after the one before it");
+  await agent.close();
+});
+
+test("an image prompt its first worker could not start runs from the log with the same base64, once", async () => {
+  const { agent, seen } = recordingAgent(await durabilityFor(), { refuseFirst: true });
+  const session = agent.session();
+  const shot = { ...image, sourceRef: "uploads:shot" };
+  assert.equal((await session.prompt([shot], { messageId: "turn-img" }).result).stopReason, "end_turn");
+  assert.deepEqual(seen, [[shot], [shot]]);
+  const again = await agent.session(session.id).prompt([shot], { messageId: "turn-img" }).result;
+  assert.equal(again.repeated, true);
+  assert.equal(seen.length, 2, "the retry ran nothing");
+  await agent.close();
+});
+
+test("an image block is read once, so the log holds what was checked", async () => {
+  const { agent, seen } = recordingAgent(await durabilityFor());
+  const session = agent.session();
+  // Accessors that answer one way when checked and another way after.
+  let dataReads = 0;
+  let mimeReads = 0;
+  const shifting = {
+    type: "image",
+    get data() { dataReads += 1; return dataReads === 1 ? png : new Uint8Array([1, 2, 3]); },
+    mimeType: "image/png",
+    sourceRef: "uploads:shifting",
+  };
+  const relabelled = {
+    type: "image",
+    data: png,
+    get mimeType() { mimeReads += 1; return mimeReads === 1 ? "image/png" : undefined; },
+  };
+  assert.equal((await session.prompt([{ type: "text", text: "look" }, shifting, relabelled]).result).stopReason, "end_turn");
+  assert.deepEqual(seen.at(-1), [{ type: "text", text: "look" }, { ...image, sourceRef: "uploads:shifting" }, image]);
+  assert.deepEqual([dataReads, mimeReads], [1, 1]);
+  // An Array subclass whose map() returns something else still stores its blocks.
+  class Remapped extends Array { map() { return "not the caller's blocks"; } }
+  const blocks = Remapped.from([{ type: "text", text: "remapped" }, image]);
+  assert.equal((await session.prompt(blocks).result).stopReason, "end_turn");
+  assert.deepEqual(seen.at(-1), [{ type: "text", text: "remapped" }, image]);
+  await agent.close();
+});
+
+const pngName = Buffer.from(await crypto.subtle.digest("SHA-256", pngBytes)).toString("hex");
+// Every image stream's name holds this: "_user_", then the base64url of the
+// namespace "libfx-image-".
+const imageStreamTag = `_user_${Buffer.from("libfx-image-").toString("base64url")}`;
+
+// The durability with a faulty image store: with `fault.lose`, every image
+// reads back as missing; with `fault.corrupt`, every image reads back with
+// its last byte changed; `fault.failWrites` fails that many image writes;
+// `fault.writeMs` makes each image write wait that long first. The test may
+// change `fault` as it goes. A World's faults are in its streams, under the
+// code that names images.
+function faultyImages(durability, fault = {}) {
+  fault.failWrites ??= 0;
+  const slowly = async () => { if (fault.writeMs) await sleep(fault.writeMs); };
+  const refuse = () => {
+    fault.failWrites -= 1;
+    throw new Error("the store is full");
+  };
+  const flipped = (bytes) => {
+    if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) return bytes;
+    const copy = bytes.slice();
+    copy[copy.length - 1] ^= 0xff;
+    return copy;
+  };
+  if (typeof durability.create === "function") {
+    return {
+      ...durability,
+      create() {
+        const backend = durability.create();
+        return {
+          ...backend,
+          async session(id) {
+            const log = await backend.session(id);
+            return {
+              ...log,
+              images: {
+                put: async (name, bytes) => {
+                  await slowly();
+                  return fault.failWrites > 0 ? refuse() : log.images.put(name, bytes);
+                },
+                get: async (name) => {
+                  if (fault.lose) return undefined;
+                  const bytes = await log.images.get(name);
+                  return fault.corrupt ? flipped(bytes) : bytes;
+                },
+              },
+            };
+          },
+        };
+      },
+    };
+  }
+  const isImage = (name) => String(name).includes(imageStreamTag);
+  const bound = (target, value) => (typeof value === "function" ? value.bind(target) : value);
+  return {
+    ...durability,
+    async world() {
+      const world = await durability.world();
+      const streams = new Proxy(world.streams, {
+        get(target, prop) {
+          const value = Reflect.get(target, prop);
+          if (prop === "write") {
+            return async (runId, name, chunk) => {
+              if (!isImage(name)) return value.call(target, runId, name, chunk);
+              await slowly();
+              return fault.failWrites > 0 ? refuse() : value.call(target, runId, name, chunk);
+            };
+          }
+          if (prop === "getChunks") {
+            return async (runId, name, options) => {
+              if (fault.lose && isImage(name)) return { data: [], cursor: null, hasMore: false, done: false };
+              const result = await value.call(target, runId, name, options);
+              if (!fault.corrupt || !isImage(name) || !Array.isArray(result?.data)) return result;
+              return { ...result, data: result.data.map((chunk) => ({ ...chunk, data: flipped(chunk?.data) })) };
+            };
+          }
+          return bound(target, value);
+        },
+      });
+      return new Proxy(world, { get: (target, prop) => (prop === "streams" ? streams : bound(target, Reflect.get(target, prop))) });
+    },
+  };
+}
+
+// Every file under a World's folder, for checking what it stored. A lock or
+// temporary file gone by the time it is read is skipped.
+async function filesUnder(dir) {
+  const files = [];
+  for (const entry of await readdir(dir, { withFileTypes: true, recursive: true })) {
+    if (!entry.isFile()) continue;
+    try {
+      files.push(await readFile(join(entry.parentPath ?? entry.path, entry.name)));
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+  return files;
+}
+
+test("a durable prompt stores each image once in the session's image store, and the log only names it", async () => {
+  const durability = await durabilityFor();
+  const { agent, seen } = recordingAgent(durability);
+  const session = agent.session();
+  const turn = session.prompt([
+    { type: "text", text: "look" },
+    image,
+    { ...image, sourceRef: "uploads:shot" },
+    image,
+  ]);
+  assert.equal((await turn.result).stopReason, "end_turn");
+  assert.deepEqual(seen, [[{ type: "text", text: "look" }, image, { ...image, sourceRef: "uploads:shot" }, image]]);
+  if (typeof durability.create === "function") {
+    const log = await durability.create().session(session.id);
+    const entries = (await log.readSince("0")).map(({ entry }) => entry);
+    assert.deepEqual(entries.find((entry) => entry.k === "input")?.input, [
+      { type: "text", text: "look" },
+      { type: "image", mimeType: "image/png", data: { sha256: pngName } },
+      { type: "image", mimeType: "image/png", sourceRef: "uploads:shot", data: { sha256: pngName } },
+      { type: "image", mimeType: "image/png", data: { sha256: pngName } },
+    ]);
+    assert.ok(!JSON.stringify(entries).includes(png), "no entry holds the image's base64");
+    assert.deepEqual(await log.images.get(pngName), pngBytes);
+  }
+  await agent.close();
+  if (typeof durability.create !== "function") {
+    // On disk: the image's bytes once, in its stream, and its base64 nowhere.
+    const files = await filesUnder(dirs.at(-1));
+    assert.ok(!files.some((bytes) => bytes.includes(Buffer.from(png))), "no file holds the image's base64");
+    assert.equal(files.filter((bytes) => bytes.includes(Buffer.from(pngBytes))).length, 1, "one file holds the image's bytes");
+  }
+});
+
+test("an image the session's store no longer holds fails its turn, naming it", async () => {
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), { lose: true }));
+  const session = agent.session();
+  const result = await session.prompt([{ type: "text", text: "look" }, image]).result;
+  assert.equal(result.stopReason, "error");
+  assert.match(result.error.message, new RegExp(`does not hold image ${pngName}`));
+  assert.deepEqual(seen, [], "the harness never ran it");
+  assert.equal((await session.prompt("after").result).stopReason, "end_turn");
+  await agent.close();
+});
+
+test("an image whose stored bytes changed fails its turn, naming it", async () => {
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), { corrupt: true }));
+  const session = agent.session();
+  const result = await session.prompt([{ type: "text", text: "look" }, image]).result;
+  assert.equal(result.stopReason, "error");
+  // A World's read skips bytes that don't match the name, so to it the image
+  // is missing; a store that returns them fails the check after the read.
+  assert.match(result.error.message, new RegExp(`(holds other bytes under|does not hold) image ${pngName}`));
+  assert.deepEqual(seen, [], "the harness never ran it");
+  assert.equal((await session.prompt("after").result).stopReason, "end_turn");
+  await agent.close();
+});
+
+test("a World whose streams lack getChunks refuses an image prompt before storing it, and text still runs", async () => {
+  const durability = await durabilityFor();
+  // memory() keeps images itself; the others keep them in World streams.
+  if (typeof durability.world !== "function") return;
+  const bound = (target, value) => (typeof value === "function" ? value.bind(target) : value);
+  const withoutGetChunks = {
+    ...durability,
+    async world() {
+      const world = await durability.world();
+      const streams = new Proxy(world.streams, { get: (target, prop) => (prop === "getChunks" ? undefined : bound(target, Reflect.get(target, prop))) });
+      return new Proxy(world, { get: (target, prop) => (prop === "streams" ? streams : bound(target, Reflect.get(target, prop))) });
+    },
+  };
+  const { agent, seen } = recordingAgent(withoutGetChunks);
+  const session = agent.session();
+  const refused = session.prompt([{ type: "text", text: "look" }, image]);
+  await assert.rejects(refused.accepted, (error) => error instanceof TypeError && /getChunks/.test(error.message));
+  await assert.rejects(refused.result);
+  assert.equal((await session.prompt("text only").result).stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["text only"]);
+  await agent.close();
+});
+
+test("a failed image write rejects the prompt before anything is stored", async () => {
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), { failWrites: 1 }));
+  const session = agent.session();
+  const refused = session.prompt([{ type: "text", text: "look" }, image], { messageId: "refused-img" });
+  // The store's own error.
+  const storeFailed = (error) => error.message === "the store is full";
+  await assert.rejects(refused.accepted, storeFailed);
+  await assert.rejects(refused.result, storeFailed);
+  assert.equal((await session.prompt([{ type: "text", text: "again" }, image]).result).stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["image"], "only the second prompt was stored and ran");
+  // The refused prompt was never stored, so its retry is a new turn.
+  const retried = await session.prompt([{ type: "text", text: "look" }, image], { messageId: "refused-img" }).result;
+  assert.equal(retried.stopReason, "end_turn");
+  assert.notEqual(retried.repeated, true);
+  assert.deepEqual(kinds(seen), ["image", "image"]);
+  await agent.close();
+});
+
+test("a failed image write rejects a steer before it is sent", async () => {
+  const fault = {};
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), fault));
+  const session = agent.session();
+  assert.equal((await session.prompt("first").result).stopReason, "end_turn");
+  fault.failWrites = 1;
+  // The store's own error.
+  await assert.rejects(session.steer([{ type: "text", text: "look" }, image]), (error) => error.message === "the store is full");
+  // The steer was never sent, so no turn ran for it before the next prompt.
+  assert.equal((await session.prompt("after").result).stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["first", "after"]);
+  await agent.close();
+});
+
+test("a retried image prompt the log already holds is answered without writing its images again", async () => {
+  const fault = {};
+  const { agent, seen } = recordingAgent(faultyImages(await durabilityFor(), fault));
+  const session = agent.session();
+  assert.equal((await session.prompt([{ type: "text", text: "look" }, image], { messageId: "img-once" }).result).stopReason, "end_turn");
+  // From now on every image write fails, so a retry that wrote again would fail.
+  fault.failWrites = Infinity;
+  const again = await agent.session(session.id).prompt([{ type: "text", text: "look" }, image], { messageId: "img-once" }).result;
+  assert.equal(again.repeated, true);
+  assert.equal(again.stopReason, "end_turn");
+  assert.deepEqual(kinds(seen), ["image"], "the retry ran nothing");
+  await agent.close();
+});
+
+test("base64 is the same with and without the runtime's own encoder and decoder", async () => {
+  const reference = (bytes) => btoa(String.fromCharCode(...bytes));
+  const inputs = [...Array.from({ length: 9 }, (_, n) => pngBytes.subarray(0, n + 1)), Uint8Array.from({ length: 3000 }, (_, i) => (i * 131) & 255)];
+  const run = async () => {
+    const { agent, seen } = recordingAgent(await durabilityFor());
+    const session = agent.session();
+    // Each image is decoded to be stored, and encoded again for the harness.
+    for (const bytes of inputs) assert.equal((await session.prompt([{ type: "image", data: reference(bytes), mimeType: "image/png" }]).result).stopReason, "end_turn");
+    // Each turn's records went through the log as base64 and back.
+    const words = JSON.parse(decoder.decode(await session.checkpoint()));
+    await agent.close();
+    return { seen, words };
+  };
+  const native = await run();
+  const encode = Uint8Array.prototype.toBase64;
+  const decode = Uint8Array.fromBase64;
+  delete Uint8Array.prototype.toBase64;
+  delete Uint8Array.fromBase64;
+  let fallback;
+  try {
+    fallback = await run();
+  } finally {
+    if (encode) Uint8Array.prototype.toBase64 = encode;
+    if (decode) Uint8Array.fromBase64 = decode;
+  }
+  for (const result of [native, fallback]) {
+    assert.deepEqual(result.seen.map((input) => input[0].data), inputs.map(reference));
+    assert.equal(result.words.length, inputs.length * 3);
+  }
 });
 
 test("a worker lives only while a delivery runs it", async () => {
@@ -1424,6 +1881,244 @@ if (durabilityKind === "queue") {
     await ops.close();
     assert.equal((await post(shared, message)).status, 503, "with no agent left, the route says so");
     await stored.close();
+  });
+}
+
+if (durabilityKind === "memory") {
+  test("one name on one store is one agent: another configuration under it is refused", async () => {
+    const durability = memory();
+    const support = createTaggedAgent({ durability, name: "support", tag: "acme" });
+    assert.throws(() => createTaggedAgent({ durability, name: "support", tag: "evil" }), (error) => error?.code === "FX_AGENT_NAME_IN_USE" && error.agent === "support");
+    // A copy with the same configuration is the same agent, as one on each
+    // server is, and only watching it differently does not change it.
+    const copy = createTaggedAgent({ durability, name: "support", tag: "acme", onEvent: () => {} });
+    // Another store, or another name, holds other sessions.
+    const elsewhere = createTaggedAgent({ durability: memory(), name: "support", tag: "evil" });
+    const named = createTaggedAgent({ durability, name: "billing", tag: "evil" });
+    await copy.close();
+    await support.close();
+    // Once the first configuration is gone, the name is free again.
+    const later = createTaggedAgent({ durability, name: "support", tag: "evil" });
+    for (const agent of [elsewhere, named, later]) await agent.close();
+  });
+
+  test("agents created without a name or a durability are one agent only when configured alike", async () => {
+    // Node keeps one default durability per environment, so every agent
+    // created without one shares its store.
+    const shared = memory();
+    const tagged = createDurableAgentFactory({ harness: ({ tag }) => scriptedHarness()(), defaultDurability: async () => shared, defaultShared: true, name: "createDefaultAgent" });
+    const first = tagged({ tag: "key-a" });
+    assert.throws(() => tagged({ tag: "key-b" }), (error) => error?.code === "FX_AGENT_NAME_IN_USE" && error.agent === "default");
+    const same = tagged({ tag: "key-a" });
+    await same.close();
+    await first.close();
+  });
+
+  test("agents created without a durability each get their own store where the default is not shared, so any options are allowed", async () => {
+    // The browser gives every such agent a memory() of its own.
+    const tagged = createDurableAgentFactory({ harness: ({ tag }) => scriptedHarness()(), defaultDurability: async () => memory(), name: "createBrowserAgent" });
+    const first = tagged({ tag: "key-a" });
+    const other = tagged({ tag: "key-b" });
+    await first.newSessionId();
+    const opened = tagged({ tag: "key-c" });
+    await opened.newSessionId();
+    await other.newSessionId();
+    for (const agent of [first, other, opened]) await agent.close();
+  });
+
+  test("an agent created without a durability is refused at once after another of its name opened the shared default", async () => {
+    const shared = memory();
+    const tagged = createDurableAgentFactory({ harness: ({ tag }) => scriptedHarness()(), defaultDurability: async () => shared, defaultShared: true, name: "createDefaultAgent" });
+    const first = tagged({ tag: "key-a" });
+    await first.newSessionId();
+    assert.throws(() => tagged({ tag: "key-b" }), (error) => error?.code === "FX_AGENT_NAME_IN_USE" && error.agent === "default");
+    const same = tagged({ tag: "key-a" });
+    await same.newSessionId();
+    await same.close();
+    await first.close();
+  });
+
+  test("an input over the size limit is refused before anything is stored", async () => {
+    const agent = createAgent({ durability: memory() });
+    const session = agent.session(undefined, { context: { user: "a" } });
+    assert.equal((await session.prompt("first").result).stopReason, "end_turn");
+    const inputs = async () => (await (await agent[Symbol.for("libfx.durableInternals")].openLog(session.id)).read()).filter(({ entry }) => entry.k === "input").length;
+    const before = await inputs();
+    const big = "x".repeat(8 * 1024 * 1024);
+    assert.throws(() => session.prompt(big), (error) => error?.code === "FX_INPUT_TOO_LARGE" && error.limit === 8 * 1024 * 1024);
+    await assert.rejects(session.steer(big), (error) => error?.code === "FX_INPUT_TOO_LARGE");
+    assert.equal(await inputs(), before, "no input was stored");
+    await agent.close();
+  });
+
+  test("a session stores its context as it was when the session opened", async () => {
+    const agent = createAgent({ durability: memory() });
+    const context = { user: "a" };
+    const session = agent.session(undefined, { context });
+    try {
+      await session.prompt("first").result;
+      const log = await agent[Symbol.for("libfx.durableInternals")].openLog(session.id);
+      const inputs = async () => (await log.read()).filter(({ entry }) => entry.k === "input").map(({ entry }) => entry);
+      // A change the caller makes later reaches neither the size check nor
+      // the log, so the 8 MiB limit holds for what is stored.
+      context.user = "x".repeat(8 * 1024 * 1024);
+      await session.steer("next", { messageId: "steer-after-change" });
+      const stored = (await inputs()).find((entry) => entry.messageId === "steer-after-change");
+      assert.deepEqual(stored.context, { user: "a" });
+      assert.ok(JSON.stringify(stored).length < 1024, "the changed context was not stored");
+    } finally {
+      await agent.close();
+    }
+  });
+}
+
+if (durabilityKind === "queue") {
+  // A World that delivers only over HTTP, to the route the test posts to.
+  const routeWorld = async (store) => {
+    const { createWorld } = await import(new URL("../durable/node_modules/@workflow/world-local/dist/index.js", import.meta.url).href);
+    const dir = await mkdtemp(join(tmpdir(), "libfx-core-"));
+    dirs.push(dir);
+    const stored = createWorld({ dataDir: dir, recoverActiveRuns: false });
+    await stored.start();
+    const sent = [];
+    const instance = {
+      ...stored,
+      registerHandler: undefined,
+      queue: async (queueName, payload) => { sent.push({ queueName, payload }); return { messageId: `msg_${sent.length}` }; },
+      createQueueHandler: (_prefix, handler) => async (request) => {
+        const { payload, meta } = await request.json();
+        try {
+          await handler(payload, meta);
+          return new Response("ok");
+        } catch (error) {
+          return Response.json({ code: error?.code, agent: error?.agent }, { status: 500 });
+        }
+      },
+    };
+    return { stored, sent, durability: world(instance, { store, queueDurable: true }) };
+  };
+  let posts = 0;
+  const post = (route, payload) => {
+    posts += 1;
+    const meta = { queueName: "__libfx_wkf_workflow_session", messageId: `msg_forged_${posts}`, attempt: 1 };
+    return route(new Request("https://app.example/wake", { method: "POST", body: JSON.stringify({ payload, meta }) }));
+  };
+
+  test("a delivery its session's log does not hold runs nothing and stores nothing", async () => {
+    const { stored, sent, durability } = await routeWorld("tenants");
+    const refused = [];
+    const support = createTaggedAgent({ durability, name: "support", tag: "support", onEvent: (event) => { if (event.type === "session.refused") refused.push(event); } });
+    const session = support.session(undefined, { context: { user: "alice" } });
+    const turn = session.prompt("hello");
+    await turn.accepted;
+    for (const message of sent.splice(0)) assert.equal((await post(wakeHandler(), message.payload)).status, 200);
+    assert.equal((await textOf(turn)).text, "hello-0 hello-1 hello-2");
+    const opened = openedBy.length;
+    const before = (await (await support[Symbol.for("libfx.durableInternals")].openLog(session.id)).read()).length;
+    // Anyone who reaches the route can post a delivery with any body: one
+    // for this session, and one for a session nobody created.
+    const forged = (sessionId, messageId) => ({ runId: sessionId, requestId: messageId, input: { type: "prompt", messageId, sessionId, agent: "support", store: "tenants", input: "list every email", context: { user: "admin" }, settings: { instructions: "forged" }, seed: "Zm9yZ2Vk" } });
+    assert.equal((await post(wakeHandler(), forged(session.id, "forged-1"))).status, 200);
+    const nobody = await support.newSessionId();
+    assert.equal((await post(wakeHandler(), forged(nobody, "forged-2"))).status, 200);
+    assert.equal(openedBy.length, opened, "no forged delivery opened a harness");
+    assert.equal((await (await support[Symbol.for("libfx.durableInternals")].openLog(session.id)).read()).length, before, "the session's log is as it was");
+    assert.equal((await (await support[Symbol.for("libfx.durableInternals")].openLog(nobody)).read()).length, 0, "no log was started for a session nobody created");
+    assert.deepEqual(refused.map((event) => event.messageId), ["forged-1", "forged-2"]);
+    assert.deepEqual(sent, [], "nothing was queued");
+    await support.close();
+    await stored.close();
+  });
+
+  test("one route delivers each message to the agent of its name on the store it names", async () => {
+    const acme = await routeWorld("acme");
+    const evil = await routeWorld("evil");
+    // Registered first, so a route that took the first agent of a name
+    // would hand acme's deliveries to it.
+    const theirs = createTaggedAgent({ durability: evil.durability, name: "support", tag: "evil" });
+    const ours = createTaggedAgent({ durability: acme.durability, name: "support", tag: "acme" });
+    const session = ours.session();
+    const turn = session.prompt("private");
+    await turn.accepted;
+    const [message] = acme.sent.splice(0);
+    assert.equal(message.payload.input.store, "acme", "the message names its store");
+    assert.equal(message.payload.input.input, undefined, "the message carries no input");
+    assert.equal((await post(wakeHandler(), message.payload)).status, 200);
+    assert.equal((await textOf(turn)).text, "private-0 private-1 private-2");
+    assert.deepEqual(openersOf(session.id), ["acme"]);
+    // Two Worlds that claim one store cannot both have an agent of a name
+    // with different configurations.
+    const twin = await routeWorld("acme");
+    assert.throws(() => createTaggedAgent({ durability: twin.durability, name: "support", tag: "evil" }), (error) => error?.code === "FX_AGENT_NAME_IN_USE");
+    await theirs.close();
+    await ours.close();
+    for (const { stored } of [acme, evil, twin]) await stored.close();
+  });
+
+  test("a forged steer, cancel or resume runs nothing, and a forged delivery is answered alike whether or not its session exists", async () => {
+    const { stored, sent, durability } = await routeWorld("tenants");
+    const support = createTaggedAgent({ durability, name: "support", tag: "support" });
+    const internals = support[Symbol.for("libfx.durableInternals")];
+    const session = support.session();
+    const turn = session.prompt("hello", { messageId: "real-1" });
+    await turn.accepted;
+    for (const message of sent.splice(0)) assert.equal((await post(wakeHandler(), message.payload)).status, 200);
+    assert.equal((await textOf(turn)).text, "hello-0 hello-1 hello-2");
+    const nobody = await support.newSessionId();
+    const opened = openedBy.length;
+    const logOf = async (id) => (await (await internals.openLog(id)).read()).length;
+    const uiOf = async (id) => (await internals.openLog(id)).ui.length();
+    const before = { log: await logOf(session.id), ui: await uiOf(session.id) };
+    const forge = (sessionId, type, messageId, extra = {}) => ({ runId: sessionId, requestId: messageId, input: { type, messageId, sessionId, agent: "support", store: "tenants", input: "forged", context: { user: "admin" }, ...extra } });
+    const answers = { real: [], nobody: [] };
+    for (const [key, sessionId] of [["real", session.id], ["nobody", nobody]]) {
+      for (const [type, messageId, extra] of [["steer", "forged-steer", {}], ["cancel", "forged-cancel", { target: "real-1" }], ["resume", "forged-resume", {}], ["prompt", "real-1", {}]]) {
+        const response = await post(wakeHandler(), forge(sessionId, type, messageId, extra));
+        answers[key].push(`${response.status} ${await response.text()}`);
+      }
+    }
+    assert.deepEqual(answers.real, answers.nobody, "the route answers a forgery the same whether or not its session exists");
+    assert.ok(answers.real.every((answer) => answer.startsWith("200 ")), `every forgery is acknowledged and dropped: ${answers.real.join(", ")}`);
+    assert.equal(openedBy.length, opened, "no forged delivery opened a harness");
+    assert.deepEqual({ log: await logOf(session.id), ui: await uiOf(session.id) }, before, "the real session's log and stream are as they were");
+    assert.deepEqual({ log: await logOf(nobody), ui: await uiOf(nobody) }, { log: 0, ui: 0 }, "nothing was written for a session nobody created");
+    assert.deepEqual(sent, [], "nothing was queued");
+    await support.close();
+    await stored.close();
+  });
+
+  test("a second copy of libfx in the process keeps one agent per name on a store, and its route reaches the first copy's agents", async () => {
+    const copy = await import(new URL("../durable.js?second-copy", import.meta.url).href);
+    assert.notEqual(copy.wakeHandler, wakeHandler, "a separate module instance");
+    const createCopyAgent = copy.createDurableAgentFactory({ harness: ({ tag }) => scriptedHarness()(), defaultDurability: async () => memory(), name: "createCopyAgent" });
+    const { stored, sent, durability } = await routeWorld("tenants");
+    const support = createTaggedAgent({ durability, name: "support", tag: "acme" });
+    assert.throws(() => createCopyAgent({ durability, name: "support", tag: "evil" }), (error) => error?.code === "FX_AGENT_NAME_IN_USE");
+    const session = support.session();
+    const turn = session.prompt("across copies");
+    await turn.accepted;
+    for (const message of sent.splice(0)) assert.equal((await post(copy.wakeHandler(), message.payload)).status, 200);
+    assert.equal((await textOf(turn)).text, "across copies-0 across copies-1 across copies-2");
+    assert.deepEqual(openersOf(session.id), ["acme"]);
+    await support.close();
+    await stored.close();
+  });
+
+  test("a delivery for an agent that has closed fails, and no agent of its name on another store takes it", async () => {
+    const acme = await routeWorld("acme");
+    const carl = await routeWorld("carl");
+    const theirs = createTaggedAgent({ durability: carl.durability, name: "support", tag: "carl" });
+    const ours = createTaggedAgent({ durability: acme.durability, name: "support", tag: "acme" });
+    const session = ours.session();
+    await session.prompt("after close").accepted;
+    const [message] = acme.sent.splice(0);
+    await ours.close();
+    const response = await post(wakeHandler(), message.payload);
+    assert.equal(response.status, 500, "the queue keeps the message to deliver again");
+    assert.deepEqual(await response.json(), { code: "FX_NO_AGENT", agent: "support" });
+    assert.deepEqual(openersOf(session.id), [], "no agent ran the closed agent's session");
+    await theirs.close();
+    for (const { stored } of [acme, carl]) await stored.close();
   });
 }
 

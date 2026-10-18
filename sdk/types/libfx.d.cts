@@ -320,6 +320,8 @@ export type FxSessionEvent = FxEventBase & (
   | { type: "session.fenced"; sessionId: string; epoch: number }
   /** A message for a session of the agent `agent` reached this one, which sent it on. */
   | { type: "session.forwarded"; sessionId: string; agent: string }
+  /** A queue delivery named an input the session's log does not hold, or none at all, so it ran nothing. */
+  | { type: "session.refused"; sessionId?: string; messageId?: string; reason: "unknown message" | "malformed message" }
   /** `cutoffs`: the times in a row the deadline cut off the same step, this one included. */
   | { type: "session.deadline"; sessionId: string; epoch: number; cutoffs: number }
   | { type: "ui.error"; sessionId: string; error: string }
@@ -752,7 +754,7 @@ export type FxAgentOptions = Omit<FxSharedOptions<FxAgentEvent>, "tools"> & FxMo
 
 /** Options for `agent.session()`. Each applies to the turns this session object starts. */
 export interface FxSessionOptions {
-  /** JSON every tool call of those turns receives as `context`. */
+  /** JSON every tool call of those turns receives as `context`, copied when `session()` is called. */
   context?: JsonValue;
   /** The model for those turns instead of the agent's whole model choice: a model ID, or a model object. */
   model?: string | FxModelOptions;
@@ -772,8 +774,7 @@ export interface FxPromptOptions {
 export interface FxSteerOptions {
   /**
    * The steer's id, so a retried request adds nothing. Follows the session id rule. Reusing a prompt's id rejects
-   * with `FX_MESSAGE_ID_IN_USE`; on a queue that outlives the process, the worker drops the steer and emits a
-   * `session.error` with that code instead.
+   * with `FX_MESSAGE_ID_IN_USE`.
    */
   messageId?: string;
 }
@@ -862,7 +863,11 @@ export type FxStreamLine = (
 export interface FxSession {
   /** The session's id; for a new session, null until its first prompt is accepted. */
   readonly id: string | null;
-  /** Queues `input` as the session's next turn and returns a view of that turn. */
+  /**
+   * Queues `input` as the session's next turn and returns a view of that turn. Throws a
+   * TypeError or RangeError for an input libfx refuses, and stores nothing. A prompt whose
+   * `signal` aborts before it is stored is never stored, and ends `cancelled`.
+   */
   prompt(input: FxSessionPromptInput, options?: FxPromptOptions): FxTurn;
   /** Continues a turn a stopped process left open; its result has the stop reason `idle` when there was none. */
   resume(): FxResumeTurn;

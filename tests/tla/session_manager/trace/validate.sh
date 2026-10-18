@@ -24,22 +24,11 @@ for f in "$here/../$spec.tla" "$here/${spec}Trace.tla" "$here/${spec}Trace.cfg" 
     fi
 done
 
-jar="${TLA2TOOLS_JAR:-$HOME/.local/share/tla/tla2tools.jar}"
-java=""
-for candidate in \
-    "${JAVA_HOME:+$JAVA_HOME/bin/java}" \
-    /opt/homebrew/opt/openjdk/bin/java \
-    /usr/local/opt/openjdk/bin/java \
-    "$(command -v java 2>/dev/null || true)"; do
-    if [ -n "$candidate" ] && [ -x "$candidate" ] && "$candidate" -version >/dev/null 2>&1; then
-        java="$candidate"
-        break
-    fi
-done
-if [ -z "$java" ] || [ ! -f "$jar" ]; then
-    echo "needs a Java runtime and tla2tools.jar (see ../check.sh)" >&2
-    exit 2
-fi
+# shellcheck source=../../lib/tlc.sh
+. "$here/../../lib/tlc.sh"
+tlc_find
+java=$tlc_java
+jar=$tlc_jar
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/session-manager-trace.XXXXXX")
 trap 'rm -rf "$work"' EXIT
