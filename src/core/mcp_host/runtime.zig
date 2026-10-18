@@ -914,6 +914,18 @@ pub const Runtime = struct {
             .input => |q| {
                 const req = r.calls.get(q.call) orelse return r.engine.cancel(q.call);
                 if (req.asker == null) {
+                    // Nobody can answer: each question is answered cancel,
+                    // dismissed without a choice, and the server goes on.
+                    const elicitations = for (q.requests) |request| {
+                        if (request.kind != .elicitation) break false;
+                    } else true;
+                    if (elicitations) {
+                        debug_trace.logf("mcp", "MCP input request answered cancel server={s} reason=no question UI", .{event.server});
+                        const values = try r.gpa.alloc([]const u8, q.requests.len);
+                        defer r.gpa.free(values);
+                        @memset(values, cancel_answer);
+                        return r.engine.respond(q.call, values);
+                    }
                     debug_trace.logf("mcp", "MCP input request declined server={s} reason=no question UI", .{event.server});
                     req.declined = true;
                     return r.engine.cancel(q.call);
@@ -985,16 +997,17 @@ pub const Runtime = struct {
             .refresh_due => try r.refreshDue(i),
             .refresh_ended => r.endRefresh(i),
             .elicit => |x| {
-                const decline: mcp.elicitation.Answer = .{ .action = .decline };
+                // Nobody can answer: dismissed without a choice.
+                const cancel: mcp.elicitation.Answer = .{ .action = .cancel };
                 const req = r.callAsking(name) orelse {
-                    debug_trace.logf("mcp", "MCP elicitation declined server={s} reason=no call can ask", .{name});
-                    return r.engine.answerElicitation(name, x.id, decline);
+                    debug_trace.logf("mcp", "MCP elicitation answered cancel server={s} reason=no call can ask", .{name});
+                    return r.engine.answerElicitation(name, x.id, cancel);
                 };
                 const json = try r.gpa.print("{{\"elicitation\":{{\"method\":\"elicitation/create\",\"params\":{s}}}}}", .{x.params});
                 var pending: Pending = .{ .server = i, .json = json, .version = r.versionCopy(i), .reply = .{ .elicit = x.id } };
                 if (!r.offer(req, pending)) {
                     pending.deinit(r.gpa);
-                    return r.engine.answerElicitation(name, x.id, decline);
+                    return r.engine.answerElicitation(name, x.id, cancel);
                 }
                 try r.holdUrl(i, x.id.slot, x.params);
             },
@@ -1496,6 +1509,10 @@ fn describeFailure(why: []const u8) []const u8 {
     return why;
 }
 
+/// An elicitation's answer when nobody can give one: dismissed without a
+/// choice.
+const cancel_answer = "{\"action\":\"cancel\"}";
+
 /// The answers to a call's input requests, in the order of `keys` (JSON
 /// string tokens); null when one is missing or the answers aren't an object.
 fn inputValues(a: Allocator, json: []const u8, keys: []const []const u8) ?[]const []const u8 {
@@ -1754,6 +1771,24 @@ test "an answer to a withdrawn 2025 question reaches no one, and the next questi
     try testing.expect(result == .result);
     try testing.expect(std.mem.find(u8, result.result.content, "e2=for-Q2") != null);
     try testing.expect(std.mem.find(u8, result.result.content, "e1 ") == null);
+}
+
+test "a question no call can show is answered cancel, and the server goes on" {
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var options = f.options();
+    options.questions = .{ .form = true };
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, options);
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    // fx can take questions, but this call has no one to ask.
+    const result = try r.call(arena.allocator(), "fake", "echo", "{\"text\":\"confirm\"}", null, null);
+    try testing.expect(result == .result);
+    try testing.expectEqualStrings("[{\"type\":\"text\",\"text\":\"c1=cancel\"}]", result.result.content);
 }
 
 test "held servers say why, and unknown names and stdio logins are refused" {
