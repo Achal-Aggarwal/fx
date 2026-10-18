@@ -1719,7 +1719,9 @@ test("a turn that crashed with a full image window reopens with all of its image
   assert.equal(images.size, 4096 + 8);
   // A crash after the last turn's tool step leaves it open, with the window
   // full of the turns before it.
-  const stepped = journal.events.findLast((event) => event.type === "turn_progress" && event.steps === 1);
+  // The last progress before the saved final reply, which a resume would
+  // deliver without asking the model.
+  const stepped = journal.events.findLast((event) => event.type === "turn_progress" && event.steps === 1 && event.data.action !== "delivering_response");
   const survived = journal.events.slice(0, journal.events.indexOf(stepped) + 1);
   const read = new Set();
   const reading = withImageStore(persisted(eventJournal(survived)), images);
