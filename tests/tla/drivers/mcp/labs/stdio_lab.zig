@@ -528,7 +528,7 @@ const Lab = struct {
                 }
             },
             .stderr => |text| try lab.print("seen", .{ .stderr = text }),
-            .dropped => |err| try lab.print("seen", .{ .dropped = @errorName(err) }),
+            .dropped => |d| try lab.print("seen", .{ .dropped = @errorName(d.err) }),
             .changed => |c| {
                 try lab.print("seen", .{ .state = @tagName(c.state), .lost = c.lost });
                 if (c.lost) {

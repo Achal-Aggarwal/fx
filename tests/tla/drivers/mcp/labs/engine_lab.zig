@@ -6,7 +6,7 @@
 //!
 //! Usage: engine_lab <trace-path> <script> [--deny TOOL]... [--capabilities JSON]
 //!          [--max-attempts N] [--no-listen] [--preferred V1,V2] [--probe-ms N]
-//!          [--timeout-ms IDLE] [--hard-ms N]
+//!          [--timeout-ms IDLE] [--hard-ms N] [--start-ms N]
 //!          [--define NAME=VALUE]... (each {NAME} in the script becomes VALUE)
 //!
 //! Script, one action per line (blank lines and lines starting with # are skipped):
@@ -134,7 +134,7 @@ const Lab = struct {
             .called => |c| {
                 const answer: ?[]const u8 = if (c.answer) |a| switch (a) {
                     .result => |r| r.content,
-                    .failure => |f| try lab.arena.print("error {d}", .{f.code}),
+                    .failure => |f| try lab.arena.print("error {d} {s}", .{ f.code, f.message }),
                     else => @tagName(a),
                 } else null;
                 try lab.print("event", .{ .tag = t, .maybe_ran = c.maybe_ran, .timed_out = c.timed_out, .answer = answer });
@@ -319,6 +319,8 @@ pub fn main(init: std.process.Init) !void {
             options.timeouts.idle_ms = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--hard-ms")) {
             options.timeouts.hard_ms = try std.fmt.parseInt(u32, value, 10);
+        } else if (std.mem.eql(u8, flag, "--start-ms")) {
+            options.timeouts.start_ms = try std.fmt.parseInt(u32, value, 10);
         } else if (std.mem.eql(u8, flag, "--preferred")) {
             var list: std.ArrayList([]const u8) = .empty;
             var it = std.mem.splitScalar(u8, value, ',');

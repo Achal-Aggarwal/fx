@@ -14,9 +14,9 @@ test("TLC: every model's smoke and stress pass, every planted bug is caught, sta
   save(join(artifacts, "gate-summary.json"), results.map(({ module, label, kind, verdict, expected, distinct, exit }) => ({ module, label, kind, verdict, expected, distinct, exit })));
   expect(results.filter((r) => r.verdict === "FAIL").map((r) => r.label)).toEqual([]);
   const count = (kind: string, verdict: string) => results.filter((r) => r.kind === kind && r.verdict === verdict).length;
-  // SharedLogins joined the four.
-  expect(count("smoke", "PASS")).toBe(5);
-  expect(count("stress", "PASS")).toBe(5);
+  // SharedLogins and SubagentAccess joined the four.
+  expect(count("smoke", "PASS")).toBe(6);
+  expect(count("stress", "PASS")).toBe(6);
   expect(count("mutant", "CAUGHT")).toBe(results.filter((r) => r.kind === "mutant").length);
   // Credentials' two findings and its repair witness became the code.
   // HostLifecycle's OneProcessPerServer did too: it
