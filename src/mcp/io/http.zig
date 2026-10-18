@@ -521,8 +521,9 @@ pub const Client = struct {
         defer line.deinit();
         var parser: sse.Parser = .init(c.options.max_message);
         defer parser.deinit(c.gpa);
+        var stream: lines.SseLines = .{};
         while (true) {
-            const got = lines.read(reader, &line, c.options.max_message) catch return .{ .status = status, .how = .broken };
+            const got = stream.read(reader, &line, c.options.max_message) catch return .{ .status = status, .how = .broken };
             if (got.too_long) return .{ .status = status, .how = .broken };
             const event = parser.line(c.gpa, got.bytes) catch return .{ .status = status, .how = .broken };
             if (event) |e| {

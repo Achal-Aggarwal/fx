@@ -261,7 +261,8 @@ pub const Server = struct {
     table_slots: [64]request.Slot = undefined,
     detector: era.Detector,
     catalog: catalog.Catalog,
-    store: tools.Store = .{ .check_headers = true },
+    /// Its `check_headers` is set for each page from the session's era.
+    store: tools.Store = .{},
     logicals: [32]Logical = undefined,
     next_handle: Handle = 1,
     timers: std.ArrayList(Timer) = .empty,
@@ -1241,6 +1242,9 @@ pub const Server = struct {
             .result => |res| {
                 if (res.kind != .complete) return .page_failed;
                 const page = tools.parsePage(res.raw) catch return .page_failed;
+                // `x-mcp-header` is a 2026 annotation: a 2025 server's tools
+                // keep theirs unchecked, as nothing projects them.
+                r.store.check_headers = !r.legacyEra();
                 const added = r.store.addPage(r.gpa, page) catch return .page_failed;
                 r.last_added = added;
                 return .{ .page_received = .{ .more = page.next_cursor != null, .ttl_ms = page.ttl_ms } };
