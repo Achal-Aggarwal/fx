@@ -1469,6 +1469,9 @@ const App = struct {
         turn_id: u64,
         user_prompt_already_presented: bool,
     ) !bool {
+        // A queued prompt is user activity, so a stale or failed model catalog
+        // refetches in the background. Cooperative hosts fetch inline and skip this.
+        if (comptime !host_profile.cooperative_agent) self.startModelCacheWarmup();
         const queued = try self.snapshotPrompt(
             prompt,
             skill_tokens,
@@ -2294,7 +2297,18 @@ const App = struct {
     }
 
     pub fn startModelCacheWarmup(self: *App) void {
+        self.loadModelCatalog(.activity);
+    }
+
+    /// Opening the model picker revalidates the catalog in the background;
+    /// the picker lists the cached models until the refresh lands.
+    pub fn revalidateModelCache(self: *App) void {
+        self.loadModelCatalog(.picker_open);
+    }
+
+    fn loadModelCatalog(self: *App, trigger: model_cache_runtime.LoadTrigger) void {
         if (comptime host_profile.cooperative_agent) {
+            // Cooperative hosts fetch inline, so only stale catalogs reload there.
             if (self.auth.credentialNeedsRefresh()) {
                 debug_trace.logf("auth", "model_cache_warmup_deferred reason=credential_refresh_required", .{});
                 return;
@@ -2313,6 +2327,7 @@ const App = struct {
             self.model_cache.startWarmup(
                 self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return,
                 self.auth.modelCatalogAccess(),
+                trigger,
             );
         }
     }

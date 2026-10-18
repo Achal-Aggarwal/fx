@@ -2421,11 +2421,17 @@ pub fn Runtime(comptime App: type) type {
             return true;
         }
 
+        /// Opens the model picker on the cached catalog and revalidates it in
+        /// the background, so models released mid-session appear once it lands.
+        fn openModelMenu(app: *App) !void {
+            if (comptime @hasDecl(App, "revalidateModelCache")) app.revalidateModelCache();
+            try app.model_cache.openMenu();
+        }
+
         fn openModelBrowseCatalog(app: *App) !void {
             if (comptime !@hasField(App, "model_cache")) return;
-            if (comptime @hasDecl(App, "ensureModelCache")) app.ensureModelCache();
             if (comptime @hasField(App, "skills")) app.skills.closeMenu();
-            try app.model_cache.openMenu();
+            try openModelMenu(app);
             app.input_runtime.inputResetState().clearCurrent(app.alloc);
             paste_blocks.clearBlocks(app.alloc, &app.input_runtime.entities.pasted_blocks);
             app.shell.render_requests.request(.footer);
@@ -2580,8 +2586,7 @@ pub fn Runtime(comptime App: type) type {
             const item = menu.selectedItem(&snapshot, query) orelse return;
             if (item.id == .model) {
                 if (delta > 0 and comptime @hasField(App, "model_cache")) {
-                    if (comptime @hasDecl(App, "ensureModelCache")) app.ensureModelCache();
-                    try app.model_cache.openMenu();
+                    try openModelMenu(app);
                     app.shell.render_requests.request(.footer);
                 }
                 return;
@@ -2622,8 +2627,7 @@ pub fn Runtime(comptime App: type) type {
                     app.input_runtime.edit_state.input.items,
                 ) orelse return true;
                 if (selected.id == .model) {
-                    if (comptime @hasDecl(App, "ensureModelCache")) app.ensureModelCache();
-                    try app.model_cache.openMenu();
+                    try openModelMenu(app);
                     app.shell.render_requests.request(.footer);
                 }
             }

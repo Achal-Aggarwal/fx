@@ -2278,6 +2278,9 @@ pub fn fetchModelIdsCancellable(
 
 pub const model_catalog_provider = model_catalog.Provider{
     .fetch_fn = fetchCatalogForProvider,
+    // An active session refetches a stale catalog so newly released models
+    // appear without a restart. Only user activity starts the refetch.
+    .refresh_interval_ms = 5 * std.time.ms_per_min,
 };
 
 pub const ModelCatalogEntry = model_catalog.ModelCatalogEntry;

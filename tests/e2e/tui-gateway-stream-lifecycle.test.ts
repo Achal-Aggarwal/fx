@@ -1655,6 +1655,80 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
     expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
   }, TIMEOUT);
 
+  test("a failed model catalog retries in the background without stalling prompts", async () => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "fx-tui-catalog-retry-")));
+    const home = join(root, "home");
+    const workspacePath = join(root, "workspace");
+    const stderrPath = join(root, "stderr.log");
+    mkdirSync(join(home, ".fx"), { recursive: true });
+    mkdirSync(workspacePath, { recursive: true });
+    writeFileSync(join(home, ".fx", "settings.json"), "{}");
+    const workspace = realpathSync(workspacePath);
+
+    // The startup catalog load fails fast. Every later catalog request hangs,
+    // like an endpoint that stopped answering.
+    const releaseHungCatalogs: Array<() => void> = [];
+    const catalogGateway = startFakeGateway(
+      [fakeGatewayFinalText("FIRST_PROMPT_OK"), fakeGatewayFinalText("SECOND_PROMPT_OK")],
+      {
+        models: () => {
+          if (catalogGateway.modelRequests.length === 1) {
+            return new Response("catalog unavailable", { status: 503 });
+          }
+          return new Promise<Response>((resolve) => {
+            releaseHungCatalogs.push(() => resolve(new Response("catalog unavailable", { status: 503 })));
+          });
+        },
+      },
+    );
+    gateway = catalogGateway;
+
+    session = await TmuxSession.create({
+      cwd: workspace,
+      stderrPath,
+      width: 120,
+      height: 40,
+      env: {
+        HOME: home,
+        TMPDIR: root,
+        AI_GATEWAY_API_KEY: "fake-catalog-retry-key",
+        VERCEL_OIDC_TOKEN: undefined,
+        FX_AUTO_UPGRADE: "0",
+        FX_SOUND: "0",
+        FX_PERMISSION_MODE: "auto",
+        FX_GATEWAY_BASE_URL: catalogGateway.baseUrl,
+        FX_GATEWAY_CHAT_URL: catalogGateway.chatUrl,
+        FX_E2E_GATEWAY_CHAT_URL: catalogGateway.chatUrl,
+        FX_E2E_GATEWAY_MODELS_URL: `${catalogGateway.baseUrl}/coding-agent/v1/models`,
+        FX_MODEL: MODEL,
+      },
+    });
+    try {
+      await session.waitForComposer(TIMEOUT);
+      await waitForCondition(() => catalogGateway.modelRequests.length === 1, "startup catalog request");
+
+      // Past the first backoff window, a prompt starts one catalog retry that
+      // never answers. The prompt must not wait for it.
+      await Bun.sleep(5_500);
+      await session.sendText("First prompt.");
+      await session.waitForText("FIRST_PROMPT_OK", 10_000);
+      expect(catalogGateway.modelRequests).toHaveLength(2);
+
+      // A second prompt joins the retry already in flight instead of starting one.
+      await session.waitForStableComposer(TIMEOUT);
+      await session.sendText("Second prompt.");
+      await session.waitForText("SECOND_PROMPT_OK", 10_000);
+      expect(catalogGateway.modelRequests).toHaveLength(2);
+
+      await session.waitForStableComposer(TIMEOUT);
+      await session.sendText("/quit");
+      expect(await session.waitForSessionEnd(TIMEOUT)).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+    } finally {
+      for (const release of releaseHungCatalogs) release();
+    }
+  }, TIMEOUT * 2);
+
   test("file edits keep earlier instruction bytes stable", async () => {
     const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
       "fx-tui-stable-verification-",
