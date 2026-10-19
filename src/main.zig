@@ -4957,6 +4957,7 @@ test {
     _ = @import("core/session/session_json.zig");
     _ = @import("core/session/session_store.zig");
     _ = @import("core/session/session_adapter.zig");
+    _ = @import("core/session/v1_conversion.zig");
     _ = @import("core/session/session_layout.zig");
     _ = @import("core/session/prompt_history_store.zig");
     _ = @import("core/app/prompt_history_runtime.zig");

@@ -468,7 +468,7 @@ reused as ideas; no v1 code is shared.
   - A session converted earlier and then continued in an old fx binary is
     not re-imported, because its id already exists; the newer turns stay
     only in the v1 copy.
-  - v1 terminal state is not converted (D13).
+  - v1 hosted terminal state moves to `~/.fx/terminal/{id}/` (D13, D56).
   - It skips `~/.fx/sessions/v2` itself, the v2 root (D19).
   - v1 event kinds map one to one: `user`, `assistant`, `tool_call`,
     `tool_result` and `steering` become `item` lines with that `type`;
@@ -614,7 +614,8 @@ The figures are medians from 2026-09-27 on a Mac (APFS, SSD).
 - **Rollback:**
   - Before the default flips, switching back to v1 hides v2 sessions but
     loses nothing.
-  - After the conversion, a downgraded fx still sees every v1 session, but
+  - After the conversion, a downgraded fx sees only the v1 sessions not yet
+    converted, since a converted session's v1 folder is removed (D60), and
     nothing done in v2.
 - **Removal condition:** v1, the converter and the v1 reader are deleted one
   release after v2 becomes the default. That requires the E2E session suite,
@@ -1138,7 +1139,8 @@ D59 replaces D55's import at start with conversion on open):
   carries what a user would otherwise lose: side files as blobs with old
   handles mapped as D47 maps them; ACP client prompts and tool identities
   as D46's settings; hosted terminal state into `~/.fx/terminal/{id}`
-  (D45); `-c`'s remembered app session as v2's last-opened when v2 has
+  (D45), whatever its folders' modes, as v1 made each private when it
+  opened it; `-c`'s remembered app session as v2's last-opened when v2 has
   none; and a `recovery.json` open turn as an interrupted turn with its
   saved pieces (D1), exactly when v1 would show it: v1 drops a checkpoint
   whose turn is not open in its log. It carried unsettled usage markers

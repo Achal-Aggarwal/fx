@@ -449,12 +449,24 @@ const subagent_dir = "subagent";
 /// its folder is gone, including when another process converted it and
 /// removed the folder while this one waited for the lock (D61).
 fn lockMember(alloc: Allocator, store: *session_store.Store, id: []const u8, started: i64, wait_ms: u64) !?Locked {
-    var dir = (try openMemberDir(store, id)) orelse return null;
+    const dir = (try openMemberDir(store, id)) orelse return null;
+    return lockOpened(alloc, store, id, dir, started, wait_ms);
+}
+
+/// `lockMember` once `opened`, the member's folder, is open; takes it.
+fn lockOpened(alloc: Allocator, store: *session_store.Store, id: []const u8, opened: io_mod.VerifiedDir, started: i64, wait_ms: u64) !?Locked {
+    var dir = opened;
     errdefer dir.close();
     const spent: u64 = @intCast(@max(io_mod.milliTimestamp() - started, 0));
-    var lock = io_mod.acquireTimedAdvisoryLock(&dir, lock_file, wait_ms -| spent) catch |err| return switch (err) {
-        error.LockBusy => error.SessionBusy,
-        else => err,
+    var lock = io_mod.acquireTimedAdvisoryLock(&dir, lock_file, wait_ms -| spent) catch |err| switch (err) {
+        error.LockBusy => return error.SessionBusy,
+        // Removed since it was opened here, so its lock file is gone too.
+        error.FileNotFound => {
+            debug_trace.logf("convert", "action=Vanished session={s}", .{id});
+            dir.close();
+            return null;
+        },
+        else => return err,
     };
     errdefer lock.release();
     if (!try stillInPlace(store, id, &dir)) {
@@ -909,9 +921,10 @@ const FrameReader = struct {
             else => return reader.problem.set("recovery.json can't be read ({s})", .{@errorName(err)}),
         };
         // v1 shows the recovery checkpoint's turn whole, in place of the open
-        // one a compaction inside it covered part of.
+        // one a compaction inside it covered part of. A compaction that kept
+        // from an earlier turn still leaves out what it covered there.
         if (checkpoint != null and reader.open_user_seq != null) for (reader.deferred.items) |*step| switch (step.*) {
-            .compacted => |*compacted| {
+            .compacted => |*compacted| if (compacted.keep_from == null) {
                 compacted.keep_tool_steps = 0;
                 compacted.keep_steering = 0;
             },
@@ -1302,6 +1315,22 @@ test "a checkpoint inside a turn covers that turn's steps and steering as v1's w
     try std.testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 1, .steering = 1 }, try coveredSteps(&events, &seqs, 5));
     try std.testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 2, .steering = 1 }, try coveredSteps(&events, &seqs, 6));
     try std.testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 3, .steering = 1 }, try coveredSteps(&events, &seqs, 9));
+}
+
+test "a member folder another process removes after it is opened and before it is locked is gone, not an error (D61)" {
+    const alloc = std.testing.allocator;
+    const io = io_mod.getIo();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".fx/sessions/v1memberid01");
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    var store = try session_store.Store.initReadOnlyFromHome(alloc, home, "/");
+    defer store.deinit(alloc);
+    const opened = (try openMemberDir(&store, "v1memberid01")).?;
+    // The other process's conversion removes the folder.
+    try tmp.dir.deleteTree(io, ".fx/sessions/v1memberid01");
+    try std.testing.expectEqual(@as(?Locked, null), try lockOpened(alloc, &store, "v1memberid01", opened, io_mod.milliTimestamp(), 0));
 }
 
 test "an older turn the current event format cannot keep names its file, turn and cause" {

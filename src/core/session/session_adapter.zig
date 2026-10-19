@@ -291,7 +291,7 @@ pub const Store = struct {
                 continue;
             };
             defer target.close();
-            if (!copyTree(&source, &target, 0)) complete = false;
+            if (!copyTree(io_mod.openVerifiedPrivateDirIfPresent, &source, &target, 0)) complete = false;
         }
         return complete;
     }
@@ -3304,7 +3304,8 @@ fn copyTerminalState(store: *Store, locked: *v1_conversion.Locked) !void {
     try owner.dir.deleteTree(io, terminal_dir_name);
     var target = try io_mod.openOrCreateVerifiedPrivateDir(&owner, terminal_dir_name);
     defer target.close();
-    if (!copyTree(&source, &target, 0)) return error.SessionStoreUnavailable;
+    // Whatever the folders' modes, as v1 opened them (it made each private).
+    if (!copyTree(io_mod.openRealDirIfPresent, &source, &target, 0)) return error.SessionStoreUnavailable;
 }
 
 /// Whether v2 holds `id`, a damaged copy included: nothing converts over
@@ -3557,9 +3558,10 @@ pub fn freeKeptChildren(alloc: Allocator, kept: []KeptChild) void {
 }
 
 /// Each v1 child whose parent is not a v1 root, with why no fx opens it
-/// (D88): a child of an earlier subagent, which v1 never let a subagent
-/// message, or one whose parent is gone or does not list it. Reads only.
-/// Caller owns the result; free it with `freeKeptChildren`.
+/// (D88): one v2 already holds, whose folder a cleanup kept (D60), a child
+/// of an earlier subagent, which v1 never let a subagent message, or one
+/// whose parent is gone or does not list it. Reads only. Caller owns the
+/// result; free it with `freeKeptChildren`.
 fn keptChildren(store: *Store, alloc: Allocator) ![]KeptChild {
     const strays = v1_conversion.strayChildren(alloc, store.home) catch |err| switch (err) {
         error.OutOfMemory => return err,
@@ -3582,7 +3584,9 @@ fn keptChildren(store: *Store, alloc: Allocator) ![]KeptChild {
     }
     try kept.ensureTotalCapacity(alloc, strays.len);
     for (strays) |stray| {
-        const reason = if (stray.parent) |parent| blk: {
+        const reason = if (holdsV2(store, alloc, stray.id))
+            try alloc.dupe(u8, "fx converted it already, so anything an older fx added since stays only in this folder")
+        else if (stray.parent) |parent| blk: {
             const role: ?sm.Role = if (stray.parent_is_child) .child else if (store.manager.peek(alloc, parent)) |peeked_value| role: {
                 var peeked = peeked_value;
                 defer peeked.deinit(alloc);
@@ -3625,7 +3629,8 @@ fn copyFailed(id: []const u8, err: anyerror) bool {
 /// are not fx's and are left out.
 const max_copy_depth = 8;
 
-fn copyTree(source: *io_mod.VerifiedDir, target: *io_mod.VerifiedDir, depth: usize) bool {
+/// `openSource` opens each folder below `source`, never through a symlink.
+fn copyTree(comptime openSource: anytype, source: *io_mod.VerifiedDir, target: *io_mod.VerifiedDir, depth: usize) bool {
     const io = io_mod.getIo();
     var complete = true;
     var it = source.dir.iterate();
@@ -3635,7 +3640,7 @@ fn copyTree(source: *io_mod.VerifiedDir, target: *io_mod.VerifiedDir, depth: usi
                 complete = copyFailed(entry.name, error.TooDeep);
                 continue;
             }
-            var from = (io_mod.openVerifiedPrivateDirIfPresent(source, entry.name) catch |err| {
+            var from = (openSource(source, entry.name) catch |err| {
                 complete = copyFailed(entry.name, err);
                 continue;
             }) orelse continue;
@@ -3645,7 +3650,7 @@ fn copyTree(source: *io_mod.VerifiedDir, target: *io_mod.VerifiedDir, depth: usi
                 continue;
             };
             defer to.close();
-            if (!copyTree(&from, &to, depth + 1)) complete = false;
+            if (!copyTree(openSource, &from, &to, depth + 1)) complete = false;
         },
         .file => copyFile(source.dir, target.dir, entry.name) catch |err| {
             complete = copyFailed(entry.name, err);
@@ -6796,6 +6801,41 @@ test "a converted v1 session's hosted terminal state lands where v2 keeps it (D4
     }
 }
 
+test "a v1 session's hosted terminal folders an old fx left readable by others convert, private (D45)" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("terminal", 1))[0];
+    const saved = try v1.tree(id, terminal_dir_name);
+    try testing.expect(saved.count() > 0);
+    // v1 opened these at any mode and made each private as it did.
+    for ([_][]const u8{ "", "/state", "/proofs" }) |sub| {
+        const path = try alloc.print("{s}/{s}{s}", .{ try v1.sessionPath(id, ""), terminal_dir_name, sub });
+        defer alloc.free(path);
+        var dir = try t.tmp.dir.openDir(io, path, .{});
+        defer dir.close(io);
+        dir.setPermissions(io, .fromMode(0o755)) catch return error.SkipZigTest;
+    }
+
+    const s = try openConverted(&t, id);
+    defer s.close();
+    for (saved.keys(), saved.values()) |path, bytes| {
+        const moved = try std.Io.Dir.path.join(alloc, &.{ ".fx", terminal_dir_name, id, terminal_dir_name, path });
+        defer alloc.free(moved);
+        const state = try V1Home.read(&t, moved);
+        defer alloc.free(state);
+        try testing.expectEqualSlices(u8, bytes, state);
+    }
+    const moved = try std.Io.Dir.path.join(alloc, &.{ ".fx", terminal_dir_name, id, terminal_dir_name, "state" });
+    defer alloc.free(moved);
+    const stat = try t.tmp.dir.statFile(io, moved, .{ .follow_symlinks = false });
+    try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
+}
+
 fn writeRecovery(v1: *V1Home, id: []const u8, seq: u64, user: []const u8, partial: []const u8) !void {
     const alloc = testing.allocator;
     const checkpoint: session_codec.RecoveryCheckpoint = .{
@@ -6854,6 +6894,55 @@ test "a v1 turn left open comes back unfinished exactly as v1 shows it (D56)" {
             },
         }
     }
+}
+
+test "a compaction inside an open v1 turn that kept an earlier turn leaves out what it covered there (D87)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const a = v1.arena.allocator();
+    const id = (try v1.fixture("unfinished", 1))[0];
+    // The fixture's lines as v1 wrote them: a finished turn (seq 1 to 3), then
+    // an open one with a tool step (4 to 7) that compacted (8), its reply in
+    // recovery.json.
+    var lines: std.ArrayList([]const u8) = .empty;
+    var it = std.mem.splitScalar(u8, try v1.file(id, "", "events.jsonl"), '\n');
+    while (it.next()) |line| if (line.len > 0) try lines.append(a, line);
+    try testing.expectEqual(@as(usize, 8), lines.items.len);
+    // Rebuilt so that the first turn runs two tool steps and the compaction in
+    // the open turn covers only the first: it keeps the first turn from there.
+    const Line = struct { from: usize, call: ?[]const u8 = null };
+    const plan = [_]Line{
+        .{ .from = 0 },               .{ .from = 5, .call = "c1" }, .{ .from = 6, .call = "c1" },
+        .{ .from = 5, .call = "c2" }, .{ .from = 6, .call = "c2" }, .{ .from = 1 },
+        .{ .from = 2 },               .{ .from = 3 },               .{ .from = 4 },
+        .{ .from = 5 },               .{ .from = 6 },               .{ .from = 7 },
+    };
+    var events: std.Io.Writer.Allocating = .init(a);
+    for (plan, 1..) |line, seq| {
+        var text = try std.mem.replaceOwned(u8, a, lines.items[line.from], try a.print("\"seq\":{d},", .{line.from + 1}), try a.print("\"seq\":{d},", .{seq}));
+        if (line.call) |call| text = try std.mem.replaceOwned(u8, a, text, "conv-stall-run", call);
+        if (line.from == 7) text = try std.mem.replaceOwned(u8, a, text, "\"covers_through_seq\":7", "\"covers_through_seq\":3");
+        try events.writer.print("{s}\n", .{text});
+    }
+    try v1.put(id, null, "events.jsonl", events.written());
+    try v1.put(id, null, "recovery.json", try std.mem.replaceOwned(u8, a, try v1.file(id, "", "recovery.json"), "\"conversation_seq\":8", "\"conversation_seq\":12"));
+
+    const s = try openConverted(&t, id);
+    defer s.close();
+    var restored = try s.restore(alloc);
+    defer restored.deinit(alloc);
+    // The summary, the first turn from its second step, and the open turn
+    // whole from the checkpoint, as v1 shows them.
+    try testing.expectEqual(@as(usize, 3), restored.history.len);
+    const first = restored.history[1].assistant;
+    try testing.expectEqualStrings("CONV_FIRST", first.user.text);
+    try testing.expectEqual(@as(usize, 1), first.execution.tool_steps.len);
+    try testing.expectEqualStrings("c2", first.execution.tool_steps[0].tool_calls[0].id);
+    try testing.expectEqualStrings("CONV_PARTIAL_REPLY", restored.history[2].interrupted.assistant.?);
 }
 
 test "a v1 session another process holds answers busy, and converts nothing (D38)" {
@@ -7535,6 +7624,33 @@ test "fx sessions convert keeps a v1 subagent's own subagent as it is, and fx do
     try testing.expectEqual(@as(usize, 1), doctor_report.kept_children.len);
     try testing.expectEqualStrings(family[2], doctor_report.kept_children[0].id);
     try testing.expectEqualStrings(reason, doctor_report.kept_children[0].reason);
+}
+
+test "fx sessions convert says a converted v1 child whose folder a cleanup kept is converted already (D60, D88)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    const child = family[1];
+    var copy = try V1Copy.take(&t, child);
+    defer copy.deinit();
+    const owner = try v1.file(child, "subagent", "owner.json");
+    const s = try openConverted(&t, family[0]);
+    s.close();
+    try testing.expect(!V1Home.exists(&t, child));
+    // The child's folder as a cleanup keeps it when an older fx changed it
+    // after its conversion: its parent's folder is gone.
+    try copy.restore(&v1, child);
+    try v1.put(child, "subagent", "owner.json", owner);
+
+    var report = try convertAll(&t.store, alloc);
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), report.kept_children.len);
+    try testing.expectEqualStrings(child, report.kept_children[0].id);
+    try testing.expectEqualStrings("fx converted it already, so anything an older fx added since stays only in this folder", report.kept_children[0].reason);
 }
 
 test "fx sessions convert converts every v1 family, and counts what it skipped (D61)" {
