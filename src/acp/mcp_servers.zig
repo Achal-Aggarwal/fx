@@ -139,7 +139,7 @@ pub fn prepare(
     defer inherited.deinit();
     const h = mcp_host.Host.create(alloc, io_mod.getIo(), configs.items.items, &inherited, .{
         .client_version = build_options.app_version,
-        .credentials = .detect(alloc, home),
+        .credentials = .{ .detect = home },
         .workspace_root = workspace_root,
         .questions = questions,
         .url_completions = url_completions,

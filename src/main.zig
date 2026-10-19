@@ -1351,6 +1351,10 @@ const App = struct {
         return SessionAppRuntime.resumeSelectedSession(self);
     }
 
+    pub fn forkBeforeSelectedPrompt(self: *App) ![]u8 {
+        return SessionAppRuntime.forkBeforeSelectedPrompt(self);
+    }
+
     pub fn startSessionCatalogPreload(self: *App) void {
         SessionAppRuntime.preloadSessionCatalog(self);
     }
@@ -4516,6 +4520,8 @@ test "semantic code block preserves indentation on wrapped continuation rows" {
 }
 
 test {
+    _ = @import("core/agent/runtime/journal.zig");
+    _ = @import("acp/libfx_journal.zig");
     _ = @import("mcp/mcp.zig");
     _ = @import("core/mcp_host/runtime.zig");
     _ = @import("napi_fetch_state.zig");

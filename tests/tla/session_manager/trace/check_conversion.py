@@ -15,8 +15,6 @@ INCONCLUSIVE (2) for malformed or empty evidence; TOOL_ERROR (3) otherwise.
 import argparse
 import hashlib
 import json
-import os
-import pwd
 import re
 import shutil
 import subprocess
@@ -26,9 +24,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 TLA = HERE.parent
-JAVA = os.environ.get("JAVA", "/opt/homebrew/opt/openjdk/bin/java")
-# The account's home, not $HOME: drivers run fx under a disposable HOME.
-JAR = os.environ.get("TLA_JAR", os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".local/share/tla/tla2tools.jar"))
+sys.path.insert(0, str(TLA.parent / "lib"))
+from tlc import toolchain  # noqa: E402
 
 KINDS = {"create", "write", "hold", "release", "open", "all", "crash", "open2", "damage", "fresh", "list"}
 REQUESTS = {"open", "all", "crash", "open2"}
@@ -176,7 +173,8 @@ def run_tlc(obs, fresh, work):
     shutil.copyfile(HERE / "V1ConversionTrace.tla", work / "V1ConversionTrace.tla")
     (work / "ConversionData.tla").write_text(data_module(obs))
     (work / "V1ConversionTrace.cfg").write_text(config(obs, fresh))
-    command = [JAVA, "-XX:+UseParallelGC", f"-Djava.io.tmpdir={work / 'tmp'}", "-cp", JAR, "tlc2.TLC",
+    java, jar = toolchain()
+    command = [java, "-XX:+UseParallelGC", f"-Djava.io.tmpdir={work / 'tmp'}", "-cp", jar, "tlc2.TLC",
                "-workers", "1", "-deadlock", "-metadir", str(work / "states"),
                "-config", "V1ConversionTrace.cfg", "V1ConversionTrace"]
     with (work / "tlc.log").open("w") as log:

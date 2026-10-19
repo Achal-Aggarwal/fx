@@ -78,6 +78,15 @@ pub const Store = struct {
         return try alloc.dupe(u8, doc.entries.items[i].credential);
     }
 
+    /// Every saved credential from one read of the store, so a host with
+    /// many servers reads the Keychain once, not once per server. The
+    /// caller frees it with `Snapshot.deinit`.
+    pub fn snapshot(s: Store, alloc: Allocator) !Snapshot {
+        var locked = try s.lock();
+        defer locked.release();
+        return .{ .doc = try s.read(alloc, &locked.dir) };
+    }
+
     /// Fails with `error.CredentialStoreUnreadable` when the store can't be
     /// read, so a sign-in can stop before it starts.
     pub fn check(s: Store, alloc: Allocator) !void {
@@ -236,6 +245,24 @@ fn refreshLockName(key: Key) [29]u8 {
     return name;
 }
 
+/// The saved credentials as one read of the store found them.
+pub const Snapshot = struct {
+    doc: Doc,
+
+    /// The credential saved under `key`, or null. Borrowed from the
+    /// snapshot until `deinit`.
+    pub fn get(s: *const Snapshot, key: Key) ?[]const u8 {
+        const i = s.doc.find(key) orelse return null;
+        return s.doc.entries.items[i].credential;
+    }
+
+    /// Zeroes the credentials and frees them.
+    pub fn deinit(s: *Snapshot, alloc: Allocator) void {
+        s.doc.deinit(alloc);
+        s.* = undefined;
+    }
+};
+
 fn readFile(alloc: Allocator, dir: *io_mod.VerifiedDir) !?[]u8 {
     var file = dir.dir.openFile(io_mod.getIo(), file_name, .{
         .mode = .read_only,
@@ -314,6 +341,28 @@ const testing = std.testing;
 
 fn testHome(tmp: *testing.TmpDir) ![]u8 {
     return io_mod.dirRealpathAlloc(testing.allocator, tmp.dir, ".");
+}
+
+test "one snapshot holds every server's credential" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try testHome(&tmp);
+    defer testing.allocator.free(home);
+    const store: Store = .{ .home = home, .backend = .file };
+    const repo: Key = .{ .name = "linear", .url = "https://mcp.linear.app/mcp", .workspace = "/Users/example/repo" };
+    try store.put(testing.allocator, .{ .name = "linear", .url = "https://mcp.linear.app/mcp" }, "{\"access\":\"l1\"}");
+    try store.put(testing.allocator, .{ .name = "plain", .url = "https://mcp.plain.com/mcp" }, "{\"access\":\"p1\"}");
+    try store.put(testing.allocator, repo, "{\"access\":\"r1\"}");
+
+    var saved = try store.snapshot(testing.allocator);
+    defer saved.deinit(testing.allocator);
+    try testing.expectEqualStrings("{\"access\":\"l1\"}", saved.get(.{ .name = "linear", .url = "https://mcp.linear.app/mcp" }).?);
+    try testing.expectEqualStrings("{\"access\":\"p1\"}", saved.get(.{ .name = "plain", .url = "https://mcp.plain.com/mcp" }).?);
+    // A workspace's server has its own, apart from the profile's.
+    try testing.expectEqualStrings("{\"access\":\"r1\"}", saved.get(repo).?);
+    // A credential is kept per name and URL.
+    try testing.expectEqual(@as(?[]const u8, null), saved.get(.{ .name = "plain", .url = "https://mcp.linear.app/mcp" }));
+    try testing.expectEqual(@as(?[]const u8, null), saved.get(.{ .name = "slack", .url = "https://mcp.slack.com/mcp" }));
 }
 
 test "a credential is kept per server name and URL, replaced, and removed" {

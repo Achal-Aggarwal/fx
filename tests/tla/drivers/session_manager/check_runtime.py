@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Strict runtime-trace checking of real fx sessions against the session manager
-trace wrappers in tests/tla/session_manager/trace/."""
+trace wrappers in tests/tla/session_manager/trace/: each log's turns, its
+children's work, a fork's copied lines (ForkLog), and the processes' wiring."""
 import argparse
 from datetime import datetime, timezone
 import importlib
@@ -173,9 +174,11 @@ def read_regular(path):
 def verify(request, report):
     ids = request.get('sessionIds', [])
     required = request.get('requiredModels', ['turns', 'wiring'])
-    if request.get('version') != 1 or not ids or len(ids) != len(set(ids)) or not all(isinstance(s, str) and VALID_ID.fullmatch(s) for s in ids):
-        raise ValueError('version 1 and nonempty unique safe sessionIds required')
-    if not required or not set(required) <= {'turns', 'children', 'wiring'} or len(required) != len(set(required)):
+    # A run that saved no session, such as a refused /fork, is judged by its
+    # wiring alone.
+    if request.get('version') != 1 or (not ids and required != ['wiring']) or len(ids) != len(set(ids)) or not all(isinstance(s, str) and VALID_ID.fullmatch(s) for s in ids):
+        raise ValueError('version 1 and unique safe sessionIds required, nonempty unless only wiring is')
+    if not required or not set(required) <= {'turns', 'children', 'fork', 'wiring'} or len(required) != len(set(required)):
         raise ValueError('requiredModels must be a nonempty unique supported model set')
     root = Path(request['sessionsRoot'])
     snapshot = report / 'input/sessions'
@@ -211,7 +214,7 @@ def verify(request, report):
     # Bind that callback only in this new, single-threaded CLI process.
     saved.run_tlc = executor.run
     wiring.run_tlc = executor.run
-    children_checked = 0
+    children_checked = forks_checked = 0
     for sid, lines in observed.items():
         try:
             if 'turns' in required:
@@ -226,10 +229,18 @@ def verify(request, report):
                     saved.check_children(target, final)
                     children_checked += 1
                     checks.append({'kind': 'children', 'sessionId': sid, **executor.last})
+            if 'fork' in required and lines[0].get('forked_from'):
+                copied, source = saved.fork_target(saved.read_lines(snapshot / sid / 'log.jsonl', raw=True), str(snapshot))
+                executor.expected = len(copied)
+                saved.check_fork(copied, source)
+                forks_checked += 1
+                checks.append({'kind': 'fork', 'sessionId': sid, **executor.last})
         except (saved.Unreadable, KeyError, TypeError, ValueError) as error:
             checks.append({'kind': 'projection', 'sessionId': sid, 'verdict': 'INCONCLUSIVE', 'detail': str(error)})
     if 'children' in required and children_checked == 0:
         checks.append({'kind': 'children', 'verdict': 'INCONCLUSIVE', 'detail': 'required child work evidence is empty'})
+    if 'fork' in required and forks_checked == 0:
+        checks.append({'kind': 'fork', 'verdict': 'INCONCLUSIVE', 'detail': 'required fork evidence is empty'})
     if 'wiring' in required:
         try:
             data = read_regular(Path(request['wiringTrace']))
@@ -244,7 +255,7 @@ def verify(request, report):
             'jarHash': sha256(jar), 'requestHash': sha256(report / 'request.json'),
             'checkerHash': sha256(Path(__file__)),
             'projectionHashes': {name: sha256(ARCHIVE / name) for name in ('check_saved_logs.py', 'check_wiring_traces.py')},
-            'scope': 'Observed TurnLifecycle/Subagents/Wiring projections only; not all per-PR model refinement.'}
+            'scope': 'Observed TurnLifecycle/Subagents/ForkLog/Wiring projections only; not all per-PR model refinement.'}
 
 
 def main():

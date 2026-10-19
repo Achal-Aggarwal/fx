@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { createConfiguredProviderFixture, completion as configuredCompletion } from "./fixtures/chat-completions";
+import { createConfiguredProviderFixture, completion as configuredCompletion, toolCompletion as configuredToolCompletion } from "./fixtures/chat-completions";
 import { spawn as nodeSpawn, type ChildProcess } from "node:child_process";
 import {
   chmodSync,
@@ -1037,6 +1037,40 @@ test("configured provider ACP prompts and switching preserve connection credenti
   } finally {
     await client.close();
     fixture.close();
+  }
+}, 45000);
+
+test("configured provider ACP runs a direct call to a supplied MCP tool that is not loaded", async () => {
+  const httpFixture = startModernMcpHttpFixture("json");
+  const isReview = (body: any) => body.tools?.some((tool: any) => tool.function?.name === "permission_decision");
+  const fixture = createConfiguredProviderFixture(body => {
+    if (isReview(body)) return configuredToolCompletion(body.model, "permission_decision", { decision: "clear", rationale: "fixture review" });
+    if (body.messages.some((message: any) => message.role === "tool")) return configuredCompletion(body.model, "direct call complete");
+    return configuredToolCompletion(body.model, MCP_TOOL_NAME, { text: "direct" }, "direct_unloaded");
+  });
+  const client = await AcpClient.create({ cwd: fixture.workspace, env: { ...fixture.env, FX_MCP_PROTOCOL_VERSION: "2026-07-28" } });
+  try {
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", {
+      cwd: fixture.workspace,
+      mcpServers: [{ ...acpHttpServer(httpFixture, "acp"), _meta: { fx: { alwaysLoaded: false } } }],
+    }, 2) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    await client.readLine();
+    await client.request("session/set_mode", { modeId: "auto" }, 3);
+    const prompt = await runPrompt(client, "Call the echo tool directly.", TIMEOUT);
+    expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+    const agentRequests = fixture.requests.filter(request => !isReview(request.body));
+    expect(agentRequests).toHaveLength(2);
+    expect(agentRequests[0].body.tools.map((tool: any) => tool.function.name)).not.toContain(MCP_TOOL_NAME);
+    const result = agentRequests[1].body.messages.find((message: any) => message.role === "tool" && message.tool_call_id === "direct_unloaded");
+    expect(result.content).toContain(`${MODERN_HTTP_TOOL_RESULT}:direct`);
+    expect(httpFixture.requests.filter((entry) => entry.message.method === "tools/call")).toHaveLength(1);
+    expect(client.stderr).toBe("");
+  } finally {
+    await client.close();
+    fixture.close();
+    httpFixture.stop();
   }
 }, 45000);
 
