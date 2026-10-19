@@ -3473,7 +3473,7 @@ fn requestAcpElicitation(
         .{},
     );
     var transition_state: mcp_elicitation.RequestState = .pending;
-    // MCP-v2 ties an answer to the call that asked, and drops it once that
+    // The MCP engine ties an answer to the call that asked, and drops it once that
     // call has ended, so its server counts as live here.
     const host_session = if (responder.acp.state.active_session) |*active| active.mcp_host != null else false;
     const transition = mcp_elicitation.decideTransition(
@@ -3492,7 +3492,7 @@ fn requestAcpElicitation(
     if (input_request.mode == .url and action == .accept) {
         if (legacy_source_id != null) {
             const sink = server.legacyUrlCompletionSink(state);
-            // MCP-v2's host has no generations to check: the sink takes the
+            // The MCP host has no generations to check: the sink takes the
             // consent itself.
             if (!host_session) return error.McpInputRequired;
             const accept_result = sink.settleAccept(sink.accept(sink.context, origin, url_id.?)) orelse return error.McpInputRequired;

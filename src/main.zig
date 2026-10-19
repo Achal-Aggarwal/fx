@@ -1630,10 +1630,6 @@ const App = struct {
         try self.mcp.loadHost(load, self.alloc, self.workspace_root, self.toolRegistry(), .{ .form = true, .url = true });
     }
 
-    pub fn mcpHostSelected(_: *const App) bool {
-        return mcp_host.selected();
-    }
-
     pub fn runMcpVerbs(self: *App, rest: []const u8) !void {
         try self.mcp.runVerbs(io_mod.homeDir() orelse "", self.workspace_root, rest);
     }
@@ -3497,7 +3493,7 @@ fn needsEarlyThreadedIo(args: []const [:0]const u8) bool {
             std.mem.eql(u8, effective_args[1], "auth") or
             std.mem.eql(u8, effective_args[1], "list") or
             std.mem.eql(u8, effective_args[1], "logout") or
-            // MCP-v2's verbs start a host or delete a stored login.
+            // The MCP verbs start a host or delete a stored login.
             std.mem.eql(u8, effective_args[1], "show") or
             std.mem.eql(u8, effective_args[1], "login") or
             std.mem.eql(u8, effective_args[1], "remove") or

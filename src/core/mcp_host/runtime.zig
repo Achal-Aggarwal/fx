@@ -1,9 +1,8 @@
-//! fx's side of MCP-v2. One thread owns the engine, which is
+//! fx's side of the MCP engine. One thread owns the engine, which is
 //! single-threaded: other threads send it requests through a queue, wake it,
 //! and read copied status snapshots. The owner turns fx's MCP config into the
 //! engine's servers (`config.zig`), keeps sign-in credentials
 //! (`credentials.zig`), and runs logins on a loopback listener (`login.zig`).
-//! Chosen with FX_MCP_ENGINE=v2 until v1 is removed.
 //!
 //! TLA+ models: `tests/tla/mcp_host/HostLifecycle.tla`,
 //! `tests/tla/mcp_host/SignIn.tla`, `tests/tla/mcp_host/SharedLogins.tla`, and
@@ -32,7 +31,7 @@ const engine = mcp.engine;
 const login_timeout_ms: i64 = 5 * 60 * 1000;
 /// The longest the owner sleeps; a `wake` ends it sooner.
 const idle_wait_ms: u32 = 1000;
-/// How long a logout waits for its revocation, as MCP-v2's `close` does.
+/// How long a logout waits for its revocation, as the engine's `close` does.
 const revoke_wait_ms: i64 = 2000;
 /// How long a refresh waits for another fx refreshing the same login; then
 /// it refreshes anyway.
@@ -69,11 +68,6 @@ fn retireEnded() void {
 /// Waits until every retired runtime's servers are gone.
 pub fn waitRetired() void {
     while (retiring.load(.acquire) != 0) io_mod.sleep(5 * std.time.ns_per_ms);
-}
-
-/// Every host runs its MCP servers through MCP-v2.
-pub fn selected() bool {
-    return true;
 }
 
 pub const State = enum {
@@ -317,7 +311,7 @@ const Login = struct {
     deadline_ms: i64,
     open_browser: bool,
     /// The address the browser came back to, kept until the login ends:
-    /// MCP-v2 reads the code in it when it redeems it.
+    /// The engine reads the code in it when it redeems it.
     callback: ?[]u8 = null,
 };
 
@@ -379,7 +373,7 @@ pub const Runtime = struct {
         not_saved: bool = false,
     };
 
-    /// A refresh MCP-v2 said was due: waiting for its login's refresh lock,
+    /// A refresh the engine said was due: waiting for its login's refresh lock,
     /// or holding it until the refresh ends.
     const Refresh = struct {
         server: usize,
@@ -1755,7 +1749,7 @@ fn declaredCapabilities(questions: elicitation.Capabilities) []const u8 {
     return "{}";
 }
 
-/// MCP-v2 names why a server is down; fx says it in words. Anything else,
+/// The engine names why a server is down; fx says it in words. Anything else,
 /// such as an HTTP failure's own text, is shown as it is.
 /// Why a new login wasn't saved, in words.
 fn notSavedReason(buffer: []u8, store: credentials.Store, err: anyerror) []const u8 {

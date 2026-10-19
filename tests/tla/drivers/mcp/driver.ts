@@ -1,4 +1,4 @@
-// Bun driver for the MCP-v2 engine models in tests/tla/mcp/.
+// Bun driver for the MCP engine models in tests/tla/mcp/.
 //
 // Builds the binaries the selected scenarios need, runs each scenario with an
 // isolated HOME and MCPV2_TRACE, checks every expected trace through the

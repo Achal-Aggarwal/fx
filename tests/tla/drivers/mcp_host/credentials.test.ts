@@ -52,7 +52,7 @@ class Session {
 
 const CREDENTIAL = JSON.stringify({ access: "kept-by-newer-fx", refresh: "r", expires_at_ms: null, token_endpoint: "http://127.0.0.1:9/token", revocation_endpoint: null, resource: URL, client_id: "c", client_secret: null, method: "none" });
 
-/** MCP-v2's store holding web's login, as `version` (1 is this fx's). */
+/** fx's MCP credential store holding web's login, as `version` (1 is this fx's). */
 function writeV2(f: Fixture, version = 1) {
   mkdirSync(join(f.home, ".fx", "mcp-credentials"), { recursive: true, mode: 0o700 });
   writeFileSync(v2Path(f), JSON.stringify({ version, servers: [{ name: "web", url: URL, credential: CREDENTIAL }] }), { mode: 0o600 });
@@ -130,7 +130,7 @@ test("a logout stays when the store becomes unreadable (trace ACCEPTED)", async 
   expect(verdict.verdict).toBe("ACCEPTED");
 }, 120_000);
 
-test("With MCP-v2's store deleted after a logout, v1's login still isn't taken (trace ACCEPTED)", async () => {
+test("With fx's MCP credential store deleted after a logout, v1's login still isn't taken (trace ACCEPTED)", async () => {
   const s = new Session(setup("cred-deleted"));
   writeV1(s.f, [v1Entry("web", URL)]);
   writeV2(s.f);

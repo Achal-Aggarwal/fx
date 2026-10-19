@@ -789,7 +789,7 @@ describe("version-scoped legacy MCP remote transports", () => {
   }
 
   test.skipIf(!tmuxAvailable())(
-    "MCP-v2: /mcp remove ends a 2025 session with a DELETE, and fx keeps running",
+    "/mcp remove ends a 2025 session with a DELETE, and fx keeps running",
     async () => {
       // The removal reloads fx's MCP host, which closes the old host's
       // servers; a 2025 session waits there for its DELETE.
@@ -802,7 +802,7 @@ describe("version-scoped legacy MCP remote transports", () => {
         cwd: root.workspace,
         width: 100,
         height: 30,
-        env: { ...fixtureEnv(root, gateway), FX_MCP_ENGINE: "v2" },
+        env: { ...fixtureEnv(root, gateway) },
       });
 
       await tui.waitForComposer(15_000);
@@ -841,9 +841,9 @@ describe("version-scoped legacy MCP remote transports", () => {
     40_000,
   );
 
-  // MCP-v2's timeouts are engine-wide, so this waits out the 60 s default.
+  // fx's MCP timeouts are engine-wide, so this waits out the 60 s default.
   test(
-    "MCP-v2: a 2025 server that never answers initialize fails after its timeout instead of hanging",
+    "a 2025 server that never answers initialize fails after its timeout instead of hanging",
     async () => {
       const fixture = startLegacyStreamableHttpFixture("2025-11-25", { mode: "hold_initialize" });
       streamable = fixture;
@@ -851,7 +851,7 @@ describe("version-scoped legacy MCP remote transports", () => {
       const started = Date.now();
       const result = await runFx(["mcp", "show", "fixture", "--json"], {
         cwd: root.workspace,
-        env: { HOME: root.home, FX_AUTO_UPGRADE: "0", FX_MCP_ENGINE: "v2" },
+        env: { HOME: root.home, FX_AUTO_UPGRADE: "0" },
         timeoutMs: 90_000,
       });
       expect(result.signal).toBeNull();
@@ -864,7 +864,7 @@ describe("version-scoped legacy MCP remote transports", () => {
   );
 
   test(
-    "MCP-v2: a 2025 server that never answers notifications/initialized fails with the reason instead of looking ready with no tools",
+    "a 2025 server that never answers notifications/initialized fails with the reason instead of looking ready with no tools",
     async () => {
       const fixture = startLegacyStreamableHttpFixture("2025-11-25", { mode: "hold_initialized" });
       streamable = fixture;
@@ -872,7 +872,7 @@ describe("version-scoped legacy MCP remote transports", () => {
       const started = Date.now();
       const result = await runFx(["mcp", "show", "fixture", "--json"], {
         cwd: root.workspace,
-        env: { HOME: root.home, FX_AUTO_UPGRADE: "0", FX_MCP_ENGINE: "v2" },
+        env: { HOME: root.home, FX_AUTO_UPGRADE: "0" },
         timeoutMs: 90_000,
       });
       expect(result.signal).toBeNull();

@@ -1706,7 +1706,7 @@ pub fn Runtime(comptime App: type) type {
             return app.input_runtime.settings_menu.active;
         }
 
-        /// The `/mcp` menu on MCP-v2.
+        /// The `/mcp` menu.
         fn mcpHostMenuActive(app: *App) bool {
             if (comptime !@hasDecl(App, "mcpHostMenuKey")) return false;
             return app.mcp.hostMenuActive();

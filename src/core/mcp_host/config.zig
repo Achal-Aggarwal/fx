@@ -1,4 +1,4 @@
-//! fx's MCP servers as MCP-v2 runs them. Each config from `builtins/mcp.zig`
+//! fx's MCP servers as the engine runs them. Each config from `builtins/mcp.zig`
 //! `loadNativeConfigs` (profile first, then the project's) becomes an
 //! `mcp.engine.Config`, or is held back with the reason, which fx shows.
 
@@ -19,7 +19,7 @@ pub const Held = enum {
     waiting_for_approval,
     /// A project server the user rejected.
     rejected,
-    /// `"type": "sse"`: HTTP+SSE is deprecated and MCP-v2 doesn't speak it.
+    /// `"type": "sse"`: HTTP+SSE is deprecated and the engine doesn't speak it.
     /// `"type": "acp"` from an editor: a draft that ACP v1 doesn't define.
     unsupported,
     /// A header, token, or client secret names an environment variable that isn't set.
@@ -144,7 +144,7 @@ pub fn resolve(
         if (s.slack_app) {
             if (s.callback_port == null) s.callback_port = slack.callback_port;
             if (auth.scopes == null) auth.scopes = slack.scopes;
-            // Slack's tokens are for its origin with a trailing slash; MCP-v2
+            // Slack's tokens are for its origin with a trailing slash; the engine
             // takes it only if it is the server's own.
             if (auth.resource == null) if (s.url) |url| {
                 auth.resource = try arena.print("{s}/", .{origin(url)});

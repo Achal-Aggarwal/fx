@@ -38,8 +38,7 @@ fn typedLoginServer(arena: Allocator, args: []const []const u8) Allocator.Error!
 /// Owns the native profile MCP runtime. All transport work and retirement happen
 /// after releasing this state lock; the lock protects only pointer publication.
 pub const State = struct {
-    /// MCP-v2's host when FX_MCP_ENGINE=v2 selects it; `runtime` then stays
-    /// null. Replaced on the UI thread when `/mcp` changes the
+    /// The MCP host. Replaced on the UI thread when `/mcp` changes the
     /// config; other threads use it through `leaseHost`.
     host: ?*mcp_host.Host = null,
     /// Guards `host` against other threads, and its leases.

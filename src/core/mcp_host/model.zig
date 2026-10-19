@@ -1,8 +1,8 @@
-//! What the model sees of MCP-v2: each server's tools under the
+//! What the model sees of the MCP engine: each server's tools under the
 //! names fx gives them, and the has, validate, call, search, schema, and
 //! snapshot operations fx's tool runtime asks for. The tool lists come from
 //! the runtime; parsing, names, bindings, ranking, schemas, and call results
-//! are fx's own MCP code, so the model sees an MCP-v2 server as it saw v1's.
+//! are fx's own MCP code.
 
 const std = @import("std");
 const runtime_mod = @import("runtime.zig");
@@ -883,7 +883,7 @@ test "a subagent made before its parent's server starts may use the server's too
     try testing.expectError(error.McpAccessDenied, c.callTool(a, "mcp_fake_echo", "{}", 4096, .{ .access = stale }));
 }
 
-test "an MCP-v2 server's tools reach the model under fx's names" {
+test "an MCP server's tools reach the model under fx's names" {
     var f: Fixture = undefined;
     try f.init();
     defer f.deinit();

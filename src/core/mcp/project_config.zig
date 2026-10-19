@@ -613,7 +613,7 @@ pub fn expandApprovedWorkspaceConfigs(
     return expandConfigs(alloc, &result.configs, &result.diagnostics, environment, false);
 }
 
-/// Expands `${VAR}` in profile servers too, as MCP-v2 does; a
+/// Expands `${VAR}` in profile servers too, as the MCP host does; a
 /// server that can't be expanded is dropped
 /// with a diagnostic, as in `.mcp.json`.
 pub fn expandProfileConfigs(

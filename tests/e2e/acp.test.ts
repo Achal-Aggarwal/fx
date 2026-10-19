@@ -2861,15 +2861,15 @@ describe("acp: model-independent", () => {
           name: MCP_TOOL_NAME,
         }),
         fakeGatewayToolCall("call_http", MCP_TOOL_NAME, { text: "acp" }),
-        finalText("ACP MCP-v2 complete"),
+        finalText("ACP MCP complete"),
       ]);
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_ENGINE: "v2" },
+          env: { ...fakeGatewayEnv(root, gateway) },
         });
         const initialized = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
-        // Only what ACP v1 defines and MCP-v2 speaks: no HTTP+SSE, no "type": "acp".
+        // Only what ACP v1 defines and fx's MCP engine speaks: no HTTP+SSE, no "type": "acp".
         expect(initialized.result.agentCapabilities.mcpCapabilities).toEqual({ http: true, sse: false, acp: false });
         const created = await client.request(
           "session/new",
@@ -2887,7 +2887,7 @@ describe("acp: model-independent", () => {
         ) as any;
         expect(created.error).toBeUndefined();
         await client.readLine();
-        // MCP-v2 starts a server when the model first needs it.
+        // fx starts a server when the model first needs it.
         expect(httpFixture.requests).toHaveLength(0);
         await client.request("session/set_mode", { modeId: "auto" }, 3);
         const requestStart = gateway.requests.length;
@@ -2954,7 +2954,7 @@ describe("acp: model-independent", () => {
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_ENGINE: "v2" },
+          env: { ...fakeGatewayEnv(root, gateway) },
           // A short description limit, so the search truncates the tool's.
           args: ["--context-limit", "mcp_description_bytes=8", "acp"],
         });
@@ -3003,7 +3003,7 @@ describe("acp: model-independent", () => {
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_ENGINE: "v2" },
+          env: { ...fakeGatewayEnv(root, gateway) },
           args: ["--context-limit", "mcp_description_bytes=8", "acp"],
         });
         const init = await client.request("initialize", { protocolVersion: 1, clientCapabilities: { session: { notices: false } } }, 1) as any;
@@ -3053,7 +3053,7 @@ describe("acp: model-independent", () => {
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_ENGINE: "v2" },
+          env: { ...fakeGatewayEnv(root, gateway) },
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         const server = { type: "http", name: "fixture", url: httpFixture.url, headers: [] };
@@ -3101,14 +3101,14 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP on MCP-v2 answers session/load at once while the old session's stdio server stops",
+    "ACP answers session/load at once while the old session's stdio server stops",
     async () => {
       const root = createIsolatedRoot("fx-acp-mcp-v2-load-stop-");
       const pidPath = join(root.root, "fixture.pid");
       const eofPath = join(root.root, "fixture.eof");
       const gateway = startFakeGateway([
         fakeGatewayToolCall("call_stdio", MCP_TOOL_NAME, { text: "acp" }),
-        finalText("ACP MCP-v2 stdio"),
+        finalText("ACP MCP stdio"),
       ]);
       // It keeps running after its input closes, so fx sends SIGTERM after 1.5 s.
       let oldPid = 0;
@@ -3125,7 +3125,7 @@ describe("acp: model-independent", () => {
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_ENGINE: "v2" },
+          env: { ...fakeGatewayEnv(root, gateway) },
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [server] }, 2) as any;
@@ -3163,15 +3163,15 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP on MCP-v2 starts a server again after session/load only once its old copy is gone",
+    "ACP starts a server again after session/load only once its old copy is gone",
     async () => {
       const root = createIsolatedRoot("fx-acp-mcp-v2-load-once-");
       const pidPath = join(root.root, "fixture.pid");
       const gateway = startFakeGateway([
         fakeGatewayToolCall("call_old", MCP_TOOL_NAME, { text: "old" }),
-        finalText("ACP MCP-v2 old"),
+        finalText("ACP MCP old"),
         fakeGatewayToolCall("call_new", MCP_TOOL_NAME, { text: "new" }),
-        finalText("ACP MCP-v2 new"),
+        finalText("ACP MCP new"),
       ]);
       // It keeps running after its input closes, so the old copy takes 1.5 s to stop.
       const server = {
@@ -3195,7 +3195,7 @@ describe("acp: model-independent", () => {
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_ENGINE: "v2" },
+          env: { ...fakeGatewayEnv(root, gateway) },
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [server] }, 2) as any;
@@ -3958,7 +3958,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP on MCP-v2 starts a project stdio server in its project",
+    "ACP starts a project stdio server in its project",
     async () => {
       const root = createIsolatedRoot("fx-acp-project-cwd-v2-");
       const pidPath = join(root.root, "project-cwd.pid");
@@ -3982,7 +3982,7 @@ describe("acp: model-independent", () => {
         fakeGatewayToolCall("call_project", MCP_TOOL_NAME, { text: "acp" }),
         finalText("ACP project MCP complete"),
       ]);
-      const env = { ...fakeGatewayEnv(root, gateway), FX_MCP_ENGINE: "v2" };
+      const env = { ...fakeGatewayEnv(root, gateway) };
       try {
         const approved = await runFx(["mcp", "approve", "fixture"], { cwd: root.workspace, env });
         expect(approved.code).toBe(0);
@@ -5274,7 +5274,7 @@ describe("acp: model-independent", () => {
   );
 
   test(
-    "ACP form elicitation answers an MCP-v2 server's input request",
+    "ACP form elicitation answers an MCP server's input request",
     async () => {
       const root = createIsolatedRoot("fx-acp-mcp-v2-form-");
       const pidPath = join(root.root, "mcp-v2-form.pid");
@@ -5282,13 +5282,13 @@ describe("acp: model-independent", () => {
       const gateway = startFakeGateway([
         fakeGatewayToolCall("select_form", "mcp_select_tool", { name: MCP_TOOL_NAME }),
         fakeGatewayToolCall("call_form", MCP_TOOL_NAME, { text: "acp-form" }),
-        finalText("ACP MCP-v2 form complete"),
+        finalText("ACP MCP form complete"),
       ]);
       const directRequests: Array<Record<string, any>> = [];
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_ENGINE: "v2" },
+          env: { ...fakeGatewayEnv(root, gateway) },
         });
         await client.request(
           "initialize",
@@ -5596,7 +5596,7 @@ describe("acp: model-independent", () => {
         expect(calls[1]?.params?.inputResponses).toEqual({
           confirm: { action: "accept" },
         });
-        // MCP-v2 sends the spec's opaque string back as it came.
+        // fx sends the spec's opaque string back as it came.
         expect(calls[1]?.params?.requestState).toEqual("opaque");
         expect(calls[1]?.params?.name).toBe(calls[0]?.params?.name);
         expect(calls[1]?.params?.arguments).toEqual(calls[0]?.params?.arguments);

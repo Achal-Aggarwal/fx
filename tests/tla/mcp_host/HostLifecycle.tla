@@ -1,5 +1,5 @@
 ---- MODULE HostLifecycle ----
-\* fx's MCP-v2 host lifecycle, as the shell runs it.
+\* fx's MCP host lifecycle, as the shell runs it.
 \*
 \* Code (vercel-labs/fx at 53a561bea):
 \*   - src/core/app/app_mcp_runtime.zig: loadHost, reloadHost (replaceHost

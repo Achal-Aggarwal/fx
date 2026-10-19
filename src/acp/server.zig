@@ -2818,7 +2818,7 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         .mcp_servers = state.cfg.allow_acp_mcp,
         .steering = !host_target.is_wasm and !state.cfg.minimal_kernel,
         .system_prompt = !host_target.is_wasm and !state.cfg.minimal_kernel,
-        // fx takes only what ACP v1 defines and MCP-v2 speaks: stdio and
+        // fx takes only what ACP v1 defines and fx's MCP engine speaks: stdio and
         // HTTP.
         .mcp_over_acp = false,
         .mcp_sse = false,

@@ -1,5 +1,5 @@
 // The trace bridge: turns what a scenario saw of real fx into TraceObs.tla
-// and checks it against a model's trace wrapper, MCP-v2's way (sentinel
+// and checks it against a model's trace wrapper, as drivers/mcp/bridge.ts does (sentinel
 // invariant: violated exactly when a complete match exists).
 //
 // Verdicts:

@@ -1,6 +1,6 @@
-# MCP-v2 client rules
+# MCP client rules
 
-Every client-side rule from the MCP specification that the MCP-v2 engine
+Every client-side rule from the MCP specification that the MCP engine
 (`src/mcp/`) follows, with the ID that the models in this folder and the
 drivers in `../drivers/mcp/` cite.
 

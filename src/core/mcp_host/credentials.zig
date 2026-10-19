@@ -1,11 +1,11 @@
-//! Sign-in credentials MCP-v2 hands fx to keep (AUTH-21): one opaque blob per
+//! Sign-in credentials the engine hands fx to keep (AUTH-21): one opaque blob per
 //! server name and URL, so a changed URL never gets an old token. They live in
 //! the macOS Keychain, or in a private file under `~/.fx/mcp-credentials/`.
 //! Either way the directory's advisory lock is held while the store is read
 //! and rewritten, so two fx processes don't overwrite each other's entries.
 //! A store this fx can't read, damaged or saved by a newer fx, is never
-//! written over. v1's logins are never taken over: v1 and
-//! MCP-v2 refreshing one login apart, neither seeing the other's saves, would
+//! written over. v1's logins are never taken over: an older fx and this
+//! one refreshing one login apart, neither seeing the other's saves, would
 //! sign it out. One fx refreshes a login at a time, under that login's
 //! refresh lock.
 //!
@@ -379,7 +379,7 @@ test "a workspace server's credential is its workspace's own, apart from the pro
     try testing.expectEqualStrings("{\"access\":\"mine\"}", still);
 }
 
-/// v1's store with a login for linear, and one MCP-v2 can't use.
+/// v1's store with a login for linear, and one the engine can't use.
 fn writeV1(home: []const u8) !void {
     var home_dir = io_mod.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) };
     defer home_dir.close();

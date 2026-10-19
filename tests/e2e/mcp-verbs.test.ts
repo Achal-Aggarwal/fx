@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
 import { fakeGatewayFinalText, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
-// `fx mcp` on MCP-v2. Sign-in is covered in mcp-auth.test.ts.
+// `fx mcp`. Sign-in is covered in mcp-auth.test.ts.
 
 const MODERN_FIXTURE = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
 
@@ -48,7 +48,6 @@ function createRoot(profile?: unknown, project?: unknown) {
     projectPath: join(workspace, ".mcp.json"),
     env: {
       HOME: home,
-      FX_MCP_ENGINE: "v2",
       FX_DISABLE_KEYCHAIN: "1",
       FX_AUTO_UPGRADE: "0",
       AI_GATEWAY_API_KEY: "fake-mcp-verbs-key",
@@ -70,7 +69,7 @@ const fixtureServer = (extra: Record<string, unknown> = {}) => ({
   ...extra,
 });
 
-describe("fx mcp on MCP-v2", () => {
+describe("fx mcp", () => {
   test("add writes each file and keeps every key it doesn't know", async () => {
     // Raw text, so the number's spelling reaches fx as written.
     const root = createRoot('{"theme":"dark","mcp":{"old":{"command":"true","environment":{"A":"1"},"startup_timeout_ms":1.50}}}');
@@ -395,7 +394,7 @@ describe("fx mcp on MCP-v2", () => {
   }, 30_000);
 });
 
-describe("/mcp in the shell on MCP-v2", () => {
+describe("/mcp in the shell", () => {
   test.skipIf(!tmuxAvailable())("/mcp runs the same verbs and prints the same text", async () => {
     // The shell can ask questions, so it says so to servers.
     const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_EXPECT_ELICITATION: "both" } }) } });
@@ -710,7 +709,7 @@ describe("/mcp in the shell on MCP-v2", () => {
   }, 90_000);
 });
 
-describe("fx ask on MCP-v2", () => {
+describe("fx ask", () => {
   test("fx ask names unapproved project servers and the command that approves them", async () => {
     const root = createRoot(undefined, { mcpServers: { proj: fixtureServer() } });
     gateway = startFakeGateway([fakeGatewayFinalText("done")], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });

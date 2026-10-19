@@ -8,7 +8,7 @@ TLA+ specifications for fx, checked with TLC, together with the scripts and Bun 
 | `cli/` | How `fx` and `fx ask` handle `--model`, `--fast`, `--ultrafast`, and `--effort` at launch, for the current design and a proposed one that validates them. | `cli/check.sh`, `bun test drivers/cli/` |
 | `durable/` | Durable libfx sessions (`sdk/fx-sdk.js`): the journal, tool replay, parallel batches, fencing, the inbox, resumption, and snapshots. | `durable/check.sh`, `durable/mutants.py` |
 | `indexer/` | When a scanned root's listing may be reused, merging parallel grep results, the file picker's loading row, and listing snapshots (`src/core/indexer/`). | `indexer/check.sh` |
-| `mcp/` | The MCP-v2 engine (`src/mcp/`): wire format, requests, stdio, version detection, the tool catalog, both HTTP transports, input-required rounds, authorization, subscriptions, elicitation, and the engine. `rules.md` lists the MCP specification rules the models cite by ID. | `mcp/check.sh`, then the drivers in `drivers/mcp/` |
+| `mcp/` | The MCP engine (`src/mcp/`): wire format, requests, stdio, version detection, the tool catalog, both HTTP transports, input-required rounds, authorization, subscriptions, elicitation, and the engine. `rules.md` lists the MCP specification rules the models cite by ID. | `mcp/check.sh`, then the drivers in `drivers/mcp/` |
 | `mcp_host/` | fx's MCP host (`src/core/mcp_host/`): host lifecycle, saved credentials, logins shared between processes, sign-in, elicitation routing, and calls held for the URLs a server asks the user to open. | `mcp_host/check.sh`, `bun test drivers/mcp_host/` |
 | `sdk/` | libfx durable sessions (`DurableSession.tla`), agent names and routing (`AgentRouting.tla`), tenants whose agents share one process (`TenantIsolation.tla`), steering (`DurableSteer.tla`), and the provider credential edge (`ProviderAuth.tla`). `check.sh` also writes the TLC state graphs the drivers walk. | `sdk/check.sh`, then the drivers |
 | `session_manager/` | The session log, turn lifecycle, writer lock, snapshots, fork, subagents, catalog, host wiring, the side-file move, and v1 conversion. `rollout/` holds the models of the changes that moved fx onto the session manager. `system-design.md` is the design record the specs check and defines the `D1` to `D62` decision numbers that code comments cite. | `session_manager/check.sh`, `session_manager/rollout/run.py`, `bun test drivers/session_manager/` |
@@ -49,11 +49,11 @@ npm ci --prefix sdk/durable
 
 ## MCP in CI
 
-CI's `TLA+ MCP models and drivers` job runs each MCP-v2 model's smoke config (`mcp/run.py check`), `mcp_host/check.sh`, and both MCP drivers. The MCP-v2 models' planted bugs (`mcp/check.sh`) run only by hand: they measure the checks, not the code.
+CI's `TLA+ MCP models and drivers` job runs each engine model's smoke config (`mcp/run.py check`), `mcp_host/check.sh`, and both MCP drivers. The engine models' planted bugs (`mcp/check.sh`) run only by hand: they measure the checks, not the code.
 
 ## MCP models without a driver here
 
-The MCP-v2 models of the two HTTP transports, input-required rounds, authorization, subscriptions, and elicitation are model-checked only. Their traces came from a conformance adapter that is not part of fx. The `drivers/mcp_host/` sign-in tests drive real fx over HTTP against the fake server in `drivers/mcp/fakes/`.
+The engine models of the two HTTP transports, input-required rounds, authorization, subscriptions, and elicitation are model-checked only. Their traces came from a conformance adapter that is not part of fx. The `drivers/mcp_host/` sign-in tests drive real fx over HTTP against the fake server in `drivers/mcp/fakes/`.
 
 The `cli/` and `shell_command/` tests also check a proposed design. Those checks run only with `FX_TLA_PROPOSED=1`, and they fail until fx implements the design.
 
@@ -69,9 +69,9 @@ tests/tla/session_manager/trace/selftest.sh             # the trace validator mu
 tests/tla/session_manager/rollout/run.py check          # the rollout models; mutate for their planted bugs
 tests/tla/indexer/check.sh                              # every config and its expected verdict
 tests/tla/acp/check.sh                                  # likewise for acp/, cli/, durable/, shell_command/, terminal/, usage/
-tests/tla/mcp/check.sh                                  # every MCP-v2 model and planted bug
+tests/tla/mcp/check.sh                                  # every MCP engine model and planted bug
 tests/tla/mcp_host/check.sh                             # every MCP host model, planted bug, and finding
-bun tests/tla/drivers/mcp/driver.ts                      # src/mcp/ along the MCP-v2 models
+bun tests/tla/drivers/mcp/driver.ts                      # src/mcp/ along the MCP engine models
 bun test ./tests/tla/drivers/mcp_host/                  # fx's MCP host along its models; FX_BIN picks the binary
 tests/tla/sdk/check.sh                                  # the SDK specs; writes the state graphs the drivers walk
 bun tests/tla/drivers/drive.mjs send --walks 40         # one durable-session graph; see .github/workflows/ci.yml for the rest

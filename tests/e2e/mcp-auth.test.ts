@@ -131,7 +131,7 @@ function startAuthFixture(
     /** The metadata's token endpoint, in place of its own. */
     tokenEndpoint?: string;
     slackBridgeClientId?: string;
-    /** fx's Slack app signs in with `http://localhost:<port>/callback`, as MCP-v2 does, not fx.sh's redirect. */
+    /** fx's Slack app signs in with `http://localhost:<port>/callback`, as fx does now, not fx.sh's redirect. */
     slackLocalhostRedirect?: boolean;
     /** Answer every refresh with this status and body, such as Slack's HTTP-200 `ok:false`. */
     refreshAnswer?: { status: number; body: unknown };
@@ -547,7 +547,7 @@ function seedExpiredCredentials(
 }
 
 /**
- * Holds MCP-v2's store lock from another process, as a busy fx would, for
+ * Holds fx's MCP credential store lock from another process, as a busy fx would, for
  * `seconds`; resolves once it is held.
  */
 async function holdStoreLock(root: ReturnType<typeof createRoot>, seconds: number) {
@@ -559,7 +559,7 @@ async function holdStoreLock(root: ReturnType<typeof createRoot>, seconds: numbe
   return holder;
 }
 
-/** A login in MCP-v2's own store (FX_DISABLE_KEYCHAIN), as fx saves it. */
+/** A login in fx's MCP credential store (FX_DISABLE_KEYCHAIN), as fx saves it. */
 function seedV2Credential(root: ReturnType<typeof createRoot>, activeAuth: AuthFixture, fields: Record<string, unknown> = {}) {
   const origin = new URL(activeAuth.url).origin;
   const directory = join(root.home, ".fx", "mcp-credentials");
@@ -1322,9 +1322,9 @@ describe("MCP login", () => {
     expect(auth.tokenExchanges).toBe(0);
   }, 60_000);
 
-  // A v1 login taken over would be refreshed by v1 and MCP-v2 apart,
-  // neither seeing the other's saves, so a server that takes each refresh
-  // token once signs both out. MCP-v2 signs in on its own instead.
+  // A v1 login taken over would be refreshed by an older fx and this one
+  // apart, neither seeing the other's saves, so a server that takes each
+  // refresh token once signs both out. fx signs in on its own instead.
   test("a v1 login isn't carried over: the server needs its own login, and v1's store stays as it is", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
@@ -1405,7 +1405,7 @@ describe("MCP login", () => {
     expect(opened.pathname).toBe("/authorize");
     expect(opened.searchParams.get("client_id")).toBe(FX_SLACK_CLIENT_ID);
     expect(opened.searchParams.get("redirect_uri")).toBe(`http://localhost:${port}/callback`);
-    // MCP-v2 adds offline_access when the authorization server lists it, as
+    // fx adds offline_access when the authorization server lists it, as
     // the stand-in does; Slack doesn't list it.
     expect(opened.searchParams.get("scope")!.split(" ").filter((x) => x !== "offline_access").sort()).toEqual([
       "channels:history", "channels:read", "channels:write", "chat:write", "emoji:read", "files:write",

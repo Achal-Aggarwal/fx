@@ -1149,7 +1149,7 @@ describe("modern MCP Streamable HTTP", () => {
     expect(fixture.cancelledCalls).toBe(1);
   }, 30_000);
 
-  test("MCP-v2 closes a held-open SSE response once its answer arrives", async () => {
+  test("fx closes a held-open SSE response once its answer arrives", async () => {
     const heldOpen = startModernMcpHttpFixture("held_open_final");
     fixture = heldOpen;
     const root = createRoot("held-open-final-v2", heldOpen, 1_000);
@@ -1172,7 +1172,7 @@ describe("modern MCP Streamable HTTP", () => {
       ["ask", "--json", "--auto", "--no-save", "Call the held-open HTTP fixture."],
       {
         cwd: root.workspace,
-        env: { ...fixtureEnv(root, gateway), FX_MCP_ENGINE: "v2" },
+        env: { ...fixtureEnv(root, gateway) },
         timeoutMs: 20_000,
       },
     );

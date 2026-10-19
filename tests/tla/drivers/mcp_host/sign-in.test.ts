@@ -1,4 +1,4 @@
-// SignIn: real sign-ins against MCP-v2's fake Streamable HTTP server with
+// SignIn: real sign-ins against the engine models' fake Streamable HTTP server with
 // fake OAuth (../mcp/fakes/http.ts): discovery,
 // registration, an authorization URL the harness follows itself (no browser),
 // the loopback callback, and the code redemption the fake logs. Checked
@@ -18,7 +18,7 @@ const RULES = [
 ];
 
 async function startFake(f: Fixture, server: Record<string, unknown> = {}) {
-  if (!existsSync(HTTP_FAKE)) throw new Error(`harness: MCP-v2's fake HTTP server is missing at ${HTTP_FAKE}`);
+  if (!existsSync(HTTP_FAKE)) throw new Error(`harness: the fake HTTP server is missing at ${HTTP_FAKE}`);
   const rules = join(f.base, "rules.json"), auth = join(f.base, "auth.json"), log = join(f.base, "http-fake.jsonl");
   writeFileSync(rules, JSON.stringify(RULES));
   writeFileSync(auth, JSON.stringify({ servers: [server], challengeScope: "mcp:read" }));

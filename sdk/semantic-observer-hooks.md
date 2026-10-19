@@ -54,7 +54,7 @@ The main model, compaction, review, vision, and title paths report distinct
 purposes without synthesizing user turns for auxiliary calls. Review retries
 have separate model-call IDs. Title tasks borrow an observer only while their
 owner guarantees a join before releasing it. MCP instrumentation stays in fx's
-host boundary; the isolated MCP-v2 engine has no tracing imports.
+host boundary; the isolated MCP engine has no tracing imports.
 
 Native child runtimes allocate a fresh execution observer and carry the existing
 durable message/work identity. They don't retain a pointer to a parent's

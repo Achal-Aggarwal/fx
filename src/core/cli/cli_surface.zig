@@ -1108,7 +1108,7 @@ fn runNonInteractiveWithDeps(
         return .handled_success;
     }
 
-    // MCP-v2's verbs print their own help, and pass `-h` after `--` to the server.
+    // The MCP verbs print their own help, and pass `-h` after `--` to the server.
     if (topLevelHelpRequest(cfg.command_catalog, effective_args)) |kind| if (kind != .mcp) {
         const text = try command_specs.renderTopLevelCommandHelp(alloc, cfg.command_catalog, kind);
         defer alloc.free(text);
@@ -2411,7 +2411,7 @@ fn runTopLevelMcp(
     return runMcpVerbs(alloc, rest, cfg, deps);
 }
 
-/// `fx mcp` on MCP-v2: the verbs `/mcp` shares.
+/// `fx mcp`: the verbs `/mcp` shares.
 fn runMcpVerbs(alloc: Allocator, rest: []const [:0]const u8, cfg: Config, deps: RunDeps) !RunResult {
     const home = deps.getenv(deps.env_ctx, "HOME") orelse {
         try writeStderr(deps, "fx mcp: HOME isn't set\n");

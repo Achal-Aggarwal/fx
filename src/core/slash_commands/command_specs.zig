@@ -1,8 +1,5 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
-
-pub const mcp_add_usage = "mcp add slack | mcp add NAME COMMAND [ARGS...] | mcp add --transport http NAME URL";
-pub const mcp_auth_usage = "mcp auth NAME";
 const display_width = @import("../shared/display_width.zig");
 const list_window = @import("../shared/list_window.zig");
 const mod_registry = @import("../mods/registry.zig");
@@ -869,7 +866,7 @@ const allowlist_user_add_tool_completions = scopedAllowlistCompletions("user", a
 const allowlist_local_remove_tool_completions = scopedAllowlistCompletions("local", allowlist_remove_tool_completions);
 const allowlist_user_remove_tool_completions = scopedAllowlistCompletions("user", allowlist_remove_tool_completions);
 
-/// `/mcp` completes MCP-v2's verbs and server names.
+/// `/mcp` completes the MCP verbs and server names.
 fn mcpVerbsOn() bool {
     return true;
 }
@@ -2205,7 +2202,7 @@ pub const slack_install_spec: TopLevelSpec = .{
     .details = &.{
         "install opens Slack authorization through fx.sh and saves the bot credentials on this computer.",
         "status shows local installation metadata; refresh renews tokens without browser authorization.",
-        "This is a workspace bot installer. Employee MCP login remains fx mcp auth NAME.",
+        "This is a workspace bot installer. Employee MCP login remains fx mcp login NAME.",
         "Credentials are saved in ~/.fx/slack/installation.json with owner-only permissions.",
         "Refresh runs only when requested; no background service is installed.",
     },
