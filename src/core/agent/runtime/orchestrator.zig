@@ -4668,11 +4668,12 @@ fn fitRequestImages(
     first_body: []const u8,
     limits: request_image_budget.Limits,
     tool_text_limit: usize,
+    blob_dir: ?[]const u8,
     trace_ctx: TraceContext,
 ) ![]const u8 {
     var body = first_body;
     while (true) {
-        const projection = try request_image_budget.withholdOldestImages(arena, request.messages, body.len, limits, tool_text_limit);
+        const projection = try request_image_budget.withholdOldestImages(arena, request.messages, body.len, limits, tool_text_limit, blob_dir);
         if (projection.withheld == 0) return body;
         var smaller = request.*;
         smaller.messages = projection.messages;
@@ -7501,6 +7502,7 @@ fn processQueuedPromptLoop(
                     &attachment_dimensions,
                     safe_tool_messages,
                     max_dimension,
+                    deps.image_blob_dir,
                 );
                 break :native projection.messages;
             } else result_request_messages;
@@ -7508,9 +7510,12 @@ fn processQueuedPromptLoop(
             // Saved turns keep steering without its envelope; the model gets it
             // back as the live update it saw when the turn took it.
             const steering_messages = try runtime_execution_memory.rewrapRestoredSteering(overlay_arena, image_projection.messages);
-            const request_messages = try with_replyable_conversation_tail(overlay_arena, steering_messages);
-            if (request_messages.ptr != steering_messages.ptr) {
-                debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{steering_messages.len});
+            // After the steering rewrap, which recognizes a parent's steering
+            // by how its text starts.
+            const located_messages = try image_attachments.noteAttachmentLocations(overlay_arena, steering_messages, deps.image_blob_dir);
+            const request_messages = try with_replyable_conversation_tail(overlay_arena, located_messages);
+            if (request_messages.ptr != located_messages.ptr) {
+                debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{located_messages.len});
             }
             // Tool images withheld because the catalog could not confirm image
             // input are invisible in the transcript otherwise. Tell the user
@@ -7573,6 +7578,7 @@ fn processQueuedPromptLoop(
                 request_data.messages,
                 request_image_budget.largestRequestBytes(agent.requestByteLimit(gateway_model)),
                 config.max_tool_result_bytes,
+                deps.image_blob_dir,
             );
             if (past_limit.withheld > 0) {
                 debug_trace.eventf("images", "request_images_withheld_before_build", step_ctx, "withheld={d}", .{past_limit.withheld});
@@ -7595,6 +7601,7 @@ fn processQueuedPromptLoop(
                         deps.agent_stream_provider.max_request_bytes,
                     ) },
                     config.max_tool_result_bytes,
+                    deps.image_blob_dir,
                     step_ctx,
                 );
                 prepared_request_body = request_body;
@@ -11014,6 +11021,13 @@ fn processQueuedPromptLoop(
                                     prepared_terminal.memory,
                                     null,
                                     advertised_dynamic_tool_names,
+                                );
+                                try runtime_tool_admission.recordRejectedToolCall(
+                                    deps,
+                                    arena,
+                                    tool_call,
+                                    safe_output,
+                                    null,
                                 );
                                 try runtime_tool_batch.appendToolResultContent(
                                     arena,
