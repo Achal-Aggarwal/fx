@@ -900,6 +900,14 @@ pub fn Handlers(comptime App: type) type {
         fn commandHandleMcp(ctx: *anyopaque, rest: []const u8) !void {
             if (comptime !@hasDecl(App, "runMcpVerbs")) return;
             const app: *App = @ptrCast(@alignCast(ctx));
+            if (comptime !runtime_profile.allows(App, .mcp)) {
+                try app.writeDomainNotice(.{
+                    .topic = "mcp",
+                    .tone = .warning,
+                    .body = "MCP servers are unavailable in this host; the embedding app provides MCP tools.",
+                }, true);
+                return;
+            }
             const command = std.mem.trim(u8, rest, " \t");
             // `/mcp` alone opens the menu, and `/mcp VERB` runs the verbs
             // `fx mcp` has.
