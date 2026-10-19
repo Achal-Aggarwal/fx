@@ -578,7 +578,6 @@ const App = struct {
     worker: WorkerRuntime = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
-    legacy_process_provider: process_provider.Provider = process_provider.unavailable_provider,
     upgrader: auto_upgrade.AutoUpgrade = .{},
     change_tracker: change_tracker_mod.ChangeTracker = .{},
     mcp: app_mcp_runtime.State = .{},
@@ -637,10 +636,6 @@ const App = struct {
                 process_provider.unavailable_provider
             else
                 shell_process_provider.provider),
-            .legacy_process_provider = if (comptime host_target.is_wasm)
-                process_provider.unavailable_provider
-            else
-                shell_process_provider.provider,
         };
         auth_runtime.Runtime.initIntoWithMode(
             &app.auth,
@@ -678,7 +673,6 @@ const App = struct {
             launch.requested_resume = null;
         }
         errdefer if (app.requested_resume) |*target| target.deinit(alloc);
-        app.session_persistence.sessions_v2 = launch.modifiers.sessions_v2;
         try BootstrapAppRuntime.bootstrap(
             &app,
             footer_rows,
@@ -734,6 +728,9 @@ const App = struct {
                     return err;
                 };
                 SessionAppRuntime.syncTerminalTitle(&app);
+            } else if (launch.upgrade_relaunch) |relaunch| {
+                SessionAppRuntime.writeUpgradeNotice(&app, app_version, build_update_channel, relaunch.previous_revision orelse "", build_revision) catch |err|
+                    debug_trace.logf("session", "event=upgrade_notice_unavailable err={s}", .{@errorName(err)});
             }
         }
         const env_disabled = if (io_mod.getenv("FX_AUTO_UPGRADE")) |val|
@@ -765,7 +762,7 @@ const App = struct {
     }
 
     pub fn rebindAfterInit(self: *App) void {
-        SessionAppRuntime.rebindSubagentHost(self);
+        SessionAppRuntime.rebindAfterMove(self);
     }
 
     pub fn setNotificationPreferences(
@@ -933,9 +930,8 @@ const App = struct {
         buffer: []u8,
         session_id: []const u8,
         terminal_cols: u16,
-        sessions_v2: bool,
     ) ![]const u8 {
-        return ui_render.formatResumeHandoff(buffer, session_id, terminal_cols, sessions_v2);
+        return ui_render.formatResumeHandoff(buffer, session_id, terminal_cols);
     }
 
     /// Full teardown for hosts that keep running after the shell ends, such as
@@ -1383,10 +1379,6 @@ const App = struct {
         return SessionAppRuntime.forkBeforeSelectedPrompt(self);
     }
 
-    pub fn startSessionCatalogPreload(self: *App) void {
-        SessionAppRuntime.preloadSessionCatalog(self);
-    }
-
     pub fn loadMoreSessionPicker(self: *App) !bool {
         return SessionAppRuntime.loadMoreSessionPicker(self);
     }
@@ -1448,26 +1440,6 @@ const App = struct {
         errdefer worker_runtime.freeQueuedPrompt(std.heap.c_allocator, queued);
         try self.worker.admitInteractivePrompt(std.heap.c_allocator, queued);
         HerdrAppRuntime.reportWorking(self);
-        return true;
-    }
-
-    pub fn queueRecoveryCheckpoint(
-        self: *App,
-        checkpoint: *const session_codec.RecoveryCheckpoint,
-    ) !bool {
-        if (!try self.snapshotAndQueuePrompt(
-            checkpoint.user.text,
-            &.{},
-            checkpoint,
-            null,
-            checkpoint.turn_id,
-            false,
-        )) return false;
-        WorkerAppRuntime.beginRecoveryPresentation(self);
-        WorkerAppRuntime.syncState(
-            self,
-            app_callbacks.Bindings(App).worker_tool_lifecycle_presenter(self),
-        );
         return true;
     }
 
@@ -5108,8 +5080,9 @@ test {
     _ = @import("core/session/session_json.zig");
     _ = @import("core/session/session_store.zig");
     _ = @import("core/session/session_adapter.zig");
+    _ = @import("core/session/v1_conversion.zig");
+    _ = @import("core/session/session_catalog_cache.zig");
     _ = @import("core/session/session_layout.zig");
-    _ = @import("core/session/legacy_background_migration.zig");
     _ = @import("core/session/prompt_history_store.zig");
     _ = @import("core/app/prompt_history_runtime.zig");
     _ = @import("core/session/web_fetch_artifacts.zig");
@@ -5117,7 +5090,6 @@ test {
     _ = @import("core/subagent/domain.zig");
     _ = @import("core/subagent/child_state.zig");
     _ = @import("core/subagent/managed_owner.zig");
-    _ = @import("core/subagent/resume_admission.zig");
     _ = @import("core/subagent/execution.zig");
     _ = @import("core/subagent/agent_adapter.zig");
     _ = @import("core/subagent/tool_host.zig");

@@ -226,10 +226,7 @@ const PendingLegacyUrl = struct {
 pub const ActiveSessionState = struct {
     observer_hooks: ?@import("libfx_hooks.zig").Config = null,
     session_id: []u8,
-    store: ?session_store.Store = null,
-    writable: ?session_store.LoadedWritableSession = null,
-    /// The session on v2 (`FX_SESSIONS_V2`); `store` and `writable` stay
-    /// null then, as one process uses one backend.
+    /// The saved session; null on the wasm host, which keeps `wasm_state`.
     v2: ?*session_adapter.Session = null,
     wasm_state: ?session_codec.DurableSessionState = null,
     wasm_revision: ?[]u8 = null,
@@ -362,15 +359,12 @@ pub const ServerState = struct {
     worker: worker_runtime.WorkerRuntime = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
-    subagent_store: ?session_store.Store = null,
     /// A v2 session's children (D22), borrowed by `subagent_host`.
     subagent_v2_children: ?*subagent_child_state.V2Children = null,
     subagent_host: ?*subagent_tool_host.Runtime = null,
-    /// Open for the whole connection when sessions are on v2.
+    /// Open for the whole connection on native hosts; the wasm host keeps
+    /// its sessions in the JS host's snapshot store (D63).
     sessions_v2: ?session_adapter.Store = null,
-    /// v2 was asked for; with no store, sessions are unavailable rather
-    /// than on v1, as one process uses one backend.
-    sessions_v2_requested: bool = false,
     capability_resolver: gateway_provider.CapabilityResolver = .{},
     terminate_connection: bool = false,
     web_fetch_runtime: web_fetch_runtime.Runtime = web_fetch_runtime.Runtime.init(.{}),
@@ -726,17 +720,10 @@ fn publishRefreshedCredential(
     adoptServerCredential(state, refreshed);
 }
 
-pub const SessionsBackend = union(enum) {
-    v1,
-    v2: *session_adapter.Store,
-    /// v2 was asked for but its store could not open (no `HOME`).
-    v2_unavailable,
-};
-
-/// Where this connection keeps its sessions.
-pub fn sessionsBackend(state: *ServerState) SessionsBackend {
-    if (state.sessions_v2) |*store| return .{ .v2 = store };
-    return if (state.sessions_v2_requested) .v2_unavailable else .v1;
+/// The native session store; null when it could not open (no `HOME`). The
+/// wasm host keeps sessions in the JS host's snapshot store instead.
+pub fn sessionsStore(state: *ServerState) ?*session_adapter.Store {
+    return if (state.sessions_v2) |*store| store else null;
 }
 
 pub fn releaseActiveSession(state: *ServerState) !void {
@@ -775,8 +762,6 @@ fn destroyActiveSession(state: *ServerState) void {
         if (active.mcp_host) |h| h.destroy();
     }
     active.session_rt.deinit(state.alloc);
-    if (active.writable) |*writable| writable.deinit(state.alloc);
-    if (active.store) |*store| store.deinit(state.alloc);
     if (active.v2) |v2| v2.close();
     if (active.wasm_state) |*wasm_state| wasm_state.deinit(state.alloc);
     if (active.wasm_revision) |revision| state.alloc.free(revision);
@@ -786,24 +771,8 @@ fn destroyActiveSession(state: *ServerState) void {
 pub fn enableSubagentHost(state: *ServerState) void {
     disableSubagentHost(state);
     const active = if (state.active_session) |*session| session else return;
-    if (active.v2) |v2| return enableSubagentHostV2(state, active, v2);
-    if (active.writable == null) return;
-    state.subagent_store = session_store.Store.init(state.alloc, state.workspace_root) catch |err| {
-        debug_trace.logf("acp", "subagent host store unavailable session={s} err={s}", .{ active.session_id, @errorName(err) });
-        return;
-    };
-    state.subagent_host = subagent_tool_host.Runtime.create(
-        state.alloc,
-        &state.subagent_store.?,
-        active.session_id,
-        .{ .context = state, .resolve_fn = resolveSubagentAuthority },
-        .{ .context = state, .run_fn = prompt_handler.runSubagentChild },
-    ) catch |err| {
-        debug_trace.logf("acp", "subagent host unavailable session={s} err={s}", .{ active.session_id, @errorName(err) });
-        state.subagent_store.?.deinit(state.alloc);
-        state.subagent_store = null;
-        return;
-    };
+    const v2 = active.v2 orelse return;
+    enableSubagentHostV2(state, active, v2);
 }
 
 /// Subagents on v2 keep their state in the session's log (D22). A host that
@@ -814,7 +783,7 @@ fn enableSubagentHostV2(state: *ServerState, active: *ActiveSessionState, v2: *s
         return;
     };
     children.* = subagent_child_state.V2Children.init(state.alloc, v2, active.workspace_root);
-    state.subagent_host = subagent_tool_host.Runtime.createV2(
+    state.subagent_host = subagent_tool_host.Runtime.create(
         state.alloc,
         children,
         .{ .context = state, .resolve_fn = resolveSubagentAuthority },
@@ -901,10 +870,6 @@ pub fn disableSubagentHost(state: *ServerState) void {
         state.alloc.destroy(children);
         state.subagent_v2_children = null;
     }
-    if (state.subagent_store) |*store| {
-        store.deinit(state.alloc);
-        state.subagent_store = null;
-    }
 }
 
 pub fn run(alloc: Allocator, cfg: Config) !void {
@@ -938,9 +903,8 @@ pub fn runWithTransport(
         .lifecycle_view = lifecycle_view,
     };
     defer state.deinit();
-    // One backend per process; the wasm host stays on v1.
-    if (comptime !host_target.is_wasm) if (session_adapter.enabled(false)) {
-        state.sessions_v2_requested = true;
+    // The wasm host keeps its sessions in the JS host's store (D63).
+    if (comptime !host_target.is_wasm) {
         state.sessions_v2 = (if (cfg.home_override) |home|
             session_adapter.Store.open(alloc, home)
         else
@@ -948,7 +912,7 @@ pub fn runWithTransport(
             debug_trace.logf("acp", "event=sessions_v2_store_unavailable err={s}", .{@errorName(err)});
             break :blk null;
         };
-    };
+    }
 
     var reader = reader_value;
     while (!state.terminate_connection) {
@@ -2455,7 +2419,7 @@ fn promptWorkerMain(active: *ActivePrompt) void {
     ) catch |err| .{
         .rpc_error = .{
             .code = ErrorCode.internal_error,
-            // v2 names a storage fault (D29); v1 keeps the error name.
+            // A storage fault is named (D29); the wasm host keeps the error name.
             .message = if (active.state.sessions_v2 != null)
                 sessions.v2StorageFaultMessage("Session could not be saved", err) orelse @errorName(err)
             else
@@ -3463,7 +3427,7 @@ fn handleSetConfigOption(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Me
                 }
             }
         }
-        if (host_target.is_wasm and session.writable == null) {
+        if (host_target.is_wasm) {
             const next_model = alloc.dupe(u8, value) catch
                 return state.writer.writeError(alloc, msg.id, .{
                     .code = ErrorCode.internal_error,
@@ -3759,22 +3723,8 @@ fn commitActiveSessionProvider(
     defer session.session_write_mutex.unlock(io_mod.getIo());
     const staged_model = try alloc.dupe(u8, model);
     errdefer alloc.free(staged_model);
-    if (session.v2) |v2| {
-        try setV2Preferences(v2, session, provider, model, session.effort);
-    } else {
-        const writable = if (session.writable) |*active|
-            active
-        else
-            return error.SessionPersistenceUnavailable;
-        _ = try writable.appendEvent(
-            alloc,
-            .{ .preferences_changed = .{
-                .provider = provider,
-                .model = @constCast(model),
-            } },
-            io_mod.milliTimestamp(),
-        );
-    }
+    const v2 = session.v2 orelse return error.SessionPersistenceUnavailable;
+    try setV2Preferences(v2, session, provider, model, session.effort);
     alloc.free(session.model);
     session.model = staged_model;
     session.provider = provider;
@@ -3815,33 +3765,7 @@ fn commitActiveSessionModel(
         session.model = staged_model;
         return;
     }
-    const writable = if (session.writable) |*active|
-        active
-    else
-        return error.SessionPersistenceUnavailable;
-    try commitSessionModel(
-        alloc,
-        writable,
-        &session.model,
-        value,
-    );
-}
-
-fn commitSessionModel(
-    alloc: Allocator,
-    writable: *session_store.LoadedWritableSession,
-    active_model: *[]u8,
-    value: []const u8,
-) !void {
-    const staged_model = try alloc.dupe(u8, value);
-    errdefer alloc.free(staged_model);
-    _ = try writable.appendEvent(
-        alloc,
-        .{ .preferences_changed = .{ .model = @constCast(value) } },
-        io_mod.milliTimestamp(),
-    );
-    alloc.free(active_model.*);
-    active_model.* = staged_model;
+    return error.SessionPersistenceUnavailable;
 }
 
 fn commitActiveSessionEffort(
@@ -3849,7 +3773,7 @@ fn commitActiveSessionEffort(
     session: *ActiveSessionState,
     effort: types.ReasoningEffort,
 ) !void {
-    if (host_target.is_wasm and session.writable == null) {
+    if (host_target.is_wasm) {
         const previous = session.effort;
         session.effort = effort;
         sessions.commitWasmSession(alloc, session) catch |err| {
@@ -3860,20 +3784,8 @@ fn commitActiveSessionEffort(
     }
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
-    if (session.v2) |v2| {
-        try setV2Preferences(v2, session, session.provider, session.model, effort);
-        session.effort = effort;
-        return;
-    }
-    const writable = if (session.writable) |*active|
-        active
-    else
-        return error.SessionPersistenceUnavailable;
-    _ = try writable.appendEvent(
-        alloc,
-        .{ .preferences_changed = .{ .effort = effort } },
-        io_mod.milliTimestamp(),
-    );
+    const v2 = session.v2 orelse return error.SessionPersistenceUnavailable;
+    try setV2Preferences(v2, session, session.provider, session.model, effort);
     session.effort = effort;
 }
 
@@ -3927,7 +3839,7 @@ fn storeSessionUltrafast(
     session: *ActiveSessionState,
     ultrafast: bool,
 ) !bool {
-    if (state.cfg.minimal_kernel and session.writable == null and session.v2 == null and session.wasm_state == null) {
+    if (state.cfg.minimal_kernel and session.v2 == null and session.wasm_state == null) {
         session.ultrafast_mode = ultrafast;
         return true;
     }
@@ -3980,7 +3892,7 @@ fn storeSessionFast(
     session: *ActiveSessionState,
     fast: bool,
 ) !bool {
-    if (state.cfg.minimal_kernel and session.writable == null and session.v2 == null and session.wasm_state == null) {
+    if (state.cfg.minimal_kernel and session.v2 == null and session.wasm_state == null) {
         session.fast_mode = fast;
         return true;
     }
@@ -3995,7 +3907,7 @@ fn storeSessionFast(
 }
 
 fn commitActiveSessionFast(alloc: Allocator, session: *ActiveSessionState, fast: bool) !void {
-    if (host_target.is_wasm and session.writable == null) {
+    if (host_target.is_wasm) {
         const previous = session.fast_mode;
         session.fast_mode = fast;
         sessions.commitWasmSession(alloc, session) catch |err| {
@@ -4006,19 +3918,11 @@ fn commitActiveSessionFast(alloc: Allocator, session: *ActiveSessionState, fast:
     }
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
-    if (session.v2) |v2| {
-        var preferences = try v2.currentPreferences(alloc);
-        defer preferences.deinit(alloc);
-        preferences.fast_mode = fast;
-        try v2.setPreferences(preferences);
-    } else {
-        const writable = if (session.writable) |*active| active else return error.SessionPersistenceUnavailable;
-        _ = try writable.appendEvent(
-            alloc,
-            .{ .preferences_changed = .{ .fast_mode = fast } },
-            io_mod.milliTimestamp(),
-        );
-    }
+    const v2 = session.v2 orelse return error.SessionPersistenceUnavailable;
+    var preferences = try v2.currentPreferences(alloc);
+    defer preferences.deinit(alloc);
+    preferences.fast_mode = fast;
+    try v2.setPreferences(preferences);
     session.fast_mode = fast;
 }
 
@@ -4095,7 +3999,6 @@ test "ACP ultrafast disable applies to volatile SDK sessions without a durable s
     };
     state.cfg.minimal_kernel = true;
     var active: ActiveSessionState = undefined;
-    active.writable = null;
     active.v2 = null;
     active.wasm_state = null;
     active.ultrafast_mode = true;
@@ -4116,21 +4019,11 @@ fn commitActiveSessionUltrafast(
     }
     session.session_write_mutex.lockUncancelable(io_mod.getIo());
     defer session.session_write_mutex.unlock(io_mod.getIo());
-    if (session.v2) |v2| {
-        var preferences = try v2.currentPreferences(alloc);
-        defer preferences.deinit(alloc);
-        preferences.ultrafast_mode = ultrafast;
-        try v2.setPreferences(preferences);
-    } else {
-        const writable = if (session.writable) |*active| active else return error.SessionPersistenceUnavailable;
-        if (ultrafast or writable.state.preferences.ultrafast_mode) {
-            _ = try writable.appendEvent(
-                alloc,
-                .{ .preferences_changed = .{ .ultrafast_mode = ultrafast } },
-                io_mod.milliTimestamp(),
-            );
-        }
-    }
+    const v2 = session.v2 orelse return error.SessionPersistenceUnavailable;
+    var preferences = try v2.currentPreferences(alloc);
+    defer preferences.deinit(alloc);
+    preferences.ultrafast_mode = ultrafast;
+    try v2.setPreferences(preferences);
     session.ultrafast_mode = ultrafast;
 }
 
@@ -4669,38 +4562,6 @@ test "ACP legacy URL state requires consent and completion" {
     removeLegacyUrl(&state, "acp-new");
 }
 
-fn acpModelTestState(
-    alloc: Allocator,
-    id: []const u8,
-    workspace_root: []const u8,
-) !session_codec.DurableSessionState {
-    const owned_id = try alloc.dupe(u8, id);
-    errdefer alloc.free(owned_id);
-    const origin_workspace_root = try alloc.dupe(u8, workspace_root);
-    errdefer alloc.free(origin_workspace_root);
-    const current_workspace_root = try alloc.dupe(u8, workspace_root);
-    errdefer alloc.free(current_workspace_root);
-    const model = try alloc.dupe(u8, "old-model");
-    errdefer alloc.free(model);
-    const history = try alloc.alloc(session_runtime.HistoryTurn, 0);
-    return .{
-        .id = owned_id,
-        .origin_workspace_root = origin_workspace_root,
-        .workspace_root = current_workspace_root,
-        .created_at_ms = 1,
-        .updated_at_ms = 1,
-        .conversation_language = session_runtime.ConversationLanguage.literal("en"),
-        .preferences = .{
-            .model = model,
-            .effort = .auto,
-            .fast_mode = false,
-        },
-        .history = history,
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    };
-}
-
 test "ACP ultrafast writes preserve v2 baselines across other preference changes" {
     const alloc = testing_allocator.no_resize;
     var tmp = std.testing.tmpDir(.{});
@@ -4718,7 +4579,6 @@ test "ACP ultrafast writes preserve v2 baselines across other preference changes
     var active: ActiveSessionState = undefined;
     active.session_write_mutex = .init;
     active.wasm_state = null;
-    active.writable = null;
     active.v2 = v2;
     active.model = try alloc.dupe(u8, "old-model");
     defer alloc.free(active.model);
@@ -4755,39 +4615,10 @@ test "ACP ultrafast writes preserve v2 baselines across other preference changes
     try std.testing.expect(!active.ultrafast_mode);
 }
 
-test "ACP ultrafast v1 writes omit default-off changes and persist explicit disable" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
-    defer alloc.free(home);
-    var store = try session_store.Store.initFromHome(alloc, home, home);
-    defer store.deinit(alloc);
-    var seed = try acpModelTestState(alloc, "acp-ultrafast", home);
-    defer seed.deinit(alloc);
-    var active: ActiveSessionState = undefined;
-    active.session_write_mutex = .init;
-    active.wasm_state = null;
-    active.v2 = null;
-    active.writable = try store.startWritableSession(alloc, seed);
-    defer active.writable.?.deinit(alloc);
-    active.ultrafast_mode = false;
-    const sequence = active.writable.?.conversation_writer.last_seq;
-    try commitActiveSessionUltrafast(alloc, &active, false);
-    try std.testing.expectEqual(sequence, active.writable.?.conversation_writer.last_seq);
-    try commitActiveSessionUltrafast(alloc, &active, true);
-    try std.testing.expect(active.ultrafast_mode);
-    try std.testing.expect(active.writable.?.state.preferences.ultrafast_mode);
-    try commitActiveSessionUltrafast(alloc, &active, false);
-    try std.testing.expect(!active.ultrafast_mode);
-    try std.testing.expect(!active.writable.?.state.preferences.ultrafast_mode);
-}
-
 test "ACP model commits honor the active session write boundary" {
     const alloc = std.testing.allocator;
     var active: ActiveSessionState = undefined;
     active.v2 = null;
-    active.writable = null;
     active.session_write_mutex = .init;
     active.model = try alloc.dupe(u8, "old-model");
     defer alloc.free(active.model);

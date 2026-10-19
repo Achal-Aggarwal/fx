@@ -137,16 +137,18 @@ async function startFx(
   return session;
 }
 
-function historyImageSnapshotPath(): string {
-  const sessionsRoot = join(root!, "home", ".fx", "sessions");
-  const sessionNames = readdirSync(sessionsRoot, { withFileTypes: true })
-    .filter((entry) =>
-      entry.isDirectory() &&
-      existsSync(join(sessionsRoot, entry.name, "images"))
-    )
-    .map((entry) => entry.name);
-  expect(sessionNames).toHaveLength(1);
-  const imageDir = join(sessionsRoot, sessionNames[0]!, "images");
+/// The folders fx captures prompt images into, outside the session store,
+/// until a turn saves them (D44).
+function imageSnapshotDirs(): string[] {
+  const tmp = realpathSync("/tmp");
+  return readdirSync(tmp).filter((name) => name.startsWith("fx-image-snapshots-")).map((name) => join(tmp, name));
+}
+
+/// The image this run captured: the one snapshot folder made since `before`.
+function historyImageSnapshotPath(before: Set<string>): string {
+  const made = imageSnapshotDirs().filter((dir) => !before.has(dir));
+  expect(made).toHaveLength(1);
+  const imageDir = made[0]!;
   const snapshotNames = readdirSync(imageDir)
     .filter((name) => name.endsWith(".bin"));
   expect(snapshotNames).toHaveLength(1);
@@ -900,7 +902,9 @@ tmuxTest(
       expect(readFileSync(saved)).toEqual(readFileSync(fixtureImagePath!));
       return saved;
     });
-    expect(savedPaths[1]).not.toBe(savedPaths[0]);
+    // The session keeps those bytes once, as the blob named by their hash.
+    expect(savedPaths[1]).toBe(savedPaths[0]);
+    expect(savedPaths[0]!.startsWith(join(root!, "home", ".fx", "sessions", "v2"))).toBe(true);
     expectCleanRuntime(active);
   },
   TIMEOUT,
@@ -910,14 +914,12 @@ for (
   const scenario of [
     {
       name: "corrupt",
-      expectedError: "ImageSnapshotCorrupt",
       damage(path: string) {
         writeFileSync(path, Buffer.from("corrupt history snapshot"));
       },
     },
     {
       name: "deleted",
-      expectedError: "FileNotFound",
       damage(path: string) {
         rmSync(path, { force: true });
       },
@@ -925,8 +927,9 @@ for (
   ]
 ) {
   tmuxTest(
-    `history recall preserves the composer when an image snapshot is ${scenario.name}`,
+    `history recall keeps its image when the captured file is ${scenario.name}`,
     async () => {
+      const before = new Set(imageSnapshotDirs());
       const active = await startFx(true, 1, false, "prompt_history");
 
       await pasteExact(active, fixtureImagePath!);
@@ -942,18 +945,18 @@ for (
         TIMEOUT,
       );
 
-      scenario.damage(historyImageSnapshotPath());
-      await active.sendLiteralText("KEEP_CURRENT_DRAFT");
+      // The recalled image carries its bytes, checked against its digest, so
+      // the file fx captured it into is never read again (D84).
+      scenario.damage(historyImageSnapshotPath(before));
       await active.sendKeys("Up");
-      await active.sendKeys("Up");
-      const rejectionTrace =
-        `[prompt_history] event=recall_rejected err=${scenario.expectedError}`;
-      await waitForTraceOrExit(active, rejectionTrace);
+      await active.waitForPane(
+        (pane) => composerContains(pane, "remember image") && composerContains(pane, "[Image 1]"),
+        TIMEOUT,
+      );
 
       expect(active.isAlive()).toBe(true);
-      await active.waitForText("KEEP_CURRENT_DRAFT", TIMEOUT);
       expect(readFileSync(stderrPath!, "utf8")).toBe("");
-      expect(readFileSync(join(root!, "trace.log"), "utf8")).toContain(rejectionTrace);
+      expect(readFileSync(join(root!, "trace.log"), "utf8")).not.toContain("event=recall_rejected");
     },
     TIMEOUT,
   );
