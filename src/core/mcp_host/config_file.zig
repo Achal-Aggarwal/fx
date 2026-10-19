@@ -359,3 +359,19 @@ test "a linked config file is never edited, whether a symlink or a hard link" {
         if (case.linked) try testing.expectError(error.Linked, write(alloc, .project, path, "{}")) else write(alloc, .project, path, "{}") catch |err| try testing.expect(case.name.len > 0 and err == error.FileNotFound);
     }
 }
+
+test "the profile's first write creates ~/.fx readable only by its owner" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(home);
+    const path = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "mcp.json" });
+    defer alloc.free(path);
+    try write(alloc, .profile, path, "{\"mcpServers\":{}}");
+    const dir = try tmp.dir.statFile(io, ".fx", .{});
+    try testing.expectEqual(@as(std.posix.mode_t, 0o700), dir.permissions.toMode() & 0o777);
+    const file = try tmp.dir.statFile(io, ".fx/mcp.json", .{});
+    try testing.expectEqual(@as(std.posix.mode_t, 0o600), file.permissions.toMode() & 0o777);
+}
