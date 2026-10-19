@@ -2460,6 +2460,7 @@ fn isInvalidGatewayResponse(err: anyerror) bool {
         error.HttpChunkTruncated,
         error.HttpHeadersOversize,
         error.UnsupportedCompressionMethod,
+        error.GatewayJsonResponseTooLarge,
         => true,
         else => false,
     };
@@ -2481,6 +2482,9 @@ test "catalog request failures preserve transport and cancellation facts" {
 
     const malformed = catalogRequestFailure(error.HttpHeadersInvalid);
     try std.testing.expectEqual(model_catalog.FailureCategory.malformed_response, malformed.category);
+
+    const oversized = catalogRequestFailure(error.GatewayJsonResponseTooLarge);
+    try std.testing.expectEqual(model_catalog.FailureCategory.malformed_response, oversized.category);
 }
 
 fn modelCatalogUrl(alloc: Allocator, path: []const u8, base_url_override: ?[]const u8) ![]u8 {

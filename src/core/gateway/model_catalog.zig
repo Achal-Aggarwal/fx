@@ -69,6 +69,14 @@ pub const Failure = struct {
     }
 };
 
+/// Milliseconds on the clock that times catalog refreshes. It keeps counting
+/// while the machine sleeps, so a catalog goes stale overnight, but ignores
+/// wall-clock changes, so adjusting the clock neither forces nor delays one.
+pub fn clockMs() i64 {
+    const timestamp = std.Io.Clock.boot.now(io_mod.getIo());
+    return @intCast(@divFloor(timestamp.nanoseconds, std.time.ns_per_ms));
+}
+
 pub fn failureForHttpStatus(status: std.http.Status) Failure {
     if (status == .unauthorized or status == .forbidden) {
         return .{ .category = .authentication, .http_status = status };

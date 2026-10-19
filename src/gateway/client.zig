@@ -560,16 +560,42 @@ fn fetchGatewayJsonAtUrlCore(
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     if (failedGatewayJsonStatus(response.head.status)) |status| return .{ .http_status = status };
 
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
     var transfer_buffer: [64 * 1024]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
-    _ = reader.streamRemaining(&out.writer) catch |err| {
+    const body = readGatewayJsonBody(alloc, response.reader(&transfer_buffer), max_gateway_json_bytes) catch |err| {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
         return err;
     };
-    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-    return .{ .success = try out.toOwnedSlice() };
+    if (cancel_flag.load(.seq_cst)) {
+        alloc.free(body);
+        return error.Cancelled;
+    }
+    return .{ .success = body };
+}
+
+/// About fifty times today's model catalog. A larger response fails rather
+/// than growing memory on every refresh.
+const max_gateway_json_bytes: usize = 16 * 1024 * 1024;
+
+/// Returns the caller-owned body, or `error.GatewayJsonResponseTooLarge` when
+/// it exceeds `max_bytes`.
+fn readGatewayJsonBody(alloc: std.mem.Allocator, reader: *std.Io.Reader, max_bytes: usize) ![]u8 {
+    return reader.allocRemaining(alloc, .limited(max_bytes)) catch |err| switch (err) {
+        error.StreamTooLong => error.GatewayJsonResponseTooLarge,
+        else => |e| e,
+    };
+}
+
+test "gateway JSON bodies past the size cap fail instead of growing" {
+    var at_cap = std.Io.Reader.fixed("12345678");
+    const body = try readGatewayJsonBody(std.testing.allocator, &at_cap, 8);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("12345678", body);
+
+    var over_cap = std.Io.Reader.fixed("123456789");
+    try std.testing.expectError(
+        error.GatewayJsonResponseTooLarge,
+        readGatewayJsonBody(std.testing.allocator, &over_cap, 8),
+    );
 }
 
 fn failedGatewayJsonStatus(status: std.http.Status) ?std.http.Status {

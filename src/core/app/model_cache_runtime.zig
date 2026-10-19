@@ -477,15 +477,14 @@ pub const Runtime = struct {
         if (reused_public_catalog) return false;
         if (access_changed) self.reset();
 
-        const now = io_mod.milliTimestamp();
+        const now = model_catalog.clockMs();
         self.mutex.lockUncancelable(io_mod.getIo());
-        // A clock that moved backwards makes every elapsed check due.
-        const elapsed = if (now < self.last_attempt_ms) std.math.maxInt(i64) else now - self.last_attempt_ms;
+        const elapsed = now - self.last_attempt_ms;
         const expired = if (refresh_interval_ms) |interval| elapsed >= interval else false;
         const picker_due = trigger == .picker_open and elapsed >= picker_revalidate_floor_ms;
         // A retained catalog whose refresh failed retries once its backoff ends.
         const retry_due = if (self.outcome.last_failure) |failed| failed.failure.retryable else false;
-        const backoff_over = now < self.last_attempt_ms or now >= self.retry_not_before_ms;
+        const backoff_over = now >= self.retry_not_before_ms;
         // A staged revalidation is newer than anything a fetch would start now.
         // A fetch that finished after the join above still holds its thread;
         // the next trigger joins it before starting another.
@@ -576,7 +575,7 @@ pub const Runtime = struct {
         self.from_profile_settings = false;
         self.state = .ready;
         self.completion_pending = true;
-        self.last_attempt_ms = io_mod.milliTimestamp();
+        self.last_attempt_ms = model_catalog.clockMs();
         self.failure_streak = 0;
         self.retry_not_before_ms = 0;
         self.requested_access = model_catalog.AccessMetadata.init(access);
@@ -658,7 +657,8 @@ pub const Runtime = struct {
     pub const TraceSnapshot = struct {
         state: []const u8,
         entries: usize,
-        last_attempt_ms: i64,
+        /// Null before the first fetch for the current access.
+        last_attempt_age_ms: ?i64,
         failure_category: ?[]const u8,
         failure_http_status: ?std.http.Status,
         failure_retryable: bool,
@@ -675,7 +675,7 @@ pub const Runtime = struct {
         return .{
             .state = @tagName(self.state),
             .entries = self.catalog.items.len,
-            .last_attempt_ms = self.last_attempt_ms,
+            .last_attempt_age_ms = if (self.last_attempt_ms > 0) model_catalog.clockMs() - self.last_attempt_ms else null,
             .failure_category = if (failure) |failed| @tagName(failed.failure.category) else null,
             .failure_http_status = if (failure) |failed| failed.failure.http_status else null,
             .failure_retryable = if (failure) |failed| failed.failure.retryable else false,
@@ -803,7 +803,7 @@ pub const Runtime = struct {
             .failed => |failed| if (failed.failure.category != .cancellation) {
                 self.failure_streak +|= 1;
                 const delay_ms = failureBackoffMs(self.failure_streak);
-                self.retry_not_before_ms = io_mod.milliTimestamp() + delay_ms;
+                self.retry_not_before_ms = model_catalog.clockMs() + delay_ms;
                 debug_trace.logf("catalog", "model catalog fetch failed category={s} failure_streak={d} retry_in_ms={d}", .{
                     @tagName(failed.failure.category),
                     self.failure_streak,
@@ -1223,7 +1223,7 @@ test "cooperative model cache retries a ready catalog after a retryable fallback
     };
     runtime.state = .ready;
     runtime.requested_access = .init(.{ .public_only = .no_credential });
-    runtime.last_attempt_ms = io_mod.milliTimestamp() - 1000;
+    runtime.last_attempt_ms = model_catalog.clockMs() - 1000;
 
     var provider = AuthChangeCatalog{ .model_id = "public/refreshed" };
     runtime.loadCooperative(provider.provider(), .{ .public_only = .no_credential });
@@ -1372,7 +1372,7 @@ test "model cache retries a failed catalog behind the failed state so requests n
 
     source.fail = false;
     source.open.store(false, .seq_cst);
-    runtime.retry_not_before_ms = io_mod.milliTimestamp();
+    runtime.retry_not_before_ms = model_catalog.clockMs();
     runtime.startWarmup(source.provider(), public, .activity);
     try std.testing.expect(fetchInFlight(&runtime));
     try std.testing.expect(runtime.isFailed());
@@ -1414,8 +1414,8 @@ test "model catalog failures back off every trigger until a success or access ch
     runtime.startWarmup(source.provider(), public, .picker_open);
     try std.testing.expectEqual(@as(usize, 1), source.calls.load(.seq_cst));
 
-    runtime.retry_not_before_ms = io_mod.milliTimestamp();
-    const before_second_failure = io_mod.milliTimestamp();
+    runtime.retry_not_before_ms = model_catalog.clockMs();
+    const before_second_failure = model_catalog.clockMs();
     runtime.startWarmup(source.provider(), public, .picker_open);
     try waitForFetchToSettle(&runtime);
     try std.testing.expectEqual(@as(usize, 2), source.calls.load(.seq_cst));
@@ -1431,7 +1431,7 @@ test "model catalog failures back off every trigger until a success or access ch
 
     // A success clears the backoff.
     source.fail = false;
-    runtime.retry_not_before_ms = io_mod.milliTimestamp();
+    runtime.retry_not_before_ms = model_catalog.clockMs();
     runtime.startWarmup(source.provider(), public, .activity);
     try waitForWarmup(&runtime);
     try std.testing.expectEqual(@as(usize, 4), source.calls.load(.seq_cst));
@@ -1581,7 +1581,7 @@ test "model cache catalog auth refresh preserves the last public catalog" {
     // The retained catalog retries once the failure backoff runs out.
     runtime.startWarmup(failed_provider.provider(), authenticatedCatalogAccess("test-key", "team_123"), .activity);
     try std.testing.expectEqual(@as(usize, 1), failed_provider.calls);
-    runtime.retry_not_before_ms = io_mod.milliTimestamp();
+    runtime.retry_not_before_ms = model_catalog.clockMs();
     runtime.startWarmup(failed_provider.provider(), authenticatedCatalogAccess("test-key", "team_123"), .activity);
     try waitForWarmup(&runtime);
     try std.testing.expectEqual(@as(usize, 2), failed_provider.calls);
