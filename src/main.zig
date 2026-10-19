@@ -3502,10 +3502,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         if (terminal_native_session.isControlModeRaw(raw_args)) {
             io_mod.setRawEnviron(raw_env);
             const process_args = argsFromRaw(raw_args);
-            var threaded = std.Io.Threaded.init(processAllocator(), .{
-                .argv0 = .init(process_args),
-                .environ = .{ .block = environBlockFromRaw(raw_env) },
-            });
+            var threaded = std.Io.Threaded.init(processAllocator(), processIoOptions(process_args, environBlockFromRaw(raw_env)));
             defer threaded.deinit();
             io_mod.setIo(threaded.io());
             try terminal_native_session.runControlMarker(raw_args);
@@ -3514,10 +3511,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         if (terminal_native_session.isLauncherModeRaw(raw_args)) {
             io_mod.setRawEnviron(raw_env);
             const process_args = argsFromRaw(raw_args);
-            var threaded = std.Io.Threaded.init(processAllocator(), .{
-                .argv0 = .init(process_args),
-                .environ = .{ .block = environBlockFromRaw(raw_env) },
-            });
+            var threaded = std.Io.Threaded.init(processAllocator(), processIoOptions(process_args, environBlockFromRaw(raw_env)));
             defer threaded.deinit();
             io_mod.setIo(threaded.io());
             try terminal_native_session.runLauncher(processAllocator());
@@ -3537,10 +3531,7 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
     if (command_runner.isForegroundSessionInvocation(cli_args)) {
         io_mod.setRawEnviron(raw_env);
         const process_args = argsFromRaw(raw_args);
-        var threaded = std.Io.Threaded.init(processAllocator(), .{
-            .argv0 = .init(process_args),
-            .environ = .{ .block = environBlockFromRaw(raw_env) },
-        });
+        var threaded = std.Io.Threaded.init(processAllocator(), processIoOptions(process_args, environBlockFromRaw(raw_env)));
         defer threaded.deinit();
         io_mod.setIo(threaded.io());
         try command_runner.runForegroundSessionBootstrap(cli_args);
@@ -3588,10 +3579,7 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
     if (needsEarlyThreadedIo(cli_args)) {
         const env_block = environBlockFromRaw(raw_env);
         const process_args = argsFromRaw(raw_args);
-        early_threaded = std.Io.Threaded.init(alloc, .{
-            .argv0 = .init(process_args),
-            .environ = .{ .block = env_block },
-        });
+        early_threaded = std.Io.Threaded.init(alloc, processIoOptions(process_args, env_block));
         if (early_threaded) |*threaded| io_mod.setIo(threaded.io());
     }
 
@@ -3600,10 +3588,7 @@ fn runNonBenchmark(raw_args: []const [*:0]const u8, raw_env: RawEnviron, cli_arg
         .interactive => |launch| {
             const env_block = environBlockFromRaw(raw_env);
             const process_args = argsFromRaw(raw_args);
-            var threaded = std.Io.Threaded.init(alloc, .{
-                .argv0 = .init(process_args),
-                .environ = .{ .block = env_block },
-            });
+            var threaded = std.Io.Threaded.init(alloc, processIoOptions(process_args, env_block));
             io_mod.setIo(threaded.io());
 
             var owned_launch = launch;
@@ -3632,6 +3617,19 @@ fn rawArgs(c_argc: c_int, c_argv: [*][*:0]c_char) []const [*:0]const u8 {
 
 fn argsFromRaw(raw_args: []const [*:0]const u8) std.process.Args {
     return .{ .vector = raw_args };
+}
+
+/// Options for every process Io. fx starts its own tasks with `io.concurrent`,
+/// and they count against the capacity that limits `io.async`. Once fx holds
+/// that many tasks, std runs each `io.async` call inline, so
+/// `HostName.connect` tries a host's addresses one at a time and waits on an
+/// unreachable address instead of returning the reachable one.
+fn processIoOptions(process_args: std.process.Args, env_block: std.process.Environ.Block) std.Io.Threaded.InitOptions {
+    return .{
+        .argv0 = .init(process_args),
+        .environ = .{ .block = env_block },
+        .async_limit = .unlimited,
+    };
 }
 
 fn environBlockFromRaw(raw_env: RawEnviron) std.process.Environ.Block {
@@ -3916,6 +3914,114 @@ test "lightweight local commands do not request early threaded io" {
     try std.testing.expect(!needsEarlyThreadedIo(&.{}));
     for ([_][:0]const u8{ "help", "sessions", "tasks", "permissions" }) |command| {
         try std.testing.expect(!needsEarlyThreadedIo(&.{command}));
+    }
+}
+
+test "process io connects through a reachable address while fx tasks hold every async slot" {
+    // This test builds the process Io from processIoOptions instead of using
+    // std.testing.io, because those options are what it checks. Only name
+    // lookup and the unreachable address are faked. std's HostName.connect,
+    // Io.Threaded, and the loopback socket are real.
+    const Fake = struct {
+        var base: std.Io.VTable = undefined;
+        var vtable: std.Io.VTable = undefined;
+        var port: u16 = 0;
+
+        // A connect to this address never completes, like a black-holed IPv6
+        // route, until std cancels the losing attempt.
+        fn blackHoleAt(port_number: u16) std.Io.net.IpAddress {
+            return .{ .ip4 = .{ .bytes = .{ 192, 0, 2, 1 }, .port = port_number } };
+        }
+
+        fn lookup(
+            userdata: ?*anyopaque,
+            _: std.Io.net.HostName,
+            resolved: *std.Io.Queue(std.Io.net.HostName.LookupResult),
+            options: std.Io.net.HostName.LookupOptions,
+        ) std.Io.net.HostName.LookupError!void {
+            const io: std.Io = .{ .userdata = userdata, .vtable = &vtable };
+            defer resolved.close(io);
+            const reachable = std.Io.net.IpAddress.parse("127.0.0.1", options.port) catch unreachable;
+            resolved.putAll(io, &.{
+                .{ .address = blackHoleAt(options.port) },
+                .{ .address = reachable },
+            }) catch return error.UnknownHostName;
+        }
+
+        fn connect(
+            userdata: ?*anyopaque,
+            address: *const std.Io.net.IpAddress,
+            options: std.Io.net.IpAddress.ConnectOptions,
+        ) std.Io.net.IpAddress.ConnectError!std.Io.net.Socket {
+            if (address.eql(&blackHoleAt(address.getPort()))) {
+                const io: std.Io = .{ .userdata = userdata, .vtable = &vtable };
+                var never: std.Io.Event = .unset;
+                try never.wait(io);
+                unreachable;
+            }
+            return base.netConnectIp(userdata, address, options);
+        }
+
+        fn hold(gate: *std.Io.Event, io: std.Io) void {
+            gate.wait(io) catch {};
+        }
+
+        fn dial(io: std.Io) !std.Io.net.Stream {
+            const name = try std.Io.net.HostName.init("gateway.test");
+            return name.connect(io, port, .{ .mode = .stream });
+        }
+
+        fn expire(io: std.Io) std.Io.Cancelable!void {
+            try io.sleep(.fromMilliseconds(5000), .awake);
+        }
+    };
+
+    const argv = [_][*:0]const u8{"fx"};
+    const environ = [_:null]?[*:0]const u8{};
+    var threaded = std.Io.Threaded.init(std.testing.allocator, processIoOptions(.{ .vector = &argv }, .{ .slice = &environ }));
+    defer threaded.deinit();
+    const real = threaded.io();
+    Fake.base = real.vtable.*;
+    Fake.vtable = Fake.base;
+    Fake.vtable.netLookup = Fake.lookup;
+    Fake.vtable.netConnectIp = Fake.connect;
+    const io: std.Io = .{ .userdata = real.userdata, .vtable = &Fake.vtable };
+
+    var server = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{ .reuse_address = true });
+    defer server.deinit(io);
+    Fake.port = server.socket.address.getPort();
+
+    // Hold more tasks than there are CPUs, as running MCP servers, request
+    // watches, and requests do.
+    var gate: std.Io.Event = .unset;
+    var holders: std.Io.Group = .init;
+    defer {
+        gate.set(io);
+        holders.await(io) catch {};
+    }
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    for (0..cpu_count + 1) |_| try holders.concurrent(io, Fake.hold, .{ &gate, io });
+
+    const Event = union(enum) {
+        dial: anyerror!std.Io.net.Stream,
+        expire: std.Io.Cancelable!void,
+    };
+    var buffer: [2]Event = undefined;
+    var select: std.Io.Select(Event) = .init(io, &buffer);
+    defer while (select.cancel()) |event| switch (event) {
+        .dial => |result| if (result) |stream| stream.close(io) else |_| {},
+        .expire => {},
+    };
+    try select.concurrent(.dial, Fake.dial, .{io});
+    try select.concurrent(.expire, Fake.expire, .{io});
+    switch (try select.await()) {
+        .dial => |result| {
+            const stream = try result;
+            defer stream.close(io);
+            const accepted = try server.accept(io);
+            accepted.close(io);
+        },
+        .expire => return error.ConnectWaitedOnUnreachableAddress,
     }
 }
 
