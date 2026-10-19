@@ -1212,6 +1212,44 @@ describe("Vision route fake Gateway", () => {
   );
 
   test(
+    "fx ask names the saved copy of an attached image but not its source path",
+    async () => {
+      const root = createIsolatedRoot();
+      const shotPath = join(root.workspace, "CleanShot 2026-10-18 at 4.36.41 PM@2x.png");
+      const original = solidPng(40, 20);
+      writeFileSync(shotPath, original);
+      const gateway = startImageGateway([sseText("Located image answer")]);
+      try {
+        const result = await runFx(
+          ["ask", "--json", "--image", shotPath, "Crop the attached screenshot."],
+          { cwd: root.workspace, env: fakeGatewayEnv(root, gateway, GEMINI_MODEL), timeoutMs: TIMEOUT },
+        );
+        expect(parseFxJson(result).output).toContain("Located image answer");
+        expect(result.stderr).toBe("");
+        expect(gateway.chatRequests).toHaveLength(1);
+        const body = gateway.chatRequests[0]!.body;
+        expect(nativeFileParts(body)).toHaveLength(1);
+        const prompt = promptParts(body).find(
+          (part) => part.type === "text" && String(part.text).endsWith("Crop the attached screenshot."),
+        );
+        const note = String(prompt?.text).match(
+          /^\[Image #1 \(image\/png\) is saved at ("(?:[^"\\]|\\.)*")\.\]\n/,
+        );
+        expect(note).not.toBeNull();
+        expect(body).not.toContain(shotPath);
+        // The saved copy outlives the run and holds the bytes the model saw.
+        const saved = JSON.parse(note![1]!) as string;
+        expect(saved.startsWith(join(root.home, ".fx", "sessions"))).toBe(true);
+        expect(readFileSync(saved)).toEqual(original);
+      } finally {
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
     "fx ask withholds native JPEG images over the 8000-pixel limit with saved-path guidance",
     async () => {
       const root = createIsolatedRoot();
