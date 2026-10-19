@@ -921,7 +921,8 @@ pub const Runtime = struct {
         };
         r.endLogin(i);
         var listener = loopback.Listener.open(r.io, s.callback_port) catch |err| switch (err) {
-            error.AddressInUse => return r.finish(req, .{ .failed = error.CallbackPortInUse }),
+            // Only a fixed port can be another app's, and the message names it.
+            error.AddressInUse => if (s.callback_port != null) return r.finish(req, .{ .failed = error.CallbackPortInUse }) else return err,
             else => return err,
         };
         const l = r.gpa.create(Login) catch |err| {
