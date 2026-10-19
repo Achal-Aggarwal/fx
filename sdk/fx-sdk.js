@@ -203,8 +203,12 @@ export function normalizeAgentOptions(value) {
     if (options[name] !== undefined && typeof options[name] !== "function") throw new TypeError(`${name} must be a function`);
   }
   Object.assign(options, normalizeModelChoice(options));
-  // fx's default model is a Gateway id; a custom provider names its own.
+  // fx's default model is a Gateway id. Codex, Grok, and a custom provider
+  // name their own models, so each needs one, as the fx CLI asks for.
   if (custom && options.model === undefined) throw new TypeError("a custom provider needs a model");
+  if (subscription && options.model === undefined) {
+    throw new TypeError(`provider "${options.provider}" needs a model; fx's default model is an AI Gateway id`);
+  }
   validateGatewayChatUrl(options.gatewayChatUrl);
   if (options.resizeImage !== undefined && typeof options.resizeImage !== "function") {
     throw new TypeError("resizeImage must be a function");

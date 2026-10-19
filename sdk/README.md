@@ -327,6 +327,8 @@ const agent = createFxAgent({
 });
 ```
 
+Name a model the plan serves, here or in `agent.session(id, { model })`. fx's default model is an AI Gateway id, so libfx refuses a Codex engine or session without one.
+
 libfx calls `credentials()` in whichever process runs the turn. It refreshes the credentials shortly before they expire and once after a rejected request, then passes the new ones to `onCredentials` for you to save. Codex doesn't accept requests from web pages, so these turns run on your server.
 
 To sign a user in, use `libfx/chatgpt`:
@@ -347,7 +349,7 @@ The sign-in uses the same OpenAI client as the Codex CLI, and the user's ChatGPT
 
 ### Grok plans
 
-`provider: "grok"` runs on a user's Grok plan, with the same `credentials` and `onCredentials` callbacks, called with `provider: "grok"`. libfx also checks that refreshed credentials still belong to the same xAI account. These turns run on your server too.
+`provider: "grok"` runs on a user's Grok plan, with the same `credentials` and `onCredentials` callbacks, called with `provider: "grok"`. It needs a Grok model too, such as `model: "grok-4.7"`; the AI Gateway id `spacexai/grok-4.7` doesn't work on a Grok plan. libfx also checks that refreshed credentials still belong to the same xAI account. These turns run on your server too.
 
 To sign a user in, use `libfx/grok`. Device code is the simplest:
 
