@@ -208,7 +208,6 @@ function fakeGatewayEnv(
     FX_GATEWAY_CHAT_URL: gateway.chatUrl,
     FX_MODEL: FAKE_GATEWAY_MODEL,
     FX_AUTO_UPGRADE: "0",
-    FX_MCP_PROTOCOL_VERSION: "2026-07-28",
   };
 }
 
@@ -1048,7 +1047,7 @@ test("configured provider ACP runs a direct call to a supplied MCP tool that is 
     if (body.messages.some((message: any) => message.role === "tool")) return configuredCompletion(body.model, "direct call complete");
     return configuredToolCompletion(body.model, MCP_TOOL_NAME, { text: "direct" }, "direct_unloaded");
   });
-  const client = await AcpClient.create({ cwd: fixture.workspace, env: { ...fixture.env, FX_MCP_PROTOCOL_VERSION: "2026-07-28" } });
+  const client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
   try {
     await client.request("initialize", { protocolVersion: 1 }, 1);
     const created = await client.request("session/new", {
@@ -4203,7 +4202,7 @@ describe("acp: model-independent", () => {
       try {
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_PROTOCOL_VERSION: undefined },
+          env: fakeGatewayEnv(root, gateway),
         });
         await client.request("initialize", { protocolVersion: 1 }, 1);
         const created = await client.request(
@@ -4239,7 +4238,7 @@ describe("acp: model-independent", () => {
         // resumes, the server shows as unavailable, and it gets no request.
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_PROTOCOL_VERSION: undefined },
+          env: fakeGatewayEnv(root, gateway),
         });
         await client.request("initialize", { protocolVersion: 1 }, 10);
         client.send({
@@ -4264,7 +4263,7 @@ describe("acp: model-independent", () => {
 
         client = await AcpClient.create({
           cwd: root.workspace,
-          env: { ...fakeGatewayEnv(root, gateway), FX_MCP_PROTOCOL_VERSION: undefined },
+          env: fakeGatewayEnv(root, gateway),
         });
         await client.request("initialize", { protocolVersion: 1 }, 20);
         client.send({

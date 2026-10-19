@@ -52,7 +52,6 @@ function createRoot(profile?: unknown, project?: unknown) {
       FX_AUTO_UPGRADE: "0",
       AI_GATEWAY_API_KEY: "fake-mcp-verbs-key",
       VERCEL_OIDC_TOKEN: undefined,
-      FX_MCP_PROTOCOL_VERSION: undefined,
     },
   };
 }

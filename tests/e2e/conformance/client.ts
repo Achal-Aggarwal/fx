@@ -34,10 +34,6 @@ if (requestedProtocol && !supportedProtocols.has(requestedProtocol)) {
   console.error(`unsupported conformance protocol: ${requestedProtocol}`);
   process.exit(2);
 }
-const conformanceEnv = {
-  ...process.env,
-  FX_MCP_PROTOCOL_VERSION: requestedProtocol ?? "2026-07-28",
-};
 let configuredServerUrl = serverUrl;
 let legacyProbeProxy: LegacyProbeProxy | null = null;
 if (requestedProtocol && requestedProtocol !== "2026-07-28") {
@@ -132,7 +128,7 @@ if (authScenario) {
   }
 }
 const fxEnv = {
-  ...conformanceEnv,
+  ...process.env,
   HOME: home,
   PATH: authScenario ? `${fakeBin}:${process.env.PATH ?? ""}` : process.env.PATH,
   ...(authScenario ? { DISPLAY: process.env.DISPLAY || ":0" } : {}),

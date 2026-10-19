@@ -170,10 +170,6 @@ describe("version-scoped legacy MCP remote transports", () => {
         sdkDiscoveryError,
       });
       const root = createRoot(`sdk-discovery-${sdkDiscoveryError}`, "http", streamable.url);
-      const profilePath = join(root.home, ".fx", "mcp.json");
-      const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-      profile.mcp.fixture.environment = { FX_MCP_PROTOCOL_VERSION: "2026-07-28" };
-      writeFileSync(profilePath, JSON.stringify(profile));
       gateway = startToolGateway("Stock SDK fallback complete.");
 
       const result = await runAsk(root, gateway, "Use the legacy MCP tool.");
@@ -841,7 +837,7 @@ describe("version-scoped legacy MCP remote transports", () => {
     40_000,
   );
 
-  // fx's MCP timeouts are engine-wide, so this waits out the 60 s default.
+  // The server's own 5 s startup timeout ends the wait.
   test(
     "a 2025 server that never answers initialize fails after its timeout instead of hanging",
     async () => {

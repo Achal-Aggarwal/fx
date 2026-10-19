@@ -179,7 +179,6 @@ function createRoot(
               ? scriptPath
               : undefined,
             FX_MCP_PID_PATH: join(root, "mcp.pid"),
-            FX_MCP_PROTOCOL_VERSION: "2026-07-28",
             FX_MCP_MODE: options.mode ?? "normal",
             FX_MCP_IMAGE_PATH: options.image ? imagePath : undefined,
             FX_MCP_PROTOCOL_ERROR_MESSAGE: options.protocolErrorMessage,
@@ -499,7 +498,6 @@ describe("modern MCP stdio compatibility", () => {
       FX_MCP_RESULT_TEXT: "${WORKSPACE_MCP_RESULT:-MODERN_MCP_TOOL_RESULT}",
       FX_MCP_WIRE_LOG: "${WORKSPACE_MCP_WIRE_LOG}",
       FX_MCP_PID_PATH: "${WORKSPACE_MCP_PID_PATH}",
-      FX_MCP_PROTOCOL_VERSION: "2026-07-28",
       FX_MCP_MODE: "${WORKSPACE_MCP_MODE:-normal}",
     };
     delete project.mcpServers.fixture.environment;
@@ -768,7 +766,6 @@ describe("modern MCP stdio compatibility", () => {
       ...fixtureEnv(root, gateway),
       FX_MCP_WIRE_LOG: root.wireLogPath,
       FX_MCP_PID_PATH: join(root.root, "mcp.pid"),
-      FX_MCP_PROTOCOL_VERSION: "2026-07-28",
       FX_MCP_MODE: "normal",
     };
     // A stdio server gets only the default variables and its own, so the
@@ -778,7 +775,6 @@ describe("modern MCP stdio compatibility", () => {
         "mcp", "add",
         "--env", `FX_MCP_WIRE_LOG=${env.FX_MCP_WIRE_LOG}`,
         "--env", `FX_MCP_PID_PATH=${env.FX_MCP_PID_PATH}`,
-        "--env", `FX_MCP_PROTOCOL_VERSION=${env.FX_MCP_PROTOCOL_VERSION}`,
         "--env", `FX_MCP_MODE=${env.FX_MCP_MODE}`,
         "fixture", "--", process.execPath, MODERN_FIXTURE,
       ],
@@ -824,7 +820,6 @@ describe("modern MCP stdio compatibility", () => {
           height: 36,
           env: {
             ...fixtureEnv(root, gateway),
-            FX_MCP_PROTOCOL_VERSION: "2025-11-25",
             FX_MCP_LEGACY_VERSION: "2025-11-25",
             FX_MCP_WIRE_LOG: root.wireLogPath,
             FX_MCP_PID_PATH: join(root.root, "literal.pid"),
@@ -1528,10 +1523,6 @@ describe("modern MCP stdio compatibility", () => {
       mode: "startup_exit",
       recordLaunchAttempts: true,
     });
-    const profilePath = join(root.home, ".fx", "mcp.json");
-    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-    delete profile.mcp.fixture.environment.FX_MCP_PROTOCOL_VERSION;
-    writeFileSync(profilePath, JSON.stringify(profile));
 
     const result = await runFx(["mcp", "show", "fixture", "--json"], {
       cwd: root.workspace,
@@ -1540,7 +1531,6 @@ describe("modern MCP stdio compatibility", () => {
         AI_GATEWAY_API_KEY: undefined,
         VERCEL_OIDC_TOKEN: undefined,
         FX_AUTO_UPGRADE: "0",
-        FX_MCP_PROTOCOL_VERSION: undefined,
         FX_TRACE_LOG: root.traceLogPath,
         FX_TRACE_SCOPES: "mcp",
       },
@@ -1565,10 +1555,6 @@ describe("modern MCP stdio compatibility", () => {
       mode: "startup_garbage",
       recordLaunchAttempts: true,
     });
-    const profilePath = join(root.home, ".fx", "mcp.json");
-    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-    delete profile.mcp.fixture.environment.FX_MCP_PROTOCOL_VERSION;
-    writeFileSync(profilePath, JSON.stringify(profile));
 
     const started = Date.now();
     const result = await runFx(["mcp", "show", "fixture", "--json"], {
@@ -1578,7 +1564,6 @@ describe("modern MCP stdio compatibility", () => {
         AI_GATEWAY_API_KEY: undefined,
         VERCEL_OIDC_TOKEN: undefined,
         FX_AUTO_UPGRADE: "0",
-        FX_MCP_PROTOCOL_VERSION: undefined,
         FX_TRACE_LOG: root.traceLogPath,
         FX_TRACE_SCOPES: "mcp",
       },
@@ -1629,10 +1614,6 @@ describe("modern MCP stdio compatibility", () => {
       mode: "startup_exit",
       recordLaunchAttempts: true,
     });
-    const profilePath = join(root.home, ".fx", "mcp.json");
-    const profile = JSON.parse(readFileSync(profilePath, "utf8"));
-    delete profile.mcp.fixture.environment.FX_MCP_PROTOCOL_VERSION;
-    writeFileSync(profilePath, JSON.stringify(profile));
     const activeGateway = startFakeGateway([
       fakeGatewayToolCall("search_failed", "capability_search", {
         kind: "mcp",
@@ -1650,7 +1631,7 @@ describe("modern MCP stdio compatibility", () => {
       ["ask", "--json", "--auto", "--no-save", "Find the fixture tools."],
       {
         cwd: root.workspace,
-        env: { ...fixtureEnv(root, activeGateway), FX_MCP_PROTOCOL_VERSION: undefined },
+        env: fixtureEnv(root, activeGateway),
         timeoutMs: 20_000,
       },
     );
@@ -1913,7 +1894,6 @@ exec "$FX_MCP_FIXTURE_RUNTIME" "$FX_MCP_FIXTURE_PATH"`,
       const unrelatedWire = join(root.root, "unrelated-wire.jsonl");
       profile.mcp.unrelated = { ...profile.mcp.fixture, environment: {
         ...profile.mcp.fixture.environment,
-        FX_MCP_PROTOCOL_VERSION: "2026-07-28",
         FX_MCP_MODE: "stall_startup", FX_MCP_WIRE_LOG: unrelatedWire,
         FX_MCP_PID_PATH: join(root.root, "unrelated.pid"),
       } };

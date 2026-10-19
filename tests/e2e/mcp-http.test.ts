@@ -82,7 +82,7 @@ function createRoot(
     JSON.stringify({
       mcp: {
         fixture: {
-          type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
+          type: "http",
           url: activeFixture.url,
           headers: { "X-Workspace": "one" },
           ...(required ? { required: true } : {}),
@@ -116,7 +116,6 @@ function fixtureEnv(
     AI_GATEWAY_API_KEY: "fake-mcp-http-key",
     VERCEL_OIDC_TOKEN: undefined,
     FX_AUTO_UPGRADE: "0",
-    FX_MCP_PROTOCOL_VERSION: "2026-07-28",
     FX_PERMISSION_MODE: "auto",
     FX_GATEWAY_BASE_URL: activeGateway.baseUrl,
     FX_GATEWAY_CHAT_URL: activeGateway.chatUrl,
@@ -231,7 +230,7 @@ describe("modern MCP Streamable HTTP", () => {
     writeFileSync(join(root.home, ".fx", "mcp.json"), JSON.stringify({
       mcp: {
         fixture: {
-          type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
+          type: "http",
           url: `http://127.0.0.1:${failing.port}/mcp`,
           oauth: { client_id: "fixture-client" },
           startup_timeout_ms: 1_000,
@@ -991,7 +990,7 @@ describe("modern MCP Streamable HTTP", () => {
       JSON.stringify({
         mcp: {
           fixture: {
-            type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
+            type: "http",
             url: fixture.url,
             header_env: { "X-Workspace": "MCP_WORKSPACE" },
             bearer_token_env: "MCP_BEARER_TOKEN",
@@ -1045,7 +1044,7 @@ describe("modern MCP Streamable HTTP", () => {
       JSON.stringify({
         mcpServers: {
           fixture: {
-            type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
+            type: "http",
             url: fixture.url,
             headers: {
               Authorization: "Bearer ${WORKSPACE_HTTP_TOKEN}",

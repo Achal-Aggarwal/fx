@@ -449,7 +449,6 @@ function createRoot(
         fixture: {
           type: transport,
           url: serverUrl,
-          environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
           ...(configureOauth
             ? {
                 oauth: {
@@ -494,7 +493,6 @@ function baseEnv(root: ReturnType<typeof createRoot>) {
     AI_GATEWAY_API_KEY: "fake-mcp-auth-key",
     VERCEL_OIDC_TOKEN: undefined,
     FX_AUTO_UPGRADE: "0",
-    FX_MCP_PROTOCOL_VERSION: "2026-07-28",
     FX_PERMISSION_MODE: "auto",
     FX_MODEL: MODEL,
     FX_TRACE_LOG: root.trace,
@@ -675,13 +673,13 @@ describe("MCP login", () => {
         JSON.stringify({
           mcp: {
             linear: {
-              type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
+              type: "http",
               url: upstream.url,
               startup_timeout_ms: 5_000,
               operation_timeout_ms: 5_000,
             },
             slack: {
-              type: "http", environment: { FX_MCP_PROTOCOL_VERSION: "2026-07-28" },
+              type: "http",
               url: auth.url,
               oauth: {
                 client_id: "fx-mcp-auth-test",
@@ -756,7 +754,6 @@ describe("MCP login", () => {
   const v2Env = (root: ReturnType<typeof createRoot>) => ({
     ...baseEnv(root),
     FX_DISABLE_KEYCHAIN: "1",
-    FX_MCP_PROTOCOL_VERSION: undefined,
     DISPLAY: ":0",
     SSH_CONNECTION: undefined,
     FX_NO_OPEN_BROWSER: undefined,
