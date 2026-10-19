@@ -119,7 +119,8 @@ function gatewaySteps() {
 
 // fx signs in through the browser with fx mcp login. For the auth scenarios
 // this browser follows the authorization URL's redirects back to fx's
-// loopback callback, as a user approving it would.
+// loopback callback, as a user approving it would. On Linux fx opens a
+// browser only when a display is set, so these scenarios also set DISPLAY.
 const authScenario = scenario.startsWith("auth/");
 const fakeBin = join(root, "bin");
 if (authScenario) {
@@ -134,6 +135,7 @@ const fxEnv = {
   ...conformanceEnv,
   HOME: home,
   PATH: authScenario ? `${fakeBin}:${process.env.PATH ?? ""}` : process.env.PATH,
+  ...(authScenario ? { DISPLAY: process.env.DISPLAY || ":0" } : {}),
   AI_GATEWAY_API_KEY: "mcp-conformance-placeholder",
   VERCEL_OIDC_TOKEN: "",
   FX_AUTO_UPGRADE: "0",
