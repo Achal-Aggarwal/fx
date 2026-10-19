@@ -1553,11 +1553,12 @@ pub const SessionConvertSnapshot = struct {
         /// The session that kept the file: `id`, or one of its subagents.
         member: []const u8,
         file: []const u8,
-        /// Why: `too_large`, a side file over `limit`, which is `bytes`
-        /// long; `not_regular`, `unreadable` or `too_deep`, hosted terminal
-        /// state that is not a file or folder, can't be read, or is nested
-        /// deeper than the copy goes.
+        /// `too_large`, a side file over `limit`, which is `bytes` long; or
+        /// `not_regular`, `unreadable` or `too_deep`, hosted terminal state
+        /// the copy can't take.
         cause: []const u8,
+        /// Why, as a clause.
+        reason: []const u8,
         bytes: u64,
         limit: u64,
     };
@@ -1583,15 +1584,7 @@ pub const SessionConvertSnapshot = struct {
         for (self.left_out) |left| {
             try out.writer.print("{s}: converted without {s}", .{ left.id, left.file });
             if (!std.mem.eql(u8, left.member, left.id)) try out.writer.print(" of its subagent {s}", .{left.member});
-            if (std.mem.eql(u8, left.cause, "too_large"))
-                try out.writer.print(", which is {d} bytes, more than the {d} the new store keeps in one file", .{ left.bytes, left.limit })
-            else if (std.mem.eql(u8, left.cause, "not_regular"))
-                try out.writer.writeAll(", which is not a file or folder")
-            else if (std.mem.eql(u8, left.cause, "too_deep"))
-                try out.writer.writeAll(", which is nested deeper than the copy goes")
-            else
-                try out.writer.writeAll(", which can't be read");
-            try out.writer.print("; ~/.fx/sessions/{s} keeps it\n", .{left.member});
+            try out.writer.print(" because {s}; ~/.fx/sessions/{s} keeps it\n", .{ left.reason, left.member });
         }
         for (self.kept) |kept| try out.writer.print("{s}: kept as it is: {s}\n", .{ kept.id, kept.reason });
         return out.toOwnedSlice();
@@ -1634,26 +1627,26 @@ pub const SessionConvertSnapshot = struct {
 test "fx sessions convert names each file it left out, in text and JSON" {
     const alloc = std.testing.allocator;
     const snapshot: SessionConvertSnapshot = .{ .converted = 1, .busy = 0, .unreadable = 0, .skipped = &.{}, .left_out = &.{
-        .{ .id = "root", .member = "root", .file = "logs/commands/replay.bin", .cause = "too_large", .bytes = 600, .limit = 512 },
-        .{ .id = "root", .member = "kid", .file = "tool-results/big.txt", .cause = "too_large", .bytes = 700, .limit = 512 },
-        .{ .id = "root", .member = "root", .file = "terminal/state/link", .cause = "not_regular", .bytes = 0, .limit = 512 },
+        .{ .id = "root", .member = "root", .file = "logs/commands/replay.bin", .cause = "too_large", .reason = "it is 600 bytes, more than the 512 the new store keeps in one file", .bytes = 600, .limit = 512 },
+        .{ .id = "root", .member = "kid", .file = "tool-results/big.txt", .cause = "too_large", .reason = "it is 700 bytes, more than the 512 the new store keeps in one file", .bytes = 700, .limit = 512 },
+        .{ .id = "root", .member = "root", .file = "terminal/state/link", .cause = "not_regular", .reason = "it is not a file or folder", .bytes = 0, .limit = 512 },
     } };
     const text = try snapshot.render(alloc, .text);
     defer alloc.free(text);
     try std.testing.expectEqualStrings(
         "converted 1, busy 0, unreadable 0\n" ++
-            "root: converted without logs/commands/replay.bin, which is 600 bytes, more than the 512 the new store keeps in one file; ~/.fx/sessions/root keeps it\n" ++
-            "root: converted without tool-results/big.txt of its subagent kid, which is 700 bytes, more than the 512 the new store keeps in one file; ~/.fx/sessions/kid keeps it\n" ++
-            "root: converted without terminal/state/link, which is not a file or folder; ~/.fx/sessions/root keeps it\n",
+            "root: converted without logs/commands/replay.bin because it is 600 bytes, more than the 512 the new store keeps in one file; ~/.fx/sessions/root keeps it\n" ++
+            "root: converted without tool-results/big.txt of its subagent kid because it is 700 bytes, more than the 512 the new store keeps in one file; ~/.fx/sessions/kid keeps it\n" ++
+            "root: converted without terminal/state/link because it is not a file or folder; ~/.fx/sessions/root keeps it\n",
         text,
     );
     const json = try snapshot.render(alloc, .json);
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
         "{\"kind\":\"sessions_convert\",\"converted\":1,\"busy\":0,\"unreadable\":0,\"skipped\":[],\"left_out\":[" ++
-            "{\"id\":\"root\",\"member\":\"root\",\"file\":\"logs/commands/replay.bin\",\"cause\":\"too_large\",\"bytes\":600,\"limit\":512}," ++
-            "{\"id\":\"root\",\"member\":\"kid\",\"file\":\"tool-results/big.txt\",\"cause\":\"too_large\",\"bytes\":700,\"limit\":512}," ++
-            "{\"id\":\"root\",\"member\":\"root\",\"file\":\"terminal/state/link\",\"cause\":\"not_regular\",\"bytes\":0,\"limit\":512}],\"kept\":[]}",
+            "{\"id\":\"root\",\"member\":\"root\",\"file\":\"logs/commands/replay.bin\",\"cause\":\"too_large\",\"reason\":\"it is 600 bytes, more than the 512 the new store keeps in one file\",\"bytes\":600,\"limit\":512}," ++
+            "{\"id\":\"root\",\"member\":\"kid\",\"file\":\"tool-results/big.txt\",\"cause\":\"too_large\",\"reason\":\"it is 700 bytes, more than the 512 the new store keeps in one file\",\"bytes\":700,\"limit\":512}," ++
+            "{\"id\":\"root\",\"member\":\"root\",\"file\":\"terminal/state/link\",\"cause\":\"not_regular\",\"reason\":\"it is not a file or folder\",\"bytes\":0,\"limit\":512}],\"kept\":[]}",
         json,
     );
 }

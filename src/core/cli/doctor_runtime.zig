@@ -286,6 +286,10 @@ fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator) !void {
         const detail = try alloc.print("{d} terminal or side folder(s) whose session is gone could not be removed", .{report.kept});
         try appendCheckOwned(checks, alloc, "session", .warn, detail);
     }
+    if (report.keeps_left_out > 0) {
+        const detail = try alloc.print("{d} converted session(s) keep files their conversion left out in their earlier folders under ~/.fx/sessions", .{report.keeps_left_out});
+        try appendCheckOwned(checks, alloc, "sessions", .ok, detail);
+    }
     const convertible = report.unconverted - report.stuck.items.len;
     if (convertible > 0) {
         const detail = try alloc.print("{d} session(s) saved by an older fx will be converted when first opened", .{convertible});

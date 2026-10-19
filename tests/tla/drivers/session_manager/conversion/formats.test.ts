@@ -372,7 +372,8 @@ scenario("fx sessions convert converts a family, skips a busy and an unreadable 
 
 // A side file larger than one v2 blob (one real profile had a 16.8 GB command
 // replay) is left out of the copy and named, and the session's v1 folder
-// keeps it through the conversion and every later open (D62).
+// keeps it through the conversion and every later open, by what the copy
+// recorded, even once the file shrinks (D62).
 scenario("a side file too large for the new store is left out, named, and kept in the session's v1 folder (D62)", async f => {
   plainReplies(f);
   const id = (await f.v1Ask(["CONV_FIRST"])).session_id;
@@ -386,16 +387,19 @@ scenario("a side file too large for the new store is left out, named, and kept i
   await o.observe("create");
   const all = await convertAll(f, false);
   await o.observe("all", all.answer(id));
-  expect(all.run.stdout).toContain(`${id}: converted without logs/commands/replay.bin, which is ${MAX_BLOB_BYTES + 1} bytes, `
+  expect(all.run.stdout).toContain(`${id}: converted without logs/commands/replay.bin because it is ${MAX_BLOB_BYTES + 1} bytes, `
     + `more than the ${MAX_BLOB_BYTES} the new store keeps in one file; ~/.fx/sessions/${id} keeps it`);
+  await o.observe("open", await openVia(f, id, "ask"));
+  truncateSync(replay, 1);
   await o.observe("open", await openVia(f, id, "ask"));
   await requireAccepted(o, "left-out-side-file");
   expect(o.observations.at(-1)?.keeps).toEqual([id]);
-  expect(statSync(replay).size).toBe(MAX_BLOB_BYTES + 1);
+  expect(statSync(replay).size).toBe(1);
 });
 
 // Hosted terminal state the copy can't take, here a link no fx writes, is
-// left out and named, and the session's v1 folder keeps it (D56).
+// left out and named, and the session's v1 folder keeps it, by what the
+// copy recorded, even once the link is gone (D56).
 scenario("hosted terminal state the copy can't take is left out, named, and kept in the session's v1 folder (D56)", async f => {
   plainReplies(f);
   const id = (await f.v1Ask(["CONV_FIRST"])).session_id;
@@ -405,12 +409,14 @@ scenario("hosted terminal state the copy can't take is left out, named, and kept
   const o = observer(f, id);
   await o.observe("create");
   await o.observe("open", await openVia(f, id, "ask"));
-  expect(f.said).toContain(`This session was converted without terminal/state/stray-link, which is not a file or folder. `
+  expect(f.said).toContain(`This session was converted without terminal/state/stray-link because it is not a file or folder. `
     + `Its earlier folder ~/.fx/sessions/${id} keeps it.`);
+  expect(readlinkSync(join(state, "stray-link"))).toBe("elsewhere");
+  rmSync(join(state, "stray-link"));
   await o.observe("open", await openVia(f, id, "ask"));
   await requireAccepted(o, "left-out-terminal");
   expect(o.observations.at(-1)?.keeps).toEqual([id]);
-  expect(readlinkSync(join(state, "stray-link"))).toBe("elsewhere");
+  expect(existsSync(join(f.v1Root, id))).toBe(true);
 });
 
 // --- why a damaged session can't be converted -------------------------------------
@@ -508,6 +514,30 @@ scenario("a crash's published child is reused after an older build changed it, a
   expect(existsSync(join(f.v1Root, child)), "the changed child's v1 folder was deleted").toBe(true);
   expect(existsSync(join(f.v1Root, id)), "the root's v1 folder stayed").toBe(false);
   await requireAccepted(o, "orphan-reused");
+});
+
+// A crash's published child whose copy left something out is reused by the
+// next open, which keeps that child's v1 folder by what its copy recorded
+// (D60, D62).
+scenario("a crash's published child whose copy left something out is reused and keeps its v1 folder (D62)", async f => {
+  familyReplies(f);
+  const id = (await f.v1Ask(["CONV_FAMILY"])).session_id;
+  const o = observer(f, id);
+  const child = o.childId;
+  assert(child, "the v1 family has no child to convert");
+  const state = join(f.v1Root, child, "terminal", "state");
+  mkdirSync(state, { recursive: true, mode: 0o700 });
+  symlinkSync("elsewhere", join(state, "stray-link"));
+  await o.observe("create");
+  await crashAtRename(f, o, id, f.stagingPath(id));
+  assert(existsSync(join(f.v2Root, child, "log.jsonl")) && !existsSync(join(f.v2Root, id, "log.jsonl")),
+    "Owned fault boundary not reached: the crash did not leave the child published and the root unpublished");
+  plainReplies(f);
+  await o.observe("open", await openVia(f, id, "ask"));
+  await requireAccepted(o, "orphan-keeps");
+  expect(o.observations.at(-1)?.keeps).toEqual([child]);
+  expect(readlinkSync(join(state, "stray-link"))).toBe("elsewhere");
+  expect(existsSync(join(f.v1Root, id)), "the root's v1 folder stayed").toBe(false);
 });
 
 // --- two converters -----------------------------------------------------------------

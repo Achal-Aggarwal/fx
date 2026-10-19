@@ -599,7 +599,7 @@ The figures are medians from 2026-09-27 on a Mac (APFS, SSD).
   - standalone first;
   - then side by side behind the switch;
   - then v2 by default, with the one-time conversion;
-  - then v1 removed one release later.
+  - then v1 removed, keeping the converter and v1's read path (D65).
 - **Mixed state:** v1 and v2 use separate roots, `~/.fx/sessions/{id}` and
   `~/.fx/sessions/v2/` (D19), and one process uses one backend.
 - **Switch (D26):** `--sessions-v2` on `fx` and `fx ask`, or
@@ -1268,9 +1268,12 @@ Settled for the converter (2026-10-06):
   is left out, named in the trace and the convert output, and the rest of
   the family converts. That member's v1 folder is then kept rather than
   removed (D60), so the file stays where it was, and the notice and the
-  convert output name the folder (2026-10-19). `V1Conversion.tla`'s
-  `keeps` holds such members, and `NoLossOnDelete` checks that no
-  conversion or cleanup removes their folders. The v2 listing must stay fast at the size
+  convert output name the folder (2026-10-19). The copy records it beside
+  its v1 fingerprint, so a later open, or a reuse of the member after a
+  crash, keeps that folder whatever has changed in it since, and `fx
+  doctor` counts such folders. `V1Conversion.tla`'s `keeps` holds such
+  members, and `NoLossOnDelete` checks that no conversion or cleanup
+  removes their folders. The v2 listing must stay fast at the size
   conversion creates (about 14,000 sessions took 1.9 s a page): fixed in
   this change, gated by the manager's benchmark. A usage marker move came
   with this decision and went with fx's usage ledger. **Why:** the real

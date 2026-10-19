@@ -3173,11 +3173,14 @@ fn runSessionConvert(alloc: Allocator, deps: RunDeps, format: output_contracts.O
     for (report.skipped.items, skipped) |from, *to| to.* = .{ .id = from.id, .code = from.code, .reason = from.reason };
     const left_out = try alloc.alloc(output_contracts.SessionConvertSnapshot.LeftOut, report.left_out.items.len);
     defer alloc.free(left_out);
+    var reasons = std.heap.ArenaAllocator.init(alloc);
+    defer reasons.deinit();
     for (report.left_out.items, left_out) |from, *to| to.* = .{
         .id = from.id,
         .member = from.file.member,
         .file = from.file.file,
         .cause = @tagName(from.file.cause),
+        .reason = try from.file.reason(reasons.allocator()),
         .bytes = from.file.bytes,
         .limit = session_adapter.ConvertReport.file_limit_bytes,
     };
