@@ -762,8 +762,10 @@ const streamReadRetries = 5;
 const missingStreamPollMs = 50;
 const missingStreamFastMs = 2000;
 
-// Runs whose log views one backend keeps, least recently read dropped first.
+// Runs whose log views one backend keeps, and the characters of JSON they
+// may hold together, least recently read dropped first.
 const maxLogViews = 32;
+const maxLogViewChars = 32 * 1024 * 1024;
 
 // Whether a newest-first listing showed every slot from the lowest it
 // listed to the newest. Pure.
@@ -944,11 +946,31 @@ function createWorldBackend(world, durability) {
   // Each run's log as this process last read it: the entries read() returned,
   // the newest slot seen, and the checkpoint's `through` they start after.
   // The log only appends, so a later read lists only slots after `known`.
+  // The entries are kept as the JSON the World stores, so every read hands
+  // out its own copy, as reading the World does, and the views' size is
+  // bounded in characters as well as in runs.
   const logViews = new Map();
-  const rememberView = (runId, view) => {
+  let logViewChars = 0;
+  const forgetView = (runId) => {
+    const view = logViews.get(runId);
+    if (!view) return;
+    logViewChars -= view.text.length;
     logViews.delete(runId);
-    logViews.set(runId, view);
-    if (logViews.size > maxLogViews) logViews.delete(logViews.keys().next().value);
+  };
+  const rememberView = (runId, entries, known, through) => {
+    forgetView(runId);
+    const text = JSON.stringify(entries);
+    if (text.length > maxLogViewChars) return;
+    logViews.set(runId, { text, known, through });
+    logViewChars += text.length;
+    for (const oldest of logViews.keys()) {
+      if (logViews.size <= maxLogViews && logViewChars <= maxLogViewChars) break;
+      forgetView(oldest);
+    }
+  };
+  const viewOf = (runId) => {
+    const view = logViews.get(runId);
+    return view && { entries: JSON.parse(view.text), known: view.known, through: view.through };
   };
   let handler = null;
   const route = typeof world.registerHandler !== "function";
@@ -1155,10 +1177,10 @@ function createWorldBackend(world, durability) {
         // earlier one lands. The entries go back as they are, as every read
         // returned them before, but no view keeps the gap for later reads.
         if (!read.missing && gapless(read)) {
-          rememberView(runId, { entries: entries.slice(), known: read.newest, through: read.through ?? 0 });
+          rememberView(runId, entries, read.newest, read.through ?? 0);
           covered = read.newest;
         } else {
-          logViews.delete(runId);
+          forgetView(runId);
           covered = null;
         }
         return entries;
@@ -1166,12 +1188,12 @@ function createWorldBackend(world, durability) {
       return {
         newest: () => covered,
         async read() {
-          const view = logViews.get(runId);
+          const view = viewOf(runId);
           if (!view) return fullRead();
           if (view.known > known) known = view.known;
           const since = await newestFirst(view.known, true);
           if (since.missing) {
-            logViews.delete(runId);
+            forgetView(runId);
             covered = null;
             return [];
           }
@@ -1184,9 +1206,9 @@ function createWorldBackend(world, durability) {
           if (!next) return fullRead();
           // The in-band count at the chain's head, as a full read notes it.
           noteSnapshot(since.snapshot, next.head);
-          rememberView(runId, { entries: next.entries, known: since.newest, through: next.through });
+          rememberView(runId, next.entries, since.newest, next.through);
           covered = since.newest;
-          return next.entries.slice();
+          return next.entries;
         },
         async readSince(cursor) {
           const { events } = await newestFirst(Number(cursor), false);
@@ -1566,14 +1588,15 @@ async function recordMessage(log, state, message) {
  * log again. Only when the sender's read showed every entry through slot
  * `newestSeen`, and every entry the sender then wrote took the next slot:
  * then nothing landed in between, so the view holds every input that comes
- * before this message's. Null otherwise. Pure.
+ * before this message's. The sender's entries go on as the JSON the World
+ * stored, not as the objects it wrote. Null otherwise. Pure.
  */
 export function handoffEntries(read, newestSeen, appended) {
   if (!Number.isSafeInteger(newestSeen) || appended.length === 0) return null;
   for (const [index, item] of appended.entries()) {
     if (Number(item.cursor) !== newestSeen + index + 1) return null;
   }
-  return [...read, ...appended];
+  return [...read, ...appended.map(({ cursor, entry }) => ({ cursor, entry: JSON.parse(JSON.stringify(entry)) }))];
 }
 
 /**

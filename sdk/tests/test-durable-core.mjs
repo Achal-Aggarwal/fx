@@ -2186,6 +2186,11 @@ test("a worker starts from its sender's read only when the sender's entries took
   // Nothing written, or a log that cannot say what it has seen.
   assert.equal(handoffEntries(read, 9, []), null);
   assert.equal(handoffEntries(read, undefined, [input("10")]), null);
+  assert.equal(handoffEntries(read, null, [input("10")]), null);
+  // The worker gets what the World stored, not the sender's own objects.
+  const written = [input("10")];
+  handoffEntries(read, 9, written)[1].entry.changed = true;
+  assert.equal(written[0].entry.changed, undefined);
 });
 
 // A World durability that tells `onList(params)` of each log listing and
@@ -2233,7 +2238,10 @@ if (durabilityKind !== "memory") {
     await untilIdle(agent);
     const ours = await agent[Symbol.for("libfx.durableInternals")].openLog(session.id);
     // More entries than a read's first page, so a whole read lists two.
-    assert.ok((await ours.read()).length > 10);
+    const first = await ours.read();
+    assert.ok(first.length > 10);
+    // A caller that changes what a read returned changes nothing stored.
+    for (const item of first) item.entry.changedByCaller = true;
     const other = createAgent({ durability: await durabilityAt(dir) });
     const theirs = await other[Symbol.for("libfx.durableInternals")].openLog(session.id);
     const fresh = async () => {
@@ -2327,6 +2335,47 @@ if (durabilityKind !== "memory") {
     }
     for (const closing of [agent, other, late, fresh]) await closing.close();
   });
+
+  test("a write a log makes while its own read lists shows in its next read", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-log-own-write-"));
+    dirs.push(dir);
+    // Runs once inside the next listing, after the World answered it.
+    let during = null;
+    const base = await durabilityAt(dir);
+    const durability = {
+      ...base,
+      world: async () => {
+        const world = await base.world();
+        const list = world.events.list.bind(world.events);
+        const events = Object.assign(Object.create(world.events), {
+          async list(...args) {
+            const page = await list(...args);
+            const write = during;
+            during = null;
+            await write?.();
+            return page;
+          },
+        });
+        return Object.assign(Object.create(world), { events });
+      },
+    };
+    const internals = (agent) => agent[Symbol.for("libfx.durableInternals")];
+    const agent = createAgent({ durability });
+    const session = agent.session();
+    for (const input of ["iota", "kappa"]) assert.equal((await textOf(session.prompt(input))).result.stopReason, "end_turn");
+    await untilIdle(agent);
+    const ours = await internals(agent).openLog(session.id);
+    await ours.read();
+    let written;
+    during = async () => { written = await ours.append({ k: "note", n: 1 }); };
+    const listed = await ours.read();
+    assert.ok(written && !listed.some(({ cursor }) => cursor === written), "the listing was answered before the write");
+    const next = await ours.read();
+    assert.ok(next.some(({ cursor }) => cursor === written));
+    const fresh = createAgent({ durability: await durabilityAt(dir) });
+    assert.deepEqual(next, await (await internals(fresh).openLog(session.id)).read());
+    for (const closing of [agent, fresh]) await closing.close();
+  });
 }
 
 if (durabilityKind === "queue") {
@@ -2346,6 +2395,52 @@ if (durabilityKind === "queue") {
     assert.ok(input >= 0 && lease > input, JSON.stringify(ops));
     assert.deepEqual(ops.slice(input + 1, lease), [], "nothing read or written between the input and the worker's lease");
     await agent.close();
+  });
+
+  test("a worker reads the log itself when another write lands between its sender's read and the input", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-handoff-gap-"));
+    dirs.push(dir);
+    const ops = [];
+    // Runs once, just before the next input is written.
+    let before = null;
+    const kindOf = (event) => {
+      try { return JSON.parse(decoder.decode(event.eventData.input)).k; } catch { return null; }
+    };
+    const { durability: base } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000 });
+    const watched = watchingLog(base, { onList: () => ops.push("list"), onCreate: (kind) => ops.push(kind) });
+    const durability = {
+      ...watched,
+      world: async () => {
+        const world = await watched.world();
+        const create = world.events.create.bind(world.events);
+        const events = Object.assign(Object.create(world.events), {
+          async create(runId, event, ...rest) {
+            if (before && event?.eventType === "step_created" && kindOf(event) === "input") {
+              const write = before;
+              before = null;
+              await write();
+            }
+            return create(runId, event, ...rest);
+          },
+        });
+        return Object.assign(Object.create(world), { events });
+      },
+    };
+    const internals = (agent) => agent[Symbol.for("libfx.durableInternals")];
+    const agent = createAgent({ durability });
+    const session = agent.session();
+    assert.equal((await textOf(session.prompt("lambda"))).result.stopReason, "end_turn");
+    await untilIdle(agent);
+    const other = createAgent({ durability: await durabilityAt(dir) });
+    const theirs = await internals(other).openLog(session.id);
+    ops.length = 0;
+    before = () => theirs.append({ k: "note", n: 1 });
+    assert.equal((await textOf(session.prompt("mu"))).result.stopReason, "end_turn");
+    const input = ops.indexOf("input");
+    const lease = ops.indexOf("lease", input);
+    assert.ok(input >= 0 && lease > input, JSON.stringify(ops));
+    assert.ok(ops.slice(input + 1, lease).includes("list"), "the worker read the log before its lease");
+    for (const closing of [agent, other]) await closing.close();
   });
 }
 
