@@ -578,7 +578,6 @@ const App = struct {
     worker: WorkerRuntime = .{},
     terminal_client: terminal_client_runtime.Runtime = .{},
     managed_executions: managed_execution.Runtime = managed_execution.Runtime.init(std.heap.c_allocator),
-    legacy_process_provider: process_provider.Provider = process_provider.unavailable_provider,
     upgrader: auto_upgrade.AutoUpgrade = .{},
     change_tracker: change_tracker_mod.ChangeTracker = .{},
     mcp: app_mcp_runtime.State = .{},
@@ -637,10 +636,6 @@ const App = struct {
                 process_provider.unavailable_provider
             else
                 shell_process_provider.provider),
-            .legacy_process_provider = if (comptime host_target.is_wasm)
-                process_provider.unavailable_provider
-            else
-                shell_process_provider.provider,
         };
         auth_runtime.Runtime.initIntoWithMode(
             &app.auth,

@@ -15,7 +15,6 @@ const session_layout = @import("session_layout.zig");
 const session_replay = @import("session_replay.zig");
 const result_store = @import("result_store.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
-const text_utils = @import("../shared/text_utils.zig");
 const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 
 const Allocator = std.mem.Allocator;
@@ -232,7 +231,7 @@ fn loadConversationStateIfPresent(
     dir: *io_mod.VerifiedDir,
     expected_session_id: []const u8,
 ) !?session_codec.DurableSessionState {
-    return load_conversation_state_at_boundary(alloc, dir, expected_session_id, null, null, null, null);
+    return load_conversation_state_at_boundary(alloc, dir, expected_session_id, null);
 }
 
 fn load_conversation_state_at_boundary(
@@ -240,9 +239,6 @@ fn load_conversation_state_at_boundary(
     dir: *io_mod.VerifiedDir,
     expected_session_id: []const u8,
     recovery: ?ConversationRecoveryBoundary,
-    replay_window: ?ConversationReplayWindow,
-    history_failed: ?*bool,
-    history_source: ?*HistoryFrameSource,
 ) !?session_codec.DurableSessionState {
     const metadata_bytes = readManagedFileAlloc(
         alloc,
@@ -278,9 +274,6 @@ fn load_conversation_state_at_boundary(
     var open_work_id: ?[]u8 = null;
     defer if (open_work_id) |work_id| alloc.free(work_id);
     const history = blk: {
-        errdefer if (history_failed) |failed| {
-            failed.* = true;
-        };
         var event_file = try openManagedFile(dir, events_file, .read_only);
         defer event_file.close(io_mod.getIo());
         const length = if (recovery) |boundary| boundary.bytes else try event_file.length(io_mod.getIo());
@@ -288,27 +281,21 @@ fn load_conversation_state_at_boundary(
         // only full loads, where a prefix replay splices into the live log.
         if (recovery != null) {
             var pure_log = HistoryFrameSource{ .log_file = event_file, .log_length = length, .limit = length };
-            break :blk try replayConversationHistory(alloc, &pure_log, &conversation_seq, &open_work_id, replay_window);
+            break :blk try replayConversationHistory(alloc, &pure_log, &conversation_seq, &open_work_id);
         }
-        var owned_source: HistoryFrameSource = undefined;
-        const frames = history_source orelse frames_blk: {
-            owned_source = try HistoryFrameSource.open(alloc, dir, expected_session_id, event_file, length);
-            break :frames_blk &owned_source;
-        };
-        defer if (history_source == null) frames.deinit(alloc);
-        const result = replayConversationHistory(alloc, frames, &conversation_seq, &open_work_id, replay_window) catch |err| retry: {
+        var frames = try HistoryFrameSource.open(alloc, dir, expected_session_id, event_file, length);
+        defer frames.deinit(alloc);
+        const result = replayConversationHistory(alloc, &frames, &conversation_seq, &open_work_id) catch |err| retry: {
             if (err == error.OutOfMemory or frames.verified == null) return err;
             // A cache-sourced replay failure is a cache problem, not a log
             // problem: retry once from the raw log so the cache can never fail
-            // a load. The writable caller owns rebuild decisions; read-only
-            // loads just fall back.
+            // a load.
             debug_trace.logf("session", "history cache replay rejected id={s} err={s}; reading log", .{ expected_session_id, @errorName(err) });
             conversation_seq = 0;
             open_work_id = null;
             frames.verified_cleanup(alloc);
             frames.reset();
-            if (history_source != null) history_snapshot.deleteForRebuild(dir);
-            break :retry try replayConversationHistory(alloc, frames, &conversation_seq, &open_work_id, replay_window);
+            break :retry try replayConversationHistory(alloc, &frames, &conversation_seq, &open_work_id);
         };
         break :blk result;
     };
@@ -508,7 +495,7 @@ pub fn load_conversation_recovery_state(
     session_id: []const u8,
     boundary: ConversationRecoveryBoundary,
 ) !session_codec.DurableSessionState {
-    const loaded = load_conversation_state_at_boundary(alloc, dir, session_id, boundary, null, null, null) catch |err| switch (err) {
+    const loaded = load_conversation_state_at_boundary(alloc, dir, session_id, boundary) catch |err| switch (err) {
         error.InvalidSessionMetadata, error.InvalidSessionFormat => return error.SessionRecoveryBoundaryInvalid,
         else => return err,
     };
@@ -850,9 +837,8 @@ fn replayConversationHistory(
     source: *HistoryFrameSource,
     conversation_seq: *u64,
     open_work_id: *?[]u8,
-    replay_window: ?ConversationReplayWindow,
 ) ![]session.HistoryTurn {
-    const window = replay_window orelse try findConversationReplayWindow(alloc, source);
+    const window = try findConversationReplayWindow(alloc, source);
     conversation_seq.* = window.last_complete_seq;
     var history: std.ArrayList(session.HistoryTurn) = .empty;
     errdefer {

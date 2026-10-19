@@ -1400,7 +1400,7 @@ pub const WorkerRuntime = struct {
 
     /// Nonblocking queue take for single-threaded hosts. Returns null while the
     /// queue is empty, held, or stopped.
-    pub fn tryTakeNextPrompt(self: *WorkerRuntime, alloc: std.mem.Allocator) !?QueuedPrompt {
+    fn tryTakeNextPrompt(self: *WorkerRuntime, alloc: std.mem.Allocator) !?QueuedPrompt {
         self.worker_mutex.lockUncancelable(io_mod.getIo());
         defer self.worker_mutex.unlock(io_mod.getIo());
         if (self.queued_prompts.items.len == 0 or

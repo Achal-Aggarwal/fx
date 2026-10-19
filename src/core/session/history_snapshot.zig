@@ -29,7 +29,6 @@
 const std = @import("std");
 const io_mod = @import("../shared/io.zig");
 const session_event = @import("session_event.zig");
-const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -233,8 +232,6 @@ pub const Verified = struct {
     frames: []FrameMeta,
     /// Log bytes covered by the cache prefix.
     covered_log_bytes: u64,
-    /// Cache file bytes belonging to the valid prefix.
-    prefix_file_bytes: u64,
     last_seq: u64,
 
     pub fn deinit(self: *Verified, alloc: Allocator) void {
@@ -337,7 +334,6 @@ pub fn openAndVerify(
         .file = file,
         .frames = owned,
         .covered_log_bytes = covered_log_bytes,
-        .prefix_file_bytes = file_offset,
         .last_seq = expected_seq - 1,
     };
 }
@@ -406,19 +402,6 @@ fn openCacheFile(dir: *io_mod.VerifiedDir, mode: std.Io.Dir.OpenFileOptions.Mode
     if (mode == .read_write and stat.permissions.toMode() & 0o777 != 0o600)
         return error.HistoryCachePermissionsUnsupported;
     return file;
-}
-
-fn deleteCacheFile(dir: *io_mod.VerifiedDir) void {
-    dir.dir.deleteFile(io_mod.getIo(), file_name) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => debug_trace.logf("session", "history cache delete failed err={s}", .{@errorName(err)}),
-    };
-}
-
-/// Deletes the cache after a cache-backed load was rejected, so the retry and
-/// later opens rebuild from the authoritative log. Writable paths only.
-pub fn deleteForRebuild(dir: *io_mod.VerifiedDir) void {
-    deleteCacheFile(dir);
 }
 
 // ---------------------------------------------------------------------------

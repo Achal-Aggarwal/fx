@@ -415,9 +415,8 @@ fn readRegistry(alloc: Allocator, a: Allocator, root: *io_mod.VerifiedDir, root_
 }
 
 /// The children schema 3's relationship index names, read only when the
-/// root has no `children.json`, as v1's `sessionHasManagedChildren`
-/// (`session_store.zig`) reads it, with v1's own codec. That format keeps
-/// no registry beside it, so v1 itself has no child lines for them. In `a`.
+/// root has no `children.json`, with v1's own codec. That format keeps no
+/// registry beside it, so v1 itself has no child lines for them. In `a`.
 fn indexedChildren(a: Allocator, root: *io_mod.VerifiedDir, ids: *std.ArrayList([]const u8), problem: *Problem) !void {
     var subagent = (try io_mod.openRealDirIfPresent(root, subagent_dir)) orelse return;
     defer subagent.close();
@@ -464,7 +463,7 @@ fn lockOpened(alloc: Allocator, store: *session_store.Store, id: []const u8, ope
     const spent: u64 = @intCast(@max(io_mod.milliTimestamp() - started, 0));
     var lock = io_mod.acquireTimedAdvisoryLock(&dir, lock_file, wait_ms -| spent) catch |err| switch (err) {
         error.LockBusy => return error.SessionBusy,
-        // Removed since it was opened here, so its lock file is gone too.
+        // Gone since it was opened here, so its lock file is gone too.
         error.FileNotFound => {
             debug_trace.logf("convert", "action=Vanished session={s}", .{id});
             dir.close();
@@ -1003,10 +1002,9 @@ fn fromState(a: Allocator, locked: *Locked, state: *session_codec.DurableSession
             else => return problem.set("permissions can't be migrated ({s})", .{@errorName(err)}),
         };
     }
-    // As v1's migration leaves it (`session_log.zig`
-    // `importLegacySnapshotStateWithOps`): a history-only checkpoint kept as
-    // an interrupted turn, the rest dropped; empty file evidence dropped;
-    // each result kept inline stored under v1's handle.
+    // As v1's migration of an older format left it: a history-only
+    // checkpoint kept as an interrupted turn, the rest dropped; empty file
+    // evidence dropped; each result kept inline stored under v1's handle.
     if (!try state.archive_legacy_recovery(a) and state.recovery_checkpoint != null)
         debug_trace.logf("convert", "action=RecoveryDropped session={s} reason=older_format", .{locked.id});
     _ = try session_log.discardEmptyLegacyFileEvidence(a, state.history);

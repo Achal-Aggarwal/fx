@@ -385,7 +385,8 @@ const CatalogWorker = struct {
                 error.OutOfMemory, error.Cancelled => return err,
                 else => fallback: {
                     // A legacy upgrade interrupted mid-rename stays listed from
-                    // its stable snapshot, so resuming it can run recovery.
+                    // its stable snapshot; opening it refuses it and keeps it
+                    // for `fx session recover` (D70).
                     if (self.read.store.readOnlyFencedLegacyCandidate(self.alloc, id, self.read.cancelled)) |value|
                         break :fallback value
                     else |fallback_err| switch (fallback_err) {
