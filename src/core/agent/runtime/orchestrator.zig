@@ -4668,11 +4668,12 @@ fn fitRequestImages(
     first_body: []const u8,
     limits: request_image_budget.Limits,
     tool_text_limit: usize,
+    blob_dir: ?[]const u8,
     trace_ctx: TraceContext,
 ) ![]const u8 {
     var body = first_body;
     while (true) {
-        const projection = try request_image_budget.withholdOldestImages(arena, request.messages, body.len, limits, tool_text_limit);
+        const projection = try request_image_budget.withholdOldestImages(arena, request.messages, body.len, limits, tool_text_limit, blob_dir);
         if (projection.withheld == 0) return body;
         var smaller = request.*;
         smaller.messages = projection.messages;
@@ -7501,6 +7502,7 @@ fn processQueuedPromptLoop(
                     &attachment_dimensions,
                     safe_tool_messages,
                     max_dimension,
+                    deps.image_blob_dir,
                 );
                 break :native projection.messages;
             } else result_request_messages;
@@ -7576,6 +7578,7 @@ fn processQueuedPromptLoop(
                 request_data.messages,
                 request_image_budget.largestRequestBytes(agent.requestByteLimit(gateway_model)),
                 config.max_tool_result_bytes,
+                deps.image_blob_dir,
             );
             if (past_limit.withheld > 0) {
                 debug_trace.eventf("images", "request_images_withheld_before_build", step_ctx, "withheld={d}", .{past_limit.withheld});
@@ -7598,6 +7601,7 @@ fn processQueuedPromptLoop(
                         deps.agent_stream_provider.max_request_bytes,
                     ) },
                     config.max_tool_result_bytes,
+                    deps.image_blob_dir,
                     step_ctx,
                 );
                 prepared_request_body = request_body;

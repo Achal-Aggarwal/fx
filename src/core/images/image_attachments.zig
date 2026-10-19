@@ -914,6 +914,7 @@ pub fn withholdDroppedImages(arena: std.mem.Allocator, messages: []const types.C
 fn writeWithheldAttachmentNotice(
     writer: *std.Io.Writer,
     attachment: types.ImageAttachment,
+    saved: ?[]const u8,
     dimensions: ?image_data.Dimensions,
     max_dimension: u32,
 ) std.Io.Writer.Error!void {
@@ -928,8 +929,7 @@ fn writeWithheldAttachmentNotice(
         try image_data.writeHostImageRecoveryNotice(writer, source_ref, max_dimension);
         return;
     }
-    // The captured copy, or once saved the session's blob (D79).
-    if (attachment.snapshot_path) |path| {
+    if (saved) |path| {
         try writer.print("The original is saved at {s}. Use an available image tool to save a smaller copy to a new file", .{path});
         // Snapshots are named .bin and blobs by their hash, which hides the
         // type from tools that choose a decoder by file name.
@@ -959,15 +959,18 @@ pub const AttachmentProjection = struct {
     messages: []const types.ChatMessage,
 };
 
-/// Leaves unsafe attachments out of the request and gives the model a source
-/// path when one exists. History is not modified. `cache` and its keys use
-/// `cache_alloc` and should outlive the requests of one turn.
+/// Leaves unsafe attachments out of the request and gives the model the
+/// path of each one's saved copy (`savedImagePath`), or without a saved
+/// session the copy fx captured, which lasts while fx runs. History is not
+/// modified. `cache` and its keys use `cache_alloc` and should outlive the
+/// requests of one turn.
 pub fn withholdOversizedAttachments(
     arena: std.mem.Allocator,
     cache_alloc: std.mem.Allocator,
     cache: *AttachmentDimensionCache,
     messages: []const types.ChatMessage,
     max_dimension: u32,
+    blob_dir: ?[]const u8,
 ) !AttachmentProjection {
     var result: ?[]types.ChatMessage = null;
     for (messages, 0..) |message, index| {
@@ -985,7 +988,8 @@ pub fn withholdOversizedAttachments(
                 kept.?.appendSliceAssumeCapacity(message.images[0..image_index]);
             }
             debug_trace.logf("images", "event=attachment_withheld image_id={d} max_dimension={d} dimensions_known={s}", .{ image.id, max_dimension, if (dimensions != null) "true" else "false" });
-            writeWithheldAttachmentNotice(&notice.writer, image, dimensions, max_dimension) catch return error.OutOfMemory;
+            const saved = (try savedImagePath(arena, image, blob_dir)) orelse image.snapshot_path;
+            writeWithheldAttachmentNotice(&notice.writer, image, saved, dimensions, max_dimension) catch return error.OutOfMemory;
         }
         const kept_images = kept orelse continue;
 
@@ -1001,21 +1005,17 @@ pub fn withholdOversizedAttachments(
 /// open the image it sees with tools instead of searching the disk for it.
 /// Only the session's own copy is named, never the path the user attached
 /// from: that file can change after it was attached, and the copy holds
-/// the bytes the model sees. An image whose bytes are inline is saved only
-/// as a blob of a v2 session, the file named by its hash in `blob_dir`,
-/// which its turn writes before any tool runs (D79); without `blob_dir`,
-/// as in libfx, its snapshot lasts only as long as the process. Returns
-/// `messages` itself when no image has a saved file, otherwise a copy
-/// allocated in `arena`. History is not modified.
+/// the bytes the model sees (`savedImagePath`). Without a saved session, as
+/// in libfx, inline bytes have no saved file, and a snapshot beside them
+/// lasts only as long as the process. Returns `messages` itself when no
+/// image has a saved file, otherwise a copy allocated in `arena`. History
+/// is not modified.
 pub fn noteAttachmentLocations(arena: std.mem.Allocator, messages: []const types.ChatMessage, blob_dir: ?[]const u8) ![]const types.ChatMessage {
     var result: ?[]types.ChatMessage = null;
     for (messages, 0..) |message, index| {
         var notes: std.Io.Writer.Allocating = .init(arena);
         for (message.images) |image| {
-            const path = if (image.inline_data == null)
-                image.snapshot_path orelse continue
-            else
-                (try savedBlobPath(arena, blob_dir, image.snapshot_sha256)) orelse continue;
+            const path = (try savedImagePath(arena, image, blob_dir)) orelse continue;
             // Quoted, because a home folder can hold spaces or brackets.
             notes.writer.print("[Image #{d} ({s}) is saved at ", .{ image.id, image.media_type }) catch return error.OutOfMemory;
             std.json.Stringify.value(path, .{}, &notes.writer) catch return error.OutOfMemory;
@@ -1029,11 +1029,16 @@ pub fn noteAttachmentLocations(arena: std.mem.Allocator, messages: []const types
     return result orelse messages;
 }
 
-/// The blob in `blob_dir` holding bytes whose hash is `digest`, or null
-/// when either is missing or the digest is not a lowercase SHA-256.
-fn savedBlobPath(arena: std.mem.Allocator, blob_dir: ?[]const u8, digest: ?[]const u8) !?[]u8 {
+/// The session's saved copy of `image`: its snapshot when its bytes are not
+/// inline, and otherwise the blob of a v2 session in `blob_dir`, which the
+/// turn writes with its user item before any tool runs (D79). A blob is
+/// named by the lowercase SHA-256 hex of its bytes, as `schema.blobHash`
+/// names it (D44), which is what `snapshot_sha256` records. Null when there
+/// is none.
+pub fn savedImagePath(arena: std.mem.Allocator, image: types.ImageAttachment, blob_dir: ?[]const u8) !?[]const u8 {
+    if (image.inline_data == null) return image.snapshot_path;
     const dir = blob_dir orelse return null;
-    const hex = digest orelse return null;
+    const hex = image.snapshot_sha256 orelse return null;
     if (hex.len != snapshot_digest_hex_len) return null;
     for (hex) |c| if (!std.ascii.isDigit(c) and (c < 'a' or c > 'f')) return null;
     return try std.Io.Dir.path.join(arena, &.{ dir, hex });
@@ -3358,7 +3363,7 @@ test "requests leave out attachments over the model pixel limit and name their s
     };
     var cache: AttachmentDimensionCache = .empty;
 
-    const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages, image_data.max_image_dimension);
+    const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages, image_data.max_image_dimension, null);
     const projected = projection.messages;
 
     try std.testing.expectEqual(@as(usize, 1), projected[0].images.len);
@@ -3392,9 +3397,9 @@ test "request cache still withholds a snapshot deleted after dimension lookup" {
     };
     var cache: AttachmentDimensionCache = .empty;
 
-    const first = try withholdOversizedAttachments(arena, arena, &cache, &messages, image_data.max_image_dimension);
+    const first = try withholdOversizedAttachments(arena, arena, &cache, &messages, image_data.max_image_dimension, null);
     try tmp.dir.deleteFile(std.testing.io, "image-1-0000000000000001.bin");
-    const second = try withholdOversizedAttachments(arena, arena, &cache, &messages, image_data.max_image_dimension);
+    const second = try withholdOversizedAttachments(arena, arena, &cache, &messages, image_data.max_image_dimension, null);
 
     try std.testing.expectEqual(@as(usize, 0), first.messages[0].images.len);
     try std.testing.expectEqual(@as(usize, 0), second.messages[0].images.len);
@@ -3412,7 +3417,7 @@ test "requests ask for a smaller copy of an oversized in-memory attachment" {
     const messages = [_]types.ChatMessage{.{ .role = .user, .content = "[Image #3]", .images = &images }};
     var cache: AttachmentDimensionCache = .empty;
 
-    const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages, image_data.max_image_dimension);
+    const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages, image_data.max_image_dimension, null);
 
     try std.testing.expectEqual(@as(usize, 0), projection.messages[0].images.len);
     try std.testing.expectEqualStrings(
@@ -3437,9 +3442,30 @@ test "requests keep verified attachments within the pixel limit unchanged" {
     const messages = [_]types.ChatMessage{.{ .role = .user, .content = "[Image #1] [Image #2]", .images = &images }};
     var cache: AttachmentDimensionCache = .empty;
 
-    const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages, image_data.max_image_dimension);
+    const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages, image_data.max_image_dimension, null);
 
     try std.testing.expectEqual(@as([*]const types.ChatMessage, &messages), projection.messages.ptr);
+}
+
+test "a withheld prompt image's notice names the saved copy the note names (D79)" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const wide = image_data.testPngHeader(9000, 10);
+    var captured = try captureInlineImageBytesInMemory(arena, 1, "image/png", &wide);
+    captured.snapshot_path = @constCast("/tmp/fx-image-snapshots-0123456789abcdef/image-1.bin");
+    const images = [_]types.ImageAttachment{captured};
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "look", .images = &images }};
+    var cache: AttachmentDimensionCache = .empty;
+    const blob_dir = "/Users/example/.fx/sessions/v2/s/blobs";
+    const saved = try withholdOversizedAttachments(arena, arena, &cache, &messages, 8000, blob_dir);
+    try std.testing.expectEqual(@as(usize, 0), saved.messages[0].images.len);
+    const blob = try std.Io.Dir.path.join(arena, &.{ blob_dir, captured.snapshot_sha256.? });
+    try std.testing.expect(std.mem.find(u8, saved.messages[0].content.?, try arena.print("The original is saved at {s}. ", .{blob})) != null);
+    // Without a saved session it names the captured copy, which lasts
+    // while fx runs.
+    const unsaved = try withholdOversizedAttachments(arena, arena, &cache, &messages, 8000, null);
+    try std.testing.expect(std.mem.find(u8, unsaved.messages[0].content.?, "The original is saved at /tmp/fx-image-snapshots-0123456789abcdef/image-1.bin. ") != null);
 }
 
 test "reference-only attachments get host recovery guidance without attempting file access" {
@@ -3454,7 +3480,7 @@ test "reference-only attachments get host recovery guidance without attempting f
     }};
     const messages = [_]types.ChatMessage{.{ .role = .user, .images = &images }};
     var cache: AttachmentDimensionCache = .empty;
-    const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages, 8000);
+    const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages, 8000, null);
     try std.testing.expectEqual(@as(usize, 0), projection.messages[0].images.len);
     const notice = projection.messages[0].content.?;
     try std.testing.expect(std.mem.find(u8, notice, "only a host source reference was supplied") != null);
@@ -3476,7 +3502,7 @@ test "requests withhold snapshots whose dimensions cannot be verified" {
     }};
     const messages = [_]types.ChatMessage{.{ .role = .user, .images = &images }};
     var cache: AttachmentDimensionCache = .empty;
-    const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages, image_data.max_single_image_dimension);
+    const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages, image_data.max_single_image_dimension, null);
     try std.testing.expectEqual(@as(usize, 0), projection.messages[0].images.len);
     try std.testing.expect(std.mem.find(u8, projection.messages[0].content.?, "dimensions could not be verified") != null);
     try std.testing.expectEqual(@as(usize, 1), messages[0].images.len);
@@ -3591,7 +3617,7 @@ test "requests find a JPEG frame header behind large metadata" {
     const messages = [_]types.ChatMessage{.{ .role = .user, .content = "[Image #1]", .images = &images }};
     var cache: AttachmentDimensionCache = .empty;
 
-    const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages, image_data.max_image_dimension);
+    const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages, image_data.max_image_dimension, null);
 
     try std.testing.expect(std.mem.startsWith(u8, projection.messages[0].content.?, "[Image #1 not sent: image/jpeg is 4032x3024 pixels"));
 }

@@ -1207,8 +1207,9 @@ pub const Session = struct {
     /// `~/.fx/session-files/{id}`, owned: where an older session kept its
     /// side files, read once by the move (D47).
     files_path: []u8,
-    /// The folder of this session's blobs once it is published, owned: each
-    /// prompt image is the file named by its hash there (D79).
+    /// The folder of this session's blobs once it is published, owned, as
+    /// `Manager.blobPath` joins it: each prompt image is the file named by
+    /// its hash there (D79).
     blobs_path: []u8,
     /// The session's blobs, shared with every capability over it (D44).
     host: *BlobHost,
@@ -1610,11 +1611,11 @@ pub const Session = struct {
     /// Opens the turn on disk if it is not open yet, so a body stored for it
     /// is a blob of a session on disk (D44). Caller holds the mutex.
     /// Keeps each inline prompt image as one of the session's blobs too and
-    /// saves the prompt naming that file, so after a resume the notice for
-    /// an image too large to send names a file the model can read (D79).
-    /// The bytes stay in the item (D44), and the item does not list the
-    /// blob, which only backs that path. Storing the same bytes again costs
-    /// one stat, so a streamed prompt encodes the same each time. The path
+    /// saves the prompt naming that file, which every request names for the
+    /// model and an image too large to send names in its notice (D79). The
+    /// bytes stay in the item (D44), and `promptImageBlobs` lists the blob
+    /// on it. Storing the same bytes again costs one stat, so a streamed
+    /// prompt encodes the same each time. The path
     /// is the one `blobPath` gives once the session is published, so an
     /// import's staged blobs (D59) get theirs too. The caller holds the
     /// mutex.

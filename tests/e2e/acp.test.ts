@@ -1264,13 +1264,12 @@ function sendSteeringPrompt(client: AcpClient, id: number, text: string): void {
   });
 }
 
-// A withheld image's original: the copy the notice names in the running
-// process, and the session's blob its saved prompt names (D79).
+// A withheld image's original: the session's blob, which the notice names
+// and its saved prompt lists (D79).
 function expectSavedOriginal(home: string, sessionId: string, body: string, original: Buffer): void {
   const named = /The original is saved at (\S+)\. Use/.exec(body)?.[1];
-  expect(named).toBeDefined();
-  expect(readFileSync(named!)).toEqual(original);
   const blob = join(sessionDir(home, sessionId), "blobs", createHash("sha256").update(original).digest("hex"));
+  expect(named).toBe(blob);
   expect(readFileSync(blob)).toEqual(original);
   expect(savedText(home, sessionId)).toContain(blob);
 }
@@ -7106,6 +7105,12 @@ describe("acp: model-independent", () => {
         expect(gateway.requests).toHaveLength(1);
         expect(gateway.requests[0]!.body).toContain("image/png");
         expect(gateway.requests[0]!.body).toContain(imageData);
+        // The request names the session's blob of the image (D79).
+        const imageBytes = Buffer.from(imageData, "base64");
+        const blob = join(sessionDir(root.home, sessionId), "blobs", createHash("sha256").update(imageBytes).digest("hex"));
+        expect(gateway.requests[0]!.body).toContain("[Image #1 (image/png) is saved at ");
+        expect(gateway.requests[0]!.body).toContain(blob);
+        expect(readFileSync(blob)).toEqual(imageBytes);
 
         const detail = await runFx(["session", "--id", sessionId, "--json"], {
           cwd: root.workspace,

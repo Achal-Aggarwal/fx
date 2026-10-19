@@ -1397,17 +1397,18 @@ Settled while removing v1 (2026-10-17):
   When a turn's user item is written, by a stream, a commit or a
   conversion's import, each inline prompt image is put as a blob of the
   session and listed on that item, and the item saves its
-  `snapshot_path` as that blob's path; the bytes stay inside the item. A
-  notice for an image too large to send names `snapshot_path` whenever
-  it is set: in the running process, the copy fx captured in its
-  temporary folder, since a new session has no folder until its first
-  turn starts; after a resume, the blob. Each request names the blob of
-  every prompt image it sends, as `[Image #N (type) is saved at
-  "<path>".]` ahead of the prompt, in the running process and after a
-  resume alike: the blob is the file named by the image's hash in the
-  session's blob folder, and the turn writes it with the user item before
-  any of its tools runs, so the model can open the file the note names. A
-  recalled image has the same bytes, so it names the same blob. **Why:**
+  `snapshot_path` as that blob's path; the bytes stay inside the item.
+  Each request names that blob for every prompt image it sends, as
+  `[Image #N (type) is saved at "<path>".]` ahead of the prompt, and the
+  notice for an image too large to send, or left out to keep a request
+  within its size limit, names the same file, in the running process and
+  after a resume alike: the blob is the file named by
+  the image's hash in the session's blob folder, and the turn writes it
+  with the user item before any of its tools runs, so the model can open
+  the file it is told about. Without a saved session the notice names the
+  copy fx captured in its temporary folder, which lasts while fx runs, and
+  the note is left out. A recalled image has the same bytes, so it names
+  the same blob. **Why:**
   the model can read the original to make a smaller copy, or open the
   image it sees with tools, as v1's `images/` folder let it.
   **Alternative:** tell the model no local file is available.
