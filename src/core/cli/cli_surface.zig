@@ -5277,9 +5277,8 @@ test "top-level MCP trust persists project approval without interactive startup"
     defer environ.deinit();
     try environ.put("HOME", home);
     try environ.put("PATH", "");
-    const stable_environ = try stableCliTestEnviron();
     io_mod.setEnvironMap(&environ);
-    defer io_mod.setEnvironMap(stable_environ);
+    defer io_mod.resetEnvironForTest();
 
     var capture = CaptureOutput.init(alloc);
     defer capture.deinit();
@@ -6118,9 +6117,8 @@ test "status and doctor inspect MCP configuration once per command" {
     defer environ.deinit();
     try environ.put("HOME", home);
     try environ.put("PATH", "");
-    const stable_environ = try stableCliTestEnviron();
     io_mod.setEnvironMap(&environ);
-    defer io_mod.setEnvironMap(stable_environ);
+    defer io_mod.resetEnvironForTest();
 
     mcp_local_inspection_calls_for_test = 0;
     var cfg = testConfig();
@@ -6418,18 +6416,6 @@ fn failingMcpLocalInspectionForTest(
     result.profile_diagnostic = .{ .failed = error.McpConfigInvalidJson };
     result.inspection_error = "McpConfigInvalidJson";
     return result;
-}
-
-var stable_cli_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableCliTestEnviron() !*const std.process.Environ.Map {
-    if (stable_cli_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_cli_test_environ = map;
-    return map;
 }
 
 fn unexpectedAcpRunForTest(_: ?*anyopaque, _: Allocator, _: acp_runner.Config) anyerror!void {

@@ -51,6 +51,7 @@ const host_tool_runtime = @import("../core/tooling/host_tool_runtime.zig");
 const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const agent_checkpoint = @import("../core/agent/runtime/checkpoint.zig");
 const host_attachments = @import("../core/hosts/host_attachments.zig");
+const image_attachments = @import("../core/images/image_attachments.zig");
 const libfx_steering = @import("libfx_steering.zig");
 const journal_events = @import("../core/agent/runtime/journal.zig");
 const libfx_journal = @import("libfx_journal.zig");
@@ -87,6 +88,7 @@ const AcpMethod = enum {
     libfx_follow_up,
     libfx_snapshot,
     libfx_journal_open,
+    libfx_journal_images,
     mcp_message,
     unknown,
 
@@ -112,6 +114,7 @@ const AcpMethod = enum {
         if (std.mem.eql(u8, method, "libfx/follow_up")) return .libfx_follow_up;
         if (std.mem.eql(u8, method, "libfx/snapshot")) return .libfx_snapshot;
         if (std.mem.eql(u8, method, "libfx/journal_open")) return .libfx_journal_open;
+        if (std.mem.eql(u8, method, "libfx/journal_images")) return .libfx_journal_images;
         if (std.mem.eql(u8, method, "mcp/message")) return .mcp_message;
         return .unknown;
     }
@@ -140,6 +143,7 @@ const AcpMethod = enum {
             .libfx_restore,
             .libfx_snapshot,
             .libfx_journal_open,
+            .libfx_journal_images,
             .mcp_message,
             .unknown,
             => true,
@@ -148,7 +152,7 @@ const AcpMethod = enum {
 
     fn isLibfx(self: AcpMethod) bool {
         return switch (self) {
-            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer, .libfx_withdraw, .libfx_handoff, .libfx_follow_up, .libfx_snapshot, .libfx_journal_open => true,
+            .libfx_checkpoint, .libfx_restore, .libfx_new, .libfx_steer, .libfx_withdraw, .libfx_handoff, .libfx_follow_up, .libfx_snapshot, .libfx_journal_open, .libfx_journal_images => true,
             else => false,
         };
     }
@@ -268,6 +272,13 @@ pub const ActiveSessionState = struct {
     steering: libfx_steering.Runtime = .{},
     /// Set when the host passed a journal; every state change is sent to it.
     journal: ?libfx_journal.Journal = null,
+    /// Images the host staged from its store for the journal it opens next.
+    /// Owned by the server allocator; cleared once the journal opens.
+    staged_images: session_codec.StagedImages = .{},
+    /// What the last open that found images missing needs staged, all told:
+    /// an open turn's tool images can take a session past one window and one
+    /// prompt, and what a running session held must reopen.
+    staging_needed: StagedTotals = .{},
 
     pub fn retainGrant(self: *ActiveSessionState, alloc: Allocator, tool_name: []const u8, target_path: []const u8) !void {
         for (self.session_grants) |grant| {
@@ -753,6 +764,7 @@ fn destroyActiveSession(state: *ServerState) void {
     active.tool_identities.deinit(state.alloc);
     active.steering.deinit(state.alloc);
     if (active.journal) |*journal| journal.deinit(state.alloc);
+    active.staged_images.deinit(state.alloc);
     types.freePermissionGrantSlice(state.alloc, active.session_grants);
     if (comptime !host_target.is_wasm) {
         if (active.mcp) |runtime| {
@@ -1069,6 +1081,26 @@ pub fn awaitOutboundResponse(state: *ServerState, id: u64, kind: OutboundKind) ?
             _ = cancelOutboundRequestLocked(state, id);
         };
     }
+}
+
+/// Takes the event of an `awaitOutboundResponse` task in `select` after
+/// `cancelOutboundRequest` made it return, and frees any response. Call when
+/// that event is the only one outstanding; `select` then has nothing left to
+/// cancel. `select` must hold a `response: ?OutboundResponse` event.
+pub fn takeCancelledResponse(state: *ServerState, select: anytype) void {
+    const item = select.queue.getOneUncancelable(select.io) catch |err| switch (err) {
+        // Only Select.cancel and cancelDiscard close the queue, and they leave
+        // nothing outstanding.
+        error.Closed => return,
+    };
+    switch (item) {
+        .response => |maybe_response| if (maybe_response) |owned| {
+            var response = owned;
+            response.deinit(state.alloc);
+        },
+        else => {},
+    }
+    std.debug.assert(select.cancel() == null);
 }
 
 /// Forgets a request that was never written to the client.
@@ -1448,6 +1480,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
             .libfx_follow_up => handleKernelFollowUp(state, alloc, msg),
             .libfx_snapshot => handleKernelSnapshot(state, alloc, msg),
             .libfx_journal_open => handleKernelJournalOpen(state, alloc, msg),
+            .libfx_journal_images => handleKernelJournalImages(state, alloc, msg),
             else => state.writer.writeError(alloc, msg.id, .{
                 .code = ErrorCode.method_not_found,
                 .message = "Method not available in the web core yet",
@@ -1473,6 +1506,7 @@ fn dispatch(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message) !void 
         .libfx_follow_up => handleKernelFollowUp(state, alloc, msg),
         .libfx_snapshot => handleKernelSnapshot(state, alloc, msg),
         .libfx_journal_open => handleKernelJournalOpen(state, alloc, msg),
+        .libfx_journal_images => handleKernelJournalImages(state, alloc, msg),
         .initialize,
         .request_cancel,
         .session_cancel,
@@ -1891,6 +1925,21 @@ fn handleKernelJournalOpen(
             .message = "Invalid libfx journal params",
         }),
     } else false;
+    // A host with an image store stores each prompt image before it sends
+    // it, so the journal names stored images instead of holding their bytes.
+    const image_store = if (parsed.value.object.get("imageStore")) |value| switch (value) {
+        .bool => |enabled| enabled,
+        else => return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Invalid libfx journal params",
+        }),
+    } else false;
+    const window = imageWindowParam(parsed.value.object.get("imageWindow")) orelse return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid libfx journal params",
+    });
+    var images: session_codec.ImageResolver = .{ .alloc = alloc, .staged = &active.staged_images };
+    defer images.deinit();
     const journal, const opened = libfx_journal.open(
         alloc,
         state.alloc,
@@ -1899,8 +1948,21 @@ fn handleKernelJournalOpen(
         events orelse "[]",
         snapshot,
         inputs_durable,
+        &images,
+        image_store,
+        window,
     ) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
+        // The host stages them from its store, then opens again.
+        error.ImagesMissing => {
+            var needed: StagedTotals = .{ .images = active.staged_images.images.count(), .bytes = active.staged_images.bytes };
+            for (images.missing.values()) |size| {
+                needed.images +|= 1;
+                needed.bytes +|= size;
+            }
+            active.staging_needed = needed;
+            return writeImagesNeeded(state, alloc, msg.id, images.missing.keys());
+        },
         error.AgentNotFresh => return state.writer.writeError(alloc, msg.id, .{
             .code = ErrorCode.invalid_request,
             .message = "A libfx journal opens only on a new session",
@@ -1922,6 +1984,9 @@ fn handleKernelJournalOpen(
     };
     defer opened.checkpoint_meta.free(alloc);
     active.journal = journal;
+    // The history holds its own copies of every staged image it named.
+    active.staged_images.clear(state.alloc);
+    active.staging_needed = .{};
     // The host runs the follow-ups the journal held, after any resume.
     const follow_ups = active.journal.?.takeFollowUps();
     defer journal_events.freePendingInputs(state.alloc, follow_ups);
@@ -1977,6 +2042,124 @@ fn handleKernelJournalOpen(
     try state.writer.writeResponse(alloc, msg.id, response.written());
 }
 
+/// Answers an open whose saved history names images the host has not
+/// staged: every such name, so one round of staging serves the next open.
+fn writeImagesNeeded(state: *ServerState, alloc: Allocator, id: ?jsonrpc.RequestId, names: []const session_codec.ImageName) !void {
+    var response: std.Io.Writer.Allocating = .init(alloc);
+    defer response.deinit();
+    try response.writer.writeAll("{\"imagesNeeded\":[");
+    for (names, 0..) |name, index| {
+        if (index > 0) try response.writer.writeByte(',');
+        try response.writer.print("\"{s}\"", .{&name});
+    }
+    try response.writer.writeAll("]}");
+    try state.writer.writeResponse(alloc, id, response.written());
+}
+
+/// The most images, and image bytes, a host may stage for one open: those of
+/// the largest image window, the newest images a session keeps, and those of
+/// the open turn, which the window leaves out and which holds one prompt's
+/// images at most.
+/// An open that needs more, because its open turn's tools returned images
+/// beyond one prompt's, may stage what it reported missing
+/// (`ActiveSessionState.staging_needed`).
+const max_staged_images = (session_codec.ImageWindow{}).max_images + image_attachments.max_libfx_prompt_images;
+const max_staged_image_bytes = (session_codec.ImageWindow{}).max_bytes + image_attachments.max_libfx_prompt_images_bytes;
+
+const StagedTotals = struct { images: usize = 0, bytes: usize = 0 };
+
+/// The image window an open asks for, `{images, bytes}`, each at most the
+/// default: a host may keep fewer images, never more than an open stages.
+/// Null when the value is not one.
+fn imageWindowParam(value: ?std.json.Value) ?session_codec.ImageWindow {
+    const defaults: session_codec.ImageWindow = .{};
+    const object = switch (value orelse return defaults) {
+        .object => |object| object,
+        else => return null,
+    };
+    var window = defaults;
+    var iterator = object.iterator();
+    while (iterator.next()) |entry| {
+        const limit = switch (entry.value_ptr.*) {
+            .integer => |integer| std.math.cast(usize, integer) orelse return null,
+            else => return null,
+        };
+        if (limit == 0) return null;
+        if (std.mem.eql(u8, entry.key_ptr.*, "images")) {
+            window.max_images = @min(limit, defaults.max_images);
+        } else if (std.mem.eql(u8, entry.key_ptr.*, "bytes")) {
+            window.max_bytes = @min(limit, defaults.max_bytes);
+        } else return null;
+    }
+    return window;
+}
+
+/// Stages images from the host's store for the journal the session opens
+/// next. `images` is `[{name, attachment}]`; each attachment holds the bytes
+/// whose SHA-256 is the name.
+fn handleKernelJournalImages(
+    state: *ServerState,
+    alloc: Allocator,
+    msg: *const jsonrpc.Message,
+) !void {
+    const invalid: jsonrpc.RpcError = .{
+        .code = ErrorCode.invalid_params,
+        .message = "Invalid libfx journal images",
+    };
+    const too_large: jsonrpc.RpcError = .{
+        .code = ErrorCode.invalid_params,
+        .message = "libfx journal images are too large",
+    };
+    var parsed = libfxSessionId(alloc, msg) catch return state.writer.writeError(alloc, msg.id, invalid);
+    defer parsed.deinit();
+    const active = activeLibfxSession(state, parsed.value) orelse
+        return state.writer.writeError(alloc, msg.id, .{
+            .code = ErrorCode.invalid_params,
+            .message = "Unknown libfx session",
+        });
+    const store = state.cfg.host_attachments orelse return state.writer.writeError(alloc, msg.id, invalid);
+    const list = parsed.value.object.get("images") orelse return state.writer.writeError(alloc, msg.id, invalid);
+    if (list != .array or list.array.items.len == 0) return state.writer.writeError(alloc, msg.id, invalid);
+
+    active.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer active.session_write_mutex.unlock(io_mod.getIo());
+    if (active.journal != null) return state.writer.writeError(alloc, msg.id, .{
+        .code = ErrorCode.invalid_request,
+        .message = "libfx journal is already open",
+    });
+    for (list.array.items) |item| {
+        if (item != .object) return state.writer.writeError(alloc, msg.id, invalid);
+        const name_value = item.object.get("name") orelse return state.writer.writeError(alloc, msg.id, invalid);
+        if (name_value != .string) return state.writer.writeError(alloc, msg.id, invalid);
+        const name = session_codec.imageName(name_value.string) orelse return state.writer.writeError(alloc, msg.id, invalid);
+        const reference = item.object.get("attachment") orelse return state.writer.writeError(alloc, msg.id, invalid);
+        const attachment = host_attachments.idFromJson(reference) orelse return state.writer.writeError(alloc, msg.id, invalid);
+        if (active.staged_images.images.count() >= @max(max_staged_images, active.staging_needed.images)) return state.writer.writeError(alloc, msg.id, too_large);
+        const bytes = store.take(state.alloc, attachment, image_attachments.max_image_bytes) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.AttachmentUnavailable => return state.writer.writeError(alloc, msg.id, invalid),
+            error.AttachmentTooLarge => return state.writer.writeError(alloc, msg.id, too_large),
+        };
+        if (bytes.len > @max(max_staged_image_bytes, active.staging_needed.bytes) -| active.staged_images.bytes) {
+            state.alloc.free(bytes);
+            return state.writer.writeError(alloc, msg.id, too_large);
+        }
+        active.staged_images.add(state.alloc, name, bytes) catch |err| {
+            state.alloc.free(bytes);
+            return switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.ImageNameMismatch => state.writer.writeError(alloc, msg.id, .{
+                    .code = ErrorCode.invalid_params,
+                    .message = "libfx image does not match its name",
+                }),
+            };
+        };
+    }
+    const written = try alloc.print("{{\"staged\":{d}}}", .{active.staged_images.images.count()});
+    defer alloc.free(written);
+    try state.writer.writeResponse(alloc, msg.id, written);
+}
+
 /// A snapshot of the session for its journal to store, when it is quiet (no
 /// turn open and no follow-up waiting) or at a turn that yielded with nothing
 /// waiting for it, which the snapshot then carries. `null` otherwise; the
@@ -2009,8 +2192,14 @@ fn handleKernelSnapshot(
     const yielded = journal.yieldedQuiet();
     if (!journal.quiet() and !yielded) return state.writer.writeResponse(alloc, msg.id, none);
     // A session past a snapshot's bounds gets none until compaction brings it
-    // back within them; the host learns why.
-    const checkpoint = active.session_rt.agent.checkpoint(alloc, meta) catch |err| switch (err) {
+    // back within them; the host learns why. Images the host stored are
+    // named, not held.
+    const stored = journal.storedImages();
+    const encoded = if (stored) |names|
+        active.session_rt.agent.checkpointNamingImages(alloc, meta, names)
+    else
+        active.session_rt.agent.checkpoint(alloc, meta);
+    const checkpoint = encoded catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.CheckpointTooLarge => return writeSnapshotSkipped(state, alloc, msg.id, if (active.session_rt.agent.history.items.len > journal_events.max_history_turns) .too_many_turns else .too_large),
         else => return writeSnapshotSkipped(state, alloc, msg.id, .invalid),
@@ -2019,8 +2208,21 @@ fn handleKernelSnapshot(
     const at_seq = journal.cursor.next_seq - 1;
     var open_turn: std.Io.Writer.Allocating = .init(alloc);
     defer open_turn.deinit();
-    if (yielded) try journal_events.writeOpenTurn(&open_turn.writer, journal.open_turn_id.slice(), journal.pending_resume.?);
-    const bytes = journal_events.encodeSnapshot(alloc, at_seq, journal.cursor.turn, journal.last_turn_id.slice(), if (yielded) open_turn.written() else null, checkpoint) catch |err| switch (err) {
+    var open_turn_names_images = false;
+    if (yielded) {
+        if (stored) |names| {
+            open_turn_names_images = try journal_events.writeOpenTurnNamingImages(&open_turn.writer, journal.open_turn_id.slice(), journal.pending_resume.?, names);
+        } else {
+            try journal_events.writeOpenTurn(&open_turn.writer, journal.open_turn_id.slice(), journal.pending_resume.?);
+            // An image the session dropped is written by name even here.
+            open_turn_names_images = session_codec.checkpointNamesImages(journal.pending_resume.?, null, null);
+        }
+    }
+    const snapshot_bytes = if (open_turn_names_images)
+        journal_events.encodeSnapshotNamingImages(alloc, at_seq, journal.cursor.turn, journal.last_turn_id.slice(), open_turn.written(), checkpoint)
+    else
+        journal_events.encodeSnapshot(alloc, at_seq, journal.cursor.turn, journal.last_turn_id.slice(), if (yielded) open_turn.written() else null, checkpoint);
+    const bytes = snapshot_bytes catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.SnapshotTooLarge => return writeSnapshotSkipped(state, alloc, msg.id, .too_large),
     };
@@ -2031,6 +2233,7 @@ fn handleKernelSnapshot(
         error.OutOfMemory => return error.OutOfMemory,
         error.AttachmentStoreFull => return state.writer.writeResponse(alloc, msg.id, none),
     };
+    if (yielded) journal.noteOpenTurnSnapshot();
     const written = try alloc.print("{{\"snapshotAttachment\":{d},\"atSeq\":{d}}}", .{ attachment, at_seq });
     defer alloc.free(written);
     try state.writer.writeResponse(alloc, msg.id, written);

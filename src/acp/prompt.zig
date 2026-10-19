@@ -23,6 +23,7 @@ const js_host_steering = if (host_target.is_wasm)
 else
     struct {};
 const io_mod = @import("../core/shared/io.zig");
+const select_watch = @import("../core/shared/select_watch.zig");
 const host_attachments = @import("../core/hosts/host_attachments.zig");
 const image_attachments = @import("../core/images/image_attachments.zig");
 const image_data = @import("../core/images/image_data.zig");
@@ -134,8 +135,46 @@ fn promptInputFailure(err: anyerror) anyerror!TerminalOutcome {
             .code = ErrorCode.invalid_params,
             .message = "Image prompt exceeds size limit",
         } },
+        error.PromptImagesTooLarge => .{ .rpc_error = .{
+            .code = ErrorCode.invalid_params,
+            .message = "Prompt images exceed the libfx limit",
+        } },
         else => err,
     };
+}
+
+/// Whether `images` fit one libfx prompt: at most
+/// `image_attachments.max_libfx_prompt_images` of them, holding at most
+/// `max_libfx_prompt_images_bytes` together. An open stages its open turn's
+/// images on top of the session's image window, and counts on this.
+fn fitsLibfxPrompt(images: []const PendingPromptImage) bool {
+    if (images.len > image_attachments.max_libfx_prompt_images) return false;
+    var bytes: usize = 0;
+    for (images) |image| bytes += image.bytes.len;
+    return bytes <= image_attachments.max_libfx_prompt_images_bytes;
+}
+
+test "a libfx prompt holds at most its limit of images and image bytes" {
+    const alloc = std.testing.allocator;
+    var media_type = "image/png".*;
+    var byte: [1]u8 = .{0x89};
+    var images: [image_attachments.max_libfx_prompt_images + 1]PendingPromptImage = @splat(.{ .id = 1, .bytes = &byte, .media_type = &media_type });
+    try std.testing.expect(fitsLibfxPrompt(images[0..image_attachments.max_libfx_prompt_images]));
+    try std.testing.expect(!fitsLibfxPrompt(&images));
+    // Reference-only images count toward the number too.
+    var references = images;
+    for (&references) |*image| image.bytes = &.{};
+    try std.testing.expect(!fitsLibfxPrompt(&references));
+
+    const bytes = try alloc.alloc(u8, image_attachments.max_libfx_prompt_images_bytes + 1);
+    defer alloc.free(bytes);
+    const exact = [_]PendingPromptImage{.{ .id = 1, .bytes = bytes[1..], .media_type = &media_type }};
+    try std.testing.expect(fitsLibfxPrompt(&exact));
+    const over = [_]PendingPromptImage{
+        .{ .id = 1, .bytes = bytes[0..1024], .media_type = &media_type },
+        .{ .id = 2, .bytes = bytes[1024..], .media_type = &media_type },
+    };
+    try std.testing.expect(!fitsLibfxPrompt(&over));
 }
 
 fn promptExecutionFailure(err: anyerror) anyerror!TerminalOutcome {
@@ -880,8 +919,10 @@ pub fn handlePrompt(
         if (session.store == null and session.wasm_state == null and session.v2 == null) {
             // libfx kernel session: images stay in memory and ride the kernel
             // checkpoint, so no filesystem snapshot backend is needed.
+            if (!fitsLibfxPrompt(prompt_input.pending_images)) return promptInputFailure(error.PromptImagesTooLarge);
             prompt_input.captureImagesInline(alloc) catch |err|
                 return promptInputFailure(err);
+            if (session.journal) |*journal| try prompt_input.noteStoredImages(state.alloc, journal);
         } else {
             if (comptime host_target.is_wasm) return promptInputFailure(error.UnsupportedPromptImage);
             var temporary_snapshot_dir: ?[]u8 = null;
@@ -1111,7 +1152,9 @@ pub fn handlePrompt(
         .grants = session.session_grants,
         .context_snapshot = context_snapshot,
         .recovery_checkpoint = recovery_checkpoint,
-        .recovery_source_already_presented = recovery_checkpoint != null,
+        // An ACP client keeps what the turn sent before it stopped; an engine
+        // in a new process says it holds none of it.
+        .recovery_source_already_presented = recovery_checkpoint != null and !prompt_input.fresh_output,
     };
 
     // A turn whose completions report no tokens sends no `usage_update`.
@@ -1486,6 +1529,8 @@ const PendingPromptImage = struct {
     bytes: []u8,
     media_type: []u8,
     source_ref: ?[]u8 = null,
+    /// The name the host stored the bytes under before it sent them.
+    stored_name: ?session_codec.ImageName = null,
 
     fn deinit(self: *PendingPromptImage, alloc: Allocator) void {
         alloc.free(self.bytes);
@@ -1502,6 +1547,9 @@ const max_host_time_ms: i64 = (1 << 53) - 1;
 const ParsedPromptInput = struct {
     text: []u8,
     continue_recovery: bool = false,
+    /// A resume whose host holds none of the turn's earlier output, such as
+    /// an engine in a new process: the turn sends its saved reply again.
+    fresh_output: bool = false,
     /// The follow-up this prompt runs, which its first progress places.
     input_id: ?[]u8 = null,
     /// The host's id for the turn this prompt starts.
@@ -1580,6 +1628,16 @@ const ParsedPromptInput = struct {
             captured += 1;
         }
         self.images = images;
+    }
+
+    /// Tells `journal` which captured images the host stored before it sent
+    /// them, so its events name them. `captureImagesInline` keeps the order.
+    fn noteStoredImages(self: *const ParsedPromptInput, session_alloc: Allocator, journal: *libfx_journal.Journal) Allocator.Error!void {
+        std.debug.assert(self.images.len == self.pending_images.len);
+        for (self.images, self.pending_images) |image, pending| {
+            const name = pending.stored_name orelse continue;
+            try journal.noteStoredImage(session_alloc, image, name);
+        }
     }
 
     fn retainImageSnapshots(self: *ParsedPromptInput) void {
@@ -1694,6 +1752,7 @@ fn parsePromptInputWithFirstImageId(
     if (parsed.value != .object) return .{ .text = try alloc.dupe(u8, "") };
 
     const continue_recovery = acp_types.fxMetaBool(parsed.value.object, "continueRecovery") orelse false;
+    const fresh_output = acp_types.fxMetaBool(parsed.value.object, "freshOutput") orelse false;
     const input_id: ?[]const u8 = if (acp_types.fxMetaField(parsed.value.object, "inputId")) |value|
         if (value == .string and libfx_steering.validInputId(value.string)) value.string else null
     else
@@ -1711,8 +1770,8 @@ fn parsePromptInputWithFirstImageId(
         null;
 
     const prompt_arr = parsed.value.object.get("prompt") orelse
-        return .{ .text = try alloc.dupe(u8, ""), .continue_recovery = continue_recovery };
-    if (prompt_arr != .array) return .{ .text = try alloc.dupe(u8, ""), .continue_recovery = continue_recovery };
+        return .{ .text = try alloc.dupe(u8, ""), .continue_recovery = continue_recovery, .fresh_output = fresh_output };
+    if (prompt_arr != .array) return .{ .text = try alloc.dupe(u8, ""), .continue_recovery = continue_recovery, .fresh_output = fresh_output };
 
     var text_buf: std.ArrayList(u8) = .empty;
     defer text_buf.deinit(alloc);
@@ -1764,6 +1823,11 @@ fn parsePromptInputWithFirstImageId(
                 break :bytes try alloc.alloc(u8, 0);
             };
             errdefer alloc.free(decoded);
+            // A host with an image store names the bytes it stored first.
+            const stored_name: ?session_codec.ImageName = if (acp_types.fxMetaField(block.object, "stored")) |value| name: {
+                if (value != .string or decoded.len == 0) return error.InvalidPromptImage;
+                break :name session_codec.imageName(value.string) orelse return error.InvalidPromptImage;
+            } else null;
 
             const image_id = std.math.add(usize, first_image_id, pending_images.items.len) catch
                 return error.ImageIdOverflow;
@@ -1782,6 +1846,7 @@ fn parsePromptInputWithFirstImageId(
                 .bytes = decoded,
                 .media_type = media_type,
                 .source_ref = source_ref,
+                .stored_name = stored_name,
             });
         } else if (std.mem.eql(u8, block_type.string, "resource")) {
             if (block.object.get("resource")) |resource| {
@@ -1835,6 +1900,7 @@ fn parsePromptInputWithFirstImageId(
     var result = ParsedPromptInput{
         .text = try alloc.dupe(u8, text_buf.items),
         .continue_recovery = continue_recovery,
+        .fresh_output = fresh_output,
         .input_accepted = input_accepted,
         .yield_at_ms = yield_at_ms,
     };
@@ -2602,9 +2668,9 @@ fn completeAuthorizedToolCallTransport(
 }
 
 /// Records a finished call's result in a journaled libfx session, so a
-/// crash before the next progress answers it with what the model sees
-/// instead of with "may have partly run". Nothing waits for it. A cancelled
-/// call did not finish and stays unanswered; a result's images are not kept.
+/// crash before the next progress answers it with what the model sees,
+/// its images too, instead of with "may have partly run". Nothing waits for
+/// it. A cancelled call did not finish and stays unanswered.
 fn recordJournalToolResult(ctx: *AcpContext, call: ToolCall, result: ToolExecutionResult) void {
     if (result.cancelled) return;
     const session = if (ctx.state.active_session) |*value| value else return;
@@ -2616,6 +2682,7 @@ fn recordJournalToolResult(ctx: *AcpContext, call: ToolCall, result: ToolExecuti
         .name = call.name,
         .failed = result.status == .failure,
         .output = result.model_output,
+        .images = if (result.tool_result_memory) |memory| memory.tool_images else &.{},
     }) catch |err| {
         debug_trace.logf("session", "event=libfx_journal_tool_result_dropped call={s} err={s} answered_by=next_progress", .{ call.id, @errorName(err) });
     };
@@ -2939,6 +3006,7 @@ fn persistAcpHistoryTurn(
         session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
         prepared_owned = false;
         if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
+        try keepImageWindow(alloc, session);
         if (session.wasm_state != null) try sessions.commitWasmSessionLocked(alloc, session);
         return;
     }
@@ -2958,6 +3026,7 @@ fn persistAcpHistoryTurn(
         session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
         prepared_owned = false;
         if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
+        try keepImageWindow(alloc, session);
         return;
     };
     try writable.prepareHistoryTurnForCommit(alloc, &prepared);
@@ -2979,6 +3048,15 @@ fn persistAcpHistoryTurn(
     session.session_rt.commitPreparedHistoryEntry(alloc, prepared);
     prepared_owned = false;
     if (current_prompt_input) |prompt_input| prompt_input.retainImageSnapshots();
+}
+
+/// Keeps a libfx session within its image window once a turn enters its
+/// history (owned by `alloc`): its images are the newest, and older ones past
+/// the window give up their bytes. A turn that fails before it is recorded
+/// drops nothing, so a reopen keeps the same images.
+fn keepImageWindow(alloc: Allocator, session: *server.ActiveSessionState) Allocator.Error!void {
+    const journal = if (session.journal) |*value| value else return;
+    try journal.dropOutsideWindow(alloc, alloc, session.session_rt.agent.history.items);
 }
 
 fn commitContextCompaction(
@@ -3629,9 +3707,29 @@ fn answerBindingForAcpInput(
 
 const AcpElicitationWait = union(enum) {
     response: ?server.OutboundResponse,
-    deadline: anyerror!void,
-    cancelled: anyerror!void,
+    watch: std.Io.Cancelable!select_watch.Outcome,
 };
+
+/// Ends an ACP elicitation's watch when either cancel flag is set or its
+/// deadline passes. See `select_watch` for why the waiter stops it instead of
+/// cancelling it.
+const AcpElicitationCondition = struct {
+    deadline_ms: i64,
+    lifecycle_cancel_flag: ?*const std.atomic.Value(bool),
+    operation_cancel_flag: ?*const std.atomic.Value(bool),
+
+    pub fn cancelled(condition: AcpElicitationCondition) bool {
+        const lifecycle = if (condition.lifecycle_cancel_flag) |flag| flag.load(.acquire) else false;
+        const operation = if (condition.operation_cancel_flag) |flag| flag.load(.acquire) else false;
+        return lifecycle or operation;
+    }
+
+    pub fn expired(condition: AcpElicitationCondition, _: std.Io) bool {
+        return acpAwakeMillis() >= condition.deadline_ms;
+    }
+};
+
+const AcpElicitationWatch = select_watch.Watch(AcpElicitationCondition);
 
 fn awaitAcpElicitationResponse(
     state: *server.ServerState,
@@ -3639,65 +3737,42 @@ fn awaitAcpElicitationResponse(
     origin: tool_mcp_runtime.InputOrigin,
     operation_cancel_flag: ?*const std.atomic.Value(bool),
 ) !?server.OutboundResponse {
-    const Cleanup = struct {
-        fn drain(state_alloc: Allocator, select: *std.Io.Select(AcpElicitationWait)) void {
-            while (select.cancel()) |item| switch (item) {
-                .response => |maybe_response| if (maybe_response) |owned| {
-                    var response = owned;
-                    response.deinit(state_alloc);
-                },
-                .deadline, .cancelled => {},
-            };
-        }
-    };
-
-    var select_buffer: [3]AcpElicitationWait = undefined;
+    var watch: AcpElicitationWatch = .{};
+    var select_buffer: [2]AcpElicitationWait = undefined;
     var select: std.Io.Select(AcpElicitationWait) = .init(io_mod.getIo(), &select_buffer);
     try select.concurrent(.response, server.awaitOutboundResponse, .{ state, id, server.OutboundKind.elicitation });
-    select.concurrent(.deadline, waitForAcpElicitationDeadline, .{origin.deadline_ms}) catch |err| {
-        Cleanup.drain(state.alloc, &select);
-        return err;
-    };
-    select.concurrent(.cancelled, waitForAcpElicitationCancellation, .{
-        origin.lifecycle_cancel_flag,
-        operation_cancel_flag,
-    }) catch |err| {
-        Cleanup.drain(state.alloc, &select);
+    select.concurrent(.watch, AcpElicitationWatch.run, .{ &watch, select.io, AcpElicitationCondition{
+        .deadline_ms = origin.deadline_ms,
+        .lifecycle_cancel_flag = origin.lifecycle_cancel_flag,
+        .operation_cancel_flag = operation_cancel_flag,
+    } }) catch |err| {
+        server.cancelOutboundRequest(state, id);
+        server.takeCancelledResponse(state, &select);
         return err;
     };
     const event = select.await() catch |err| {
-        Cleanup.drain(state.alloc, &select);
+        watch.stop(select.io);
+        server.cancelOutboundRequest(state, id);
+        while (select.cancel()) |item| switch (item) {
+            .response => |maybe_response| if (maybe_response) |owned| {
+                var response = owned;
+                response.deinit(state.alloc);
+            },
+            .watch => {},
+        };
         return err;
     };
     return switch (event) {
         .response => |response| result: {
-            Cleanup.drain(state.alloc, &select);
+            watch.finish(&select);
             break :result response;
         },
-        .deadline, .cancelled => result: {
+        .watch => result: {
             server.cancelOutboundRequest(state, id);
-            Cleanup.drain(state.alloc, &select);
+            server.takeCancelledResponse(state, &select);
             break :result null;
         },
     };
-}
-
-fn waitForAcpElicitationDeadline(deadline_ms: i64) anyerror!void {
-    while (acpAwakeMillis() < deadline_ms) {
-        const remaining = deadline_ms - acpAwakeMillis();
-        try io_mod.getIo().sleep(.fromMilliseconds(@intCast(@max(@min(remaining, 20), 1))), .awake);
-    }
-}
-
-fn waitForAcpElicitationCancellation(
-    lifecycle_cancel_flag: ?*const std.atomic.Value(bool),
-    operation_cancel_flag: ?*const std.atomic.Value(bool),
-) anyerror!void {
-    while ((lifecycle_cancel_flag == null or !lifecycle_cancel_flag.?.load(.acquire)) and
-        (operation_cancel_flag == null or !operation_cancel_flag.?.load(.acquire)))
-    {
-        try io_mod.getIo().sleep(.fromMilliseconds(10), .awake);
-    }
 }
 
 fn acpAwakeMillis() i64 {
@@ -4052,7 +4127,18 @@ test "parsePromptInput accepts explicit recovery continuation metadata" {
     defer result.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), result.text.len);
     try std.testing.expect(result.continue_recovery);
+    try std.testing.expect(!result.fresh_output);
     try std.testing.expectEqual(@as(usize, 0), result.rerun_call_ids.len);
+}
+
+test "parsePromptInput reads whether a resume's host holds the turn's earlier output" {
+    const alloc = std.testing.allocator;
+    const params =
+        "{\"sessionId\":\"s1\",\"prompt\":[],\"_meta\":{\"fx\":{\"continueRecovery\":true,\"freshOutput\":true}}}";
+    var result = try parsePromptInput(alloc, params);
+    defer result.deinit(alloc);
+    try std.testing.expect(result.continue_recovery);
+    try std.testing.expect(result.fresh_output);
 }
 
 test "parsePromptInput keeps the call ids a resume runs again and drops the rest" {

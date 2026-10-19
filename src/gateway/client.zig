@@ -7,6 +7,7 @@ const agent_stream_provider = @import("../core/agent/stream_provider.zig");
 const debug_trace = @import("../core/shared/debug_trace.zig");
 const http_pool = @import("../core/shared/http_pool.zig");
 const io_mod = @import("../core/shared/io.zig");
+const select_watch = @import("../core/shared/select_watch.zig");
 const mem_utils = @import("../core/shared/mem_utils.zig");
 const types = @import("../core/shared/types.zig");
 const atomic_value = @import("../core/mcp/atomic_value.zig");
@@ -1005,11 +1006,11 @@ fn openGatewayRequestBounded(
 
     const Event = union(enum) {
         request: anyerror!std.http.Client.Request,
-        watch: anyerror!BoundedRequestWatch.Outcome,
+        watch: anyerror!select_watch.Outcome,
     };
     const Cleanup = struct {
         fn drain(select: *std.Io.Select(Event), watch: *BoundedRequestWatch) void {
-            watch.stopped.set(select.io);
+            watch.stop(select.io);
             while (select.cancel()) |item| switch (item) {
                 .request => |request_result| {
                     var late_request = request_result catch continue;
@@ -1030,7 +1031,7 @@ fn openGatewayRequestBounded(
     var watch: BoundedRequestWatch = .{};
     var select_buffer: [2]Event = undefined;
     var select: std.Io.Select(Event) = .init(io_mod.getIo(), &select_buffer);
-    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, cancel_flag, epoch.deadline }) catch |err| return err;
+    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, select.io, RequestCondition{ .cancel_flag = cancel_flag, .deadline = epoch.deadline } }) catch |err| return err;
     select.concurrent(.request, RequestOpenOperation.run, .{&operation}) catch |err| {
         watch.finish(&select);
         return err;
@@ -1971,7 +1972,7 @@ pub fn runBoundedHttpOperation(
 
     const Event = union(enum) {
         request: anyerror!Result,
-        watch: anyerror!BoundedRequestWatch.Outcome,
+        watch: anyerror!select_watch.Outcome,
     };
     const Operation = @TypeOf(operation);
     const Runner = struct {
@@ -1981,7 +1982,7 @@ pub fn runBoundedHttpOperation(
     };
     const Cleanup = struct {
         fn drain(result_alloc: std.mem.Allocator, select: *std.Io.Select(Event), watch: *BoundedRequestWatch) void {
-            watch.stopped.set(select.io);
+            watch.stop(select.io);
             while (select.cancel()) |item| switch (item) {
                 .request => |request_result| {
                     var late_result = request_result catch continue;
@@ -1995,7 +1996,7 @@ pub fn runBoundedHttpOperation(
     var watch: BoundedRequestWatch = .{};
     var select_buffer: [2]Event = undefined;
     var select: std.Io.Select(Event) = .init(zio, &select_buffer);
-    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, cancel_flag, deadline }) catch |err| {
+    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, select.io, RequestCondition{ .cancel_flag = cancel_flag, .deadline = deadline } }) catch |err| {
         return err;
     };
     select.concurrent(.request, Runner.run, .{operation}) catch |err| {
@@ -2035,50 +2036,25 @@ pub fn runBoundedHttpOperation(
     }
 }
 
-/// Watches one bounded request for cancellation and its deadline. The request
-/// owner stops it with `finish` instead of cancelling it: in Zig 0.17 a cancel
-/// can interrupt whatever task the watch's worker thread runs next, and an
-/// interrupted connect then fails with ISCONN.
-const BoundedRequestWatch = struct {
-    stopped: std.Io.Event = .unset,
+/// Ends a bounded request's watch when its cancel flag is set or its deadline
+/// passes. The request owner stops the watch with `finish` when the request
+/// wins, as `select_watch` explains.
+const RequestCondition = struct {
+    cancel_flag: *std.atomic.Value(bool),
+    deadline: ?std.Io.Clock.Timestamp,
 
-    const Outcome = enum { stopped, cancelled, deadline };
-
-    fn run(
-        watch: *BoundedRequestWatch,
-        cancel_flag: *std.atomic.Value(bool),
-        deadline: ?std.Io.Clock.Timestamp,
-    ) anyerror!Outcome {
-        const zio = io_mod.getIo();
-        while (true) {
-            if (cancel_flag.load(.seq_cst)) return .cancelled;
-            if (deadline) |limit| {
-                const now = std.Io.Clock.Timestamp.now(zio, .awake);
-                if (!std.Io.Clock.Timestamp.compare(now, .lt, limit)) return .deadline;
-            }
-            watch.stopped.waitTimeout(zio, .{ .duration = .{
-                .raw = .fromMilliseconds(5),
-                .clock = .awake,
-            } }) catch |err| switch (err) {
-                error.Timeout => continue,
-                else => |e| return e,
-            };
-            return .stopped;
-        }
+    pub fn cancelled(condition: RequestCondition) bool {
+        return condition.cancel_flag.load(.seq_cst);
     }
 
-    /// Stops the watch and waits for its event, then releases the select.
-    /// Call only when the watch event is the one still outstanding.
-    fn finish(watch: *BoundedRequestWatch, select: anytype) void {
-        watch.stopped.set(select.io);
-        const event = select.queue.getOneUncancelable(select.io) catch |err| switch (err) {
-            // Only Select.cancel closes the queue, so nothing is outstanding.
-            error.Closed => return,
-        };
-        std.debug.assert(event == .watch);
-        std.debug.assert(select.cancel() == null);
+    pub fn expired(condition: RequestCondition, io: std.Io) bool {
+        const limit = condition.deadline orelse return false;
+        const now = std.Io.Clock.Timestamp.now(io, .awake);
+        return !std.Io.Clock.Timestamp.compare(now, .lt, limit);
     }
 };
+
+const BoundedRequestWatch = select_watch.Watch(RequestCondition);
 
 const GatewayCancelWatcher = struct {
     fn run(
@@ -8093,25 +8069,11 @@ test "direct gateway cancellation before admission opens no connection" {
     if (fixture.failure) |err| return err;
 }
 
-var stable_models_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableModelsTestEnviron() !*const std.process.Environ.Map {
-    if (stable_models_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_models_test_environ = map;
-    return map;
-}
-
 const ModelsUrlTestEnv = struct {
     alloc: std.mem.Allocator,
     map: std.process.Environ.Map,
 
     fn install(alloc: std.mem.Allocator, models_url: []const u8) !*ModelsUrlTestEnv {
-        _ = try stableModelsTestEnviron();
-
         const self = try alloc.create(ModelsUrlTestEnv);
         errdefer alloc.destroy(self);
         self.* = .{
@@ -8125,7 +8087,7 @@ const ModelsUrlTestEnv = struct {
     }
 
     fn deinit(self: *ModelsUrlTestEnv) void {
-        if (stable_models_test_environ) |map| io_mod.setEnvironMap(map);
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);
