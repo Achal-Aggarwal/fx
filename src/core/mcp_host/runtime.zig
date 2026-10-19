@@ -134,6 +134,9 @@ pub const Question = struct {
     input_requests_json: []const u8,
     /// The version the server speaks, which decides how a form's schema reads.
     version: ?[]const u8,
+    /// Set while the user waits for a 2025 server to complete the URLs they
+    /// opened: the owner completes it, and the question closes.
+    url_wait: ?*const tool_mcp_runtime.LegacyUrlCompletionSignal = null,
 };
 
 /// Asks a call's questions on the caller's thread. Returns the
@@ -219,6 +222,16 @@ const Request = struct {
     /// Owner thread only: fx declined the server's question, so the call's
     /// cancellation is fx's answer, not the user's.
     declined: bool = false,
+    /// Owner thread only: the URLs a 2025 server's -32042 answer listed,
+    /// held with the call while the user opens them and the server
+    /// completes them (`tests/tla/mcp_host/UrlRetry.tla`).
+    urls: std.ArrayList(UrlNeed) = .empty,
+    url_phase: enum { none, consent, waiting } = .none,
+    url_server: usize = 0,
+    /// The -32042 answer: the call's result unless it is called again.
+    url_failure: ?CallResult = null,
+    /// Closes the waiting question: the owner sets it, the caller reads it.
+    url_signal: tool_mcp_runtime.LegacyUrlCompletionSignal = .{},
 
     const Kind = union(enum) {
         tools: []const u8,
@@ -264,6 +277,10 @@ const Pending = struct {
         /// 2025: the server's elicitation, by slot and number, so an answer
         /// to one it withdrew never reaches the next in that slot.
         elicit: mcp.core.elicitation.Id,
+        /// 2025: whether the user opens a held call's URLs.
+        url_consent: *Request,
+        /// 2025: the user's choice while the server completes them.
+        url_wait: *Request,
     },
 
     fn deinit(p: *Pending, gpa: Allocator) void {
@@ -274,11 +291,23 @@ const Pending = struct {
                 for (input.keys) |k| gpa.free(k);
                 gpa.free(input.keys);
             },
-            .elicit => {},
+            .elicit, .url_consent, .url_wait => {},
         }
         p.* = undefined;
     }
 };
+
+/// A URL a call's -32042 answer listed. `params` is the runtime allocator's.
+const UrlNeed = struct {
+    id: mcp.core.elicitation.Id,
+    params: []u8,
+    seen: bool = false,
+    /// Its slot went to another question, or the server withdrew it, so no
+    /// completion of it can come.
+    dropped: bool = false,
+};
+
+const url_elicitation_required: i64 = -32042;
 
 const Login = struct {
     runtime: *Runtime,
@@ -329,6 +358,10 @@ pub const Runtime = struct {
     /// 2025 URL questions the client was shown, by server and slot, with the
     /// server's elicitation id, until the server completes or withdraws them.
     url_questions: std.ArrayList(struct { server: usize, slot: u8, id: []u8 }) = .empty,
+    /// URLs a -32042 answer listed, until that call's `.called` takes them.
+    required: std.ArrayList(struct { server: usize, need: UrlNeed }) = .empty,
+    /// Calls held for their URLs after a -32042 answer.
+    held: std.ArrayList(*Request) = .empty,
     /// Logouts waiting for their revocation's answer.
     logouts: std.ArrayList(struct { server: usize, request: *Request, deadline_ms: i64 }) = .empty,
     refreshes: std.ArrayList(Refresh) = .empty,
@@ -432,6 +465,9 @@ pub const Runtime = struct {
         r.refreshes.deinit(r.gpa);
         for (r.url_questions.items) |q| r.gpa.free(q.id);
         r.url_questions.deinit(r.gpa);
+        for (r.required.items) |q| r.gpa.free(q.need.params);
+        r.required.deinit(r.gpa);
+        r.held.deinit(r.gpa);
         r.finished.deinit(r.gpa);
         r.snapshot_arena.deinit();
         r.arena.deinit();
@@ -625,6 +661,7 @@ pub const Runtime = struct {
             .server = r.resolved.servers[pending.server].name,
             .input_requests_json = pending.json,
             .version = pending.version,
+            .url_wait = if (pending.reply == .url_wait) &req.url_signal else null,
         }) catch |err| answer: {
             debug_trace.logf("mcp", "MCP question not answered server={s} err={s}", .{ r.resolved.servers[pending.server].name, @errorName(err) });
             break :answer null;
@@ -736,11 +773,7 @@ pub const Runtime = struct {
                 const i = r.serverIndex(c.server) orelse return r.finish(req, .{ .call = .unknown_server });
                 if (r.resolved.servers[i].held != null) return r.finish(req, .{ .failed = error.Held });
                 if (r.flags[i].needs_login) _ = try r.pickUpLogin(i);
-                // Room first: a call the engine took must have its waiter.
-                try r.calls.ensureUnusedCapacity(r.gpa, 1);
-                const handle_ = try r.engine.call(r.resolved.servers[i].name, c.tool, c.arguments);
-                if (req.observation) |call_| call_.engineRequest(handle_);
-                r.calls.putAssumeCapacity(handle_, req);
+                try r.send(req, i);
             },
             .cancel => |target| {
                 var it = r.calls.iterator();
@@ -748,6 +781,8 @@ pub const Runtime = struct {
                     try r.engine.cancel(entry.key_ptr.*);
                     break;
                 };
+                // A call held for its URLs ends here.
+                if (r.isHeld(target)) r.endHeld(target, .{ .call = .{ .ended = .{ .outcome = .cancelled, .maybe_ran = false, .timed_out = false } } });
                 // A tools waiter just stops waiting; the list still arrives.
                 for (r.tool_waiters.items, 0..) |w, k| if (w.request == target) {
                     _ = r.tool_waiters.swapRemove(k);
@@ -794,6 +829,35 @@ pub const Runtime = struct {
                         r.engine.answerElicitation(name, id, answer) catch |err| {
                             debug_trace.logf("mcp", "MCP elicitation answer not sent server={s} err={s}", .{ name, @errorName(err) });
                         };
+                    },
+                    // The call may have ended meanwhile; it is used only while held.
+                    .url_consent => |held| if (r.isHeld(held) and held.url_phase == .consent) {
+                        const choice = urlChoice(scratch.allocator(), a.json, held.urls.items.len);
+                        const action: @FieldType(mcp.elicitation.Answer, "action") = switch (choice) {
+                            .accepted => .accept,
+                            .declined => .decline,
+                            .cancelled => .cancel,
+                        };
+                        // Nothing goes back to the server: accept is consent, and
+                        // the engine waits for each completion.
+                        for (held.urls.items) |need| if (!need.dropped) r.engine.answerElicitation(name, need.id, .{ .action = action }) catch |err| {
+                            debug_trace.logf("mcp", "MCP elicitation answer not sent server={s} err={s}", .{ name, @errorName(err) });
+                        };
+                        held.url_phase = .none;
+                        if (choice != .accepted) return r.endHeld(held, null);
+                        held.url_signal.status.store(.pending, .release);
+                        held.url_signal.wake.store(false, .release);
+                        r.askUrls(held, .waiting) catch |err| {
+                            logUrlCallEnded(name, "wait", err);
+                            r.endHeld(held, null);
+                        };
+                    },
+                    // Every completion came, or the user chose Retry. The
+                    // signal wins over a choice made as it came, as on screen.
+                    .url_wait => |held| if (r.isHeld(held) and held.url_phase == .waiting) {
+                        const completed = held.url_signal.status.load(.acquire) == .completed;
+                        if (!completed and urlChoice(scratch.allocator(), a.json, held.urls.items.len) != .accepted) return r.endHeld(held, null);
+                        r.callAgain(held);
                     },
                 }
             },
@@ -942,14 +1006,18 @@ pub const Runtime = struct {
             // engine keeps trying, so a later request may still get them.
             .phase => |phase| if (phase == .backoff or phase == .failed) r.endToolWaiters(i, .failed),
             .called => |c| {
-                const entry = r.calls.fetchRemove(c.call) orelse return;
+                const entry = r.calls.fetchRemove(c.call) orelse return r.releaseRequired(i);
                 const req = entry.value;
-                var result = copyCall(req.alloc, c) catch |err| return r.finish(req, .{ .failed = err });
+                var result = copyCall(req.alloc, c) catch |err| {
+                    r.releaseRequired(i);
+                    return r.finish(req, .{ .failed = err });
+                };
                 if (req.declined and result == .ended and result.ended.outcome == .cancelled) result.ended.outcome = .unsupported_input;
                 if (result == .ended and result.ended.outcome == .transport_failed) {
                     const down = if (r.enginePhase(i)) |p| p == .backoff or p == .failed else false;
                     if (down) result.ended.why = r.failureText(req.alloc, i) catch null;
                 }
+                if (r.holdForUrls(i, req, result)) return;
                 r.finish(req, .{ .call = result });
             },
             .progress => |p| {
@@ -1049,23 +1117,39 @@ pub const Runtime = struct {
             .refresh_due => try r.refreshDue(i),
             .refresh_ended => r.endRefresh(i),
             .elicit => |x| {
-                // Nobody can answer: dismissed without a choice.
-                const cancel: mcp.elicitation.Answer = .{ .action = .cancel };
-                const req = r.callAsking(name) orelse {
-                    debug_trace.logf("mcp", "MCP elicitation answered cancel server={s} reason=no call can ask", .{name});
-                    return r.engine.answerElicitation(name, x.id, cancel);
-                };
-                const json = try r.gpa.print("{{\"elicitation\":{{\"method\":\"elicitation/create\",\"params\":{s}}}}}", .{x.params});
-                var pending: Pending = .{ .server = i, .json = json, .version = r.versionCopy(i), .reply = .{ .elicit = x.id } };
-                if (!r.offer(req, pending)) {
-                    pending.deinit(r.gpa);
-                    return r.engine.answerElicitation(name, x.id, cancel);
+                // A question in a slot means a URL that slot held is gone.
+                r.dropUrlSlot(i, x.id.slot);
+                if (x.required) {
+                    // Listed in a call's -32042 answer: that call's `.called`
+                    // comes next and takes it.
+                    const params = try r.gpa.dupe(u8, x.params);
+                    r.required.append(r.gpa, .{ .server = i, .need = .{ .id = x.id, .params = params } }) catch |err| {
+                        r.gpa.free(params);
+                        return err;
+                    };
+                } else {
+                    // Nobody can answer: dismissed without a choice.
+                    const cancel: mcp.elicitation.Answer = .{ .action = .cancel };
+                    const req = r.callAsking(name) orelse {
+                        debug_trace.logf("mcp", "MCP elicitation answered cancel server={s} reason=no call can ask", .{name});
+                        return r.engine.answerElicitation(name, x.id, cancel);
+                    };
+                    const json = try r.gpa.print("{{\"elicitation\":{{\"method\":\"elicitation/create\",\"params\":{s}}}}}", .{x.params});
+                    var pending: Pending = .{ .server = i, .json = json, .version = r.versionCopy(i), .reply = .{ .elicit = x.id } };
+                    if (!r.offer(req, pending)) {
+                        pending.deinit(r.gpa);
+                        return r.engine.answerElicitation(name, x.id, cancel);
+                    }
                 }
                 try r.holdUrl(i, x.id.slot, x.params);
             },
-            .elicitation_complete => |slot| r.endUrl(i, slot, true),
+            .elicitation_complete => |slot| {
+                r.urlCompleted(i, slot);
+                r.endUrl(i, slot, true);
+            },
             .elicit_withdrawn => |slot| {
                 r.dropWithdrawn(i, slot);
+                r.dropUrlSlot(i, slot);
                 r.endUrl(i, slot, false);
             },
             else => {},
@@ -1121,6 +1205,169 @@ pub const Runtime = struct {
         };
     }
 
+    /// A 2025 server's -32042 answer listed URLs the user must open first: a
+    /// call that can ask is held for them, and asked. False when it ends now.
+    fn holdForUrls(r: *Runtime, i: usize, req: *Request, result: CallResult) bool {
+        const listed = for (r.required.items) |q| {
+            if (q.server == i) break true;
+        } else false;
+        if (!listed) return false;
+        const name = r.resolved.servers[i].name;
+        if (req.asker == null or result != .failure or result.failure.code != url_elicitation_required) {
+            debug_trace.logf("mcp", "MCP elicitation answered cancel server={s} reason=no call can ask", .{name});
+            r.releaseRequired(i);
+            return false;
+        }
+        r.holdUrls(i, req, result) catch |err| {
+            logUrlCallEnded(name, "hold", err);
+            r.unhold(req);
+            r.releaseRequired(i);
+            return false;
+        };
+        return true;
+    }
+
+    fn holdUrls(r: *Runtime, i: usize, req: *Request, result: CallResult) Allocator.Error!void {
+        try r.held.ensureUnusedCapacity(r.gpa, 1);
+        req.url_server = i;
+        r.held.appendAssumeCapacity(req);
+        var k: usize = 0;
+        while (k < r.required.items.len) {
+            if (r.required.items[k].server != i) {
+                k += 1;
+                continue;
+            }
+            try req.urls.append(r.gpa, r.required.items[k].need);
+            _ = r.required.orderedRemove(k);
+        }
+        req.url_failure = result;
+        try r.askUrls(req, .consent);
+    }
+
+    /// Offers a held call's URLs to its caller: for consent, or with the
+    /// call's signal while the server completes them.
+    fn askUrls(r: *Runtime, req: *Request, phase: @FieldType(Request, "url_phase")) Allocator.Error!void {
+        var out: std.Io.Writer.Allocating = .init(r.gpa);
+        defer out.deinit();
+        // An allocating writer fails only when allocation does.
+        out.writer.writeByte('{') catch return error.OutOfMemory;
+        // A key per URL, "a" on: a call holds at most one per engine slot.
+        for (req.urls.items, 0..) |need, n| {
+            if (n > 0) out.writer.writeByte(',') catch return error.OutOfMemory;
+            const key = [_]u8{ '"', 'a' + @as(u8, @intCast(n)), '"' };
+            out.writer.writeAll(&key) catch return error.OutOfMemory;
+            out.writer.writeAll(":{\"method\":\"elicitation/create\",\"params\":") catch return error.OutOfMemory;
+            out.writer.writeAll(need.params) catch return error.OutOfMemory;
+            out.writer.writeByte('}') catch return error.OutOfMemory;
+        }
+        out.writer.writeByte('}') catch return error.OutOfMemory;
+        const pending: Pending = .{
+            .server = req.url_server,
+            .json = try out.toOwnedSlice(),
+            .version = r.versionCopy(req.url_server),
+            .reply = if (phase == .consent) .{ .url_consent = req } else .{ .url_wait = req },
+        };
+        r.mutex.lockUncancelable(r.io);
+        // A question the call left unasked ended with that call.
+        var stale = req.question;
+        req.question = pending;
+        r.mutex.unlock(r.io);
+        if (stale) |*p| p.deinit(r.gpa);
+        req.url_phase = phase;
+    }
+
+    fn isHeld(r: *const Runtime, req: *Request) bool {
+        return std.mem.findScalar(*Request, r.held.items, req) != null;
+    }
+
+    /// Ends a held call with its -32042 answer, or with `result`.
+    fn endHeld(r: *Runtime, req: *Request, result: ?Request.Outcome) void {
+        const failure: Request.Outcome = if (req.url_failure) |f| .{ .call = f } else .{ .failed = error.Cancelled };
+        r.unhold(req);
+        r.finish(req, result orelse failure);
+    }
+
+    /// Takes a call off the held list and lets go of its URLs. A waiting
+    /// question still on screen closes as Cancel.
+    fn unhold(r: *Runtime, req: *Request) void {
+        if (std.mem.findScalar(*Request, r.held.items, req)) |k| _ = r.held.orderedRemove(k);
+        const name = r.resolved.servers[req.url_server].name;
+        for (req.urls.items) |need| {
+            // One still shown is dismissed; the engine refuses the rest.
+            if (!need.dropped and !need.seen) r.engine.answerElicitation(name, need.id, .{ .action = .cancel }) catch {};
+            r.gpa.free(need.params);
+        }
+        req.urls.clearAndFree(r.gpa);
+        if (req.url_phase == .waiting) {
+            req.url_signal.status.store(.cancelled, .release);
+            req.url_signal.wake.store(true, .release);
+        }
+        req.url_phase = .none;
+    }
+
+    /// The user opened every URL, and the server completed them or the user
+    /// chose Retry: the call goes again, as a new request.
+    fn callAgain(r: *Runtime, req: *Request) void {
+        const failure = req.url_failure orelse CallResult{ .ended = .{ .outcome = .cancelled, .maybe_ran = false, .timed_out = false } };
+        req.url_failure = null;
+        r.unhold(req);
+        r.send(req, req.url_server) catch |err| {
+            logUrlCallEnded(r.resolved.servers[req.url_server].name, "again", err);
+            r.finish(req, .{ .call = failure });
+        };
+    }
+
+    /// Sends a call to server `i`'s engine and waits for its `.called`.
+    fn send(r: *Runtime, req: *Request, i: usize) !void {
+        const c = req.kind.call;
+        // Room first: a call the engine took must have its waiter.
+        try r.calls.ensureUnusedCapacity(r.gpa, 1);
+        const handle_ = try r.engine.call(r.resolved.servers[i].name, c.tool, c.arguments);
+        if (req.observation) |call_| call_.engineRequest(handle_);
+        r.calls.putAssumeCapacity(handle_, req);
+    }
+
+    /// URLs a -32042 answer listed that no call holds: dismissed.
+    fn releaseRequired(r: *Runtime, i: usize) void {
+        var k: usize = 0;
+        while (k < r.required.items.len) {
+            const q = r.required.items[k];
+            if (q.server != i) {
+                k += 1;
+                continue;
+            }
+            _ = r.required.orderedRemove(k);
+            r.engine.answerElicitation(r.resolved.servers[i].name, q.need.id, .{ .action = .cancel }) catch {};
+            r.gpa.free(q.need.params);
+        }
+    }
+
+    /// The URL a held call has in `slot` can't complete any more: another
+    /// question took the slot, or the server withdrew it.
+    fn dropUrlSlot(r: *Runtime, i: usize, slot: u8) void {
+        for (r.held.items) |req| if (req.url_server == i) {
+            for (req.urls.items) |*need| if (need.id.slot == slot and !need.seen) {
+                need.dropped = true;
+            };
+        };
+    }
+
+    /// The server completed the URL in `slot`: a held call counts it, and
+    /// once every URL it waits for has come, its waiting question closes.
+    fn urlCompleted(r: *Runtime, i: usize, slot: u8) void {
+        for (r.held.items) |req| if (req.url_server == i) {
+            var all = true;
+            for (req.urls.items) |*need| {
+                if (need.id.slot == slot and !need.dropped) need.seen = true;
+                all = all and need.seen;
+            }
+            if (all and req.url_phase == .waiting) {
+                req.url_signal.status.store(.completed, .release);
+                req.url_signal.wake.store(true, .release);
+            }
+        };
+    }
+
     fn saveCredential(r: *Runtime, i: usize) !void {
         const s = r.resolved.servers[i];
         if (s.url == null) return;
@@ -1166,6 +1413,9 @@ pub const Runtime = struct {
         var it = r.calls.valueIterator();
         while (it.next()) |req| r.finish(req.*, .{ .failed = error.Stopped });
         r.calls.clearRetainingCapacity();
+        while (r.held.items.len > 0) r.endHeld(r.held.items[0], .{ .failed = error.Stopped });
+        for (r.required.items) |q| r.gpa.free(q.need.params);
+        r.required.clearRetainingCapacity();
         for (r.tool_waiters.items) |w| r.finish(w.request, .{ .failed = error.Stopped });
         r.tool_waiters.clearRetainingCapacity();
         for (r.logouts.items) |l| r.finish(l.request, .ok);
@@ -1605,6 +1855,28 @@ fn inputValues(a: Allocator, json: []const u8, keys: []const []const u8) ?[]cons
     return values;
 }
 
+/// A held call that ended with its -32042 answer because fx failed at `step`.
+fn logUrlCallEnded(server: []const u8, step: []const u8, err: anyerror) void {
+    debug_trace.logf("mcp", "MCP URL call ended server={s} step={s} err={s}", .{ server, step, @errorName(err) });
+}
+
+/// The user's choice for a held call's `n` URLs, from fx's `inputResponses`
+/// object: accepted only when every URL was.
+fn urlChoice(a: Allocator, json: ?[]const u8, n: usize) enum { accepted, declined, cancelled } {
+    const answers = std.json.parseFromSliceLeaky(std.json.Value, a, json orelse return .cancelled, .{ .parse_numbers = false }) catch return .cancelled;
+    if (answers != .object or answers.object.count() != n) return .cancelled;
+    var declined = false;
+    for (answers.object.values()) |reply| {
+        if (reply != .object) return .cancelled;
+        const action = reply.object.get("action") orelse return .cancelled;
+        if (action != .string) return .cancelled;
+        if (std.mem.eql(u8, action.string, "decline")) {
+            declined = true;
+        } else if (!std.mem.eql(u8, action.string, "accept")) return .cancelled;
+    }
+    return if (declined) .declined else .accepted;
+}
+
 /// A 2025 elicitation's answer from fx's `inputResponses` object.
 fn elicitAnswer(a: Allocator, json: ?[]const u8) ?mcp.elicitation.Answer {
     const answers = std.json.parseFromSliceLeaky(std.json.Value, a, json orelse return null, .{ .parse_numbers = false }) catch return null;
@@ -1907,6 +2179,19 @@ test "held servers say why, and unknown names and stdio logins are refused" {
     try testing.expectError(error.Held, r.call(a, "off", "echo", null, null, null));
     try testing.expectError(error.NotHttp, r.login("fake", false));
     try testing.expectError(error.UnknownServer, r.logout("nope"));
+}
+
+test "a held call's URLs are opened only when the user accepted every one" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expect(urlChoice(a, "{\"a\":{\"action\":\"accept\"},\"b\":{\"action\":\"accept\"}}", 2) == .accepted);
+    try testing.expect(urlChoice(a, "{\"a\":{\"action\":\"accept\"},\"b\":{\"action\":\"decline\"}}", 2) == .declined);
+    try testing.expect(urlChoice(a, "{\"a\":{\"action\":\"cancel\"},\"b\":{\"action\":\"accept\"}}", 2) == .cancelled);
+    // A URL with no answer, or no answer at all, is not consent.
+    try testing.expect(urlChoice(a, "{\"a\":{\"action\":\"accept\"}}", 2) == .cancelled);
+    try testing.expect(urlChoice(a, null, 1) == .cancelled);
+    try testing.expect(urlChoice(a, "not json", 1) == .cancelled);
 }
 
 test "answers go back under the server's keys, and an answer that can't be read declines" {

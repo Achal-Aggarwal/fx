@@ -704,8 +704,30 @@ const Asking = struct {
             .lifecycle_cancel_flag = self.cancel,
         };
         self.origin = origin;
-        const answer = try self.responder.callback(self.responder.context, alloc, origin, .{ .input_requests_json = question.input_requests_json });
+        const signal = question.url_wait orelse {
+            const answer = try self.responder.callback(self.responder.context, alloc, origin, .{ .input_requests_json = question.input_requests_json });
+            return @constCast(answer);
+        };
+        // A surface with no Retry control (ACP) waits for the server alone.
+        if (!self.responder.legacy_url_manual_completion) return self.waitForUrls(signal, origin.deadline_ms);
+        const answer = try self.responder.callback(self.responder.context, alloc, origin, .{
+            .input_requests_json = question.input_requests_json,
+            .legacy_retry_without_responses = true,
+            .legacy_url_phase = .await_completion,
+            .legacy_url_completion_signal = signal,
+        });
         return @constCast(answer);
+    }
+
+    /// Waits until the server completes every URL, the question's deadline,
+    /// or a cancel. The owner reads the signal, so there is no answer.
+    fn waitForUrls(self: *const Asking, signal: *const tool_mcp_runtime.LegacyUrlCompletionSignal, deadline_ms: i64) ?[]u8 {
+        while (signal.status.load(.acquire) == .pending) {
+            if (self.cancel) |flag| if (flag.load(.acquire)) break;
+            if (std.Io.Clock.awake.now(self.io).toMilliseconds() >= deadline_ms) break;
+            std.Io.sleep(self.io, .fromMilliseconds(50), .awake) catch {};
+        }
+        return null;
     }
 
     /// A 2025 server's form schema reads by its version's rules.
