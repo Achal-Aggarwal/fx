@@ -1519,12 +1519,19 @@ pub const ImageAttachment = struct {
     inline_data: ?[]u8 = null,
     /// Owned opaque host reference, never filesystem or network authority.
     source_ref: ?[]u8 = null,
+    /// Owned path of the v2 session's blob that holds these bytes (D89),
+    /// which the model's note names so its tools can open the image. An
+    /// image saved as a blob keeps only this handle: readers load its bytes
+    /// from the blob when they need them, checked against its digest. The
+    /// session store owns the file: fx never writes or deletes through this
+    /// path.
+    blob_path: ?[]u8 = null,
 
     /// Whether the session no longer holds this image: a libfx session with
     /// an image store keeps only its newest images, and an older one keeps
     /// its digest, which names it in the host's store, without its bytes.
     pub fn droppedFromSession(self: ImageAttachment) bool {
-        return self.inline_data == null and self.snapshot_path == null and self.snapshot_sha256 != null;
+        return self.inline_data == null and self.snapshot_path == null and self.blob_path == null and self.snapshot_sha256 != null;
     }
 };
 
@@ -3329,6 +3336,11 @@ pub fn dupeImageAttachmentSlice(alloc: std.mem.Allocator, attachments: []const I
             try alloc.dupe(u8, value)
         else
             null;
+        errdefer if (source_ref) |value| alloc.free(value);
+        const blob_path = if (attachment.blob_path) |value|
+            try alloc.dupe(u8, value)
+        else
+            null;
         copy[i] = .{
             .id = attachment.id,
             .path = path,
@@ -3337,6 +3349,7 @@ pub fn dupeImageAttachmentSlice(alloc: std.mem.Allocator, attachments: []const I
             .snapshot_sha256 = snapshot_sha256,
             .inline_data = inline_data,
             .source_ref = source_ref,
+            .blob_path = blob_path,
         };
         copied += 1;
     }
@@ -3351,6 +3364,7 @@ pub fn freeImageAttachment(alloc: std.mem.Allocator, attachment: ImageAttachment
     if (attachment.snapshot_sha256) |sha256| alloc.free(sha256);
     if (attachment.inline_data) |data| alloc.free(data);
     if (attachment.source_ref) |source_ref| alloc.free(source_ref);
+    if (attachment.blob_path) |path| alloc.free(path);
 }
 
 pub fn freeImageAttachmentSlice(alloc: std.mem.Allocator, attachments: []ImageAttachment) void {

@@ -4668,12 +4668,11 @@ fn fitRequestImages(
     first_body: []const u8,
     limits: request_image_budget.Limits,
     tool_text_limit: usize,
-    blob_dir: ?[]const u8,
     trace_ctx: TraceContext,
 ) ![]const u8 {
     var body = first_body;
     while (true) {
-        const projection = try request_image_budget.withholdOldestImages(arena, request.messages, body.len, limits, tool_text_limit, blob_dir);
+        const projection = try request_image_budget.withholdOldestImages(arena, request.messages, body.len, limits, tool_text_limit);
         if (projection.withheld == 0) return body;
         var smaller = request.*;
         smaller.messages = projection.messages;
@@ -5945,6 +5944,19 @@ fn processQueuedPromptInner(
     );
     for (job.grants) |grant| {
         try local_grants.append(arena, .{ .tool_name = grant.tool_name, .target_path = grant.target_path });
+    }
+
+    // The turn's images are saved before any request is built, so a note
+    // never names a file the session failed to write (D89,
+    // `tests/tla/session_manager/PromptImages.tla` NoteNamesBlob). The copy
+    // borrows the worker's fields; only what the save sets lives in this
+    // arena, and a saved image keeps only its handle.
+    if (deps.save_prompt_images) |save| {
+        if (job.images.len > 0) {
+            const images = try arena.dupe(types.ImageAttachment, job.images);
+            try save(deps.ctx, arena, images);
+            job.images = images;
+        }
     }
 
     const current_user_message: ChatMessage = .{
@@ -7502,7 +7514,6 @@ fn processQueuedPromptLoop(
                     &attachment_dimensions,
                     safe_tool_messages,
                     max_dimension,
-                    deps.image_blob_dir,
                 );
                 break :native projection.messages;
             } else result_request_messages;
@@ -7512,7 +7523,7 @@ fn processQueuedPromptLoop(
             const steering_messages = try runtime_execution_memory.rewrapRestoredSteering(overlay_arena, image_projection.messages);
             // After the steering rewrap, which recognizes a parent's steering
             // by how its text starts.
-            const located_messages = try image_attachments.noteAttachmentLocations(overlay_arena, steering_messages, deps.image_blob_dir);
+            const located_messages = try image_attachments.noteAttachmentLocations(overlay_arena, steering_messages);
             const request_messages = try with_replyable_conversation_tail(overlay_arena, located_messages);
             if (request_messages.ptr != located_messages.ptr) {
                 debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{located_messages.len});
@@ -7578,7 +7589,6 @@ fn processQueuedPromptLoop(
                 request_data.messages,
                 request_image_budget.largestRequestBytes(agent.requestByteLimit(gateway_model)),
                 config.max_tool_result_bytes,
-                deps.image_blob_dir,
             );
             if (past_limit.withheld > 0) {
                 debug_trace.eventf("images", "request_images_withheld_before_build", step_ctx, "withheld={d}", .{past_limit.withheld});
@@ -7601,7 +7611,6 @@ fn processQueuedPromptLoop(
                         deps.agent_stream_provider.max_request_bytes,
                     ) },
                     config.max_tool_result_bytes,
-                    deps.image_blob_dir,
                     step_ctx,
                 );
                 prepared_request_body = request_body;

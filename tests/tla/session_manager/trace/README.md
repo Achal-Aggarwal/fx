@@ -56,6 +56,7 @@ emits one line              "log_len": 2, ...}      (Trace == <<...>>)  EXTENDS 
 | `WiringTrace.tla` | Its wrapper. Accepted when every step is allowed in turn; the usage steps change nothing a traced step reads, so they are left out |
 | `check_conversion.py --request R --report D` | Checks a recorded v1-to-v2 conversion run against `V1Conversion.tla` (D59): each step's result on disk and through fx's own readers and listing. Exit 0 ACCEPTED only when TLC matched every observation, 1 REJECTED, 2 INCONCLUSIVE, 3 TOOL_ERROR. `--selftest` requires its good and planted runs to get their verdicts |
 | `V1ConversionTrace.tla` | Its wrapper. Each observation's step kind limits the model actions that may run before it; a request step makes exactly one request, and only a writer an earlier hold step left running may write during it |
+| `PromptImagesTrace.tla`, `.cfg` | Checks a run of `drivers/session_manager/prompt-images.test.ts` against `PromptImages.tla` (D89): each turn's first request, its user item, and the session's blobs folder, with every save, failed save and process exit between them left to TLC. A note counts only when it names the image's own blob |
 | `selftest.sh` | Proves the tooling both accepts and rejects (below) |
 
 ## Self-test

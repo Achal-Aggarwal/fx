@@ -1831,6 +1831,9 @@ pub fn dupeImageAttachmentSlice(alloc: Allocator, attachments: []const ImageAtta
     }
     return copy;
 }
+/// A full copy of `src`: a saved image is only its blob's handle (D89), and
+/// an unsaved one keeps its bytes inline, so readers such as Vision find the
+/// image either way.
 fn dupeImageAttachment(alloc: Allocator, src: ImageAttachment) !ImageAttachment {
     const path = try alloc.dupe(u8, src.path);
     errdefer alloc.free(path);
@@ -1845,12 +1848,21 @@ fn dupeImageAttachment(alloc: Allocator, src: ImageAttachment) !ImageAttachment 
         try alloc.dupe(u8, value)
     else
         null;
+    errdefer if (snapshot_sha256) |value| alloc.free(value);
+    const inline_data = if (src.inline_data) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (inline_data) |value| alloc.free(value);
+    const source_ref = if (src.source_ref) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (source_ref) |value| alloc.free(value);
+    const blob_path = if (src.blob_path) |value| try alloc.dupe(u8, value) else null;
     return .{
         .id = src.id,
         .path = path,
         .media_type = media_type,
         .snapshot_path = snapshot_path,
         .snapshot_sha256 = snapshot_sha256,
+        .inline_data = inline_data,
+        .source_ref = source_ref,
+        .blob_path = blob_path,
     };
 }
 /// Deep-copies one history turn; caller owns the returned turn and frees with freeHistoryTurn.
@@ -4318,6 +4330,35 @@ test "active context and image catalog retain historical images" {
     try std.testing.expectEqual(@as(usize, 1), catalog.len);
     try std.testing.expectEqual(@as(usize, 3), catalog[0].id);
     try std.testing.expectEqualStrings("/tmp/historical.png", catalog[0].path);
+}
+
+test "the image catalog keeps each image's handle and bytes, so Vision can read a resumed one (D89)" {
+    const alloc = std.testing.allocator;
+    const digest = "abababababababababababababababababababababababababababababababab";
+    var resumed = [_]ImageAttachment{.{
+        .id = 1,
+        .path = @constCast("/Users/example/old.png"),
+        .media_type = @constCast("image/png"),
+        .snapshot_sha256 = @constCast(digest),
+        .blob_path = @constCast("/Users/example/.fx/sessions/v2/s/blobs/" ++ digest),
+    }};
+    const history = [_]HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("old image"), .images = &resumed },
+        .assistant = @constCast("old answer"),
+    } }};
+    var unsaved_bytes = "png".*;
+    const current = [_]ImageAttachment{.{
+        .id = 2,
+        .path = @constCast("/Users/example/new.png"),
+        .media_type = @constCast("image/png"),
+        .inline_data = &unsaved_bytes,
+        .source_ref = @constCast("host:new"),
+    }};
+    const catalog = try collect_image_catalog(alloc, &history, &current);
+    defer core_types.freeImageAttachmentSlice(alloc, catalog);
+    try std.testing.expectEqualStrings(resumed[0].blob_path.?, catalog[0].blob_path.?);
+    try std.testing.expectEqualStrings("png", catalog[1].inline_data.?);
+    try std.testing.expectEqualStrings("host:new", catalog[1].source_ref.?);
 }
 
 test "full image catalog merges canonical history and current images" {
