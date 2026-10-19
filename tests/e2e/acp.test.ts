@@ -1075,6 +1075,29 @@ test("configured provider ACP runs a direct call to a supplied MCP tool that is 
   }
 }, 45000);
 
+test("ACP finishes a call to an unknown tool as failed", async () => {
+  const fixture = createConfiguredProviderFixture(body => body.messages.some((message: any) => message.role === "tool")
+    ? configuredCompletion(body.model, "recovered")
+    : configuredToolCompletion(body.model, "missing_tool", {}, "call_missing"));
+  const client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+  try {
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }, 2) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    const prompt = await runPrompt(client, "Call a tool.", TIMEOUT);
+    expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+    const updates = prompt.messages
+      .filter((message: any) => message.method === "session/update" && message.params?.update?.toolCallId === "call_missing")
+      .map((message: any) => message.params.update);
+    expect(updates.map((update: any) => update.status)).toEqual(["pending", "failed"]);
+    expect(JSON.stringify(updates[1].content)).toContain("Unsupported tool: missing_tool");
+    expect(client.stderr).toBe("");
+  } finally {
+    await client.close();
+    fixture.close();
+  }
+}, 45000);
+
 function createIsolatedRoot(prefix: string) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
   const home = join(root, "home");

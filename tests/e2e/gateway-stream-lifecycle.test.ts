@@ -1269,6 +1269,7 @@ describe("gateway stream lifecycle", () => {
       expect(json.error).toBeUndefined();
       expect(json.output).toContain("Memory removal verified.");
       expect(json.tool_calls).toEqual([
+        { name: "memory", status: "error" },
         { name: "read_file", status: "success" },
       ]);
       expect(gateway.requestCount()).toBe(3);

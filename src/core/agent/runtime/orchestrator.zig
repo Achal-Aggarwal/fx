@@ -11015,6 +11015,13 @@ fn processQueuedPromptLoop(
                                     null,
                                     advertised_dynamic_tool_names,
                                 );
+                                try runtime_tool_admission.recordRejectedToolCall(
+                                    deps,
+                                    arena,
+                                    tool_call,
+                                    safe_output,
+                                    null,
+                                );
                                 try runtime_tool_batch.appendToolResultContent(
                                     arena,
                                     &within_turn_suffix,
