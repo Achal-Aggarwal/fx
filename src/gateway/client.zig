@@ -263,10 +263,6 @@ pub const ProviderAttemptOwner = enum {
     agent,
 };
 
-pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const u8) !GetResult {
-    return fetchGatewayGet(alloc, api_key, null, path, e2e_gateway_credits_url_env);
-}
-
 const usage_response_max_bytes: usize = 1024 * 1024;
 const usage_request_timeout_ms: i64 = 15_000;
 
@@ -376,18 +372,13 @@ const UsageGetOperation = struct {
     }
 };
 
-fn fetchGatewayGet(alloc: std.mem.Allocator, api_key: ?[]const u8, gateway_team: ?[]const u8, path: []const u8, e2e_url_env: []const u8) !GetResult {
+pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const u8) !GetResult {
     const default_url = try alloc.print("{s}{s}", .{ gatewayBaseUrl(), path });
     defer alloc.free(default_url);
+    const url = try resolveE2eGatewayUrl(e2e_gateway_credits_url_env, default_url);
 
-    return fetchGatewayGetAtUrl(alloc, api_key, gateway_team, default_url, e2e_url_env);
-}
-
-fn fetchGatewayGetAtUrl(alloc: std.mem.Allocator, api_key: ?[]const u8, gateway_team: ?[]const u8, default_url: []const u8, e2e_url_env: []const u8) !GetResult {
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
-
-    const url = try resolveE2eGatewayUrl(e2e_url_env, default_url);
 
     var auth_header: ?[]u8 = null;
     defer if (auth_header) |value| secret.zeroAndFree(alloc, value);
@@ -398,8 +389,6 @@ fn fetchGatewayGetAtUrl(alloc: std.mem.Allocator, api_key: ?[]const u8, gateway_
         auth_header = try alloc.print("Bearer {s}", .{key});
         headers.authorization = .{ .override = auth_header.? };
     }
-    var extra_headers_buf: [1]std.http.Header = undefined;
-    const extra_headers = gatewayModelCatalogExtraHeaders(&extra_headers_buf, gateway_team);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -408,7 +397,6 @@ fn fetchGatewayGetAtUrl(alloc: std.mem.Allocator, api_key: ?[]const u8, gateway_
         .location = .{ .url = url },
         .method = .GET,
         .headers = headers,
-        .extra_headers = extra_headers,
         .response_writer = &out.writer,
         .redirect_behavior = .unhandled,
     });
