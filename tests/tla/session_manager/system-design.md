@@ -1268,11 +1268,11 @@ Settled for the converter (2026-10-06):
   is left out, named in the trace and the convert output, and the rest of
   the family converts. That member's v1 folder is then kept rather than
   removed (D60), so the file stays where it was, and the notice and the
-  convert output name the folder (2026-10-19). The copy records each file
-  it left out in place of its v1 fingerprint, so a later open, or a reuse
-  of the member after a crash, keeps that folder whatever has changed in
-  it since, a reuse names those files again, an older fx finds no
-  fingerprint to match and keeps the folder too, and `fx doctor` counts
+  convert output name the folder (2026-10-19). The copy names the first
+  32 files it left out and counts them all, in place of its v1
+  fingerprint, so a later open, or a reuse of the member after a crash,
+  keeps that folder whatever has changed in it since, a reuse names those
+  files again, an older fx finds no fingerprint to match and keeps the folder too, and `fx doctor` counts
   such folders, a subagent's among them. `V1Conversion.tla`'s `keeps`
   holds such members, and `NoLossOnDelete` checks that no conversion or
   cleanup removes their folders. The v2 listing must stay fast at the
