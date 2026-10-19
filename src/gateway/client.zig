@@ -2041,16 +2041,15 @@ pub fn runBoundedHttpOperation(
 /// wins, as `select_watch` explains.
 const RequestCondition = struct {
     cancel_flag: *std.atomic.Value(bool),
-    deadline: ?std.Io.Clock.Timestamp,
+    deadline: std.Io.Clock.Timestamp,
 
     pub fn cancelled(condition: RequestCondition) bool {
         return condition.cancel_flag.load(.seq_cst);
     }
 
     pub fn expired(condition: RequestCondition, io: std.Io) bool {
-        const limit = condition.deadline orelse return false;
         const now = std.Io.Clock.Timestamp.now(io, .awake);
-        return !std.Io.Clock.Timestamp.compare(now, .lt, limit);
+        return !std.Io.Clock.Timestamp.compare(now, .lt, condition.deadline);
     }
 };
 
