@@ -196,6 +196,8 @@ const NOT_UTF8 = "1784738825843-1784738825843707000-d16deab4f376c347";
 scenario("a schema 3 session whose prompt is not UTF-8 is shown, refused with the reason, and left as v1 leaves it", async f => {
   mkdirSync(f.v1Root, { recursive: true });
   cpSync(join(import.meta.dir, "fixtures", NOT_UTF8), join(f.v1Root, NOT_UTF8), { recursive: true });
+  // As its build left it, whatever modes a checkout gives the fixture's files.
+  assert.equal(Bun.spawnSync(["chmod", "-R", "go-rwx", join(f.v1Root, NOT_UTF8)]).exitCode, 0);
   makePrivate(f.home);
   // v1's migration refuses this session, which is why v1 cannot continue
   // it; v1 shows it as it is, so it is read without migrating.
