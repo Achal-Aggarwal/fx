@@ -2407,15 +2407,17 @@ test "connection watch closes a body that stops sending as stalled" {
 }
 
 test "connection watch never cuts a body whose events arrive inside the window" {
-    test_body_stall_timeout_ms = 150;
+    test_body_stall_timeout_ms = 1_000;
     defer test_body_stall_timeout_ms = null;
-    // Twelve events 50 ms apart last four times the window.
-    var server: SilentBodyServer = .{ .server = undefined, .events = 12, .gap_ms = 50, .close = true };
+    // 75 events 20 ms apart outlast the window by half, while each gap stays
+    // far inside it so a slow scheduler cannot stretch one into a stall.
+    var server: SilentBodyServer = .{ .server = undefined, .events = 75, .gap_ms = 20, .close = true };
     try server.start();
     defer server.stop();
     const body = try readWatchedBody(&server, null);
     try std.testing.expectEqual(@as(?anyerror, null), body.err);
-    try std.testing.expectEqual(@as(usize, 12), body.events);
+    try std.testing.expectEqual(@as(usize, 75), body.events);
+    try std.testing.expect(body.elapsed_ms > 1_000);
 }
 
 test "cancelling a request wins over its body stall window" {
