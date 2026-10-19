@@ -1,6 +1,4 @@
 const std = @import("std");
-const io_mod = @import("../shared/io.zig");
-const mem_utils = @import("../shared/mem_utils.zig");
 const selected_schema = @import("selected_schema.zig");
 const tool_names = @import("tool_names.zig");
 const permissions = @import("../permissions/permissions.zig");
@@ -338,7 +336,7 @@ const BoundedEncodedScalar = struct {
     observed_bytes: usize,
 };
 
-pub fn boundedEncodedScalar(alloc: Allocator, value: []const u8, max_bytes: usize) !BoundedEncodedScalar {
+fn boundedEncodedScalar(alloc: Allocator, value: []const u8, max_bytes: usize) !BoundedEncodedScalar {
     const encoded = try encodeScalarAlloc(alloc, value);
     errdefer alloc.free(encoded);
     const observed = encoded.len;

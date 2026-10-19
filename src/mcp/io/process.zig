@@ -159,6 +159,27 @@ pub const SpawnError = std.process.SpawnError || std.Io.ConcurrentError;
 /// How a process ended: its exit code, or the signal that ended it.
 pub const Exit = union(enum) { code: u8, signal: u8 };
 
+/// The start of `text` in `out`: as much as fits without cutting a UTF-8
+/// sequence, with each control byte as '?', so a server's text is safe to
+/// show. Shorter than `text` when it was cut.
+pub fn maskedPrefix(out: []u8, text: []const u8) []const u8 {
+    var n: usize = @min(text.len, out.len);
+    if (n < text.len) {
+        while (n > 0 and (text[n] & 0xC0) == 0x80) n -= 1;
+    }
+    for (text[0..n], out[0..n]) |c, *e| e.* = if (c < 0x20 or c == 0x7f) '?' else c;
+    return out[0..n];
+}
+
+test "a masked prefix keeps whole UTF-8 sequences and shows control bytes as '?'" {
+    var out: [6]u8 = undefined;
+    try std.testing.expectEqualStrings("a?b?", maskedPrefix(&out, "a\x1bb\x7f"));
+    // "\xc3\xa9" is one character: cut at 6 it would split, so it stops before it.
+    try std.testing.expectEqualStrings("abcde", maskedPrefix(&out, "abcde\xc3\xa9"));
+    try std.testing.expectEqualStrings("abcd\xc3\xa9", maskedPrefix(&out, "abcd\xc3\xa9z"));
+    try std.testing.expectEqualStrings("", maskedPrefix(&out, ""));
+}
+
 /// Bytes of the stderr tail a failure quotes: its last `tail_lines` lines.
 pub const tail_max = 240;
 const tail_lines = 3;
@@ -651,15 +672,10 @@ pub const Process = struct {
     }
 
     fn keepTail(p: *Process, line: []const u8) void {
-        var n: usize = @min(std.mem.trimEnd(u8, line, " \t\r").len, tail_max);
-        if (n < line.len) {
-            while (n > 0 and (line[n] & 0xC0) == 0x80) n -= 1;
-        }
         p.tail_lock.lockUncancelable(p.io);
         defer p.tail_lock.unlock(p.io);
         const slot = p.tail_next;
-        for (line[0..n], p.tail[slot][0..n]) |c, *e| e.* = if (c < 0x20 or c == 0x7f) '?' else c;
-        p.tail_len[slot] = @intCast(n);
+        p.tail_len[slot] = @intCast(maskedPrefix(&p.tail[slot], std.mem.trimEnd(u8, line, " \t\r")).len);
         p.tail_next = (slot + 1) % tail_lines;
         p.tail_count = @min(p.tail_count + 1, tail_lines);
     }

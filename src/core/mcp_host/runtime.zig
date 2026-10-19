@@ -1804,8 +1804,6 @@ fn declaredCapabilities(questions: elicitation.Capabilities) []const u8 {
     return "{}";
 }
 
-/// The engine names why a server is down; fx says it in words. Anything else,
-/// such as an HTTP failure's own text, is shown as it is.
 /// Why a new login wasn't saved, in words.
 fn notSavedReason(buffer: []u8, store: credentials.Store, err: anyerror) []const u8 {
     const why: []const u8 = switch (err) {
@@ -1867,6 +1865,8 @@ fn writeFailure(w: *std.Io.Writer, why: []const u8, exit: ?mcp.stdio.Exit, stray
     if (tail) |t| try w.print("; its last stderr lines: \"{s}\"", .{t});
 }
 
+/// The engine names why a server is down; fx says it in words. Anything else,
+/// such as an HTTP failure's own text, is shown as it is.
 fn describeFailure(why: []const u8) []const u8 {
     const known = [_]struct { []const u8, []const u8 }{
         .{ "no_shared_version", "it supports no MCP version fx speaks" },

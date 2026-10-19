@@ -1,9 +1,7 @@
 const std = @import("std");
 const catalog_freshness = @import("catalog_freshness.zig");
-const mcp_contract = @import("mcp_contract.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
-const freeOwnedStrings = mcp_contract.freeOwnedStrings;
 
 const max_tool_display_title_bytes: usize = 200;
 
@@ -62,21 +60,6 @@ pub const McpTool = struct {
     tags: []const []u8,
 };
 
-pub fn freeTools(alloc: Allocator, tools: []const McpTool) void {
-    for (tools) |tool| {
-        alloc.free(tool.original_name);
-        alloc.free(tool.prefixed_name);
-        if (tool.title) |value| alloc.free(value);
-        alloc.free(tool.description);
-        alloc.free(tool.input_schema_json);
-        if (tool.output_schema_json) |value| alloc.free(value);
-        if (tool.icons_json) |value| alloc.free(value);
-        if (tool.annotations_json) |value| alloc.free(value);
-        if (tool.metadata_json) |value| alloc.free(value);
-        freeOwnedStrings(alloc, tool.tags);
-    }
-}
-
 pub fn digestTools(tools: []const McpTool) catalog_freshness.Digest {
     const Sha256 = std.crypto.hash.sha2.Sha256;
     var hasher = Sha256.init(.{});
@@ -108,14 +91,14 @@ pub fn definitionDigest(tool: McpTool, instructions: ?[]const u8) [32]u8 {
     return digest;
 }
 
-pub fn hashField(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
+fn hashField(hasher: *std.crypto.hash.sha2.Sha256, value: []const u8) void {
     var length: [8]u8 = undefined;
     std.mem.writeInt(u64, &length, value.len, .big);
     hasher.update(&length);
     hasher.update(value);
 }
 
-pub fn hashOptionalField(
+fn hashOptionalField(
     hasher: *std.crypto.hash.sha2.Sha256,
     value: ?[]const u8,
 ) void {

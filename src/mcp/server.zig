@@ -59,11 +59,7 @@ const note_max = 160;
 /// The start of `line`, at most `max` bytes, terminal-safe, in `buf`: never
 /// a cut UTF-8 sequence, control bytes as '?', and "..." when cut.
 fn excerptOf(comptime max: usize, buf: *[max + 3]u8, line: []const u8) []const u8 {
-    var n: usize = @min(line.len, max);
-    if (n < line.len) {
-        while (n > 0 and (line[n] & 0xC0) == 0x80) n -= 1;
-    }
-    for (line[0..n], buf[0..n]) |c, *e| e.* = if (c < 0x20 or c == 0x7f) '?' else c;
+    const n = process.maskedPrefix(buf[0..max], line).len;
     if (n == line.len) return buf[0..n];
     @memcpy(buf[n..][0..3], "...");
     return buf[0 .. n + 3];

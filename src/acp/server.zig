@@ -380,8 +380,6 @@ pub const ServerState = struct {
     outbound_mutex: std.Io.Mutex = .init,
     outbound_cond: std.Io.Condition = .init,
     next_outbound_request_id: u64 = 1,
-    /// Source of fresh logical MCP request IDs for MCP over ACP.
-    next_mcp_message_id: std.atomic.Value(u64) = .init(1),
     pending_outbound: std.AutoHashMapUnmanaged(u64, PendingOutbound) = .empty,
     legacy_url_mutex: std.Io.Mutex = .init,
     pending_legacy_urls: std.ArrayList(PendingLegacyUrl) = .empty,

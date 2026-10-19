@@ -93,7 +93,7 @@ appends. `sdk/tests/test-types.mjs` checks the public types across Node, CommonJ
 browser, and explicit Wasm entry points. The gateway unit fixture exercises model
 start/end pairing through success, transport failure, and cancellation.
 
-The focused ACP fixtures exercise real command approval, MCP-v1/v2 calls and
+The focused ACP fixtures exercise real command approval, MCP calls and
 elicitation, and native child execution. Core fixtures cover question outcomes,
 review retries, title generation, and batched vision calls. SDK fixtures cover
 host-owned input effects, MCP correlation, and child engines on both backends.
