@@ -250,8 +250,10 @@ pub fn createTempSnapshotDir(alloc: std.mem.Allocator) ![]u8 {
     for (0..16) |_| {
         var suffix: u64 = undefined;
         io_mod.getIo().random(std.mem.asBytes(&suffix));
+        // Fixed width, so the model's note naming a snapshot here is the
+        // same length in every process.
         const path = try alloc.print(
-            "{s}/fx-image-snapshots-{x}",
+            "{s}/fx-image-snapshots-{x:0>16}",
             .{ temp_root, suffix },
         );
         errdefer alloc.free(path);
@@ -3221,6 +3223,16 @@ test "requests name the saved file of each attached image, never its source" {
     // A request whose images have no saved file passes through untouched.
     const unsaved = [_]types.ChatMessage{.{ .role = .user, .content = "[Image #5] [Image #6]", .images = images[4..] }};
     try std.testing.expect((try noteAttachmentLocations(arena, &unsaved)).ptr == (&unsaved).ptr);
+}
+
+test "temporary snapshot folders have names of one length" {
+    const alloc = std.testing.allocator;
+    for (0..8) |_| {
+        const path = try createTempSnapshotDir(alloc);
+        defer alloc.free(path);
+        defer cleanupSnapshotDir(path);
+        try std.testing.expectEqual(@as(usize, "fx-image-snapshots-".len + 16), std.Io.Dir.path.basename(path).len);
+    }
 }
 
 test "image location notes quote the saved path" {

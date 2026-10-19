@@ -5543,10 +5543,12 @@ test("direct providers keep images with their users through tools and resume", a
       };
       const firstPrompt = "Read fixture.txt, then describe the attached image.";
       const secondPrompt = "Compare the earlier image with this new image.";
+      // Each image's message starts with a note naming its saved copy.
       const imageOwners = (raw: string): Array<{ text: string; images: string[] }> => JSON.parse(raw).input
         .filter((entry: { role?: string }) => entry.role === "user")
         .map((entry: { content: Array<{ type: string; text?: string; image_url?: string }> }) => ({
-          text: entry.content.filter(part => part.type === "input_text").map(part => part.text).join(""),
+          text: entry.content.filter(part => part.type === "input_text").map(part => part.text).join("")
+            .replace(/^(\[Image #\d+ \(image\/png\) is saved at "[^"\n]*"\.\]\n)+/, ""),
           images: entry.content.filter(part => part.type === "input_image").map(part => part.image_url!),
         }))
         .filter((entry: { images: string[] }) => entry.images.length > 0);
@@ -5582,6 +5584,8 @@ test("direct providers keep images with their users through tools and resume", a
       const imageDir = join(profile, ".fx", "sessions", sessionId, "images");
       const snapshotName = readdirSync(imageDir).find(name => name.endsWith(".bin") && readFileSync(join(imageDir, name)).equals(firstImage));
       expect(snapshotName).toBeDefined();
+      expect(direct.bodies[0]).toContain(`/${sessionId}/images/${snapshotName}\\".]`);
+      expect(direct.bodies[0]).not.toContain(firstPath);
       writeFileSync(join(imageDir, snapshotName!), secondImage);
       const rejected = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Inspect the earlier images again."], { cwd: profile, env, timeoutMs: TIMEOUT });
       expect(rejected.code, rejected.stdout + rejected.stderr).toBe(1);
