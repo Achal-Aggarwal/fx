@@ -842,23 +842,11 @@ fn writeTestErrorResponse(zio: std.Io, stream: std.Io.net.Stream, body_bytes: us
     try writer.interface.flush();
 }
 
-var stable_xai_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableXaiTestEnviron() !*const std.process.Environ.Map {
-    if (stable_xai_test_environ) |map| return map;
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_xai_test_environ = map;
-    return map;
-}
-
 const XaiTestEnvironment = struct {
     alloc: Allocator,
     map: std.process.Environ.Map,
 
     fn install(alloc: Allocator, responses_url: []const u8) !*@This() {
-        _ = try stableXaiTestEnviron();
         const self = try alloc.create(@This());
         errdefer alloc.destroy(self);
         self.* = .{
@@ -873,7 +861,7 @@ const XaiTestEnvironment = struct {
     }
 
     fn deinit(self: *@This()) void {
-        if (stable_xai_test_environ) |map| io_mod.setEnvironMap(map);
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);

@@ -7650,20 +7650,7 @@ const TestAskHome = struct {
     alloc: Allocator,
     map: std.process.Environ.Map,
 
-    var stable_empty: ?*std.process.Environ.Map = null;
-
-    fn stableEmptyEnv() !*const std.process.Environ.Map {
-        if (stable_empty) |map| return map;
-        const alloc = std.heap.page_allocator;
-        const map = try alloc.create(std.process.Environ.Map);
-        map.* = std.process.Environ.Map.init(alloc);
-        stable_empty = map;
-        return map;
-    }
-
     fn install(alloc: Allocator, home: []const u8) !*TestAskHome {
-        _ = try stableEmptyEnv();
-
         const self = try alloc.create(TestAskHome);
         errdefer alloc.destroy(self);
 
@@ -7679,9 +7666,7 @@ const TestAskHome = struct {
     }
 
     fn deinit(self: *TestAskHome) void {
-        if (stable_empty) |map| {
-            io_mod.setEnvironMap(map);
-        }
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);

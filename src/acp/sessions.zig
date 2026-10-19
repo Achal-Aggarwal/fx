@@ -3183,25 +3183,11 @@ test "ACP load maps one-off child denial to invalid params" {
     ) != null);
 }
 
-var acp_session_stable_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableAcpSessionTestEnviron() !*const std.process.Environ.Map {
-    if (acp_session_stable_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    acp_session_stable_test_environ = map;
-    return map;
-}
-
 const AcpSessionTestHome = struct {
     alloc: Allocator,
     map: std.process.Environ.Map,
 
     fn install(alloc: Allocator, home: []const u8) !*AcpSessionTestHome {
-        _ = try stableAcpSessionTestEnviron();
-
         const self = try alloc.create(AcpSessionTestHome);
         errdefer alloc.destroy(self);
 
@@ -3216,9 +3202,7 @@ const AcpSessionTestHome = struct {
     }
 
     fn deinit(self: *AcpSessionTestHome) void {
-        if (acp_session_stable_test_environ) |map| {
-            io_mod.setEnvironMap(map);
-        }
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);

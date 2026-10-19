@@ -8145,25 +8145,11 @@ test "direct gateway cancellation before admission opens no connection" {
     if (fixture.failure) |err| return err;
 }
 
-var stable_models_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableModelsTestEnviron() !*const std.process.Environ.Map {
-    if (stable_models_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_models_test_environ = map;
-    return map;
-}
-
 const ModelsUrlTestEnv = struct {
     alloc: std.mem.Allocator,
     map: std.process.Environ.Map,
 
     fn install(alloc: std.mem.Allocator, models_url: []const u8) !*ModelsUrlTestEnv {
-        _ = try stableModelsTestEnviron();
-
         const self = try alloc.create(ModelsUrlTestEnv);
         errdefer alloc.destroy(self);
         self.* = .{
@@ -8177,7 +8163,7 @@ const ModelsUrlTestEnv = struct {
     }
 
     fn deinit(self: *ModelsUrlTestEnv) void {
-        if (stable_models_test_environ) |map| io_mod.setEnvironMap(map);
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);
