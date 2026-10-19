@@ -3941,10 +3941,9 @@ test "process io connects through a reachable address while fx tasks hold every 
         ) std.Io.net.HostName.LookupError!void {
             const io: std.Io = .{ .userdata = userdata, .vtable = &vtable };
             defer resolved.close(io);
-            const reachable = std.Io.net.IpAddress.parse("127.0.0.1", options.port) catch unreachable;
             resolved.putAll(io, &.{
                 .{ .address = blackHoleAt(options.port) },
-                .{ .address = reachable },
+                .{ .address = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = options.port } } },
             }) catch return error.UnknownHostName;
         }
 
