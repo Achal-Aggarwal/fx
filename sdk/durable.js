@@ -762,6 +762,35 @@ const streamReadRetries = 5;
 const missingStreamPollMs = 50;
 const missingStreamFastMs = 2000;
 
+// Runs whose log views one backend keeps, least recently read dropped first.
+const maxLogViews = 32;
+
+/**
+ * A run's log view extended by the entries listed after it, as a full read
+ * returns the log: every entry after the newest checkpoint's `through`.
+ * Null when that checkpoint covers less than the view starts after, which
+ * only a full read can answer. `head` is the chain's head as a full read
+ * notes it: the newest chained entry, or the checkpoint's `through`. Pure.
+ */
+export function extendLogView(view, newer) {
+  const combined = [...view.entries, ...newer];
+  let through = view.through;
+  for (let index = combined.length - 1; index >= 0; index -= 1) {
+    const entry = combined[index].entry;
+    if (entry?.k === "checkpoint") {
+      through = entry.through === null || entry.through === undefined ? 0 : Number(entry.through);
+      break;
+    }
+  }
+  if (through < view.through) return null;
+  const entries = combined.filter((item) => Number(item.cursor) > through);
+  let head = null;
+  for (let index = entries.length - 1; index >= 0 && head === null; index -= 1) {
+    if (chainedKind(entries[index].entry?.k)) head = entries[index].cursor;
+  }
+  return { entries, through, head: head ?? (through ? String(through) : "null") };
+}
+
 // Events a session-log read lists per page: the first page, then the rest.
 const firstPageEvents = 10;
 const laterPageEvents = 100;
@@ -908,6 +937,15 @@ function createWorldBackend(world, durability) {
   // poll.
   const watchers = new Map();
   const changed = (runId) => { for (const watcher of watchers.get(runId) ?? []) watcher(); };
+  // Each run's log as this process last read it: the entries read() returned,
+  // the newest slot seen, and the checkpoint's `through` they start after.
+  // The log only appends, so a later read lists only slots after `known`.
+  const logViews = new Map();
+  const rememberView = (runId, view) => {
+    logViews.delete(runId);
+    logViews.set(runId, view);
+    if (logViews.size > maxLogViews) logViews.delete(logViews.keys().next().value);
+  };
   let handler = null;
   const route = typeof world.registerHandler !== "function";
   const listEvents = (runId, cursor, limit) => world.events.list({
@@ -1053,11 +1091,17 @@ function createWorldBackend(world, durability) {
         // The newest chained entry read: the chain's head, unless the read
         // stopped before reaching any.
         let newestChained;
+        // The newest slot this read listed, and how many slots above
+        // `stopBelow` it listed, entries or not. Unlike `known`, which this
+        // object's own writes also raise, these say only what the listing
+        // showed.
+        let newest = stopBelow;
+        let listed = 0;
         // Ends the read. `head` is where the chain's head is when the read
         // found no chained entry, or undefined when the read does not show.
         const done = (head) => {
           noteSnapshot(snapshot, newestChained ?? head);
-          return { events, through };
+          return { events, through, snapshot, newest, listed };
         };
         // A session's newest checkpoint is usually among its last few
         // entries, so a read starts with a small page and fetches more only
@@ -1071,13 +1115,15 @@ function createWorldBackend(world, durability) {
             if (!missingRun(error)) throw error;
             // The run's creation starts its count.
             if (stopBelow === 0) noteSnapshot({ seq: 0, seqInBand: inBandAtRunCreation }, "null");
-            return { events, through };
+            return { events, through, newest, listed, missing: true };
           }
           snapshot ??= page.snapshot;
           for (const event of page.data) {
             const slot = slotOf(event);
             if (slot > known) known = slot;
             if (slot <= stopBelow) return done(undefined);
+            if (slot > newest) newest = slot;
+            listed += 1;
             // The checkpoint stands for the entries through its `through`,
             // the last of them the chain's head.
             if (through !== null && slot <= through) return done(through === 0 ? "null" : String(through));
@@ -1094,10 +1140,33 @@ function createWorldBackend(world, durability) {
           cursor = page.cursor;
         }
       };
+      const fullRead = async () => {
+        const { events, through, newest } = await newestFirst(0, true);
+        const entries = events.reverse();
+        rememberView(runId, { entries: entries.slice(), known: newest, through: through ?? 0 });
+        return entries;
+      };
       return {
+        // The newest slot of the run this session object has seen.
+        newest: () => known,
         async read() {
-          const { events } = await newestFirst(0, true);
-          return events.reverse();
+          const view = logViews.get(runId);
+          if (!view) return fullRead();
+          if (view.known > known) known = view.known;
+          const since = await newestFirst(view.known, false);
+          if (since.missing) {
+            logViews.delete(runId);
+            return [];
+          }
+          // A listing that skipped a slot may show a later write before an
+          // earlier one, and a checkpoint covering less than the view starts
+          // after is not one the view can stand for: read the log whole.
+          const next = since.listed === since.newest - view.known ? extendLogView(view, since.events.reverse()) : null;
+          if (!next) return fullRead();
+          // The in-band count at the chain's head, as a full read notes it.
+          noteSnapshot(since.snapshot, next.head);
+          rememberView(runId, { entries: next.entries, known: since.newest, through: next.through });
+          return next.entries.slice();
         },
         async readSince(cursor) {
           const { events } = await newestFirst(Number(cursor), false);
@@ -1465,8 +1534,25 @@ const messageIdInUse = (message) => Object.assign(
 async function recordMessage(log, state, message) {
   if (idInUse(state, message)) throw messageIdInUse(message);
   const entries = messageEntries(state, message);
-  for (const entry of entries) await log.append(entry);
-  return entries.length;
+  const appended = [];
+  for (const entry of entries) appended.push({ cursor: await log.append(entry), entry });
+  return appended;
+}
+
+/**
+ * The log a sender read and then extended with its own entries, as the
+ * worker it starts in the same request may use it instead of reading the
+ * log again. Only when the sender wrote something and every entry it wrote
+ * took the slot right after the newest one it had seen: then nothing landed
+ * in between, so the view holds every input that comes before this
+ * message's. Null otherwise. Pure.
+ */
+export function handoffEntries(read, newestSeen, appended) {
+  if (!Number.isSafeInteger(newestSeen) || appended.length === 0) return null;
+  for (const [index, item] of appended.entries()) {
+    if (Number(item.cursor) !== newestSeen + index + 1) return null;
+  }
+  return [...read, ...appended];
 }
 
 /**
@@ -1551,9 +1637,12 @@ class SessionWorker {
   // (`tests/tla/sdk/TenantIsolation.tla` OnlySentRuns). Then it runs the
   // session when no live worker holds it. Returns `{ timeoutSeconds }` to
   // have the same message delivered again later.
-  async consume(message, delivery = null) {
-    const log = await this.backend.session(this.sessionId);
-    let entries = await log.read();
+  // `handoff` is the sender's own session object and the log it read and
+  // extended, when the request that took the prompt runs it (see
+  // handoffEntries); the worker starts from them instead of reading again.
+  async consume(message, delivery = null, handoff = null) {
+    const log = handoff?.log ?? await this.backend.session(this.sessionId);
+    let entries = handoff?.entries ?? await log.read();
     let state = this.fold(entries, delivery);
     if (!knownMessage(state, message)) {
       this.agent.emit("session.refused", { sessionId: this.sessionId, messageId: message.messageId, reason: "unknown message" });
@@ -2547,14 +2636,14 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
     // One delivery of `message` to the session's worker here: from the
     // queue, with `delivery` naming the queue's message and attempt, or with
     // `inRequest` from the request that took the prompt.
-    const receive = (created, message, delivery, { inRequest = false } = {}) => {
+    const receive = (created, message, delivery, { inRequest = false, handoff = null } = {}) => {
       let worker = workers.get(message.sessionId);
       if (!worker) {
         worker = new SessionWorker(agent, created, message.sessionId);
         workers.set(message.sessionId, worker);
       }
       worker.deliveries += 1;
-      let work = worker.consume(message, delivery);
+      let work = worker.consume(message, delivery, handoff);
       if (inRequest) {
         // No queue delivered this message, so none delivers it again: a turn
         // that must go on later continues in a fresh message. One whose
@@ -2620,7 +2709,9 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
         // OnlySentRuns), and a queue that ends with the process loses no
         // input.
         const log = await created.session(sessionId);
-        await recordMessage(log, foldSessionLog(await log.read()), full);
+        const read = await log.read();
+        const newestSeen = log.newest?.();
+        const appended = await recordMessage(log, foldSessionLog(read), full);
         const queued = queuedMessage(full, created.store);
         const idempotencyKey = `${sessionId}:${message.type}:${message.messageId}`;
         if (inRequest && created.runInRequest) {
@@ -2637,7 +2728,9 @@ export function createDurableAgentFactory({ harness, defaultDurability, defaultS
             seeded = true;
             const delivery = backstop ? { messageId: backstop, attempt: 0 } : null;
             // receive() reports a failure to the host; the backstop retries it.
-            const work = receive(created, queued, delivery, { inRequest: true }).then(() => {}, () => {});
+            const entries = handoffEntries(read, newestSeen, appended);
+            const handoff = entries ? { log, entries } : null;
+            const work = receive(created, queued, delivery, { inRequest: true, handoff }).then(() => {}, () => {});
             created.waitUntil?.(work);
             return;
           }

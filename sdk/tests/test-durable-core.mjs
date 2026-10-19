@@ -8,7 +8,7 @@ import { strict as assert } from "node:assert";
 import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createDurableAgentFactory, foldSessionLog, memory, wakeHandler } from "../durable.js";
+import { createDurableAgentFactory, extendLogView, foldSessionLog, handoffEntries, memory, wakeHandler } from "../durable.js";
 import { world } from "../durable/world.mjs";
 
 const durabilityKind = process.argv[2] || "memory";
@@ -234,6 +234,12 @@ async function durabilityFor(options = {}) {
   if (durabilityKind === "memory") return memory(options);
   const dir = await mkdtemp(join(tmpdir(), "libfx-core-"));
   dirs.push(dir);
+  return durabilityAt(dir, options);
+}
+
+// A durability of this run's kind on `dir`: each call is another server on
+// the same store.
+async function durabilityAt(dir, options = {}) {
   // A queue-held lease needs a deadline: a function's, ten minutes away.
   if (durabilityKind === "queue") return (await queueWorldAt(dir, { queueLeases: true, maxDurationMs: 600_000, ...options })).durability;
   return durabilityKind === "world" ? appWorldAt(dir, options) : local({ dir, ...options });
@@ -2119,6 +2125,158 @@ if (durabilityKind === "queue") {
     assert.deepEqual(openersOf(session.id), [], "no agent ran the closed agent's session");
     await theirs.close();
     for (const { stored } of [acme, carl]) await stored.close();
+  });
+}
+
+// A log of `count` slots as a World holds one: inputs, a chain of leases,
+// records and releases, and checkpoints whose `through` only moves forward.
+function randomLog(seed, count) {
+  let state = seed;
+  const next = () => (state = (state * 1103515245 + 12345) % 2147483648) / 2147483648;
+  const log = [];
+  let through = null;
+  for (let slot = 1; slot <= count; slot += 1) {
+    const roll = next();
+    let entry;
+    if (roll < 0.15 && slot > 2) {
+      through = String(Math.max(Number(through ?? 0), Math.floor(1 + next() * (slot - 1))));
+      entry = { k: "checkpoint", through, data: `c${slot}` };
+    } else if (roll < 0.35) entry = { k: "input", key: `prompt:p${slot}`, type: "prompt", messageId: `p${slot}` };
+    else entry = { k: ["lease", "record", "release"][Math.floor(next() * 3)], a: null, n: slot };
+    log.push({ cursor: String(slot), entry });
+  }
+  return log;
+}
+
+// The log as a whole read returns it: every entry after the newest
+// checkpoint's `through`, which is 0 without one.
+function wholeRead(log) {
+  let through = 0;
+  for (const { entry } of log) if (entry.k === "checkpoint") through = entry.through === null ? 0 : Number(entry.through);
+  return { entries: log.filter(({ cursor }) => Number(cursor) > through), through };
+}
+
+test("a log view extended by the entries after it reads as the whole log does, wherever it was cut", () => {
+  for (let seed = 1; seed <= 200; seed += 1) {
+    const log = randomLog(seed, 1 + (seed % 40));
+    const whole = wholeRead(log);
+    const chained = [...whole.entries].reverse().find(({ entry }) => ["lease", "record", "release"].includes(entry.k));
+    for (let cut = 0; cut <= log.length; cut += 1) {
+      const next = extendLogView(wholeRead(log.slice(0, cut)), log.slice(cut));
+      assert.ok(next, `seed ${seed} cut ${cut} kept a view`);
+      assert.deepEqual(next.entries, whole.entries, `seed ${seed} cut ${cut}`);
+      assert.equal(next.through, whole.through);
+      assert.equal(next.head, chained?.cursor ?? (whole.through ? String(whole.through) : "null"));
+    }
+  }
+  // A checkpoint covering less than the view starts after cannot stand for
+  // the view; only a whole read can answer it.
+  const view = { entries: [{ cursor: "12", entry: { k: "record", a: "11" } }], through: 10 };
+  assert.equal(extendLogView(view, [{ cursor: "13", entry: { k: "checkpoint", through: "5" } }]), null);
+});
+
+test("a worker starts from its sender's read only when the sender's entries took the very next slots", () => {
+  const read = [{ cursor: "7", entry: { k: "release" } }];
+  const input = (cursor) => ({ cursor, entry: { k: "input", messageId: "m" } });
+  assert.deepEqual(handoffEntries(read, 9, [input("10")]), [...read, input("10")]);
+  assert.deepEqual(handoffEntries(read, 9, [input("10"), input("11")]), [...read, input("10"), input("11")]);
+  // Another server's write landed between the read and the input.
+  assert.equal(handoffEntries(read, 9, [input("11")]), null);
+  assert.equal(handoffEntries(read, 9, [input("10"), input("12")]), null);
+  // Nothing written, or a log that cannot say what it has seen.
+  assert.equal(handoffEntries(read, 9, []), null);
+  assert.equal(handoffEntries(read, undefined, [input("10")]), null);
+});
+
+// A World durability that tells `onList(params)` of each log listing and
+// `onCreate(kind)` of each entry written.
+function watchingLog(base, { onList = () => {}, onCreate = () => {} } = {}) {
+  return {
+    ...base,
+    world: async () => {
+      const world = await base.world();
+      const list = world.events.list.bind(world.events);
+      const create = world.events.create.bind(world.events);
+      const events = Object.assign(Object.create(world.events), {
+        list(params, ...rest) {
+          onList(params);
+          return list(params, ...rest);
+        },
+        create(runId, event, ...rest) {
+          if (event?.eventType === "step_created") {
+            try { onCreate(JSON.parse(decoder.decode(event.eventData.input)).k); } catch {}
+          }
+          return create(runId, event, ...rest);
+        },
+      });
+      return Object.assign(Object.create(world), { events });
+    },
+  };
+}
+
+async function untilIdle(agent) {
+  const internals = agent[Symbol.for("libfx.durableInternals")];
+  for (let tries = 0; internals.liveWorkers() > 0; tries += 1) {
+    assert.ok(tries < 200, "the worker never let go");
+    await sleep(10);
+  }
+}
+
+if (durabilityKind !== "memory") {
+  test("a server reads again only what landed in a session's log since it last read it, and sees what a fresh server sees", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-log-view-"));
+    dirs.push(dir);
+    const lists = [];
+    const agent = createAgent({ durability: watchingLog(await durabilityAt(dir), { onList: (params) => lists.push(params) }) });
+    const session = agent.session();
+    for (const input of ["rho", "sigma", "tau", "chi"]) assert.equal((await textOf(session.prompt(input))).result.stopReason, "end_turn");
+    await untilIdle(agent);
+    const ours = await agent[Symbol.for("libfx.durableInternals")].openLog(session.id);
+    // More entries than a read's first page, so a whole read lists two.
+    assert.ok((await ours.read()).length > 10);
+    const other = createAgent({ durability: await durabilityAt(dir) });
+    const theirs = await other[Symbol.for("libfx.durableInternals")].openLog(session.id);
+    const fresh = async () => {
+      const reader = createAgent({ durability: await durabilityAt(dir) });
+      const entries = await (await reader[Symbol.for("libfx.durableInternals")].openLog(session.id)).read();
+      await reader.close();
+      return entries;
+    };
+    // Another server adds an input.
+    await theirs.append({ k: "input", key: "cancel:cnl_elsewhere", type: "cancel", messageId: "cnl_elsewhere" });
+    lists.length = 0;
+    const cached = await ours.read();
+    assert.equal(lists.length, 1, "one short page lists what landed since");
+    assert.equal(lists[0].pagination.cursor, undefined);
+    assert.deepEqual(cached, await fresh());
+    // Then a checkpoint that covers the chain: only the entries after its
+    // head are read, the input written after the head and the checkpoint.
+    const { head } = foldSessionLog(await theirs.read());
+    await theirs.append({ k: "checkpoint", through: head, data: "", pending: [], recent: [] });
+    const after = await ours.read();
+    assert.deepEqual(after, await fresh());
+    assert.deepEqual(after.map(({ entry }) => entry.k), ["input", "checkpoint"]);
+    for (const closing of [agent, other]) await closing.close();
+  });
+}
+
+if (durabilityKind === "queue") {
+  test("a prompt the request runs itself starts its worker from the sender's read, without reading the log again", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-handoff-"));
+    dirs.push(dir);
+    const ops = [];
+    const { durability: base } = await queueWorldAt(dir, { queueLeases: true, runInRequest: true, maxDurationMs: 60_000 });
+    const agent = createAgent({ durability: watchingLog(base, { onList: () => ops.push("list"), onCreate: (kind) => ops.push(kind) }) });
+    const session = agent.session();
+    assert.equal((await textOf(session.prompt("upsilon"))).result.stopReason, "end_turn");
+    await untilIdle(agent);
+    ops.length = 0;
+    assert.equal((await textOf(session.prompt("phi"))).result.stopReason, "end_turn");
+    const input = ops.indexOf("input");
+    const lease = ops.indexOf("lease", input);
+    assert.ok(input >= 0 && lease > input, JSON.stringify(ops));
+    assert.deepEqual(ops.slice(input + 1, lease), [], "nothing read or written between the input and the worker's lease");
+    await agent.close();
   });
 }
 
