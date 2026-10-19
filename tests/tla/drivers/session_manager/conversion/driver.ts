@@ -577,9 +577,12 @@ export async function compareContinuations(f: Fixture, snapshot: string, rootId:
     cpSync(snapshot, home, { recursive: true });
     if (v1Private && !v2) makePrivate(home);
     oracleReplies(f, family, agent);
-    const mark = f.gateway.requests.length;
+    // The fake gateway files a request by what its body holds, so a session
+    // that quotes its title or review instruction lands in those lists.
+    const lists = [f.gateway.requests, f.gateway.classifierRequests, f.gateway.titleRequests];
+    const marks = lists.map(list => list.length);
     const run = await f.fx(v2, ["ask", "--json", "--auto", "--resume-id", rootId, "CONV_ORACLE"], home);
-    const bodies: string[] = f.gateway.requests.slice(mark).map((r: any) => r.body);
+    const bodies: string[] = lists.flatMap((list, i) => list.slice(marks[i])).map((r: any) => r.body);
     const root = bodies.find(b => b.includes("CONV_ORACLE") && !b.includes("CONV_ORACLE_CHILD"));
     const child = bodies.find(b => b.includes("CONV_ORACLE_CHILD") && !b.includes("CONV_ORACLE_CHILD_ANSWER"));
     sides.push({ root: root && shown(root, home), child: child && shown(child, home), ok: run.code === 0, home });
