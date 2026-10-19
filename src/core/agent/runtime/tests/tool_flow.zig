@@ -3094,8 +3094,8 @@ test "modern mixed batch materializes unsupported terminal before admission" {
     try std.testing.expectEqualStrings("read_file", hooks.permission_names.items[0]);
     try std.testing.expectEqual(@as(usize, 1), hooks.executed_names.items.len);
     try std.testing.expectEqualStrings("read_file", hooks.executed_names.items[0]);
-    // Hosts finish their own record of the call (ACP's final update, the
-    // `fx ask --json` tool_calls entry) only through the rejection hook.
+    // Hosts finish their own record of a refused call (ACP's final update,
+    // the `fx ask --json` tool_calls entry) through the rejection hook.
     try std.testing.expectEqual(@as(usize, 1), hooks.rejected_names.items.len);
     try std.testing.expectEqualStrings("missing_tool", hooks.rejected_names.items[0]);
     try expectLifecycleCallIds(

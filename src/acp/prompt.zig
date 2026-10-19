@@ -414,6 +414,11 @@ const AcpContext = struct {
         updated.* = .published;
     }
 
+    fn providerTerminalPublished(self: *const AcpContext, tool_call_id: []const u8) bool {
+        const publication = self.published_tool_calls.get(tool_call_id) orelse return false;
+        return publication == .published;
+    }
+
     fn sendToolCallProgressText(self: *AcpContext, tool_call_id: []const u8, text: ?[]const u8) !void {
         const plain = if (text) |value| try stripAnsiAlloc(self.alloc, value) else null;
         defer if (plain) |value| if (text) |original| {
@@ -2802,12 +2807,13 @@ fn recordToolCallRejected(
     command_result_json: ?[]const u8,
 ) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    const acp_id = ctx.sendToolCallPending(arena, call) catch "call_unknown";
-    // An unsupported call named like a provider search already got its
-    // final update from the terminal lifecycle event.
-    if (ctx.published_tool_calls.get(acp_id)) |publication| {
-        if (publication == .published) return;
+    // A call named like a provider search gets its final update from the
+    // terminal lifecycle event, under the id it streamed with.
+    if (ctx.providerTerminalPublished(call.id)) return;
+    if (call.provisional_id) |provisional_id| {
+        if (ctx.providerTerminalPublished(provisional_id)) return;
     }
+    const acp_id = ctx.sendToolCallPending(arena, call) catch "call_unknown";
     ctx.sendToolCallErrorWithCommandResult(
         acp_id,
         toolUpdateContentText(.{
@@ -5185,6 +5191,61 @@ test "ACP provider search lifecycle publishes only public terminal updates" {
     try std.testing.expectEqual(@as(usize, 2), provider_failed);
     try std.testing.expectEqual(@as(usize, 1), read_pending);
     try std.testing.expectEqual(@as(usize, 0), read_completed);
+}
+
+test "ACP rejection of a finished provider search sends no second card or update" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-rejected-search.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = .{ .stdout = capture };
+    var ctx = AcpContext{
+        .alloc = alloc,
+        .state = &state,
+        .session_id = "session_1",
+    };
+    defer ctx.deinitPublishedToolCalls();
+
+    try pushToolLifecycle(&ctx, .{ .provisional = .{
+        .id = .{ .turn_id = 1, .call_id = "streamed_search" },
+        .tool_name = "exa_search",
+        .activity_kind = .read,
+    } });
+    try pushToolLifecycle(&ctx, .{ .terminal = .{
+        .id = .{ .turn_id = 1, .call_id = "streamed_search" },
+        .outcome = .{ .kind = .failed, .summary = "Failed exa_search" },
+    } });
+    try recordToolCallRejected(&ctx, alloc, .{
+        .id = "streamed_search",
+        .name = "exa_search",
+        .arguments_json = "{}",
+    }, "Unsupported tool: exa_search", null);
+    try recordToolCallRejected(&ctx, alloc, .{
+        .id = "final_search",
+        .provisional_id = "streamed_search",
+        .name = "exa_search",
+        .arguments_json = "{}",
+    }, "Unsupported tool: exa_search", null);
+    try capture.sync(io_mod.getIo());
+
+    var captured_file = try tmp.dir.openFile(io_mod.getIo(), "acp-rejected-search.jsonl", .{});
+    defer captured_file.close(io_mod.getIo());
+    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 64 * 1024);
+    var lines = std.mem.splitScalar(u8, captured, '\n');
+    var updates: usize = 0;
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        updates += 1;
+        try std.testing.expect(std.mem.find(u8, line, "final_search") == null);
+        try std.testing.expect(std.mem.find(u8, line, "exa_search") == null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), updates);
 }
 
 test "ACP propagateGrant stores deduped runtime session grants" {
