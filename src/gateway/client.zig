@@ -2133,23 +2133,6 @@ fn suspendGapDetected(previous: SuspendClockSample, current: SuspendClockSample)
     return boot_elapsed - awake_elapsed > suspend_gap_tolerance_ns;
 }
 
-pub fn spawnHttpCancelWatcher(
-    done: *std.atomic.Value(bool),
-    cancel_flag: *std.atomic.Value(bool),
-    stream: std.Io.net.Stream,
-) !std.Thread {
-    return spawn_gateway_cancel_watcher(done, cancel_flag, null, null, null, stream);
-}
-
-pub fn spawnHttpCancelWatcherBounded(
-    done: *std.atomic.Value(bool),
-    cancel_flag: *std.atomic.Value(bool),
-    deadline: std.Io.Clock.Timestamp,
-    stream: std.Io.net.Stream,
-) !std.Thread {
-    return spawn_gateway_cancel_watcher(done, cancel_flag, null, deadline, null, stream);
-}
-
 /// One shared concrete opener result so every backend reuses the same
 /// bounded-operation instantiation instead of specializing per file.
 pub const OpenedPost = struct {
@@ -2198,24 +2181,202 @@ pub fn openBoundedPost(
     return runBoundedHttpOperation(OpenedPost, alloc, cancel_flag, deadline, operation);
 }
 
-pub const CancelWatch = struct {
+/// Watches one provider request on its connection with the lifecycle the
+/// gateway path uses: cancellation, the caller deadline, the response-head
+/// wait, and, once the head commits, a response body that stops sending.
+/// Call `armHead` before waiting for the head, `commitHead` when it arrives,
+/// read the body through an `sse.Reader` given `progress`, pass a failed read
+/// to `failure`, and call `finish` after a complete response.
+pub const ConnectionWatch = struct {
     done: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
+    state: ConnectedRequestWatch,
 
-    pub fn start(self: *CancelWatch, cancel: *std.atomic.Value(bool), deadline: ?std.Io.Clock.Timestamp, connection: std.Io.net.Stream) !void {
-        self.done.store(false, .seq_cst);
-        self.thread = if (deadline) |limit|
-            try spawnHttpCancelWatcherBounded(&self.done, cancel, limit, connection)
-        else
-            try spawnHttpCancelWatcher(&self.done, cancel, connection);
+    pub fn init(timing: ResponseHeadTiming) ConnectionWatch {
+        return .{ .state = .init(timing) };
     }
 
-    pub fn stop(self: *CancelWatch) void {
+    /// The body stall window for a request. An agent stream, which has no
+    /// caller deadline, gets the gateway's agent window; a caller deadline
+    /// already bounds the whole request, so it gets none.
+    pub fn bodyStallTimeoutMs(deadline: ?std.Io.Clock.Timestamp) i64 {
+        if (deadline != null) return std.math.maxInt(i64);
+        if (builtin.is_test) {
+            if (test_body_stall_timeout_ms) |ms| return ms;
+        }
+        return agent_stream_stall_timeout_ms;
+    }
+
+    pub fn start(self: *ConnectionWatch, cancel: *std.atomic.Value(bool), deadline: ?std.Io.Clock.Timestamp, connection: std.Io.net.Stream) !void {
+        self.done.store(false, .seq_cst);
+        self.thread = try spawn_gateway_cancel_watcher(&self.done, cancel, null, deadline, &self.state, connection);
+    }
+
+    /// Starts the response-head wait. An error names the cause that already
+    /// ended the request.
+    pub fn armHead(self: *ConnectionWatch) ?anyerror {
+        return self.state.arm_response_head();
+    }
+
+    /// Records the head and starts timing body silence.
+    pub fn commitHead(self: *ConnectionWatch) ?anyerror {
+        return self.state.commit_response_head();
+    }
+
+    /// Progress hook for the body's `sse.Reader`. Borrows `self`.
+    pub fn progress(self: *ConnectionWatch) sse.Progress {
+        return .{ .context = &self.state, .mark_fn = markProgress };
+    }
+
+    fn markProgress(context: *anyopaque) void {
+        const state: *ConnectedRequestWatch = @ptrCast(@alignCast(context));
+        state.markStreamProgress();
+    }
+
+    /// The error to report for a failed read: the watch's own cause, such as
+    /// `error.Timeout` or `error.StreamStalled`, when it closed the
+    /// connection, otherwise `err`.
+    pub fn failure(self: *ConnectionWatch, err: anyerror) anyerror {
+        return self.state.finish_error(err);
+    }
+
+    /// Ends the watch after a complete response. Returns the watch's cause
+    /// when it closed the connection first.
+    pub fn finish(self: *ConnectionWatch) ?anyerror {
+        return self.state.finish();
+    }
+
+    pub fn stop(self: *ConnectionWatch) void {
         self.done.store(true, .seq_cst);
         if (self.thread) |thread| thread.join();
         self.thread = null;
     }
 };
+
+/// Tests shorten the agent body stall window.
+pub var test_body_stall_timeout_ms: ?i64 = null;
+
+/// Accepts one connection and sends `events` SSE data events `gap_ms` apart.
+/// Then it closes the connection when `close` is set, or holds it open
+/// without sending another byte until the test stops it.
+const SilentBodyServer = struct {
+    io_backend: std.Io.Threaded = .init_single_threaded,
+    server: std.Io.net.Server,
+    events: usize,
+    gap_ms: u64,
+    close: bool,
+    thread: ?std.Thread = null,
+    stopping: std.atomic.Value(bool) = .init(false),
+
+    fn start(self: *SilentBodyServer) !void {
+        var address = try std.Io.net.IpAddress.parse("127.0.0.1", 0);
+        self.server = try address.listen(self.io_backend.io(), .{ .reuse_address = true });
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    fn stop(self: *SilentBodyServer) void {
+        self.stopping.store(true, .seq_cst);
+        const zio = self.io_backend.io();
+        const listener = std.Io.net.Stream{ .socket = self.server.socket };
+        listener.shutdown(zio, .both) catch {};
+        if (self.thread) |thread| thread.join();
+        self.server.deinit(zio);
+    }
+
+    fn sleepMs(ms: u64) void {
+        var sleep_io: std.Io.Threaded = .init_single_threaded;
+        sleep_io.io().sleep(.fromMilliseconds(@intCast(ms)), .real) catch {};
+    }
+
+    fn run(self: *SilentBodyServer) void {
+        const zio = self.io_backend.io();
+        var stream = self.server.accept(zio) catch return;
+        defer stream.close(zio);
+        var buffer: [64]u8 = undefined;
+        var writer = stream.writer(zio, &buffer);
+        for (0..self.events) |index| {
+            if (index > 0) sleepMs(self.gap_ms);
+            if (self.stopping.load(.seq_cst)) return;
+            writer.interface.writeAll("data: x\n\n") catch return;
+            writer.interface.flush() catch return;
+        }
+        if (self.close) return;
+        while (!self.stopping.load(.seq_cst)) sleepMs(5);
+    }
+};
+
+const WatchedBody = struct { err: ?anyerror, events: usize, elapsed_ms: i64 };
+
+fn cancelAfterMs(cancel: *std.atomic.Value(bool), ms: u64) void {
+    SilentBodyServer.sleepMs(ms);
+    cancel.store(true, .seq_cst);
+}
+
+/// Reads the server's body as an agent stream would, through a
+/// `ConnectionWatch` with no caller deadline.
+fn readWatchedBody(server: *SilentBodyServer, cancel_after_ms: ?u64) !WatchedBody {
+    const zio = io_mod.getIo();
+    const address = std.Io.net.IpAddress{ .ip4 = .loopback(server.server.socket.address.getPort()) };
+    var stream = try address.connect(zio, .{ .mode = .stream });
+    defer stream.close(zio);
+    var cancel = std.atomic.Value(bool).init(false);
+    var watch: ConnectionWatch = .init(.{ .patient = true, .stall_timeout_ms = ConnectionWatch.bodyStallTimeoutMs(null) });
+    defer watch.stop();
+    try watch.start(&cancel, null, stream);
+    if (watch.armHead()) |err| return err;
+    if (watch.commitHead()) |err| return err;
+    const canceller = if (cancel_after_ms) |ms| try std.Thread.spawn(.{}, cancelAfterMs, .{ &cancel, ms }) else null;
+    defer if (canceller) |thread| thread.join();
+    var socket_buffer: [64]u8 = undefined;
+    var socket_reader = stream.reader(zio, &socket_buffer);
+    var events = sse.Reader{ .max_event_bytes = 64, .progress = watch.progress() };
+    defer events.deinit(std.testing.allocator);
+    const started = std.Io.Clock.Timestamp.now(zio, .awake);
+    var count: usize = 0;
+    const err: ?anyerror = while (true) {
+        const event = events.next(std.testing.allocator, &socket_reader.interface, &cancel) catch |err| break watch.failure(err);
+        if (event == null) break watch.finish();
+        count += 1;
+    };
+    return .{ .err = err, .events = count, .elapsed_ms = @intCast(started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds()) };
+}
+
+test "connection watch closes a body that stops sending as stalled" {
+    test_body_stall_timeout_ms = 80;
+    defer test_body_stall_timeout_ms = null;
+    var server: SilentBodyServer = .{ .server = undefined, .events = 1, .gap_ms = 0, .close = false };
+    try server.start();
+    defer server.stop();
+    const body = try readWatchedBody(&server, null);
+    try std.testing.expectEqual(@as(?anyerror, error.StreamStalled), body.err);
+    try std.testing.expectEqual(@as(usize, 1), body.events);
+    try std.testing.expect(body.elapsed_ms >= 70 and body.elapsed_ms < 2_000);
+}
+
+test "connection watch never cuts a body whose events arrive inside the window" {
+    test_body_stall_timeout_ms = 1_000;
+    defer test_body_stall_timeout_ms = null;
+    // 75 events 20 ms apart outlast the window by half, while each gap stays
+    // far inside it so a slow scheduler cannot stretch one into a stall.
+    var server: SilentBodyServer = .{ .server = undefined, .events = 75, .gap_ms = 20, .close = true };
+    try server.start();
+    defer server.stop();
+    const body = try readWatchedBody(&server, null);
+    try std.testing.expectEqual(@as(?anyerror, null), body.err);
+    try std.testing.expectEqual(@as(usize, 75), body.events);
+    try std.testing.expect(body.elapsed_ms > 1_000);
+}
+
+test "cancelling a request wins over its body stall window" {
+    test_body_stall_timeout_ms = 5_000;
+    defer test_body_stall_timeout_ms = null;
+    var server: SilentBodyServer = .{ .server = undefined, .events = 1, .gap_ms = 0, .close = false };
+    try server.start();
+    defer server.stop();
+    const body = try readWatchedBody(&server, 30);
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), body.err);
+    try std.testing.expect(body.elapsed_ms < 2_000);
+}
 
 fn spawn_gateway_cancel_watcher(
     done: *std.atomic.Value(bool),
