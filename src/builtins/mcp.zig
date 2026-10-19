@@ -13,7 +13,6 @@ const tool_dispatch = @import("../core/tooling/tool_dispatch.zig");
 const build_options = @import("build_options");
 const config_runtime = @import("../core/config/config_runtime.zig");
 const elicitation = @import("../core/mcp/elicitation.zig");
-const slack_preset = @import("../core/mcp/slack_preset.zig");
 const profile_paths = @import("../core/shared/profile_paths.zig");
 const text_utils = @import("../core/shared/text_utils.zig");
 

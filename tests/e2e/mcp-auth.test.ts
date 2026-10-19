@@ -121,38 +121,20 @@ afterEach(async () => {
 function startAuthFixture(
   upstreamUrl: string,
   options: {
-    wrongState?: boolean;
     rejectRefresh?: boolean;
     authorizationMetadataContentType?: string;
-    transport?: "http" | "sse";
-    rejectToolAuth?: boolean;
-    challengeMarkerPath?: string;
-    refreshBarrierStartedPath?: string;
-    refreshBarrierReleasePath?: string;
     stallRefresh?: boolean;
-    subscriptionChallenge?: "unauthorized" | "scope";
-    rotateOnSecondToolsPage?: boolean;
     rotateAuthorizationToken?: boolean;
     /** Appended to the access token a code is exchanged for, such as "\r\n". */
     accessTokenSuffix?: string;
-    rotateOnResourceReadCall?: number;
-    failFeatureRefreshAfterRotation?: boolean;
-    rejectResourceTemplateAuth?: boolean;
-    authorizationServerTrailingSlash?: boolean;
-    authorizationResponseIssuer?: string;
-    authorizationResponseTrailingSlash?: boolean;
     omitScopes?: boolean;
     /** The metadata's token endpoint, in place of its own. */
     tokenEndpoint?: string;
-    rejectDiscoveryWithoutChallenge?: boolean;
-    rejectDiscoveryWithRestAuthorizationDocument?: boolean;
     slackBridgeClientId?: string;
     /** fx's Slack app signs in with `http://localhost:<port>/callback`, as MCP-v2 does, not fx.sh's redirect. */
     slackLocalhostRedirect?: boolean;
     /** Answer every refresh with this status and body, such as Slack's HTTP-200 `ok:false`. */
     refreshAnswer?: { status: number; body: unknown };
-    slackBridgeStatus?: number;
-    slackBridgeScopes?: unknown;
     challengeScope?: string;
     rejectCodeExchange?: boolean;
     resourceAtOrigin?: boolean;
@@ -170,8 +152,7 @@ function startAuthFixture(
     codeBarrierReleasePath?: string;
   } = {},
 ) {
-  const transport = options.transport ?? "http";
-  const resourcePath = transport === "sse" ? "/sse" : "/mcp";
+  const resourcePath = "/mcp";
   const metadataResourcePath = (options.resourceAtOrigin ?? Boolean(options.slackBridgeClientId)) ? "" : resourcePath;
   const requests: Array<{
     method: string;
@@ -196,12 +177,8 @@ function startAuthFixture(
   let refreshCancellations = 0;
   let revocations = 0;
   let protectedToolCalls = 0;
-  let proxyStreamCancellations = 0;
   let expectedChallenge = "";
   let expectedScope = "tools.read offline_access";
-  let subscriptionRejections = 0;
-  let paginationRejections = 0;
-  let resourceReadRequests = 0;
 
   const server = Bun.serve({
     port: 0,
@@ -219,16 +196,14 @@ function startAuthFixture(
       });
       const origin = `http://127.0.0.1:${server.port}`;
       const resource = `${origin}${metadataResourcePath}`;
-      const protectedRoute = url.pathname === resourcePath ||
-        (transport === "sse" && url.pathname === "/messages");
+      const protectedRoute = url.pathname === resourcePath;
 
       if (url.pathname === "/api/slack/install/config" && options.slackBridgeClientId) {
         expect(url.searchParams.get("flow")).toBe("auth");
-        if (options.slackBridgeStatus) return new Response("unavailable", { status: options.slackBridgeStatus });
         return Response.json({
           client_id: options.slackBridgeClientId,
           redirect_uri: "https://fx.sh/api/slack/oauth/callback",
-          user_scopes: "slackBridgeScopes" in options ? options.slackBridgeScopes : ["tools.read"],
+          user_scopes: ["tools.read"],
         });
       }
 
@@ -246,154 +221,14 @@ function startAuthFixture(
           });
         }
         const message = body === "" ? null : JSON.parse(body);
-        if (
-          message?.method === "server/discover" &&
-          options.rejectDiscoveryWithoutChallenge
-        ) {
-          return new Response("", { status: 403 });
-        }
-        if (
-          message?.method === "server/discover" &&
-          options.rejectDiscoveryWithRestAuthorizationDocument
-        ) {
-          return Response.json(
-            {
-              error: 401,
-              reason: "Unauthorized",
-              detail: "You are not authorized for this resource.",
-            },
-            { status: 400 },
-          );
-        }
-        if (message?.method === "resources/read") {
-          resourceReadRequests += 1;
-          if (
-            token === ACCESS_INITIAL &&
-            resourceReadRequests === options.rotateOnResourceReadCall
-          ) {
-            return new Response("", {
-              status: 401,
-              headers: {
-                "www-authenticate":
-                  `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}", scope="tools.read"`,
-              },
-            });
-          }
-        }
-        if (
-          token === ACCESS_REFRESHED &&
-          options.failFeatureRefreshAfterRotation &&
-          [
-            "resources/list",
-            "resources/templates/list",
-            "prompts/list",
-          ].includes(message?.method)
-        ) {
-          return Response.json(
-            { error: "feature refresh failed after rotation" },
-            { status: 503 },
-          );
-        }
-        if (
-          message?.method === "resources/templates/list" &&
-          options.rejectResourceTemplateAuth
-        ) {
-          return new Response("", {
-            status: 403,
-            headers: {
-              "www-authenticate":
-                `Bearer error="insufficient_scope", scope="resources.read", resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}"`,
-            },
-          });
-        }
-        if (
-          message?.method === "subscriptions/listen" &&
-          options.subscriptionChallenge &&
-          subscriptionRejections === 0
-        ) {
-          subscriptionRejections += 1;
-          const scopeChallenge = options.subscriptionChallenge === "scope";
-          return new Response("", {
-            status: scopeChallenge ? 403 : 401,
-            headers: {
-              "www-authenticate": scopeChallenge
-                ? `Bearer error="insufficient_scope", scope="tools.call", resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}"`
-                : `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}", scope="tools.read"`,
-            },
-          });
-        }
-        if (
-          message?.method === "tools/list" &&
-          message.params?.cursor === "p2" &&
-          token === ACCESS_INITIAL &&
-          options.rotateOnSecondToolsPage &&
-          paginationRejections === 0
-        ) {
-          paginationRejections += 1;
-          return new Response("", {
-            status: 401,
-            headers: {
-              "www-authenticate":
-                `Bearer resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}", scope="tools.read"`,
-            },
-          });
-        }
-        if (message?.method === "tools/call") {
-          protectedToolCalls += 1;
-          if (options.rejectToolAuth) {
-            if (options.challengeMarkerPath) {
-              writeFileSync(
-                options.challengeMarkerPath,
-                `${message.id}\n`,
-              );
-            }
-            return new Response("", {
-              status: 403,
-              headers: {
-                "www-authenticate":
-                  `Bearer error="insufficient_scope", scope="tools.call", resource_metadata="${origin}/.well-known/oauth-protected-resource${resourcePath}"`,
-              },
-            });
-          }
-        }
-        const target = transport === "sse" && url.pathname === "/messages"
-          ? `${new URL(upstreamUrl).origin}/messages`
-          : upstreamUrl;
+        if (message?.method === "tools/call") protectedToolCalls += 1;
         const upstreamHeaders = new Headers(request.headers);
         upstreamHeaders.set("connection", "close");
-        const upstreamResponse = await fetch(target, {
+        return await fetch(upstreamUrl, {
           method: request.method,
           headers: upstreamHeaders,
           ...(body === "" ? {} : { body }),
         });
-        if (
-          transport === "sse" &&
-          request.method === "GET" &&
-          upstreamResponse.body
-        ) {
-          const reader = upstreamResponse.body.getReader();
-          return new Response(
-            new ReadableStream({
-              async pull(controller) {
-                const chunk = await reader.read();
-                if (chunk.done) {
-                  controller.close();
-                } else {
-                  controller.enqueue(chunk.value);
-                }
-              },
-              async cancel(reason) {
-                proxyStreamCancellations += 1;
-                await reader.cancel(reason);
-              },
-            }),
-            {
-              status: upstreamResponse.status,
-              headers: upstreamResponse.headers,
-            },
-          );
-        }
-        return upstreamResponse;
       }
       if (
         url.pathname ===
@@ -402,7 +237,7 @@ function startAuthFixture(
         return Response.json({
           resource,
           authorization_servers: [
-            options.authorizationServerTrailingSlash ? `${origin}/` : origin,
+            origin,
           ],
           ...(options.omitScopes
             ? {}
@@ -442,12 +277,11 @@ function startAuthFixture(
         redirect.searchParams.set("code", "fixture-code");
         redirect.searchParams.set(
           "state",
-          options.wrongState ? "wrong-state" : url.searchParams.get("state")!,
+          url.searchParams.get("state")!,
         );
         redirect.searchParams.set(
           "iss",
-          options.authorizationResponseIssuer ??
-            (options.authorizationResponseTrailingSlash ? `${origin}/` : origin),
+          origin,
         );
         return Response.redirect(redirect, 302);
       }
@@ -482,19 +316,6 @@ function startAuthFixture(
           }
           // A refused refresh is refused whichever token it presents.
           if (!options.rejectRefresh) expect(form.get("refresh_token")).toBe(REFRESH_INITIAL);
-          if (
-            refreshes === 1 &&
-            options.refreshBarrierStartedPath &&
-            options.refreshBarrierReleasePath
-          ) {
-            writeFileSync(options.refreshBarrierStartedPath, "refresh-started");
-            if (!await waitForFile(options.refreshBarrierReleasePath, 10_000)) {
-              return Response.json(
-                { error: "refresh barrier timed out" },
-                { status: 504 },
-              );
-            }
-          }
           if (options.stallRefresh && refreshes === 1) {
             return new Response(
               new ReadableStream({
@@ -565,9 +386,7 @@ function startAuthFixture(
 
   return {
     resource: `http://127.0.0.1:${server.port}${metadataResourcePath}`,
-    url: `http://127.0.0.1:${server.port}${
-      transport === "sse" ? "/sse" : "/mcp"
-    }`,
+    url: `http://127.0.0.1:${server.port}/mcp`,
     requests,
     /** The access tokens the server takes; a test may withdraw them. */
     validTokens,
@@ -592,15 +411,6 @@ function startAuthFixture(
     },
     get protectedToolCalls() {
       return protectedToolCalls;
-    },
-    get proxyStreamCancellations() {
-      return proxyStreamCancellations;
-    },
-    get subscriptionRejections() {
-      return subscriptionRejections;
-    },
-    get paginationRejections() {
-      return paginationRejections;
     },
     stop() {
       server.stop(true);

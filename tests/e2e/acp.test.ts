@@ -54,7 +54,6 @@ import {
 } from "./fixtures/mcp-modern-http";
 import {
   LEGACY_REMOTE_TOOL_RESULT,
-  LEGACY_SSE_TOOL_RESULT,
   startLegacyHttpSseFixture,
   startLegacyStreamableHttpFixture,
 } from "./fixtures/mcp-legacy-remote";
