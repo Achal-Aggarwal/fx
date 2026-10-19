@@ -1214,6 +1214,7 @@ const App = struct {
         defer if (context_targets.len > 0) self.alloc.free(context_targets);
 
         try AgentAppRuntime.refreshProjectContext(self, context_targets);
+        self.noteModelCatalogActivity();
         self.session.setConversationLanguageFromUserMessage(prompt);
 
         debug_trace.logf(
@@ -1237,6 +1238,15 @@ const App = struct {
         return true;
     }
 
+    /// A prompt the user submitted is activity, so a stale or failed model
+    /// catalog refetches in the background. Only these submission paths call
+    /// it: a recovery continuation can queue during startup, before the App
+    /// reaches the address a fetch thread may hold. Cooperative hosts fetch
+    /// inline and skip it.
+    fn noteModelCatalogActivity(self: *App) void {
+        if (comptime !host_profile.cooperative_agent) self.startModelCacheWarmup();
+    }
+
     pub fn adoptPendingUserPrompt(
         self: *App,
         draft: *const input_submit_runtime.PendingPromptDraft,
@@ -1258,6 +1268,7 @@ const App = struct {
             &.{};
         defer if (context_targets.len > 0) self.alloc.free(context_targets);
         try AgentAppRuntime.refreshProjectContext(self, context_targets);
+        self.noteModelCatalogActivity();
         self.session.setConversationLanguageFromUserMessage(draft.prompt);
 
         const skill_tokens = try promptCardSkillTokensFromDisplaySpans(
@@ -2294,7 +2305,18 @@ const App = struct {
     }
 
     pub fn startModelCacheWarmup(self: *App) void {
+        self.loadModelCatalog(.activity);
+    }
+
+    /// Opening the model picker revalidates the catalog in the background;
+    /// the picker lists the cached models until the refresh lands.
+    pub fn revalidateModelCache(self: *App) void {
+        self.loadModelCatalog(.picker_open);
+    }
+
+    fn loadModelCatalog(self: *App, trigger: model_cache_runtime.LoadTrigger) void {
         if (comptime host_profile.cooperative_agent) {
+            // Cooperative hosts fetch inline, so only stale catalogs reload there.
             if (self.auth.credentialNeedsRefresh()) {
                 debug_trace.logf("auth", "model_cache_warmup_deferred reason=credential_refresh_required", .{});
                 return;
@@ -2313,6 +2335,7 @@ const App = struct {
             self.model_cache.startWarmup(
                 self.providerSet().select(self.provider_selection.selection().provider).model_catalog orelse return,
                 self.auth.modelCatalogAccess(),
+                trigger,
             );
         }
     }

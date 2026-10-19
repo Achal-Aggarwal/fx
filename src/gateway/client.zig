@@ -264,25 +264,6 @@ pub const ProviderAttemptOwner = enum {
     agent,
 };
 
-pub fn fetchGatewayJson(
-    alloc: std.mem.Allocator,
-    api_key: ?[]const u8,
-    gateway_team: ?[]const u8,
-    url: []const u8,
-) !GatewayJsonResult {
-    var result = try fetchGatewayGetAtUrl(alloc, api_key, gateway_team, url, e2e_gateway_models_url_env);
-    if (failedGatewayJsonStatus(result.status)) |status| {
-        result.deinit(alloc);
-        return .{ .http_status = status };
-    }
-
-    return .{ .success = result.body };
-}
-
-pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const u8) !GetResult {
-    return fetchGatewayGet(alloc, api_key, null, path, e2e_gateway_credits_url_env);
-}
-
 const usage_response_max_bytes: usize = 1024 * 1024;
 const usage_request_timeout_ms: i64 = 15_000;
 
@@ -392,18 +373,13 @@ const UsageGetOperation = struct {
     }
 };
 
-fn fetchGatewayGet(alloc: std.mem.Allocator, api_key: ?[]const u8, gateway_team: ?[]const u8, path: []const u8, e2e_url_env: []const u8) !GetResult {
+pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const u8) !GetResult {
     const default_url = try alloc.print("{s}{s}", .{ gatewayBaseUrl(), path });
     defer alloc.free(default_url);
+    const url = try resolveE2eGatewayUrl(e2e_gateway_credits_url_env, default_url);
 
-    return fetchGatewayGetAtUrl(alloc, api_key, gateway_team, default_url, e2e_url_env);
-}
-
-fn fetchGatewayGetAtUrl(alloc: std.mem.Allocator, api_key: ?[]const u8, gateway_team: ?[]const u8, default_url: []const u8, e2e_url_env: []const u8) !GetResult {
     var client: std.http.Client = .{ .allocator = alloc, .io = io_mod.getIo() };
     defer client.deinit();
-
-    const url = try resolveE2eGatewayUrl(e2e_url_env, default_url);
 
     var auth_header: ?[]u8 = null;
     defer if (auth_header) |value| secret.zeroAndFree(alloc, value);
@@ -414,8 +390,6 @@ fn fetchGatewayGetAtUrl(alloc: std.mem.Allocator, api_key: ?[]const u8, gateway_
         auth_header = try alloc.print("Bearer {s}", .{key});
         headers.authorization = .{ .override = auth_header.? };
     }
-    var extra_headers_buf: [1]std.http.Header = undefined;
-    const extra_headers = gatewayModelCatalogExtraHeaders(&extra_headers_buf, gateway_team);
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
@@ -424,7 +398,6 @@ fn fetchGatewayGetAtUrl(alloc: std.mem.Allocator, api_key: ?[]const u8, gateway_
         .location = .{ .url = url },
         .method = .GET,
         .headers = headers,
-        .extra_headers = extra_headers,
         .response_writer = &out.writer,
         .redirect_behavior = .unhandled,
     });
@@ -445,8 +418,12 @@ pub fn fetchGatewayJsonCancellable(
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
 
     const request_url = try resolveE2eGatewayUrl(e2e_gateway_models_url_env, url);
-    return fetchGatewayJsonAtUrlCancellable(alloc, api_key, gateway_team, request_url, cancel_flag);
+    return fetchGatewayJsonAtUrlCancellable(alloc, api_key, gateway_team, request_url, cancel_flag, gateway_json_fetch_timeout_ms);
 }
+
+/// A stalled catalog request fails with `error.Timeout` after this long, so a
+/// hung endpoint cannot hold a background refresh or an ACP options request.
+const gateway_json_fetch_timeout_ms: i64 = 30_000;
 
 fn fetchGatewayJsonAtUrlCancellable(
     alloc: std.mem.Allocator,
@@ -454,6 +431,7 @@ fn fetchGatewayJsonAtUrlCancellable(
     gateway_team: ?[]const u8,
     url: []const u8,
     cancel_flag: *std.atomic.Value(bool),
+    timeout_ms: i64,
 ) !GatewayJsonResult {
     var operation = GatewayJsonFetchOperation{
         .alloc = alloc,
@@ -462,7 +440,11 @@ fn fetchGatewayJsonAtUrlCancellable(
         .url = url,
         .cancel_flag = cancel_flag,
     };
-    return runCancellableGatewayJsonFetch(alloc, cancel_flag, &operation);
+    const deadline = std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), .{
+        .clock = .awake,
+        .raw = .fromMilliseconds(timeout_ms),
+    });
+    return runBoundedHttpOperation(GatewayJsonResult, alloc, cancel_flag, deadline, &operation);
 }
 
 const GatewayJsonFetchOperation = struct {
@@ -482,66 +464,6 @@ const GatewayJsonFetchOperation = struct {
         );
     }
 };
-
-fn runCancellableGatewayJsonFetch(
-    alloc: std.mem.Allocator,
-    cancel_flag: *std.atomic.Value(bool),
-    operation: *GatewayJsonFetchOperation,
-) !GatewayJsonResult {
-    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-
-    const Event = union(enum) {
-        request: anyerror!GatewayJsonResult,
-        watch: anyerror!select_watch.Outcome,
-    };
-    const Runner = struct {
-        fn run(value: *GatewayJsonFetchOperation) anyerror!GatewayJsonResult {
-            return value.run();
-        }
-    };
-    const Cleanup = struct {
-        fn drain(result_alloc: std.mem.Allocator, select: *std.Io.Select(Event), watch: *BoundedRequestWatch) void {
-            watch.stop(select.io);
-            while (select.cancel()) |item| switch (item) {
-                .request => |request_result| {
-                    var late_result = request_result catch continue;
-                    late_result.deinit(result_alloc);
-                },
-                .watch => {},
-            };
-        }
-    };
-
-    var watch: BoundedRequestWatch = .{};
-    var select_buffer: [2]Event = undefined;
-    var select: std.Io.Select(Event) = .init(io_mod.getIo(), &select_buffer);
-    select.concurrent(.watch, BoundedRequestWatch.run, .{ &watch, select.io, RequestCondition{ .cancel_flag = cancel_flag, .deadline = null } }) catch |err| return err;
-    select.concurrent(.request, Runner.run, .{operation}) catch |err| {
-        watch.finish(&select);
-        return err;
-    };
-
-    const event = select.await() catch |err| {
-        Cleanup.drain(alloc, &select, &watch);
-        return err;
-    };
-    switch (event) {
-        .request => |request_result| {
-            watch.finish(&select);
-            if (cancel_flag.load(.seq_cst)) {
-                var result = request_result catch return error.Cancelled;
-                result.deinit(alloc);
-                return error.Cancelled;
-            }
-            return request_result;
-        },
-        .watch => |watch_result| {
-            Cleanup.drain(alloc, &select, &watch);
-            _ = try watch_result;
-            return error.Cancelled;
-        },
-    }
-}
 
 fn fetchGatewayJsonAtUrlCore(
     alloc: std.mem.Allocator,
@@ -612,16 +534,42 @@ fn fetchGatewayJsonAtUrlCore(
     if (cancel_flag.load(.seq_cst)) return error.Cancelled;
     if (failedGatewayJsonStatus(response.head.status)) |status| return .{ .http_status = status };
 
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
     var transfer_buffer: [64 * 1024]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
-    _ = reader.streamRemaining(&out.writer) catch |err| {
+    const body = readGatewayJsonBody(alloc, response.reader(&transfer_buffer), max_gateway_json_bytes) catch |err| {
         if (cancel_flag.load(.seq_cst)) return error.Cancelled;
         return err;
     };
-    if (cancel_flag.load(.seq_cst)) return error.Cancelled;
-    return .{ .success = try out.toOwnedSlice() };
+    if (cancel_flag.load(.seq_cst)) {
+        alloc.free(body);
+        return error.Cancelled;
+    }
+    return .{ .success = body };
+}
+
+/// About fifty times today's model catalog. A larger response fails rather
+/// than growing memory without bound.
+const max_gateway_json_bytes: usize = 16 * 1024 * 1024;
+
+/// Returns the caller-owned body, or `error.GatewayJsonResponseTooLarge` when
+/// it exceeds `max_bytes`.
+fn readGatewayJsonBody(alloc: std.mem.Allocator, reader: *std.Io.Reader, max_bytes: usize) ![]u8 {
+    return reader.allocRemaining(alloc, .limited(max_bytes)) catch |err| switch (err) {
+        error.StreamTooLong => error.GatewayJsonResponseTooLarge,
+        else => |e| e,
+    };
+}
+
+test "gateway JSON bodies past the size cap fail instead of growing" {
+    var at_cap = std.Io.Reader.fixed("12345678");
+    const body = try readGatewayJsonBody(std.testing.allocator, &at_cap, 8);
+    defer std.testing.allocator.free(body);
+    try std.testing.expectEqualStrings("12345678", body);
+
+    var over_cap = std.Io.Reader.fixed("123456789");
+    try std.testing.expectError(
+        error.GatewayJsonResponseTooLarge,
+        readGatewayJsonBody(std.testing.allocator, &over_cap, 8),
+    );
 }
 
 fn failedGatewayJsonStatus(status: std.http.Status) ?std.http.Status {
@@ -2093,16 +2041,15 @@ pub fn runBoundedHttpOperation(
 /// wins, as `select_watch` explains.
 const RequestCondition = struct {
     cancel_flag: *std.atomic.Value(bool),
-    deadline: ?std.Io.Clock.Timestamp,
+    deadline: std.Io.Clock.Timestamp,
 
     pub fn cancelled(condition: RequestCondition) bool {
         return condition.cancel_flag.load(.seq_cst);
     }
 
     pub fn expired(condition: RequestCondition, io: std.Io) bool {
-        const limit = condition.deadline orelse return false;
         const now = std.Io.Clock.Timestamp.now(io, .awake);
-        return !std.Io.Clock.Timestamp.compare(now, .lt, limit);
+        return !std.Io.Clock.Timestamp.compare(now, .lt, condition.deadline);
     }
 };
 
@@ -8195,7 +8142,7 @@ fn expectCancellableGatewayJsonCancellation(
 
     const started = std.Io.Clock.Timestamp.now(zio, .awake);
     const result = if (use_tls)
-        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, api_key, null, models_url, &cancel_flag)
+        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, api_key, null, models_url, &cancel_flag, gateway_json_fetch_timeout_ms)
     else
         fetchGatewayJsonCancellable(std.testing.allocator, api_key, null, "https://ai-gateway.vercel.sh/v1/models", &cancel_flag);
     const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
@@ -8208,6 +8155,26 @@ fn expectCancellableGatewayJsonCancellation(
 
 test "cancellable gateway JSON request closes a held response head" {
     try expectCancellableGatewayJsonCancellation(.response_head_stall, "test-key", false, 20, 800, 500);
+}
+
+test "cancellable gateway JSON request times out a held response head" {
+    const zio = io_mod.getIo();
+    var fixture = try LoopbackGatewayFixture.init(.response_head_stall, 2000);
+    defer fixture.deinit();
+    try fixture.start();
+    try std.testing.expect(fixture.waitForAcceptStart(5000));
+    const models_url = try std.testing.allocator.print("http://127.0.0.1:{d}/v1/models", .{fixture.port()});
+    defer std.testing.allocator.free(models_url);
+
+    var cancel_flag = std.atomic.Value(bool).init(false);
+    const started = std.Io.Clock.Timestamp.now(zio, .awake);
+    try std.testing.expectError(
+        error.Timeout,
+        fetchGatewayJsonAtUrlCancellable(std.testing.allocator, "test-key", null, models_url, &cancel_flag, 100),
+    );
+    const elapsed_ms = started.durationTo(std.Io.Clock.Timestamp.now(zio, .awake)).raw.toMilliseconds();
+    try std.testing.expect(elapsed_ms < 1500);
+    if (fixture.failure) |err| return err;
 }
 
 test "cancellable gateway JSON request closes a stalled request send" {
