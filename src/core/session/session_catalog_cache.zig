@@ -20,8 +20,6 @@ const text_utils = @import("../shared/text_utils.zig");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
-// v6 stores the disposable row payload in a bounded binary encoding. Every
-// older format remains a cache miss and is rebuilt from canonical sessions.
 const magic = "fx-resume-catalog-v6\n";
 const file_name = ".resume-catalog";
 const max_bytes = 64 * 1024 * 1024;
@@ -30,10 +28,6 @@ const Fingerprint = [Sha256.digest_length]u8;
 
 const Entry = struct {
     value: union(enum) { visible: session_store.SessionSummary, excluded: []u8 },
-    /// A stale schema-v3 projection whose committed log failed to replay in
-    /// this listing: listed from its manifest. The failure may be transient,
-    /// so the row is never cached and every listing checks it again.
-    unreplayable: bool = false,
 
     pub fn deinit(self: *Entry, alloc: Allocator) void {
         switch (self.value) {
@@ -57,10 +51,8 @@ const Summary = struct {
     has_checkpoint: bool,
     has_managed_children: bool,
 
-    /// The row contract `load` enforces. Discovery can report a summary
-    /// outside it, such as a legacy session whose clock stepped back, and one
-    /// such row would make `load` reject the whole file, so the catalog lists
-    /// that session without caching it.
+    /// The row contract `decodeRows` enforces: one row outside it rejects
+    /// the whole file.
     fn persistable(self: Summary) bool {
         if (self.created_at_ms < 0 or self.updated_at_ms < self.created_at_ms) return false;
         if (!std.unicode.utf8ValidateSlice(self.language)) return false;
@@ -107,7 +99,7 @@ const Row = struct {
 };
 
 /// Owns parsed cache bytes. Reused entries are separately owned by the caller.
-pub const Loaded = struct {
+const Loaded = struct {
     bytes: ?[]u8 = null,
     parsed: ?[]Row = null,
     index: std.StringHashMapUnmanaged(usize) = .empty,
@@ -119,10 +111,10 @@ pub const Loaded = struct {
         self.* = .{};
     }
 
-    pub fn load(alloc: Allocator, dir: ?io_mod.VerifiedDir, cancelled: ?*const std.atomic.Value(bool)) !Loaded {
+    pub fn load(alloc: Allocator, dir: ?io_mod.VerifiedDir) !Loaded {
         const root = dir orelse return .{};
-        return loadChecked(alloc, root.dir, cancelled) catch |err| switch (err) {
-            error.OutOfMemory, error.Cancelled => return err,
+        return loadChecked(alloc, root.dir) catch |err| switch (err) {
+            error.OutOfMemory => return err,
             error.FileNotFound => .{},
             else => blk: {
                 debug_trace.logf("core", "session catalog cache ignored err={s}", .{@errorName(err)});
@@ -131,7 +123,7 @@ pub const Loaded = struct {
         };
     }
 
-    fn loadChecked(alloc: Allocator, dir: std.Io.Dir, cancelled: ?*const std.atomic.Value(bool)) !Loaded {
+    fn loadChecked(alloc: Allocator, dir: std.Io.Dir) !Loaded {
         // Opening a FIFO or device for reading can block, so the helper checks
         // the entry and opens it without blocking before any read.
         var file = try io_mod.openExistingRegularFile(dir, file_name, .read_only);
@@ -142,7 +134,6 @@ pub const Loaded = struct {
         errdefer alloc.free(bytes);
         var offset: usize = 0;
         while (offset < bytes.len) {
-            if (cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
             const end = @min(bytes.len, offset + 64 * 1024);
             const read = try file.readPositionalAll(io_mod.getIo(), bytes[offset..end], offset);
             if (read != end - offset) return error.InvalidCatalogCache;
@@ -153,13 +144,12 @@ pub const Loaded = struct {
         var digest: Fingerprint = undefined;
         Sha256.hash(payload, &digest, .{});
         if (!std.mem.eql(u8, &digest, bytes[magic.len..][0..Sha256.digest_length])) return error.InvalidCatalogCache;
-        const rows = try decodeRows(alloc, payload, cancelled);
+        const rows = try decodeRows(alloc, payload);
         errdefer alloc.free(rows);
         var index: std.StringHashMapUnmanaged(usize) = .empty;
         errdefer index.deinit(alloc);
         try index.ensureTotalCapacity(alloc, @intCast(rows.len));
         for (rows, 0..) |row, i| {
-            if (cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
             const entry = index.getOrPutAssumeCapacity(row.id);
             if (entry.found_existing) return error.InvalidCatalogCache;
             entry.value_ptr.* = i;
@@ -186,18 +176,13 @@ pub const Loaded = struct {
     }
 };
 
-fn decodeRows(
-    alloc: Allocator,
-    payload: []const u8,
-    cancelled: ?*const std.atomic.Value(bool),
-) ![]Row {
+fn decodeRows(alloc: Allocator, payload: []const u8) ![]Row {
     var cursor = ByteCursor{ .bytes = payload };
     const count = try cursor.readInt(u32);
     if (count > max_records) return error.InvalidCatalogCache;
     const rows = try alloc.alloc(Row, count);
     errdefer alloc.free(rows);
     for (rows) |*row| {
-        if (cancelled) |stop| if (stop.load(.acquire)) return error.Cancelled;
         const id = try cursor.readString();
         session_layout.validateSessionId(id) catch return error.InvalidCatalogCache;
         const raw_fingerprint = try cursor.take(@sizeOf(Fingerprint));
@@ -337,10 +322,6 @@ fn addStat(hash: *Sha256, stat: std.Io.File.Stat) void {
 pub const ActionableSessionCatalog = struct {
     summaries: std.ArrayList(session_store.SessionSummary) = .empty,
     skipped_invalid: usize = 0,
-    /// Owned ids of listed sessions whose stale schema-v3 log failed to replay
-    /// in this listing. Such rows are never cached, so every listing observes
-    /// them afresh.
-    unreplayable_ids: std.ArrayList([]u8) = .empty,
     /// Owned ids of the sessions counted in `skipped_invalid`, which v2's
     /// listing still shows until they are converted or refused (D59).
     invalid_ids: std.ArrayList([]u8) = .empty,
@@ -348,8 +329,6 @@ pub const ActionableSessionCatalog = struct {
     pub fn deinit(self: *ActionableSessionCatalog, alloc: Allocator) void {
         for (self.summaries.items) |*summary| summary.deinit(alloc);
         self.summaries.deinit(alloc);
-        for (self.unreplayable_ids.items) |id| alloc.free(id);
-        self.unreplayable_ids.deinit(alloc);
         for (self.invalid_ids.items) |id| alloc.free(id);
         self.invalid_ids.deinit(alloc);
         self.* = undefined;
@@ -402,16 +381,14 @@ const CatalogWorker = struct {
                     continue;
                 }
             }
-            var fenced = false;
             var candidate = self.read.store.readOnlyCandidate(self.alloc, id, self.read.cancelled) catch |err| switch (err) {
                 error.OutOfMemory, error.Cancelled => return err,
                 else => fallback: {
                     // A legacy upgrade interrupted mid-rename stays listed from
                     // its stable snapshot, so resuming it can run recovery.
-                    if (self.read.store.readOnlyFencedLegacyCandidate(self.alloc, id, self.read.cancelled)) |value| {
-                        fenced = true;
-                        break :fallback value;
-                    } else |fallback_err| switch (fallback_err) {
+                    if (self.read.store.readOnlyFencedLegacyCandidate(self.alloc, id, self.read.cancelled)) |value|
+                        break :fallback value
+                    else |fallback_err| switch (fallback_err) {
                         error.OutOfMemory, error.Cancelled => return fallback_err,
                         else => {},
                     }
@@ -436,10 +413,7 @@ const CatalogWorker = struct {
                 // child.
                 else => false,
             };
-            var entry = Entry{
-                .value = if (managed) .{ .excluded = try self.alloc.dupe(u8, id) } else .{ .visible = candidate.summary },
-                .unreplayable = !fenced and candidate.storage == .schema_v3 and candidate.projection_state == .stale,
-            };
+            var entry = Entry{ .value = if (managed) .{ .excluded = try self.alloc.dupe(u8, id) } else .{ .visible = candidate.summary } };
             if (!managed) owned = false;
             errdefer entry.deinit(self.alloc);
             try self.entries.append(self.alloc, entry);
@@ -459,7 +433,7 @@ pub fn listActionableCatalog(
     // A worker that fails stops the others.
     var stop = std.atomic.Value(bool).init(false);
     const stop_requested = &stop;
-    var cached = try Loaded.load(std.heap.c_allocator, store.canonical_root.sessions, stop_requested);
+    var cached = try Loaded.load(std.heap.c_allocator, store.canonical_root.sessions);
     defer cached.deinit(std.heap.c_allocator);
     var read = CatalogRead{ .store = store, .candidates = store.readOnlyCandidates(), .active_id = active_id, .cancelled = stop_requested, .cache = &cached };
     // Worker storage is independent of the caller's allocator and ends after the merge.
@@ -514,11 +488,6 @@ pub fn listActionableCatalog(
         switch (entry.value) {
             .visible => |summary| {
                 if (active_id) |active| if (std.mem.eql(u8, active, summary.id)) continue;
-                if (entry.unreplayable) {
-                    const unreplayable_id = try alloc.dupe(u8, summary.id);
-                    errdefer alloc.free(unreplayable_id);
-                    try catalog.unreplayable_ids.append(alloc, unreplayable_id);
-                }
                 var copy = try summary_codec.cloneSessionSummary(alloc, summary);
                 errdefer copy.deinit(alloc);
                 try catalog.summaries.append(alloc, copy);
@@ -546,7 +515,7 @@ test "catalog cache ignores a FIFO without blocking" {
     var dir = io_mod.VerifiedDir{ .dir = try tmp.dir.openDir(std.testing.io, ".", .{ .iterate = true, .follow_symlinks = false }) };
     defer dir.close();
     // Reading a FIFO waits for a writer that never comes; the index is ignored.
-    var loaded = try Loaded.load(alloc, dir, null);
+    var loaded = try Loaded.load(alloc, dir);
     defer loaded.deinit(alloc);
     try std.testing.expect(loaded.parsed == null);
 }
@@ -566,7 +535,7 @@ test "catalog rows reject a v5 JSON payload relabelled v6" {
     try bytes.writer.writeAll(&digest);
     try bytes.writer.writeAll(payload);
     try io_mod.durableReplaceVerified(alloc, &dir, file_name, bytes.written());
-    var loaded = try Loaded.load(alloc, dir, null);
+    var loaded = try Loaded.load(alloc, dir);
     defer loaded.deinit(alloc);
     try std.testing.expect(loaded.parsed == null);
 }

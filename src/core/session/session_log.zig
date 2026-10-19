@@ -1,6 +1,5 @@
 const std = @import("std");
 const testing_allocator = @import("../shared/testing_allocator.zig");
-const builtin = @import("builtin");
 const debug_trace = @import("../shared/debug_trace.zig");
 const io_mod = @import("../shared/io.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
@@ -22,7 +21,6 @@ const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
 const Allocator = std.mem.Allocator;
 const Identifier = session_event.Identifier;
 const private_dir_permissions = std.Io.File.Permissions.fromMode(0o700);
-const lock_deadline_ms: u64 = 2000;
 /// Real first events stay under 2 KiB; this leaves room for two maximum-length
 /// workspace paths while keeping listing reads independent of log size.
 const listed_first_event_max_bytes: usize = 16 * 1024;
@@ -109,25 +107,22 @@ test "conversation cut counts standalone text without changing steering prefixes
     try std.testing.expectEqual(@as(usize, 1), steering.point.steering);
 }
 
-pub const ConversationWriter = struct {
+/// What a replay of a v1 conversation log has seen so far.
+const ReplayState = struct {
     alloc: Allocator,
-    file: std.Io.File,
-    committed_bytes: u64 = 0,
     last_seq: u64 = 0,
     latest_checkpoint_coverage: u64 = 0,
     turn_open: bool = false,
     pending_tool_calls: std.ArrayList(session_event.PendingToolCall) = .empty,
-    failure: ?error{ SessionWriterChanged, SessionPersistenceUncertain, SessionCommitFailed } = null,
-    test_sync_ops: if (builtin.is_test) io_mod.DurableOps else void = if (builtin.is_test) .{} else {},
 
-    fn pendingIndex(self: *const ConversationWriter, call_id: []const u8) ?usize {
+    fn pendingIndex(self: *const ReplayState, call_id: []const u8) ?usize {
         for (self.pending_tool_calls.items, 0..) |pending, index| {
             if (std.mem.eql(u8, pending.call_id, call_id)) return index;
         }
         return null;
     }
 
-    fn clearPendingToolCalls(self: *ConversationWriter) void {
+    fn clearPendingToolCalls(self: *ReplayState) void {
         for (self.pending_tool_calls.items) |pending| {
             self.alloc.free(@constCast(pending.call_id));
             self.alloc.free(@constCast(pending.tool_name));
@@ -136,7 +131,7 @@ pub const ConversationWriter = struct {
     }
 
     fn applyReplayedEvent(
-        self: *ConversationWriter,
+        self: *ReplayState,
         seq: u64,
         event: session_event.ConversationEvent,
     ) !void {
@@ -434,7 +429,7 @@ fn scan_conversation_recovery(
     const file = reader.file;
     const length = reader.length;
     reader.length = 0;
-    var state = ConversationWriter{ .alloc = alloc, .file = file };
+    var state = ReplayState{ .alloc = alloc };
     defer {
         state.clearPendingToolCalls();
         state.pending_tool_calls.deinit(alloc);
@@ -933,7 +928,7 @@ fn replayConversationHistory(
 
 /// Reads complete canonical turns while retaining only the turn being built.
 /// Each returned turn is owned by the caller.
-pub const ConversationHistoryReader = struct {
+const ConversationHistoryReader = struct {
     alloc: Allocator,
     file: std.Io.File,
     reader: std.Io.File.Reader,
@@ -2141,25 +2136,6 @@ test "root init rejects symlinked durable and sessions roots" {
     }
 }
 
-fn testState(alloc: Allocator, id: []const u8, updated_at_ms: i64) !session_codec.DurableSessionState {
-    return .{
-        .id = try alloc.dupe(u8, id),
-        .origin_workspace_root = try alloc.dupe(u8, "/tmp/fx-plan-03"),
-        .workspace_root = try alloc.dupe(u8, "/tmp/fx-plan-03"),
-        .created_at_ms = 10,
-        .updated_at_ms = updated_at_ms,
-        .conversation_language = session.ConversationLanguage.literal("en"),
-        .preferences = .{
-            .model = try alloc.dupe(u8, "test/model"),
-            .effort = types.ReasoningEffort.literal("high"),
-            .fast_mode = false,
-        },
-        .history = &.{},
-        .total_input_tokens = 0,
-        .total_output_tokens = 0,
-    };
-}
-
 test "legacy import file projection cleans up allocation failures" {
     const Check = struct {
         fn run(alloc: Allocator) !void {
@@ -2237,19 +2213,4 @@ test "takeExecution frees provider replay on allocation failure" {
             try std.testing.expectEqual(@as(usize, 1), execution.files.len);
         }
     }.run, .{standalone_response});
-}
-
-/// Duplicates a history so it outlives the resumed session it came from.
-fn dupeHistory(alloc: Allocator, history: []const session.HistoryTurn) ![]session.HistoryTurn {
-    const copy = try alloc.alloc(session.HistoryTurn, history.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (copy[0..initialized]) |turn| session.freeHistoryTurn(alloc, turn);
-        alloc.free(copy);
-    }
-    for (history, 0..) |turn, index| {
-        copy[index] = try session.dupeHistoryTurn(alloc, turn);
-        initialized += 1;
-    }
-    return copy;
 }

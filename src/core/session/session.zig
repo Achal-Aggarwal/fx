@@ -1501,8 +1501,8 @@ pub const SessionRuntime = struct {
         self.permission_state.deinit(alloc);
     }
 
-    /// As `configureWebFetchArtifacts`, for a v2 session, whose downloads
-    /// are its blobs (D44, D49).
+    /// Keeps a v2 session's web-fetch downloads as its blobs (D44, D49), or
+    /// records why they can't be kept.
     pub fn configureWebFetchArtifactBlobs(
         self: *SessionRuntime,
         alloc: Allocator,

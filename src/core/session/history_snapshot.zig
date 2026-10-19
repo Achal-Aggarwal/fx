@@ -33,8 +33,6 @@ const debug_trace = @import("../shared/debug_trace.zig");
 
 const Allocator = std.mem.Allocator;
 
-const private_file_permissions = std.Io.File.Permissions.fromMode(0o600);
-
 pub const file_name = "history-cache.bin";
 
 const magic = "fx-history-cache\x1a\n"; // 18 bytes; all offsets use magic.len
@@ -55,7 +53,6 @@ const max_frames: usize = 4 * 1024 * 1024;
 // mis-encode a newly introduced field type.
 // ---------------------------------------------------------------------------
 
-const EncodeError = error{ OutOfMemory, PayloadTooLarge };
 const DecodeError = error{ InvalidCache, OutOfMemory };
 
 const ByteCursor = struct {

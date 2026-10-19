@@ -27,7 +27,6 @@ const execution_memory = @import("../agent/execution_memory.zig");
 const gateway_error_format = @import("../shared/gateway_error_format.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const mem_utils = @import("../shared/mem_utils.zig");
-const io_mod = @import("../shared/io.zig");
 const types = @import("../shared/types.zig");
 const diff_mod = @import("../output/diff.zig");
 const domain = @import("domain.zig");

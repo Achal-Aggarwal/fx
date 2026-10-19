@@ -37,7 +37,6 @@ const LegacyStoredSession = migration.LegacyStoredSession;
 const legacyToDurableState = migration.legacyToDurableState;
 const loadSchemaV3ReadOnly = migration.loadSchemaV3ReadOnly;
 const normalizeWorkspaceRoot = paths.normalizeWorkspaceRoot;
-pub const sessionDirPath = paths.sessionDirPath;
 const sessionJsonPath = paths.sessionJsonPath;
 pub const validateSessionId = paths.validateSessionId;
 pub const generateSessionId = paths.generateSessionId;
@@ -264,7 +263,7 @@ pub const Store = struct {
     ) !?session_child_store.SessionChildCapability {
         var session_dir = try self.openSessionDir(session_id);
         defer session_dir.close();
-        const display = try sessionDirPath(alloc, self.sessions_dir, session_id);
+        const display = try paths.sessionDirPath(alloc, self.sessions_dir, session_id);
         defer alloc.free(display);
         return session_child_store.SessionChildCapability.initLegacySubagentControl(alloc, session_dir.dir, display);
     }
@@ -583,7 +582,7 @@ pub const Store = struct {
             self.sessions_dir,
             session_id,
         );
-        const source_dir_path = try sessionDirPath(
+        const source_dir_path = try paths.sessionDirPath(
             alloc,
             self.sessions_dir,
             session_id,
@@ -641,7 +640,7 @@ fn resolveSessionSnapshotLocators(
     sessions_dir: []const u8,
     session_id: []const u8,
 ) !void {
-    const session_dir = try sessionDirPath(alloc, sessions_dir, session_id);
+    const session_dir = try paths.sessionDirPath(alloc, sessions_dir, session_id);
     defer alloc.free(session_dir);
     const image_dir = try std.Io.Dir.path.join(alloc, &.{ session_dir, "images" });
     defer alloc.free(image_dir);
@@ -985,7 +984,7 @@ fn initTempStore(alloc: Allocator, tmp: *std.testing.TmpDir) !TempStore {
 }
 
 fn makeSessionDir(alloc: Allocator, store: Store, id: []const u8) !void {
-    const dir = try sessionDirPath(alloc, store.sessions_dir, id);
+    const dir = try paths.sessionDirPath(alloc, store.sessions_dir, id);
     defer alloc.free(dir);
     try config_runtime.makeAbsolutePath(dir);
 }
@@ -1035,22 +1034,6 @@ fn writeLegacyFixture(
     }
     const path = try writeSessionFixture(alloc, store, id, text);
     alloc.free(path);
-}
-
-fn readFixtureFile(
-    alloc: Allocator,
-    store: Store,
-    id: []const u8,
-    name: []const u8,
-    max_bytes: usize,
-) ![]u8 {
-    const session_dir = try sessionDirPath(alloc, store.sessions_dir, id);
-    defer alloc.free(session_dir);
-    const path = try std.Io.Dir.path.join(alloc, &.{ session_dir, name });
-    defer alloc.free(path);
-    var file = try std.Io.Dir.openFileAbsolute(io_mod.getIo(), path, .{});
-    defer file.close(io_mod.getIo());
-    return io_mod.readFileToEnd(alloc, &file, max_bytes);
 }
 
 test "missing session ID error and unsupported schema error" {
@@ -1113,7 +1096,7 @@ test "exact legacy read does not create state" {
     var loaded = try ctx.store.loadReadOnly(alloc, "legacy-detail");
     defer loaded.deinit(alloc);
     try std.testing.expectEqualStrings("legacy-detail", loaded.id);
-    const session_dir = try sessionDirPath(
+    const session_dir = try paths.sessionDirPath(
         alloc,
         ctx.store.sessions_dir,
         "legacy-detail",

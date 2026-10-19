@@ -595,7 +595,7 @@ pub fn storageFormatForLegacy(
 }
 
 /// Emits one structured discovery trace line. Pure logging; never fails.
-pub fn logDiscovery(
+fn logDiscovery(
     mode: DiscoveryMode,
     session_id: []const u8,
     storage: ?CandidateStorage,

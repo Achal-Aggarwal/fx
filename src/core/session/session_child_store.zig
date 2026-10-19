@@ -235,7 +235,6 @@ const CapabilityImpl = struct {
     terminal_dir: ?io_mod.VerifiedDir = null,
     display_session_path: []u8,
     legacy_direct_kind: ?ManagedChildKind = null,
-    legacy_background_root: bool = false,
     legacy_display_route: ?[]u8 = null,
     replace_ops: io_mod.DurableOps,
     lock_ops: io_mod.LockOps,
@@ -290,16 +289,6 @@ const CapabilityImpl = struct {
         if (self.legacy_direct_kind) |direct_kind| {
             if (kind != direct_kind) return error.SessionChildStoreFailed;
             return self.directRoute(kind);
-        }
-        if (self.legacy_background_root) {
-            return switch (kind) {
-                .background_records => &self.background_records.?,
-                .background_logs => if (self.background_logs) |*managed_route|
-                    managed_route
-                else
-                    null,
-                else => error.SessionChildStoreFailed,
-            };
         }
         // A v2 capability has no side folder: its bodies are blobs (D48),
         // and its terminal state lives in its terminal folder (D45).
@@ -523,19 +512,6 @@ const CapabilityImpl = struct {
     ) ![]u8 {
         if (self.legacy_direct_kind == kind) {
             return alloc.dupe(u8, self.legacy_display_route.?);
-        }
-        if (self.legacy_background_root) {
-            return switch (kind) {
-                .background_records => alloc.dupe(
-                    u8,
-                    self.legacy_display_route.?,
-                ),
-                .background_logs => std.Io.Dir.path.join(
-                    alloc,
-                    &.{ self.legacy_display_route.?, "logs" },
-                ),
-                else => error.SessionChildStoreFailed,
-            };
         }
         return switch (kind) {
             .background_records => std.Io.Dir.path.join(
@@ -1096,11 +1072,7 @@ pub const SessionChildCapability = struct {
         self: *const SessionChildCapability,
         alloc: Allocator,
     ) !SessionChildCapability {
-        if (self.impl.legacy_direct_kind != null or
-            self.impl.legacy_background_root)
-        {
-            return error.SessionChildStoreFailed;
-        }
+        if (self.impl.legacy_direct_kind != null) return error.SessionChildStoreFailed;
         var cloned = if (self.impl.blobs) |blobs|
             try initBlobs(alloc, blobs, self.impl.display_session_path, .read_only)
         else

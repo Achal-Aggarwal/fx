@@ -1267,7 +1267,7 @@ pub fn cloneVerifiedImageAttachment(
     );
 }
 
-pub fn copyVerifiedImageAttachmentToDir(
+fn copyVerifiedImageAttachmentToDir(
     alloc: std.mem.Allocator,
     attachment: types.ImageAttachment,
     new_id: usize,

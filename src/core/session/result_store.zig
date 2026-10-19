@@ -16,7 +16,7 @@ pub const preview_bytes: usize = 4 * 1024;
 pub const read_default_bytes: usize = 8 * 1024;
 pub const read_max_bytes: usize = 64 * 1024;
 pub const full_read_chunk_bytes: usize = 64 * 1024;
-pub const stored_text_max_bytes: usize = 8 * 1024 * 1024;
+const stored_text_max_bytes: usize = 8 * 1024 * 1024;
 
 pub const PreparedResult = struct {
     model_output: []const u8,
@@ -318,7 +318,7 @@ pub fn storeLargeResultManaged(
 /// Bound on one serialized diff content pack (previous + after snapshots of
 /// a committed file edit). Oversized packs stay inline and the enclosing
 /// record's own size guard covers them.
-pub const diff_content_max_bytes: usize = 2 * stored_text_max_bytes;
+const diff_content_max_bytes: usize = 2 * stored_text_max_bytes;
 
 /// Restored previous/after contents of a committed file presentation.
 /// The caller owns both slices; release with deinit.
@@ -347,7 +347,7 @@ fn isLowerHex(bytes: []const u8) bool {
     return true;
 }
 
-pub fn isDiffContentHandle(handle: []const u8) bool {
+fn isDiffContentHandle(handle: []const u8) bool {
     if (handle.len != diff_content_handle_bytes or
         !std.mem.startsWith(u8, handle, diff_content_handle_prefix) or
         !std.mem.endsWith(u8, handle, diff_content_handle_suffix))
@@ -363,7 +363,7 @@ pub fn isDiffContentHandle(handle: []const u8) bool {
         isLowerHex(handle[content_start..content_end]);
 }
 
-pub fn diffContentHandleMatchesCall(
+fn diffContentHandleMatchesCall(
     handle: []const u8,
     tool_call_id: []const u8,
 ) bool {
@@ -379,7 +379,7 @@ pub fn diffContentHandleMatchesCall(
     );
 }
 
-pub fn diffContentHandleMatchesContentDigest(
+fn diffContentHandleMatchesContentDigest(
     handle: []const u8,
     digest: [32]u8,
 ) bool {
@@ -391,7 +391,7 @@ pub fn diffContentHandleMatchesContentDigest(
         );
 }
 
-/// Loads and digest-verifies a pack written by storeDiffContent.
+/// Loads and digest-verifies a pack v1 wrote.
 pub fn loadDiffContentManaged(
     alloc: Allocator,
     capability: *session_child_store.SessionChildCapability,
@@ -688,7 +688,7 @@ fn targetHandle(
     };
 }
 
-pub fn isStoredTextHandle(handle: []const u8) bool {
+fn isStoredTextHandle(handle: []const u8) bool {
     return std.mem.startsWith(u8, handle, "result-") and
         std.mem.endsWith(u8, handle, ".txt");
 }

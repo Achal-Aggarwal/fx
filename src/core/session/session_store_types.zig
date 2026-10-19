@@ -122,8 +122,8 @@ pub const ResumeTarget = union(enum) {
     id: []const u8,
 };
 
-/// Options controlling a resume. `log` is threaded into the canonical log layer;
-/// `seed_preferences` overrides the merged-config preferences on migration.
+/// Options for reading a v1 session. `allow_large_legacy` lifts the size
+/// bound on a legacy snapshot, for a conversion.
 pub const ResumeOptions = struct {
     allow_large_legacy: bool = false,
 };

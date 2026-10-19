@@ -1065,10 +1065,6 @@ fn parseFingerprint(raw: []const u8) ![32]u8 {
     return result;
 }
 
-fn writeOptionalString(writer: *std.Io.Writer, value: ?[]const u8) !void {
-    if (value) |text| try std.json.Stringify.value(text, .{}, writer) else try writer.writeAll("null");
-}
-
 fn cloneStrings(alloc: Allocator, source: []const []u8) ![][]u8 {
     const result = try alloc.alloc([]u8, source.len);
     var built: usize = 0;
@@ -1143,6 +1139,43 @@ test "subagent failure codec reads historical absence and rejects invalid detail
     const future = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
     defer alloc.free(future);
     try std.testing.expectError(error.UnsupportedSchema, parseRegistry(alloc, future, parent_id));
+}
+
+test "a registry v1 wrote decodes a child's active work and its last failure" {
+    const alloc = std.testing.allocator;
+    const parent_id = "01J00000000000000000000000";
+    const saved =
+        \\{"schema_version":2,"parent_id":"01J00000000000000000000000","generation":3,"children":[
+        \\{"id":"01J00000000000000000000001","kind":"persistent","persistent":{"agent":"reviewer","instructions":"Review carefully."},"phase":"running","work_generation":2,"active":{"id":"work-2","request_fingerprint":"0707070707070707070707070707070707070707070707070707070707070707","message":"review this","root_user_intent_context":"ship it","root_user_messages":["fix the bug","then review"],"root_user_evidence_complete":false,"permission_mode":"auto","created_at_ms":1700000000000},"last_work_id":null,"last_request_fingerprint":null,"last_outcome":null,"last_failure":null},
+        \\{"id":"01J00000000000000000000002","kind":"one_off","persistent":null,"phase":"finished","work_generation":1,"active":null,"last_work_id":"work-1","last_request_fingerprint":"0000000000000000000000000000000000000000000000000000000000000000","last_outcome":"failed","last_failure":"agent_turn_failed: the provider closed the stream"}]}
+    ;
+    var registry = try parseRegistry(alloc, saved, parent_id);
+    defer registry.deinit(alloc);
+    try std.testing.expectEqual(@as(u64, 3), registry.generation);
+    try std.testing.expectEqual(@as(usize, 2), registry.children.len);
+
+    const running = registry.children[0];
+    try std.testing.expectEqual(Phase.running, running.phase);
+    try std.testing.expectEqualStrings("reviewer", running.kind.persistent.agent);
+    try std.testing.expectEqualStrings("Review carefully.", running.kind.persistent.instructions);
+    const active = running.active.?;
+    try std.testing.expectEqualStrings("work-2", active.id);
+    try std.testing.expectEqual(@as([32]u8, @splat(7)), active.request_fingerprint);
+    try std.testing.expectEqualStrings("review this", active.message);
+    try std.testing.expectEqualStrings("ship it", active.root_user_intent_context);
+    try std.testing.expectEqual(@as(usize, 2), active.root_user_messages.len);
+    try std.testing.expectEqualStrings("then review", active.root_user_messages[1]);
+    try std.testing.expect(!active.root_user_evidence_complete);
+    try std.testing.expectEqual(types.PermissionMode.auto, active.permission_mode);
+    try std.testing.expectEqual(@as(i64, 1700000000000), active.created_at_ms);
+    try std.testing.expect(running.last_failure == null);
+
+    const failed = registry.children[1];
+    try std.testing.expect(failed.kind == .one_off);
+    try std.testing.expect(failed.active == null);
+    try std.testing.expectEqualStrings("work-1", failed.last_work_id.?);
+    try std.testing.expectEqual(Outcome.failed, failed.last_outcome.?);
+    try std.testing.expectEqualStrings("agent_turn_failed: the provider closed the stream", failed.last_failure.?.view());
 }
 
 test "interrupted active work clears ownership" {

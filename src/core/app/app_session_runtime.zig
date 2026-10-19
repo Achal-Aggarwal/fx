@@ -2132,7 +2132,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         /// Makes `v2` the open session, taking ownership, and restores the app
-        /// from it through v1's state, as `installResumedSession` does.
+        /// from it through v1's state.
         fn installResumedV2Session(app: *App, v2: *session_adapter.Session, notice: ResumeNotice) !void {
             var v2_owned = true;
             errdefer if (v2_owned) v2.close();
