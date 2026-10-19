@@ -1075,6 +1075,43 @@ for (const [name, finalText] of [
   }, 45000);
 }
 
+test("ACP shell completed and replayed updates show the command output", async () => {
+  const fixture = createConfiguredProviderFixture(body => body.messages.some((message: any) => message.role === "tool")
+    ? configuredCompletion(body.model, "done")
+    : configuredToolCompletion(body.model, "shell", { request: { action: "run", command: "echo hello-$((6*7))" } }, "call_shell"));
+  const shellText = (lines: any[]) => lines
+    .filter((message: any) => message.method === "session/update" && message.params?.update?.toolCallId === "call_shell")
+    .map((message: any) => message.params.update)
+    .filter((update: any) => update.status === "completed")
+    .map((update: any) => update.content);
+  let client: AcpClient | undefined;
+  try {
+    client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: fixture.workspace, mcpServers: [] }, 2) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    await client.request("session/set_mode", { modeId: "full-access" }, 3);
+    const prompt = await runPrompt(client, "Run the command.", TIMEOUT);
+    expect(prompt.promptResult.result.stopReason).toBe("end_turn");
+    const expected = [{ type: "content", content: { type: "text", text: "hello-42\n" } }];
+    expect(shellText(prompt.messages)).toEqual([expected]);
+    expect(client.stderr).toBe("");
+    client.endStdin();
+    expect(await client.waitForExit()).toBe(0);
+    await client.close();
+
+    client = await AcpClient.create({ cwd: fixture.workspace, env: fixture.env });
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const loaded = await client.request("session/load", { sessionId: created.result.sessionId, cwd: fixture.workspace, mcpServers: [] }, 2) as any;
+    if (loaded.error) throw new Error(JSON.stringify(loaded));
+    expect(shellText(client.rawLines.map(line => JSON.parse(line)))).toEqual([expected]);
+    expect(client.stderr).toBe("");
+  } finally {
+    await client?.close();
+    fixture.close();
+  }
+}, 45000);
+
 function createIsolatedRoot(prefix: string) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
   const home = join(root, "home");
