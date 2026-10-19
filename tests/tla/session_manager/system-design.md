@@ -1268,17 +1268,19 @@ Settled for the converter (2026-10-06):
   is left out, named in the trace and the convert output, and the rest of
   the family converts. That member's v1 folder is then kept rather than
   removed (D60), so the file stays where it was, and the notice and the
-  convert output name the folder (2026-10-19). The copy records it beside
-  its v1 fingerprint, so a later open, or a reuse of the member after a
-  crash, keeps that folder whatever has changed in it since, and `fx
-  doctor` counts such folders. `V1Conversion.tla`'s `keeps` holds such
-  members, and `NoLossOnDelete` checks that no conversion or cleanup
-  removes their folders. The v2 listing must stay fast at the size
-  conversion creates (about 14,000 sessions took 1.9 s a page): fixed in
-  this change, gated by the manager's benchmark. A usage marker move came
-  with this decision and went with fx's usage ledger. **Why:** the real
-  run showed each
-  limit. **Alternative:** keep whole families in memory, refuse the
+  convert output name the folder (2026-10-19). The copy records each file
+  it left out in place of its v1 fingerprint, so a later open, or a reuse
+  of the member after a crash, keeps that folder whatever has changed in
+  it since, a reuse names those files again, an older fx finds no
+  fingerprint to match and keeps the folder too, and `fx doctor` counts
+  such folders, a subagent's among them. `V1Conversion.tla`'s `keeps`
+  holds such members, and `NoLossOnDelete` checks that no conversion or
+  cleanup removes their folders. The v2 listing must stay fast at the
+  size conversion creates (about 14,000 sessions took 1.9 s a page):
+  fixed in this change, gated by the manager's benchmark. A usage marker
+  move came with this decision and went with fx's usage ledger. **Why:**
+  the real run showed each limit. **Alternative:** keep whole families in
+  memory, refuse the
   family, or fix the listing later.
 
 Settled for removing v1 (2026-10-16):

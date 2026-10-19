@@ -657,8 +657,8 @@ pub const Doctor = struct {
     /// Roots an older fx saved that v2 does not hold yet; each converts
     /// when it is first opened (D73).
     unconverted: usize = 0,
-    /// Converted roots whose v1 folder keeps something their copy left out
-    /// (D56, D62).
+    /// v1 folders of converted roots and their subagents that keep
+    /// something their copy left out (D56, D62).
     keeps_left_out: usize = 0,
     /// Those of them that can't be converted, among the checked ones.
     stuck: std.ArrayList(Stuck) = .empty,
@@ -752,8 +752,16 @@ fn doctorV1(store: *Store, alloc: Allocator, report: *Doctor, limit: usize) !voi
             defer peeked.deinit(alloc);
             var scratch = std.heap.ArenaAllocator.init(alloc);
             defer scratch.deinit();
-            if (parseV1Source(scratch.allocator(), peeked.state.v1_source)) |source| {
-                if (source.keeps) report.keeps_left_out += 1;
+            const a = scratch.allocator();
+            if (parseV1Source(a, peeked.state.v1_source)) |source| {
+                if (source.keeps()) report.keeps_left_out += 1;
+            }
+            for (peeked.state.children.items) |child| {
+                if (!(v1_conversion.hasFolder(store.home, child.id) catch false)) continue;
+                const child_state_value = store.manager.peek(a, child.id) catch continue;
+                if (parseV1Source(a, child_state_value.state.v1_source)) |source| {
+                    if (source.keeps()) report.keeps_left_out += 1;
+                }
             }
             continue;
         } else |err| switch (err) {
@@ -2757,14 +2765,27 @@ const slow_conversion_ns: i128 = 150 * std.time.ns_per_ms;
 const slow_conversion_text = "Converting this session from the previous session format…";
 
 /// What v2 keeps of a converted member's v1 source (`set v1_source`): the
-/// fingerprint its removal checks (D60), and whether its v1 folder keeps
-/// something its copy left out (D56, D62), which no removal then takes.
+/// fingerprint its removal checks (D60), and what its copy left out (D56,
+/// D62), which its v1 folder keeps and no removal then takes. The
+/// fingerprint is empty then, so an older fx, which removes a v1 folder
+/// whose fingerprint matches, never takes that folder either.
 const V1Source = struct {
-    fingerprint: []const u8,
-    keeps: bool = false,
+    fingerprint: []const u8 = "",
+    left_out: []const Record = &.{},
+
+    const Record = struct { file: []const u8, cause: LeftOut.Cause, bytes: u64 = 0 };
+    /// The most records a copy keeps; its v1 folder keeps every file.
+    const max_records = 32;
+
+    fn keeps(source: V1Source) bool {
+        return source.left_out.len > 0;
+    }
 };
 
-/// A side file a conversion leaves out (D62): larger than one v2 blob.
+/// A file a conversion leaves out, which the member's v1 folder keeps: a
+/// side file larger than one v2 blob (D62), hosted terminal state the copy
+/// can't take (D56), or, in salvage, a side file a kept result names that
+/// is not what it records (D74).
 pub const LeftOut = struct {
     /// The family member that kept it in v1.
     member: []u8,
@@ -2832,7 +2853,7 @@ const Conversion = struct {
     members: usize = 0,
     turns: usize = 0,
     files: usize = 0,
-    /// The side files the first pass found too large to keep (D62).
+    /// Every file this conversion left out, of every member (D56, D62).
     left_out: std.ArrayList(LeftOut) = .empty,
 
     const Outcome = enum { converted, held };
@@ -2985,7 +3006,7 @@ const Conversion = struct {
         var arena = std.heap.ArenaAllocator.init(c.alloc);
         defer arena.deinit();
         var registry = try child_state.Registry.init(arena.allocator(), &id);
-        try c.writeMember(session, &member, locked, .{ .root = .{ .registry = &registry, .has_log = &.{} } }, false);
+        try c.writeMember(session, &member, locked, .{ .root = .{ .registry = &registry, .has_log = &.{} } }, &.{});
         try session.handle.publishImport();
         debug_trace.logf("convert", "action=Salvaged session={s} copy={s} turns={d} rules_dropped={}", .{ root_id, &id, member.turns, member.rules_dropped });
         return .{
@@ -3263,15 +3284,14 @@ const Conversion = struct {
             c.discardStaging(locked.id);
         }
         try c.copyTerminalState(rootOf(role, locked.id), locked);
-        const keeps = c.leftOutOf(locked.id);
-        try c.writeMember(session, member, locked, role, keeps);
-        return .{ .id = locked.id, .session = session, .keeps = keeps };
-    }
-
-    /// Whether this conversion left anything of `member_id`'s out.
-    fn leftOutOf(c: *const Conversion, member_id: []const u8) bool {
-        for (c.left_out.items) |entry| if (std.mem.eql(u8, entry.member, member_id)) return true;
-        return false;
+        var records: std.ArrayList(V1Source.Record) = .empty;
+        defer records.deinit(c.alloc);
+        for (c.left_out.items) |entry| {
+            if (!std.mem.eql(u8, entry.member, locked.id) or records.items.len == V1Source.max_records) continue;
+            try records.append(c.alloc, .{ .file = entry.file, .cause = entry.cause, .bytes = entry.bytes });
+        }
+        try c.writeMember(session, member, locked, role, records.items);
+        return .{ .id = locked.id, .session = session, .keeps = records.items.len > 0 };
     }
 
     /// A child an earlier try published before it stopped (TLA `Orphan`):
@@ -3290,19 +3310,28 @@ const Conversion = struct {
         const a = scratch.allocator();
         const source = parseV1Source(a, peeked.state.v1_source);
         const unchanged = if (source) |known| std.mem.eql(u8, known.fingerprint, &(try v1_conversion.fingerprintOf(a, &locked.dir))) else false;
-        debug_trace.logf("convert", "action=Reused member={s} v1={s}", .{ locked.id, if (unchanged) "unchanged" else "kept" });
+        const left_out: []const V1Source.Record = if (source) |known| known.left_out else &.{};
+        // What the earlier try left out, told now as this run tells its own.
+        for (left_out) |record| {
+            try c.left_out.ensureUnusedCapacity(c.alloc, 1);
+            const member = try c.alloc.dupe(u8, locked.id);
+            errdefer c.alloc.free(member);
+            const file = try c.alloc.dupe(u8, record.file);
+            c.left_out.appendAssumeCapacity(.{ .member = member, .file = file, .bytes = record.bytes, .cause = record.cause });
+        }
+        debug_trace.logf("convert", "action=Reused member={s} v1={s} left_out={d}", .{ locked.id, if (unchanged) "unchanged" else "kept", left_out.len });
         return .{
             .id = locked.id,
             .session = null,
             .unchanged = unchanged,
-            .keeps = if (source) |known| known.keeps else false,
+            .keeps = left_out.len > 0,
         };
     }
 
     /// Writes `member` into `session`, each batch at its original time
     /// (D59): its turns and compactions, then its settings at the time v1
-    /// lists it, `keeps` among them.
-    fn writeMember(c: *Conversion, session: *Session, member: *const v1_conversion.Member, locked: *v1_conversion.Locked, role: Role, keeps: bool) !void {
+    /// lists it, among them `records`, what its copy left out.
+    fn writeMember(c: *Conversion, session: *Session, member: *const v1_conversion.Member, locked: *v1_conversion.Locked, role: Role, records: []const V1Source.Record) !void {
         var arena = std.heap.ArenaAllocator.init(c.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -3351,7 +3380,8 @@ const Conversion = struct {
         for (c.left_out.items) |entry| if (std.mem.eql(u8, entry.member, locked.id)) try left_out.append(a, entry.file);
         const side = try sideFileLines(a, session.handle, &locked.dir, &body_folders, member.stored, left_out.items);
         try settings.appendSlice(a, side.events);
-        try settings.append(a, .{ .set = .{ .key = .v1_source, .value = try jsonValue(a, V1Source{ .fingerprint = &member.fingerprint, .keeps = keeps }) } });
+        const source: V1Source = .{ .fingerprint = if (records.len > 0) "" else &member.fingerprint, .left_out = records };
+        try settings.append(a, .{ .set = .{ .key = .v1_source, .value = try jsonValue(a, source) } });
         if (role == .root) {
             for (try child_state.v1ImportLines(a, role.root.registry.*, role.root.has_log)) |line| try settings.append(a, switch (line) {
                 .spawned => |spawned| .{ .child_spawned = .{ .child = spawned.child, .work_id = spawned.work_id, .data = spawned.data } },
@@ -3436,14 +3466,15 @@ fn holdsV2(store: *Store, alloc: Allocator, id: []const u8) bool {
 fn parseV1Source(a: Allocator, raw: ?[]const u8) ?V1Source {
     const bytes = raw orelse return null;
     const source = std.json.parseFromSliceLeaky(V1Source, a, bytes, .{ .ignore_unknown_fields = true }) catch return null;
-    if (source.fingerprint.len != 64) return null;
+    if (!source.keeps() and source.fingerprint.len != 64) return null;
     return source;
 }
 
 /// Removes what a conversion left in v1 for the converted session
 /// `root_id` and its children: each member's v1 state, while its v1 copy is
-/// what was converted (TLA CClean, D60). A member another process holds,
-/// or that changed, keeps it; nothing here fails the open.
+/// what was converted (TLA CClean, D60). A member whose copy left something
+/// out (D56, D62), one another process holds, or one that changed keeps
+/// it; nothing here fails the open.
 fn cleanLeftovers(store: *Store, alloc: Allocator, root_id: []const u8, state: *const sm.State) void {
     if (state.v1_source == null) return;
     var scratch = std.heap.ArenaAllocator.init(alloc);
@@ -3475,7 +3506,7 @@ fn cleanLeftovers(store: *Store, alloc: Allocator, root_id: []const u8, state: *
             debug_trace.logf("convert", "action=Kept session={s} reason=no_source", .{id});
             continue;
         };
-        if (source.keeps) {
+        if (source.keeps()) {
             debug_trace.logf("convert", "action=Kept session={s} reason=left_out", .{id});
             continue;
         }
@@ -3715,11 +3746,12 @@ fn strayReason(store: *Store, alloc: Allocator, stray: v1_conversion.Stray) ![]u
         defer peeked.deinit(alloc);
         var scratch = std.heap.ArenaAllocator.init(alloc);
         defer scratch.deinit();
-        const keeps = if (parseV1Source(scratch.allocator(), peeked.state.v1_source)) |source| source.keeps else false;
-        return alloc.dupe(u8, if (keeps)
-            "fx converted it already without some of its files, so this folder keeps them"
-        else
-            "fx converted it already, so anything an older fx added since stays only in this folder");
+        const left_out: []const V1Source.Record = if (parseV1Source(scratch.allocator(), peeked.state.v1_source)) |source| source.left_out else &.{};
+        return switch (left_out.len) {
+            0 => alloc.dupe(u8, "fx converted it already, so anything an older fx added since stays only in this folder"),
+            1 => alloc.print("fx converted it already without {s}, so this folder keeps it", .{left_out[0].file}),
+            else => alloc.print("fx converted it already without {d} of its files, so this folder keeps them", .{left_out.len}),
+        };
     } else |err| switch (err) {
         error.NotFound, error.InvalidArgument => {},
         error.OutOfMemory => return err,
@@ -7866,6 +7898,75 @@ test "fx sessions convert says a converted v1 child whose folder a cleanup kept 
     try testing.expectEqualStrings("fx converted it already, so anything an older fx added since stays only in this folder", report.kept_children[0].reason);
 }
 
+test "fx doctor counts each v1 folder a family's conversion kept, a subagent's included (D62)" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 2);
+    for (family) |id| {
+        var commands = try t.tmp.dir.createDirPathOpen(io, try v1.sessionPath(id, "logs/commands"), .{});
+        defer commands.close(io);
+        var file = try commands.createFile(io, "replay.bin", .{});
+        defer file.close(io);
+        // Sparse: no disk for the hole.
+        try file.setLength(io, sm.max_blob_bytes + 1);
+    }
+    var report = try convertAll(&t.store, alloc);
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), report.converted);
+    try testing.expectEqual(@as(usize, 2), report.left_out.items.len);
+    for (family) |id| try testing.expect(V1Home.exists(&t, id));
+    var doctor_report = try doctor(&t.store, alloc, 64, 0);
+    defer doctor_report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 2), doctor_report.keeps_left_out);
+    // Each copy names what it left out and keeps no fingerprint, which an
+    // older fx would match to remove the folder.
+    var scratch = std.heap.ArenaAllocator.init(alloc);
+    defer scratch.deinit();
+    for (family) |id| {
+        const peeked = try t.store.manager.peek(scratch.allocator(), id);
+        const source = parseV1Source(scratch.allocator(), peeked.state.v1_source).?;
+        try testing.expectEqualStrings("", source.fingerprint);
+        try testing.expectEqual(@as(usize, 1), source.left_out.len);
+        try testing.expectEqualStrings("logs/commands/replay.bin", source.left_out[0].file);
+        try testing.expectEqual(LeftOut.Cause.too_large, source.left_out[0].cause);
+        try testing.expectEqual(@as(u64, sm.max_blob_bytes + 1), source.left_out[0].bytes);
+    }
+}
+
+test "fx sessions convert says when it can't read a kept v1 child's converted copy (D88)" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    const child = family[1];
+    var copy = try V1Copy.take(&t, child);
+    defer copy.deinit();
+    const owner = try v1.file(child, "subagent", "owner.json");
+    const s = try openConverted(&t, family[0]);
+    s.close();
+    try copy.restore(&v1, child);
+    try v1.put(child, "subagent", "owner.json", owner);
+    // The converted copy is damaged since.
+    var copied = try t.tmp.dir.openDir(io, try std.Io.Dir.path.join(v1.arena.allocator(), &.{ ".fx", "sessions", "v2", child }), .{});
+    defer copied.close(io);
+    try copied.writeFile(io, .{ .sub_path = "log.jsonl", .data = "not a log\n" });
+
+    var report = try convertAll(&t.store, alloc);
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), report.kept_children.len);
+    try testing.expectEqualStrings(child, report.kept_children[0].id);
+    try testing.expect(std.mem.startsWith(u8, report.kept_children[0].reason, "fx can't read its converted copy ("));
+}
+
 test "fx sessions convert converts every v1 family, and counts what it skipped (D61)" {
     const alloc = testing.allocator;
     var t: TestHome = undefined;
@@ -8074,11 +8175,29 @@ test "a child an earlier try published keeps its v1 folder when that try left a 
         try testing.expect(staged.keeps);
     }
 
+    var told: std.ArrayList(u8) = .empty;
+    defer told.deinit(alloc);
+    t.store.notice = .{ .context = &told, .emit = struct {
+        fn emit(context: ?*anyopaque, text: []const u8) void {
+            const out: *std.ArrayList(u8) = @ptrCast(@alignCast(context.?));
+            out.appendSlice(testing.allocator, text) catch {};
+        }
+    }.emit };
     const s = try openConverted(&t, root);
     defer s.close();
     try testing.expect(!V1Home.exists(&t, root));
     const stat = try t.tmp.dir.statFile(io, try v1.sessionPath(child, "logs/commands/replay.bin"), .{});
     try testing.expectEqual(@as(u64, sm.max_blob_bytes + 1), stat.size);
+    // The open names what the earlier try left out, as that try would have.
+    var expected: [320]u8 = undefined;
+    try testing.expect(std.mem.find(u8, told.items, try std.mem.print(&expected, "converted without logs/commands/replay.bin of its subagent {s} because", .{child})) != null);
+
+    // fx sessions convert names the kept folder and what it keeps.
+    var report = try convertAll(&t.store, alloc);
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), report.kept_children.len);
+    try testing.expectEqualStrings(child, report.kept_children[0].id);
+    try testing.expectEqualStrings("fx converted it already without logs/commands/replay.bin, so this folder keeps it", report.kept_children[0].reason);
 }
 
 test "a v1 session whose session.json is damaged names that file, whatever registry it has (D61)" {
