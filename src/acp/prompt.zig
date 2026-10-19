@@ -2803,6 +2803,11 @@ fn recordToolCallRejected(
 ) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
     const acp_id = ctx.sendToolCallPending(arena, call) catch "call_unknown";
+    // An unsupported call named like a provider search already got its
+    // final update from the terminal lifecycle event.
+    if (ctx.published_tool_calls.get(acp_id)) |publication| {
+        if (publication == .published) return;
+    }
     ctx.sendToolCallErrorWithCommandResult(
         acp_id,
         toolUpdateContentText(.{
