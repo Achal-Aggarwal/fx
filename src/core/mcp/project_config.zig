@@ -123,7 +123,12 @@ pub const WorkspaceDiagnosticCause = enum {
     approved_rejected_overlap,
     /// Under "mcpServers" in a profile that also has "mcp".
     ignored_alias,
+    /// A key the server sets that fx doesn't act on.
+    ignored_key,
 };
+
+/// The keys fx reads but doesn't act on.
+pub const IgnoredKey = enum { required, restart_limit };
 
 pub const WorkspaceEnvironmentField = enum {
     command,
@@ -194,6 +199,8 @@ pub const WorkspaceDiagnostic = struct {
     environment_field: ?WorkspaceEnvironmentField = null,
     /// Why, for `.invalid_entry`.
     problem: ?EntryProblem = null,
+    /// Which, for `.ignored_key`.
+    ignored_key: ?IgnoredKey = null,
     cause: WorkspaceDiagnosticCause,
 
     pub fn deinit(self: *WorkspaceDiagnostic, alloc: Allocator) void {
@@ -235,6 +242,10 @@ pub fn renderWorkspaceDiagnostic(
             },
         );
     }
+    if (diagnostic.cause == .ignored_key) return alloc.print(
+        "{s} server '{s}' sets \"{s}\", which fx ignores; remove it.",
+        .{ diagnosticFile(diagnostic), encoded_server.bytes, @tagName(diagnostic.ignored_key orelse .required) },
+    );
     // Every reason is a constant, so this is the one `print` there is.
     const why: []const u8 = if (diagnostic.cause == .invalid_entry) switch (diagnostic.problem orelse .other) {
         .not_object => "it isn't a JSON object",
@@ -253,6 +264,26 @@ pub fn renderWorkspaceDiagnostic(
         "{s} server '{s}' was skipped: {s}.",
         .{ diagnosticFile(diagnostic), encoded_server.bytes, why },
     );
+}
+
+/// A note for each key a server sets that fx doesn't act on: `required`, and
+/// a `restart_limit` other than the default.
+pub fn noteIgnoredKeys(
+    alloc: Allocator,
+    notes: *std.ArrayList(WorkspaceDiagnostic),
+    configs: []const McpServerConfig,
+) Allocator.Error!void {
+    for (configs) |c| {
+        const keys = [_]?IgnoredKey{
+            if (c.required) .required else null,
+            if (c.restart_limit != mcp_contract.default_restart_limit) .restart_limit else null,
+        };
+        for (keys) |maybe| if (maybe) |key| {
+            const owned = try alloc.dupe(u8, c.name);
+            errdefer alloc.free(owned);
+            try notes.append(alloc, .{ .profile = c.source != .workspace, .server_name = owned, .cause = .ignored_key, .ignored_key = key });
+        };
+    }
 }
 
 fn diagnosticFile(diagnostic: WorkspaceDiagnostic) []const u8 {
@@ -1477,6 +1508,28 @@ fn freeHttpHeaderEnvList(alloc: Allocator, headers: *std.ArrayList(McpHttpHeader
         alloc.free(header.env);
     }
     headers.deinit(alloc);
+}
+
+test "a server that sets required or a non-default restart_limit gets a note naming the key" {
+    const alloc = std.testing.allocator;
+    var notes: std.ArrayList(WorkspaceDiagnostic) = .empty;
+    defer {
+        for (notes.items) |*note| note.deinit(alloc);
+        notes.deinit(alloc);
+    }
+    const configs = [_]McpServerConfig{
+        .{ .name = "plain", .command = "x" },
+        .{ .name = "gated", .transport = .http, .url = "https://g.example/mcp", .required = true },
+        .{ .name = "retry", .command = "x", .restart_limit = 3, .source = .workspace },
+    };
+    try noteIgnoredKeys(alloc, &notes, &configs);
+    try std.testing.expectEqual(@as(usize, 2), notes.items.len);
+    const first = try renderWorkspaceDiagnostic(alloc, notes.items[0]);
+    defer alloc.free(first);
+    try std.testing.expectEqualStrings("~/.fx/mcp.json server 'gated' sets \"required\", which fx ignores; remove it.", first);
+    const second = try renderWorkspaceDiagnostic(alloc, notes.items[1]);
+    defer alloc.free(second);
+    try std.testing.expectEqualStrings(".mcp.json server 'retry' sets \"restart_limit\", which fx ignores; remove it.", second);
 }
 
 test "profile document accepts mcpServers alias and preserves strict entry parsing" {

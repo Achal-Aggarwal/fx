@@ -145,7 +145,13 @@ pub fn resolve(
         }
         // Where fx keeps logins, it decides each refresh.
         if (s.url != null) auth.refresh_via_host = true;
-        try engine.append(arena, .{ .name = s.name, .transport = transport, .auth = auth });
+        // The server's own limits: how long its start may take, and how long a
+        // request may go without an answer.
+        var timeouts: @FieldType(mcp.engine.Options, "timeouts") = .{};
+        timeouts.start_ms = c.startup_timeout_ms;
+        timeouts.idle_ms = c.operation_timeout_ms;
+        timeouts.hard_ms = @max(timeouts.hard_ms, c.operation_timeout_ms);
+        try engine.append(arena, .{ .name = s.name, .transport = transport, .auth = auth, .timeouts = timeouts });
         try engine_server.append(arena, i);
     }
     return .{ .servers = servers, .engine = engine.items, .engine_server = engine_server.items };
@@ -242,6 +248,25 @@ test "an approved .mcp.json server keeps its login under its own workspace, neve
     try testing.expectEqual(@as(?[]const u8, null), r.servers[0].credentialKey().workspace);
     try testing.expectEqualStrings("/Users/example/repo", r.servers[1].workspace.?);
     try testing.expectEqualStrings("/Users/example/repo", r.servers[1].credentialKey().workspace.?);
+}
+
+test "a server's startup and operation timeouts become its engine limits" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var inherited: std.process.Environ.Map = .init(testing.allocator);
+    defer inherited.deinit();
+    const configs = [_]McpServerConfig{
+        .{ .name = "plain", .command = "x" },
+        .{ .name = "tuned", .transport = .http, .url = "https://t.example/mcp", .startup_timeout_ms = 5_000, .operation_timeout_ms = 900_000 },
+    };
+    const r = try resolve(arena_state.allocator(), &configs, &inherited, "/Users/example/repo");
+    try testing.expectEqual(@as(u32, 30_000), r.engine[0].timeouts.?.start_ms);
+    try testing.expectEqual(@as(u32, 60_000), r.engine[0].timeouts.?.idle_ms);
+    try testing.expectEqual(@as(u32, 600_000), r.engine[0].timeouts.?.hard_ms);
+    try testing.expectEqual(@as(u32, 5_000), r.engine[1].timeouts.?.start_ms);
+    try testing.expectEqual(@as(u32, 900_000), r.engine[1].timeouts.?.idle_ms);
+    // A request may go 15 minutes without an answer, so the 10-minute cap rises.
+    try testing.expectEqual(@as(u32, 900_000), r.engine[1].timeouts.?.hard_ms);
 }
 
 test "stdio and HTTP servers become engine configs; the rest are held back with the reason" {

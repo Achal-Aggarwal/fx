@@ -59,6 +59,7 @@ pub fn loadNativeConfigs(alloc: Allocator, workspace_root: []const u8) !NativeCo
         if (err == error.OutOfMemory) return error.OutOfMemory;
         debug_trace.logf("mcp", "workspace MCP choices unavailable err={s}", .{@errorName(err)});
         loaded.configs = profile;
+        try project_config.noteIgnoredKeys(alloc, &loaded.diagnostics, loaded.configs.items);
         return loaded;
     };
     defer choice_load.deinit(alloc);
@@ -91,6 +92,7 @@ pub fn loadNativeConfigs(alloc: Allocator, workspace_root: []const u8) !NativeCo
 
     loaded.configs = try project_config.mergeNative(alloc, &profile, &workspace.configs);
     profile.deinit(alloc);
+    try project_config.noteIgnoredKeys(alloc, &loaded.diagnostics, loaded.configs.items);
     return loaded;
 }
 

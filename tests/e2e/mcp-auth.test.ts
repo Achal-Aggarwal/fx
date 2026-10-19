@@ -459,7 +459,6 @@ function createRoot(
               }
             : {}),
           startup_timeout_ms: 5_000,
-          operation_timeout_ms: 5_000,
         },
       },
     }),

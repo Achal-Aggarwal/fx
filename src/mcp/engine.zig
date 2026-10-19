@@ -37,6 +37,8 @@ pub const Config = struct {
     name: []const u8,
     transport: Transport,
     auth: auth_client.Options = .{},
+    /// This server's own limits; null for the engine's.
+    timeouts: ?request.Timeouts = null,
 };
 
 pub const Options = struct {
@@ -525,7 +527,7 @@ pub const Engine = struct {
             .era = e.options.era,
             .auth = slot.config.auth,
             .listen_tools = e.options.listen_tools,
-            .timeouts = e.options.timeouts,
+            .timeouts = slot.config.timeouts orelse e.options.timeouts,
             .trace = tracer,
         });
         slot.server = s;
@@ -571,6 +573,7 @@ pub const Engine = struct {
                 },
             },
             .auth = c.auth,
+            .timeouts = c.timeouts,
         };
         const auth = &slot.config.auth;
         auth.client_name = try a.dupe(u8, c.auth.client_name);
@@ -652,7 +655,8 @@ fn same(a: Config, b: Config) bool {
         if ((x == null) != (y == null)) return false;
         if (x != null and !std.mem.eql(u8, x.?, y.?)) return false;
     }
-    return std.mem.eql(u8, a.auth.client_name, b.auth.client_name) and std.meta.eql(a.auth.flow, b.auth.flow);
+    return std.mem.eql(u8, a.auth.client_name, b.auth.client_name) and std.meta.eql(a.auth.flow, b.auth.flow) and
+        std.meta.eql(a.timeouts, b.timeouts);
 }
 
 test {
@@ -774,4 +778,29 @@ test "the scopes are part of a server's config, so new ones restart it" {
     try std.testing.expect(!same(a, b));
     b.auth.scopes = null;
     try std.testing.expect(!same(a, b));
+}
+
+test "a server's own timeouts replace the engine's, and the others keep the engine's" {
+    var e: Engine = undefined;
+    const servers = [_]Config{
+        .{ .name = "plain", .transport = .{ .http = .{ .url = "https://plain.example.invalid/mcp" } } },
+        .{ .name = "tuned", .transport = .{ .http = .{ .url = "https://tuned.example.invalid/mcp" } }, .timeouts = .{ .start_ms = 5_000, .idle_ms = 90_000 } },
+    };
+    try e.init(std.testing.io, std.testing.allocator, .{ .context = &TestHost.context, .allow = TestHost.allow, .log = TestHost.log }, .{
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+        .timeouts = .{ .start_ms = 20_000 },
+    }, &servers);
+    defer e.deinit();
+
+    const plain = try e.ensureServer(e.slots.items[0]);
+    const tuned = try e.ensureServer(e.slots.items[1]);
+    try std.testing.expectEqual(@as(u32, 20_000), plain.options.timeouts.start_ms);
+    try std.testing.expectEqual(@as(u32, 5_000), tuned.options.timeouts.start_ms);
+    try std.testing.expectEqual(@as(u32, 90_000), tuned.options.timeouts.idle_ms);
+    // A reload that changes only the timeouts replaces the server.
+    var retimed = servers[1];
+    retimed.timeouts = .{ .start_ms = 6_000 };
+    try std.testing.expect(same(servers[1], servers[1]));
+    try std.testing.expect(!same(servers[1], retimed));
+    try std.testing.expect(!same(servers[0], .{ .name = "plain", .transport = servers[0].transport, .timeouts = .{} }));
 }
