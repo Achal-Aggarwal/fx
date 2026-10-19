@@ -2758,9 +2758,26 @@ const V1Source = struct {
 pub const LeftOut = struct {
     /// The family member that kept it in v1.
     member: []u8,
-    /// `{folder}/{name}` in that member's v1 folder.
+    /// Its path in that member's v1 folder.
     file: []u8,
+    /// Its size, for `too_large`.
     bytes: u64,
+    cause: Cause,
+
+    pub const Cause = enum {
+        /// A side file larger than one v2 blob (D62).
+        too_large,
+        /// Hosted terminal state that is not a folder or a regular file,
+        /// such as a link or a FIFO (D56).
+        not_regular,
+        /// Hosted terminal state that does not open (D56).
+        unreadable,
+        /// Hosted terminal state nested deeper than the copy goes (D56).
+        too_deep,
+        /// A side file a kept result names that is missing or not what the
+        /// result records, which salvage does not copy (D74).
+        unavailable,
+    };
 
     fn deinit(entry: LeftOut, alloc: Allocator) void {
         alloc.free(entry.member);
@@ -2769,9 +2786,23 @@ pub const LeftOut = struct {
 
     /// What a host tells the user about it.
     fn note(entry: LeftOut, alloc: Allocator, root_id: []const u8) ![]u8 {
+        var buffer: [128]u8 = undefined;
+        const reason = entry.why(&buffer);
         if (std.mem.eql(u8, entry.member, root_id))
-            return alloc.print("This session was converted without {s}, which is {d} bytes, more than the {d} the new store keeps in one file.", .{ entry.file, entry.bytes, sm.max_blob_bytes });
-        return alloc.print("This session was converted without {s} of its subagent {s}, which is {d} bytes, more than the {d} the new store keeps in one file.", .{ entry.file, entry.member, entry.bytes, sm.max_blob_bytes });
+            return alloc.print("This session was converted without {s}, {s}. Its earlier folder ~/.fx/sessions/{s} keeps it.", .{ entry.file, reason, entry.member });
+        return alloc.print("This session was converted without {s} of its subagent {s}, {s}. Its earlier folder ~/.fx/sessions/{s} keeps it.", .{ entry.file, entry.member, reason, entry.member });
+    }
+
+    /// Why the copy left it out, to follow its name.
+    fn why(entry: LeftOut, buffer: []u8) []const u8 {
+        return switch (entry.cause) {
+            .too_large => std.mem.print(buffer, "which is {d} bytes, more than the {d} the new store keeps in one file", .{ entry.bytes, sm.max_blob_bytes }) catch
+                "which is larger than the new store keeps in one file",
+            .not_regular => "which is not a file or folder",
+            .unreadable => "which can't be read",
+            .too_deep => "which is nested deeper than the copy goes",
+            .unavailable => "which is missing or not what its result records",
+        };
     }
 };
 
@@ -2887,8 +2918,8 @@ const Conversion = struct {
         }
         c.phase();
         // The root's v1 state first, so v1 stops listing the family.
-        removeMember(&v1, root_id, staged.items[staged.items.len - 1]);
-        for (staged.items[0 .. staged.items.len - 1]) |member| removeMember(&v1, root_id, member);
+        c.removeMember(&v1, root_id, staged.items[staged.items.len - 1]);
+        for (staged.items[0 .. staged.items.len - 1]) |member| c.removeMember(&v1, root_id, member);
         c.members = members.len;
         return .converted;
     }
@@ -2953,18 +2984,99 @@ const Conversion = struct {
         };
     }
 
+    /// Copies `<v1>/terminal` to `~/.fx/terminal/{id}/terminal` (D45), over
+    /// what a crashed try left there, whatever its folders' modes, as v1
+    /// opened them (it made each private). An entry the copy can't take is
+    /// left out, and the member's v1 folder keeps it (D56, D62). A copy, not
+    /// a move: a conversion that stops leaves v1 whole.
+    fn copyTerminalState(c: *Conversion, root_id: []const u8, locked: *v1_conversion.Locked) !void {
+        const io = io_mod.getIo();
+        var source = (io_mod.openRealDirIfPresent(&locked.dir, terminal_dir_name) catch |err|
+            return c.leaveOut(root_id, locked.id, terminal_dir_name, .unreadable, err)) orelse return;
+        defer source.close();
+        var root = try c.store.makeProfileFolder(terminal_dir_name);
+        defer root.close();
+        var owner = try io_mod.openOrCreateVerifiedPrivateDir(&root, locked.id);
+        defer owner.close();
+        try owner.dir.deleteTree(io, terminal_dir_name);
+        var target = try io_mod.openOrCreateVerifiedPrivateDir(&owner, terminal_dir_name);
+        defer target.close();
+        try c.copyTerminalTree(root_id, locked.id, &source, &target, terminal_dir_name, 0);
+    }
+
+    /// Copies the folders and regular files below `source`, at `path` in
+    /// the member's v1 folder, leaving out what `uncopyableIn` names. A
+    /// write that fails fails the copy.
+    fn copyTerminalTree(
+        c: *Conversion,
+        root_id: []const u8,
+        member_id: []const u8,
+        source: *io_mod.VerifiedDir,
+        target: *io_mod.VerifiedDir,
+        path: []const u8,
+        depth: usize,
+    ) (ConversionStorageError || Allocator.Error)!void {
+        const io = io_mod.getIo();
+        var it = source.dir.iterate();
+        while (it.next(io) catch |err| return c.leaveOut(root_id, member_id, path, .unreadable, err)) |entry| {
+            var buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const sub = std.mem.print(&buffer, "{s}/{s}", .{ path, entry.name }) catch return conversionStorageFailed("terminal", error.NameTooLong);
+            switch (entry.kind) {
+                .directory => {
+                    if (depth + 1 == max_copy_depth) {
+                        try c.leaveOut(root_id, member_id, sub, .too_deep, null);
+                        continue;
+                    }
+                    var from = (io_mod.openRealDirIfPresent(source, entry.name) catch |err| {
+                        try c.leaveOut(root_id, member_id, sub, .unreadable, err);
+                        continue;
+                    }) orelse continue;
+                    defer from.close();
+                    var to = io_mod.openOrCreateVerifiedPrivateDir(target, entry.name) catch |err| return conversionStorageFailed("terminal", err);
+                    defer to.close();
+                    try c.copyTerminalTree(root_id, member_id, &from, &to, sub, depth + 1);
+                },
+                .file => {
+                    var file = io_mod.openExistingReadOnlyRegularFile(source.dir, entry.name, .no_follow) catch |err| {
+                        try c.leaveOut(root_id, member_id, sub, .unreadable, err);
+                        continue;
+                    };
+                    defer file.close(io);
+                    copyOpenedFile(&file, target.dir, entry.name) catch |err| return conversionStorageFailed("terminal", err);
+                },
+                else => try c.leaveOut(root_id, member_id, sub, .not_regular, null),
+            }
+        }
+    }
+
+    /// Records `file` in `member_id`'s v1 folder as left out of its copy,
+    /// naming it in the trace.
+    fn leaveOut(c: *Conversion, root_id: []const u8, member_id: []const u8, file: []const u8, cause: LeftOut.Cause, err: ?anyerror) Allocator.Error!void {
+        try c.left_out.ensureUnusedCapacity(c.alloc, 1);
+        const member = try c.alloc.dupe(u8, member_id);
+        errdefer c.alloc.free(member);
+        const owned = try c.alloc.dupe(u8, file);
+        c.left_out.appendAssumeCapacity(.{ .member = member, .file = owned, .bytes = 0, .cause = cause });
+        debug_trace.logf("convert", "action=LeftOut session={s} member={s} file={s} cause={s} err={s}", .{ root_id, member_id, file, @tagName(cause), if (err) |value| @errorName(value) else "none" });
+    }
+
     fn traceHeld(root_id: []const u8) Outcome {
         debug_trace.logf("convert", "action=Held session={s}", .{root_id});
         return .held;
     }
 
     /// Removes a published member's v1 folder while it is the copy converted
-    /// (CDelete).
-    fn removeMember(v1: *session_store.Store, root_id: []const u8, member: Staged) void {
+    /// (CDelete), unless it holds a file the conversion left out (D62),
+    /// which then stays only there.
+    fn removeMember(c: *const Conversion, v1: *session_store.Store, root_id: []const u8, member: Staged) void {
         if (!member.unchanged) {
             debug_trace.logf("convert", "action=KeptV1 session={s} member={s}", .{ root_id, member.id });
             return;
         }
+        for (c.left_out.items) |entry| if (std.mem.eql(u8, entry.member, member.id)) {
+            debug_trace.logf("convert", "action=KeptV1 session={s} member={s} reason=left_out file={s}", .{ root_id, member.id, entry.file });
+            return;
+        };
         _ = v1_conversion.removeFolder(v1, member.id, "converted");
     }
 
@@ -3032,7 +3144,7 @@ const Conversion = struct {
                 const member = try c.alloc.dupe(u8, locked.id);
                 errdefer c.alloc.free(member);
                 const file = try c.alloc.print("{s}/{s}", .{ folder, entry.name });
-                c.left_out.appendAssumeCapacity(.{ .member = member, .file = file, .bytes = stat.size });
+                c.left_out.appendAssumeCapacity(.{ .member = member, .file = file, .bytes = stat.size, .cause = .too_large });
                 debug_trace.logf("convert", "action=LeftOut session={s} member={s} file={s} bytes={d} limit={d}", .{ root_id, locked.id, file, stat.size, sm.max_blob_bytes });
             }
         }
@@ -3101,7 +3213,7 @@ const Conversion = struct {
         const member_id = try c.alloc.dupe(u8, locked.id);
         errdefer c.alloc.free(member_id);
         const file = try c.alloc.print("{s}/{s}", .{ folder, name });
-        c.left_out.appendAssumeCapacity(.{ .member = member_id, .file = file, .bytes = 0 });
+        c.left_out.appendAssumeCapacity(.{ .member = member_id, .file = file, .bytes = 0, .cause = .unavailable });
         debug_trace.logf("convert", "action=LeftOut session={s} member={s} file={s} reason=\"{s}\"", .{ root_id, locked.id, file, why });
     }
 
@@ -3230,12 +3342,12 @@ const Conversion = struct {
         }
         session.import_ts = @max(newest, member.listed_ms);
         _ = try session.write(settings.items);
-        try copyTerminalState(c.store, locked);
+        try c.copyTerminalState(rootOf(role, locked.id), locked);
         c.turns += member.turns;
         c.files += side.bodies;
     }
 
-    /// Tells the host about each side file the conversion left out (D62),
+    /// Tells the host about each file the conversion left out (D56, D62),
     /// as it tells it the open is slow.
     fn tellLeftOut(c: *Conversion, root_id: []const u8) void {
         const notice = c.store.notice orelse return;
@@ -3288,24 +3400,6 @@ fn childInstructionsOf(registry: child_state.Registry, id: []const u8) ?[]const 
         .persistent => |persistent| if (persistent.instructions.len == 0) null else persistent.instructions,
     };
     return null;
-}
-
-/// Copies `<v1>/terminal` to `~/.fx/terminal/{id}/terminal` (D45), over
-/// what a crashed try left there. A copy, not a move: a conversion that
-/// stops leaves v1 whole.
-fn copyTerminalState(store: *Store, locked: *v1_conversion.Locked) !void {
-    const io = io_mod.getIo();
-    var source = (try io_mod.openRealDirIfPresent(&locked.dir, terminal_dir_name)) orelse return;
-    defer source.close();
-    var root = try store.makeProfileFolder(terminal_dir_name);
-    defer root.close();
-    var owner = try io_mod.openOrCreateVerifiedPrivateDir(&root, locked.id);
-    defer owner.close();
-    try owner.dir.deleteTree(io, terminal_dir_name);
-    var target = try io_mod.openOrCreateVerifiedPrivateDir(&owner, terminal_dir_name);
-    defer target.close();
-    // Whatever the folders' modes, as v1 opened them (it made each private).
-    if (!copyTree(io_mod.openRealDirIfPresent, &source, &target, 0)) return error.SessionStoreUnavailable;
 }
 
 /// Whether v2 holds `id`, a damaged copy included: nothing converts over
@@ -3380,8 +3474,44 @@ fn cleanLeftovers(store: *Store, alloc: Allocator, root_id: []const u8, state: *
             debug_trace.logf("convert", "action=Kept session={s} reason=changed", .{id});
             continue;
         }
+        if (leftOutFile(a, &locked.dir)) |file| {
+            debug_trace.logf("convert", "action=Kept session={s} reason=left_out file={s}", .{ id, file });
+            continue;
+        }
         if (v1_conversion.removeFolder(&v1, id, "leftover")) debug_trace.logf("convert", "action=Cleaned session={s}", .{id});
     }
+}
+
+/// The first file in v1's folder `dir` that its conversion left out and so
+/// keeps that folder for: a side file larger than one v2 blob (D62), or
+/// hosted terminal state the copy can't take (D56). Null when there is
+/// none. A folder or file that can't be checked counts as one, so a cleanup
+/// never removes what might hold one. In `a`.
+fn leftOutFile(a: Allocator, dir: *io_mod.VerifiedDir) ?[]const u8 {
+    if (oversizedSideFile(a, dir.dir)) |file| return file;
+    var terminal = (io_mod.openRealDirIfPresent(dir, terminal_dir_name) catch return terminal_dir_name) orelse return null;
+    defer terminal.close();
+    return uncopyableIn(a, &terminal, terminal_dir_name, 0);
+}
+
+/// The first side file in `dir` larger than one v2 blob, or the folder that
+/// can't be checked; null when there is none. In `a`.
+fn oversizedSideFile(a: Allocator, dir: std.Io.Dir) ?[]const u8 {
+    const io = io_mod.getIo();
+    for (body_folders) |folder| {
+        var side = dir.openDir(io, folder, .{ .iterate = true, .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return folder,
+        };
+        defer side.close(io);
+        var it = side.iterate();
+        while (it.next(io) catch return folder) |entry| {
+            if (entry.kind != .file) continue;
+            const stat = side.statFile(io, entry.name, .{ .follow_symlinks = false }) catch return folder;
+            if (stat.size > sm.max_blob_bytes) return a.print("{s}/{s}", .{ folder, entry.name }) catch folder;
+        }
+    }
+    return null;
 }
 
 /// Whether v1 still has a folder for `id`; one that cannot be checked is
@@ -3419,7 +3549,8 @@ pub const ConvertReport = struct {
     unreadable: usize = 0,
     /// One per skipped session, in the order v1 lists its folders.
     skipped: std.ArrayList(Skipped) = .empty,
-    /// Each side file a converted family was converted without (D62).
+    /// Each file a converted family was converted without, which its v1
+    /// folder keeps (D56, D62).
     left_out: std.ArrayList(LeftOutFile) = .empty,
     /// Each v1 subagent no conversion takes, kept as it is (D88).
     kept_children: []KeptChild = &.{},
@@ -3584,19 +3715,32 @@ fn keptChildren(store: *Store, alloc: Allocator) ![]KeptChild {
     }
     try kept.ensureTotalCapacity(alloc, strays.len);
     for (strays) |stray| {
-        const reason = if (holdsV2(store, alloc, stray.id))
-            try alloc.dupe(u8, "fx converted it already, so anything an older fx added since stays only in this folder")
-        else if (stray.parent) |parent| blk: {
-            const role: ?sm.Role = if (stray.parent_is_child) .child else if (store.manager.peek(alloc, parent)) |peeked_value| role: {
+        const converted = if (store.manager.peek(alloc, stray.id)) |peeked_value| blk: {
+            var peeked = peeked_value;
+            peeked.deinit(alloc);
+            break :blk true;
+        } else |_| false;
+        const reason = if (converted) converted: {
+            var scratch = std.heap.ArenaAllocator.init(alloc);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            const path = try std.Io.Dir.path.join(a, &.{ store.home, profile_paths.root_dir_name, profile_paths.sessions_dir_name, stray.id });
+            var dir: ?io_mod.VerifiedDir = if (std.Io.Dir.cwd().openDir(io_mod.getIo(), path, .{ .iterate = true, .follow_symlinks = false })) |value| .{ .dir = value } else |_| null;
+            defer if (dir) |*value| value.close();
+            if (if (dir) |*value| leftOutFile(a, value) else null) |file|
+                break :converted try alloc.print("fx converted it already without {s}, which the new store can't keep, so this folder keeps it", .{file});
+            break :converted try alloc.dupe(u8, "fx converted it already, so anything an older fx added since stays only in this folder");
+        } else if (stray.parent) |parent| switch (stray.parent_kind) {
+            .child => try alloc.print("it is a subagent of the earlier subagent {s}, which no fx opens", .{parent}),
+            .unreadable => try alloc.print("its parent session {s} can't be read, so it stays with it", .{parent}),
+            .absent => if (store.manager.peek(alloc, parent)) |peeked_value| blk: {
                 var peeked = peeked_value;
                 defer peeked.deinit(alloc);
-                break :role peeked.role;
-            } else |_| null;
-            const r = role orelse break :blk try alloc.print("its parent session {s} is gone, so no fx opens it", .{parent});
-            break :blk switch (r) {
-                .child => try alloc.print("it is a subagent of the earlier subagent {s}, which no fx opens", .{parent}),
-                .root => try alloc.print("its parent {s} does not list it, so no fx opens it", .{parent}),
-            };
+                break :blk switch (peeked.role) {
+                    .child => try alloc.print("it is a subagent of the earlier subagent {s}, which no fx opens", .{parent}),
+                    .root => try alloc.print("its parent {s} does not list it, so no fx opens it", .{parent}),
+                };
+            } else |_| try alloc.print("its parent session {s} is gone, so no fx opens it", .{parent}),
         } else try alloc.dupe(u8, "it names no parent session, so no fx opens it");
         errdefer alloc.free(reason);
         debug_trace.logf("convert", "action=KeptChild session={s} reason=\"{s}\"", .{ stray.id, reason });
@@ -3628,6 +3772,32 @@ fn copyFailed(id: []const u8, err: anyerror) bool {
 /// Side folders are a few levels deep (a kind, then files); deeper trees
 /// are not fx's and are left out.
 const max_copy_depth = 8;
+
+/// The first entry below `dir`, at `path` in a v1 folder, that the
+/// conversion's terminal copy leaves out (D56): one that is not a folder or
+/// a regular file, one that does not open, or one nested deeper than the
+/// copy goes. Null when it leaves out none. In `a`.
+fn uncopyableIn(a: Allocator, dir: *io_mod.VerifiedDir, path: []const u8, depth: usize) ?[]const u8 {
+    const io = io_mod.getIo();
+    var it = dir.dir.iterate();
+    while (it.next(io) catch return path) |entry| {
+        const sub = a.print("{s}/{s}", .{ path, entry.name }) catch return path;
+        switch (entry.kind) {
+            .directory => {
+                if (depth + 1 == max_copy_depth) return sub;
+                var child = (io_mod.openRealDirIfPresent(dir, entry.name) catch return sub) orelse continue;
+                defer child.close();
+                if (uncopyableIn(a, &child, sub, depth + 1)) |file| return file;
+            },
+            .file => {
+                var file = io_mod.openExistingReadOnlyRegularFile(dir.dir, entry.name, .no_follow) catch return sub;
+                file.close(io);
+            },
+            else => return sub,
+        }
+    }
+    return null;
+}
 
 /// `openSource` opens each folder below `source`, never through a symlink.
 fn copyTree(comptime openSource: anytype, source: *io_mod.VerifiedDir, target: *io_mod.VerifiedDir, depth: usize) bool {
@@ -3661,9 +3831,13 @@ fn copyTree(comptime openSource: anytype, source: *io_mod.VerifiedDir, target: *
 }
 
 fn copyFile(from: std.Io.Dir, to: std.Io.Dir, name: []const u8) !void {
-    const io = io_mod.getIo();
     var source = try io_mod.openExistingReadOnlyRegularFile(from, name, .no_follow);
-    defer source.close(io);
+    defer source.close(io_mod.getIo());
+    try copyOpenedFile(&source, to, name);
+}
+
+fn copyOpenedFile(source: *std.Io.File, to: std.Io.Dir, name: []const u8) !void {
+    const io = io_mod.getIo();
     var target = try to.createFile(io, name, .{ .exclusive = true, .permissions = .fromMode(0o600), .resolve_beneath = true });
     defer target.close(io);
     var buffer: [16 * 1024]u8 = undefined;
@@ -6836,6 +7010,44 @@ test "a v1 session's hosted terminal folders an old fx left readable by others c
     try testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
 }
 
+test "a v1 session whose hosted terminal state holds an entry the copy can't take converts without it, and its v1 folder keeps it (D56, D62)" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const id = (try v1.fixture("terminal", 1))[0];
+    var state = try t.tmp.dir.openDir(io, try v1.sessionPath(id, "terminal/state"), .{});
+    defer state.close(io);
+    state.symLink(io, "elsewhere", "stray-link", .{}) catch return error.SkipZigTest;
+
+    var report = try convertAll(&t.store, alloc);
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), report.converted);
+    try testing.expectEqual(@as(usize, 0), report.skipped.items.len);
+    try testing.expectEqual(@as(usize, 1), report.left_out.items.len);
+    const left = report.left_out.items[0].file;
+    try testing.expectEqualStrings(id, left.member);
+    try testing.expectEqualStrings("terminal/state/stray-link", left.file);
+    try testing.expectEqual(LeftOut.Cause.not_regular, left.cause);
+    // The rest of its terminal state is copied, the link is not.
+    try testing.expect(pathExists(&t, &.{ ".fx", terminal_dir_name, id, "terminal", "state", "record-shell-P1Rx7ZvNXwWFA8DxO1uT2w.json" }));
+    try testing.expect(!pathExists(&t, &.{ ".fx", terminal_dir_name, id, "terminal", "state", "stray-link" }));
+
+    // Its v1 folder keeps the link, after a later run's cleanup too, and
+    // fx doctor has nothing to name.
+    var again = try convertAll(&t.store, alloc);
+    defer again.deinit(alloc);
+    var link: [64]u8 = undefined;
+    try testing.expectEqualStrings("elsewhere", link[0..try state.readLink(io, "stray-link", &link)]);
+    var doctor_report = try doctor(&t.store, alloc, 64, 0);
+    defer doctor_report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 0), doctor_report.stuck.items.len);
+    try testing.expectEqual(@as(usize, 0), doctor_report.unconverted);
+}
+
 fn writeRecovery(v1: *V1Home, id: []const u8, seq: u64, user: []const u8, partial: []const u8) !void {
     const alloc = testing.allocator;
     const checkpoint: session_codec.RecoveryCheckpoint = .{
@@ -7592,18 +7804,7 @@ test "fx sessions convert keeps a v1 subagent's own subagent as it is, and fx do
     defer v1.deinit();
     const family = try v1.fixture("family", 3);
     const a = v1.arena.allocator();
-    // The second child becomes the first's own subagent, as fx made them
-    // before a subagent lost the subagent tool.
-    var registry = try std.json.parseFromSliceLeaky(std.json.Value, a, try v1.file(family[0], "subagent", "children.json"), .{});
-    const children = &registry.object.getPtr("children").?.array;
-    for (children.items, 0..) |child, index| {
-        if (std.mem.eql(u8, child.object.get("id").?.string, family[2])) {
-            _ = children.orderedRemove(index);
-            break;
-        }
-    } else return error.TestUnexpectedResult;
-    try v1.put(family[0], "subagent", "children.json", try std.json.Stringify.valueAlloc(a, registry, .{}));
-    try v1.put(family[2], "subagent", "owner.json", try a.print("{{\"schema_version\":1,\"parent_id\":\"{s}\"}}", .{family[1]}));
+    try nestThirdChild(&v1, family);
     const before = try v1.tree(family[2], ".");
 
     var report = try convertAll(&t.store, alloc);
@@ -7624,6 +7825,50 @@ test "fx sessions convert keeps a v1 subagent's own subagent as it is, and fx do
     try testing.expectEqual(@as(usize, 1), doctor_report.kept_children.len);
     try testing.expectEqualStrings(family[2], doctor_report.kept_children[0].id);
     try testing.expectEqualStrings(reason, doctor_report.kept_children[0].reason);
+}
+
+test "fx sessions convert says a v1 subagent's own subagent stays with a parent it can't read (D88)" {
+    const alloc = testing.allocator;
+    const io = io_mod.getIo();
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    try nestThirdChild(&v1, family);
+    var parent = try t.tmp.dir.openDir(io, try v1.sessionPath(family[1], "."), .{});
+    defer parent.close(io);
+    parent.setFilePermissions(io, "session.json", .fromMode(0o000), .{}) catch return error.SkipZigTest;
+    defer parent.setFilePermissions(io, "session.json", .fromMode(0o600), .{}) catch {};
+    // Not when the file still opens, as it does for root.
+    if (parent.readFileAlloc(io, "session.json", alloc, .limited(1 << 20))) |bytes| {
+        alloc.free(bytes);
+        return error.SkipZigTest;
+    } else |_| {}
+
+    var report = try convertAll(&t.store, alloc);
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), report.kept_children.len);
+    try testing.expectEqualStrings(family[2], report.kept_children[0].id);
+    var expected: [160]u8 = undefined;
+    try testing.expectEqualStrings(try std.mem.print(&expected, "its parent session {s} can't be read, so it stays with it", .{family[1]}), report.kept_children[0].reason);
+}
+
+/// Makes `family`'s third member the second's own subagent, as fx made
+/// them before a subagent lost the subagent tool.
+fn nestThirdChild(v1: *V1Home, family: []const []const u8) !void {
+    const a = v1.arena.allocator();
+    var registry = try std.json.parseFromSliceLeaky(std.json.Value, a, try v1.file(family[0], "subagent", "children.json"), .{});
+    const children = &registry.object.getPtr("children").?.array;
+    for (children.items, 0..) |child, index| {
+        if (std.mem.eql(u8, child.object.get("id").?.string, family[2])) {
+            _ = children.orderedRemove(index);
+            break;
+        }
+    } else return error.TestUnexpectedResult;
+    try v1.put(family[0], "subagent", "children.json", try std.json.Stringify.valueAlloc(a, registry, .{}));
+    try v1.put(family[2], "subagent", "owner.json", try a.print("{{\"schema_version\":1,\"parent_id\":\"{s}\"}}", .{family[1]}));
 }
 
 test "fx sessions convert says a converted v1 child whose folder a cleanup kept is converted already (D60, D88)" {
@@ -8078,7 +8323,7 @@ test "a legacy session larger than the current format's metadata converts (D61)"
     try testing.expectEqual(long_answer.len, restored.history[0].assistant.assistant.len);
 }
 
-test "a v1 side file larger than one v2 blob is left out and named, and the rest of its session converts and continues (D62)" {
+test "a v1 side file larger than one v2 blob is left out and named, its v1 folder keeps it, and the rest of its session converts and continues (D62)" {
     const alloc = testing.allocator;
     const io = io_mod.getIo();
     var t: TestHome = undefined;
@@ -8108,8 +8353,8 @@ test "a v1 side file larger than one v2 blob is left out and named, and the rest
     // Opened: the host is told what was left out.
     const s = try openConverted(&t, roots[0]);
     defer s.close();
-    var expected: [256]u8 = undefined;
-    try testing.expectEqualStrings(try std.mem.print(&expected, "This session was converted without logs/commands/replay.bin, which is {d} bytes, more than the {d} the new store keeps in one file.", .{ sm.max_blob_bytes + 1, sm.max_blob_bytes }), told.items);
+    var expected: [320]u8 = undefined;
+    try testing.expectEqualStrings(try std.mem.print(&expected, "This session was converted without logs/commands/replay.bin, which is {d} bytes, more than the {d} the new store keeps in one file. Its earlier folder ~/.fx/sessions/{s} keeps it.", .{ sm.max_blob_bytes + 1, sm.max_blob_bytes, roots[0] }), told.items);
     try testing.expect(s.host.moved.get("logs/commands/small.bin") != null);
     try testing.expect(s.host.moved.get("logs/commands/replay.bin") == null);
     try s.commitTurn(assistantTurn("next", "reply"), types.ConversationLanguage.default());
@@ -8128,6 +8373,15 @@ test "a v1 side file larger than one v2 blob is left out and named, and the rest
     try testing.expectEqualStrings(roots[1], left.file.member);
     try testing.expectEqualStrings("logs/commands/replay.bin", left.file.file);
     try testing.expectEqual(@as(u64, sm.max_blob_bytes + 1), left.file.bytes);
+
+    // Each v1 folder keeps the file it alone holds, and a later run, whose
+    // cleanup removes a converted session's v1 folder, keeps it too.
+    var again = try convertAll(&t.store, alloc);
+    defer again.deinit(alloc);
+    for (roots) |id| {
+        const stat = try t.tmp.dir.statFile(io, try v1.sessionPath(id, "logs/commands/replay.bin"), .{});
+        try testing.expectEqual(@as(u64, sm.max_blob_bytes + 1), stat.size);
+    }
 }
 
 test "only the adapter imports the session manager" {

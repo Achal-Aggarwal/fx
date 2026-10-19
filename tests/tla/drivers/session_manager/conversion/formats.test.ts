@@ -5,12 +5,12 @@
 // request is observed and judged by TLC as in runtime.test.ts.
 import { expect } from "bun:test";
 import assert from "node:assert/strict";
-import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { binary, shellQuote } from "../../lib/context";
 import {
   askAnswer, compareContinuations, convertAll, crashAtRename, fakeGatewayFinalText, fakeGatewaySse, fakeGatewayToolCall, familyReplies,
-  makePrivate, observer, olderRelease, openVia, plainReplies, requireAccepted, scenario, TmuxSession, waitUntil, type Fixture,
+  makePrivate, MAX_BLOB_BYTES, observer, olderRelease, openVia, plainReplies, requireAccepted, scenario, TmuxSession, waitUntil, type Fixture,
 } from "./driver";
 
 // --- older v1 formats ----------------------------------------------------------
@@ -366,6 +366,51 @@ scenario("fx sessions convert converts a family, skips a busy and an unreadable 
   expect(lines.sort()).toEqual([`${busy}: busy, open in another fx`, `${damaged}: unreadable: ${skips[damaged].reason}`].sort());
   expect(skips[damaged]?.reason).toMatch(/session\.json \S/);
   for (const id of roots) await requireAccepted(o[id], `convert-all-${id === family ? "family" : id === busy ? "busy" : "unreadable"}`);
+});
+
+// --- what a conversion leaves out -------------------------------------------------
+
+// A side file larger than one v2 blob (one real profile had a 16.8 GB command
+// replay) is left out of the copy and named, and the session's v1 folder
+// keeps it through the conversion and every later open (D62).
+scenario("a side file too large for the new store is left out, named, and kept in the session's v1 folder (D62)", async f => {
+  plainReplies(f);
+  const id = (await f.v1Ask(["CONV_FIRST"])).session_id;
+  const commands = join(f.v1Root, id, "logs", "commands");
+  mkdirSync(commands, { recursive: true, mode: 0o700 });
+  const replay = join(commands, "replay.bin");
+  writeFileSync(replay, "", { mode: 0o600 });
+  // Sparse: no disk for the hole.
+  truncateSync(replay, MAX_BLOB_BYTES + 1);
+  const o = observer(f, id);
+  await o.observe("create");
+  const all = await convertAll(f, false);
+  await o.observe("all", all.answer(id));
+  expect(all.run.stdout).toContain(`${id}: converted without logs/commands/replay.bin, which is ${MAX_BLOB_BYTES + 1} bytes, `
+    + `more than the ${MAX_BLOB_BYTES} the new store keeps in one file; ~/.fx/sessions/${id} keeps it`);
+  await o.observe("open", await openVia(f, id, "ask"));
+  await requireAccepted(o, "left-out-side-file");
+  expect(o.observations.at(-1)?.keeps).toEqual([id]);
+  expect(statSync(replay).size).toBe(MAX_BLOB_BYTES + 1);
+});
+
+// Hosted terminal state the copy can't take, here a link no fx writes, is
+// left out and named, and the session's v1 folder keeps it (D56).
+scenario("hosted terminal state the copy can't take is left out, named, and kept in the session's v1 folder (D56)", async f => {
+  plainReplies(f);
+  const id = (await f.v1Ask(["CONV_FIRST"])).session_id;
+  const state = join(f.v1Root, id, "terminal", "state");
+  mkdirSync(state, { recursive: true, mode: 0o700 });
+  symlinkSync("elsewhere", join(state, "stray-link"));
+  const o = observer(f, id);
+  await o.observe("create");
+  await o.observe("open", await openVia(f, id, "ask"));
+  expect(f.said).toContain(`This session was converted without terminal/state/stray-link, which is not a file or folder. `
+    + `Its earlier folder ~/.fx/sessions/${id} keeps it.`);
+  await o.observe("open", await openVia(f, id, "ask"));
+  await requireAccepted(o, "left-out-terminal");
+  expect(o.observations.at(-1)?.keeps).toEqual([id]);
+  expect(readlinkSync(join(state, "stray-link"))).toBe("elsewhere");
 });
 
 // --- why a damaged session can't be converted -------------------------------------

@@ -16,9 +16,12 @@
 (* it is. It publishes the children and then the root, deletes each      *)
 (* member's v1 folder under its lock while that folder is the version   *)
 (* its copy holds (D60), and releases the locks. A delete the file      *)
-(* system refuses leaves the folder and still answers. Nothing converts *)
-(* without a request, and the converter writes no v1 file: it only      *)
-(* deletes a folder whose copy is published.                             *)
+(* system refuses leaves the folder and still answers. A member whose v1 *)
+(* folder keeps something its copy left out (`keeps`: a side file larger *)
+(* than one v2 blob, D62, or hosted terminal state the copy can't take,  *)
+(* D56) is converted without it, and its folder is never deleted.        *)
+(* Nothing converts without a request, and the converter writes no v1    *)
+(* file: it only deletes a folder whose copy is published.               *)
 (*                                                                         *)
 (* Older builds keep writing v1 sessions throughout: a writer holds a     *)
 (* session's lock while it has the session open, and a write in progress *)
@@ -98,10 +101,12 @@ VARIABLES
     refused,    \* [Procs -> SUBSET Ids]: deletes refused in the current request
     reqs,       \* requests made
     crashes,
-    famOf       \* [Roots -> SUBSET Ids]: the members a root's conversion covered
+    famOf,      \* [Roots -> SUBSET Ids]: the members a root's conversion covered
+    keeps       \* SUBSET Ids: members whose v1 folder keeps something its
+                \* copy leaves out (D56, D62); fixed
 
 vars == <<v1ver, v1lock, writing, locks, bad, pub, base, staged, stagedBase,
-          extra, conv, req, out, refused, reqs, crashes, famOf>>
+          extra, conv, req, out, refused, reqs, crashes, famOf, keeps>>
 
 Idle == [pc |-> "idle", root |-> None, members |-> {}, copied |-> {}]
 NoReq == [kind |-> "none", root |-> None]
@@ -127,6 +132,7 @@ TypeOK ==
     /\ reqs \in 0..MaxReq
     /\ crashes \in 0..MaxCrash
     /\ famOf \in [Roots -> SUBSET Ids]
+    /\ keeps \subseteq Ids
 
 Live(i) == pub[i] \in {"import", "fresh", "salvage"}
 
@@ -136,11 +142,13 @@ Orphan(i) == Parent[i] # None /\ pub[i] = "import" /\ pub[Parent[i]] = "none"
 Dirty == \E i \in Ids : staged[i]
 
 \* A v1 folder a crash or a refused delete left behind, unchanged since its
-\* copy (damage changes its fingerprint too), free, and not refused in p's
-\* current request: p's open deletes it.
+\* copy (damage changes its fingerprint too), free, not refused in p's
+\* current request, and keeping no file its copy left out: p's open
+\* deletes it.
 Leftover(p, i) ==
     /\ pub[i] = "import" /\ v1ver[i] > 0 /\ v1ver[i] = base[i] /\ bad[i] = "ok"
     /\ v1lock[i] = "free" /\ i \notin refused[p]
+    /\ i \notin keeps
 
 \* What the picker and `fx sessions` list: v2 roots, and v1 roots v2 does not
 \* hold; children are internal.
@@ -166,6 +174,7 @@ Init ==
     /\ reqs = 0
     /\ crashes = 0
     /\ famOf = [r \in Roots |-> {}]
+    /\ keeps \in SUBSET Ids
 
 (* -- v1 writers: older builds *)
 
@@ -175,7 +184,7 @@ WCreate(i) ==
     /\ pub[i] = "none"                                   \* A1
     /\ v1ver' = [v1ver EXCEPT ![i] = 1]
     /\ UNCHANGED <<v1lock, writing, locks, bad, pub, base, staged, stagedBase,
-                   extra, conv, req, out, refused, reqs, crashes, famOf>>
+                   extra, conv, req, out, refused, reqs, crashes, famOf, keeps>>
 
 WLock(i) ==
     /\ v1ver[i] > 0
@@ -184,7 +193,7 @@ WLock(i) ==
     /\ v1lock' = [v1lock EXCEPT ![i] = "writer"]
     /\ locks' = [locks EXCEPT ![i] = @ + 1]
     /\ UNCHANGED <<v1ver, writing, bad, pub, base, staged, stagedBase, extra,
-                   conv, req, out, refused, reqs, crashes, famOf>>
+                   conv, req, out, refused, reqs, crashes, famOf, keeps>>
 
 WBegin(i) ==
     /\ v1lock[i] = "writer"
@@ -192,21 +201,21 @@ WBegin(i) ==
     /\ v1ver[i] < MaxV
     /\ writing' = [writing EXCEPT ![i] = TRUE]
     /\ UNCHANGED <<v1ver, v1lock, locks, bad, pub, base, staged, stagedBase,
-                   extra, conv, req, out, refused, reqs, crashes, famOf>>
+                   extra, conv, req, out, refused, reqs, crashes, famOf, keeps>>
 
 WEnd(i) ==
     /\ writing[i]
     /\ writing' = [writing EXCEPT ![i] = FALSE]
     /\ v1ver' = [v1ver EXCEPT ![i] = @ + 1]
     /\ UNCHANGED <<v1lock, locks, bad, pub, base, staged, stagedBase, extra,
-                   conv, req, out, refused, reqs, crashes, famOf>>
+                   conv, req, out, refused, reqs, crashes, famOf, keeps>>
 
 WUnlock(i) ==
     /\ v1lock[i] = "writer"
     /\ ~writing[i]
     /\ v1lock' = [v1lock EXCEPT ![i] = "free"]
     /\ UNCHANGED <<v1ver, writing, locks, bad, pub, base, staged, stagedBase,
-                   extra, conv, req, out, refused, reqs, crashes, famOf>>
+                   extra, conv, req, out, refused, reqs, crashes, famOf, keeps>>
 
 \* A writer dies: the kernel drops its lock, and v1's own open repairs a torn
 \* write back to the last whole version.
@@ -217,7 +226,7 @@ WCrash(i) ==
     /\ writing' = [writing EXCEPT ![i] = FALSE]
     /\ crashes' = crashes + 1
     /\ UNCHANGED <<v1ver, locks, bad, pub, base, staged, stagedBase, extra,
-                   conv, req, out, refused, reqs, famOf>>
+                   conv, req, out, refused, reqs, famOf, keeps>>
 
 \* A member's v1 files become unreadable: damage from outside fx, which may
 \* leave a start v1's recover validates.
@@ -226,7 +235,8 @@ Damage(i) ==
     /\ bad[i] = "ok"
     /\ \E d \in Damages \ {"ok"} : bad' = [bad EXCEPT ![i] = d]
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, pub, base, staged,
-                   stagedBase, extra, conv, req, out, refused, reqs, crashes, famOf>>
+                   stagedBase, extra, conv, req, out, refused, reqs, crashes, famOf,
+                   keeps>>
 
 (* -- the new build's own v2 sessions *)
 
@@ -236,7 +246,8 @@ FCreate(i) ==
     /\ i \in Ids => ~staged[i]
     /\ pub' = [pub EXCEPT ![i] = "fresh"]
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, base, staged,
-                   stagedBase, extra, conv, req, out, refused, reqs, crashes, famOf>>
+                   stagedBase, extra, conv, req, out, refused, reqs, crashes, famOf,
+                   keeps>>
 
 FAppend(i) ==
     /\ Live(i)
@@ -244,7 +255,8 @@ FAppend(i) ==
     /\ extra[i] < MaxExtra
     /\ extra' = [extra EXCEPT ![i] = @ + 1]
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, pub, base, staged,
-                   stagedBase, conv, req, out, refused, reqs, crashes, famOf>>
+                   stagedBase, conv, req, out, refused, reqs, crashes, famOf,
+                   keeps>>
 
 (* -- requests and the converter, in each requesting process *)
 
@@ -258,7 +270,7 @@ Request(p, k, r) ==
     /\ refused' = [refused EXCEPT ![p] = {}]
     /\ reqs' = reqs + 1
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, pub, base, staged,
-                   stagedBase, extra, conv, crashes, famOf>>
+                   stagedBase, extra, conv, crashes, famOf, keeps>>
 
 Answer(p, a) ==
     /\ req' = [req EXCEPT ![p] = NoReq]
@@ -275,7 +287,8 @@ AHeld(p) ==
     /\ ~\E i \in Fam(req[p].root) : Leftover(p, i)
     /\ Answer(p, Done(p))
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, pub, base, staged,
-                   stagedBase, extra, conv, refused, reqs, crashes, famOf>>
+                   stagedBase, extra, conv, refused, reqs, crashes, famOf,
+                   keeps>>
 
 \* A leftover v1 folder, unchanged since its copy, is deleted under its lock.
 CClean(p, i) ==
@@ -285,7 +298,8 @@ CClean(p, i) ==
     /\ Leftover(p, i)
     /\ v1ver' = [v1ver EXCEPT ![i] = 0]
     /\ UNCHANGED <<v1lock, writing, locks, bad, pub, base, staged,
-                   stagedBase, extra, conv, req, out, refused, reqs, crashes, famOf>>
+                   stagedBase, extra, conv, req, out, refused, reqs, crashes, famOf,
+                   keeps>>
 
 \* The file system refuses that delete: the folder stays, the open goes on.
 CCleanRefused(p, i) ==
@@ -297,7 +311,7 @@ CCleanRefused(p, i) ==
     /\ refused' = [refused EXCEPT ![p] = @ \cup {i}]
     /\ crashes' = crashes + 1
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, pub, base, staged,
-                   stagedBase, extra, conv, req, out, reqs, famOf>>
+                   stagedBase, extra, conv, req, out, reqs, famOf, keeps>>
 
 \* Neither store holds it.
 AMissing(p) ==
@@ -305,7 +319,8 @@ AMissing(p) ==
     /\ pub[req[p].root] = "none" /\ v1ver[req[p].root] = 0
     /\ Answer(p, IF req[p].kind = "open" THEN "notfound" ELSE "converted")
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, pub, base, staged,
-                   stagedBase, extra, conv, refused, reqs, crashes, famOf>>
+                   stagedBase, extra, conv, refused, reqs, crashes, famOf,
+                   keeps>>
 
 \* Takes every present member's lock, or answers "busy" holding none. The
 \* check that v2 does not hold the root is made under the locks: another
@@ -322,7 +337,7 @@ CBegin(p) ==
        ELSE /\ Answer(p, "busy")
             /\ UNCHANGED <<v1lock, conv>>
     /\ UNCHANGED <<v1ver, writing, locks, bad, pub, base, staged,
-                   stagedBase, extra, refused, reqs, crashes, famOf>>
+                   stagedBase, extra, refused, reqs, crashes, famOf, keeps>>
 
 \* Under the locks: the family's staging leftovers go, and each member not
 \* already published gets a fresh copy in .tmp; an unreadable member drops
@@ -345,7 +360,7 @@ CStage(p) ==
             /\ conv' = [conv EXCEPT ![p].pc = "staged", ![p].copied = copy]
             /\ UNCHANGED <<v1lock, req, out>>
     /\ UNCHANGED <<v1ver, writing, locks, bad, pub, base, extra, refused,
-                   reqs, crashes, famOf>>
+                   reqs, crashes, famOf, keeps>>
 
 \* Publishing is the manager's atomic rename.
 CPublishChild(p, c) ==
@@ -356,7 +371,7 @@ CPublishChild(p, c) ==
     /\ pub' = [pub EXCEPT ![c] = "import"]
     /\ base' = [base EXCEPT ![c] = stagedBase[c]]
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, stagedBase, extra, conv,
-                   req, out, refused, reqs, crashes, famOf>>
+                   req, out, refused, reqs, crashes, famOf, keeps>>
 
 CPublishRoot(p) ==
     LET r == conv[p].root IN
@@ -368,13 +383,15 @@ CPublishRoot(p) ==
     /\ conv' = [conv EXCEPT ![p].pc = "published"]
     /\ famOf' = [famOf EXCEPT ![r] = conv[p].members]
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, stagedBase, extra, req,
-                   out, refused, reqs, crashes>>
+                   out, refused, reqs, crashes, keeps>>
 
 \* A member whose v1 folder p may delete: one it copied in this run, or a
-\* reused child still at its copy's version and fingerprint.
+\* reused child still at its copy's version and fingerprint, that keeps no
+\* file its copy left out.
 Deletable(p, i) ==
     /\ i \in conv[p].members /\ v1ver[i] > 0 /\ v1ver[i] = base[i]
     /\ i \in conv[p].copied \/ bad[i] = "ok"
+    /\ i \notin keeps
 
 \* D60: with the copy durable, each member's v1 folder goes, still locked.
 CDelete(p, i) ==
@@ -383,7 +400,7 @@ CDelete(p, i) ==
     /\ i \notin refused[p]
     /\ v1ver' = [v1ver EXCEPT ![i] = 0]
     /\ UNCHANGED <<v1lock, writing, locks, bad, pub, base, staged, stagedBase,
-                   extra, conv, req, out, refused, reqs, crashes, famOf>>
+                   extra, conv, req, out, refused, reqs, crashes, famOf, keeps>>
 
 \* The file system refuses that delete: the folder stays as a leftover.
 CDeleteRefused(p, i) ==
@@ -394,7 +411,7 @@ CDeleteRefused(p, i) ==
     /\ refused' = [refused EXCEPT ![p] = @ \cup {i}]
     /\ crashes' = crashes + 1
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, pub, base, staged,
-                   stagedBase, extra, conv, req, out, reqs, famOf>>
+                   stagedBase, extra, conv, req, out, reqs, famOf, keeps>>
 
 \* Every member's folder is gone, refused, or not deletable (a reused child
 \* an older build changed or that was damaged): the locks go, it answers.
@@ -405,7 +422,7 @@ CFinish(p) ==
     /\ conv' = [conv EXCEPT ![p] = Idle]
     /\ Answer(p, Done(p))
     /\ UNCHANGED <<v1ver, writing, locks, bad, pub, base, staged, stagedBase,
-                   extra, refused, reqs, crashes, famOf>>
+                   extra, refused, reqs, crashes, famOf, keeps>>
 
 (* -- salvage of a damaged v1 root (D64) *)
 
@@ -419,7 +436,8 @@ SElsewhere(p) ==
     /\ ~OnlyV1(req[p].root)
     /\ Answer(p, IF Live(req[p].root) THEN "inv2" ELSE "notfound")
     /\ UNCHANGED <<v1ver, v1lock, writing, locks, bad, pub, base, staged,
-                   stagedBase, extra, conv, refused, reqs, crashes, famOf>>
+                   stagedBase, extra, conv, refused, reqs, crashes, famOf,
+                   keeps>>
 
 \* Takes the root's v1 lock for the read, or answers "busy".
 SBegin(p) ==
@@ -433,7 +451,7 @@ SBegin(p) ==
        ELSE /\ Answer(p, "busy")
             /\ UNCHANGED <<conv, v1lock>>
     /\ UNCHANGED <<v1ver, writing, locks, bad, pub, base, staged,
-                   stagedBase, extra, refused, reqs, crashes, famOf>>
+                   stagedBase, extra, refused, reqs, crashes, famOf, keeps>>
 
 \* Reads the root under its lock and answers. A validated start is
 \* published as a fresh v2 session in one rename, the manager's import;
@@ -452,7 +470,7 @@ SFinish(p) ==
                   [] bad[r] = "salvage" -> "recovered"
                   [] OTHER -> "unsalvageable")
     /\ UNCHANGED <<v1ver, writing, locks, bad, base, staged, stagedBase,
-                   extra, refused, reqs, crashes, famOf>>
+                   extra, refused, reqs, crashes, famOf, keeps>>
 
 SalvStep(p) == SElsewhere(p) \/ SBegin(p) \/ SFinish(p)
 
@@ -466,7 +484,7 @@ CCrash(p) ==
     /\ out' = [out EXCEPT ![p] = [ans |-> "none", root |-> req[p].root]]
     /\ crashes' = crashes + 1
     /\ UNCHANGED <<v1ver, writing, locks, bad, pub, base, staged,
-                   stagedBase, extra, refused, reqs, famOf>>
+                   stagedBase, extra, refused, reqs, famOf, keeps>>
 
 \* A converter's steps, without its faults.
 ConvWork(p) ==
@@ -559,23 +577,26 @@ NothingHalfConverted ==
 
 \* D60: a v1 folder goes only once its v2 copy is published and is that
 \* folder's version, under its converter's lock or free; no writer deletes.
+\* D62: never one that keeps a file its copy left out.
 NoLossOnDelete ==
     [][\A i \in Ids :
          (v1ver[i] > 0 /\ v1ver'[i] = 0) =>
              /\ pub[i] = "import" /\ pub'[i] = "import"
              /\ base[i] = v1ver[i] /\ ~writing[i]
-             /\ v1lock[i] # "writer"]_vars
+             /\ v1lock[i] # "writer"
+             /\ i \notin keeps]_vars
 
 \* An answered open or conversion leaves no v1 folder of the family that
 \* equals its copy, except one held by a writer or by another converter
-\* (which deletes it as it finishes), damaged since, or whose delete was
-\* refused.
+\* (which deletes it as it finishes), damaged since, keeping a file its
+\* copy left out, or whose delete was refused.
 LeftoversGone ==
     [][\A p \in Procs :
          (AnswerStep(p) /\ out'[p].ans \in {"opened", "converted"}) =>
              \A i \in Fam(req[p].root) :
                  (pub'[i] = "import" /\ v1ver'[i] > 0 /\ v1ver'[i] = base'[i])
-                     => (v1lock'[i] \in {"writer"} \cup (Procs \ {p}) \/ bad'[i] # "ok" \/ i \in refused'[p])]_vars
+                     => (v1lock'[i] \in {"writer"} \cup (Procs \ {p}) \/ bad'[i] # "ok"
+                         \/ i \in keeps \/ i \in refused'[p])]_vars
 
 \* The converter writes no v1 file: it only deletes v1 folders.
 ConverterOnlyDeletes ==

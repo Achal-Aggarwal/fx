@@ -19,7 +19,7 @@ import { expect, test } from "bun:test";
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { tmpdir } from "node:os";
 import { artifacts, binary, repetitions, shellQuote, targetHelpers, worktree } from "../../lib/context";
@@ -40,12 +40,29 @@ type Run = { pid: number; code: number | null; signal: string | null; stdout: st
 type Observation = {
   k: Kind; r: string; ans: Answer; ans2?: Answer; v1: Record<string, number>; pub: Record<string, string>;
   base: Record<string, number>; extra: Record<string, number>; bad: Record<string, Damage>;
-  dirty: boolean; held: string[]; listed: string[]; denied: boolean;
+  dirty: boolean; held: string[]; listed: string[]; denied: boolean; keeps: string[];
 };
 type Verdict = { verdict: string; matched?: number; expected?: number; detail?: string; report: string };
 
 // The v1 files that make a session's contents; locks and usage do not.
 const CONTENT = new Set(["session.json", "events.jsonl", "children.json"]);
+// The largest file one v2 blob holds (`max_blob_bytes`), the v1 folders
+// whose files become blobs, and how deep the hosted terminal copy goes.
+export const MAX_BLOB_BYTES = 512 * 1024 * 1024;
+const SIDE_FOLDERS = ["tool-results", "logs/commands", "artifacts/web-fetch"];
+const MAX_COPY_DEPTH = 8;
+
+// Whether the hosted terminal copy leaves out an entry below `dir`: one that
+// is not a folder or a regular file, one that does not open, or a folder as
+// deep as the copy goes (D56).
+function terminalLeavesOut(dir: string, depth: number): boolean {
+  return readdirSync(dir).some(name => {
+    const path = join(dir, name), stat = lstatSync(path);
+    if (stat.isDirectory()) return depth + 1 === MAX_COPY_DEPTH || terminalLeavesOut(path, depth + 1);
+    if (!stat.isFile()) return true;
+    try { closeSync(openSync(path, "r")); return false; } catch { return true; }
+  });
+}
 export const VIAS: Via[] = ["ask", "app", "continue", "picker", "slash", "acp"];
 
 let pathFault: string | null = null;
@@ -125,7 +142,7 @@ export function fixture(label: string, at?: string, models?: object[]) {
     const hash = createHash("sha256");
     const walk = (d: string) => {
       for (const name of readdirSync(d).sort()) {
-        const p = join(d, name), s = statSync(p);
+        const p = join(d, name), s = lstatSync(p);
         if (s.isDirectory()) walk(p);
         else if (CONTENT.has(name)) hash.update(relative(dir, p)).update("\0").update(readFileSync(p)).update("\0");
       }
@@ -362,6 +379,24 @@ export function observer(f: Fixture, rootId: string, homeDir = f.home, older = f
   let childId: string | null = null;
   // `carried`: per kind of D56 state, whether the read-back found it carried.
   const content: { root: boolean | null; child: boolean | null; carried: Record<string, boolean> } = { root: null, child: null, carried: {} };
+  // The model's `keeps` (D56, D62): members whose v1 folder keeps something
+  // the copy leaves out, a side file larger than one blob or hosted terminal
+  // state the copy can't take. A member stays in it once seen, as `keeps` is
+  // fixed, so a later delete shows.
+  const keeps = new Set<string>();
+  function keepsLeftOut(id: string): boolean {
+    const tooLarge = SIDE_FOLDERS.some(folder => {
+      const dir = join(v1Root, id, folder);
+      return existsSync(dir) && readdirSync(dir).some(name => {
+        const stat = lstatSync(join(dir, name));
+        return stat.isFile() && stat.size > MAX_BLOB_BYTES;
+      });
+    });
+    const terminal = join(v1Root, id, "terminal");
+    let root;
+    try { root = lstatSync(terminal); } catch { return tooLarge; }
+    return tooLarge || !root.isDirectory() || terminalLeavesOut(terminal, 0);
+  }
 
   const members = () => [rootId, ...(childId ? [childId] : [])];
   // The root's child as v1 records it: in the root's subagent/children.json,
@@ -433,6 +468,7 @@ export function observer(f: Fixture, rootId: string, homeDir = f.home, older = f
   // open2 step's second answer.
   async function observe(k: Kind, ans: Answer = "none", denied = false, ans2?: Answer) {
     childId ??= childOf();
+    for (const id of members()) if (keepsLeftOut(id)) keeps.add(id);
     const v1: Record<string, number> = {};
     for (const id of members()) {
       const fp = f.fingerprint(id, homeDir);
@@ -492,6 +528,7 @@ export function observer(f: Fixture, rootId: string, homeDir = f.home, older = f
     const o: Observation = {
       k, r: ["open", "open2", "all", "crash", "recover"].includes(k) ? rootId : "none", ans, ...(ans2 ? { ans2 } : {}), v1, pub, base, extra,
       bad: Object.fromEntries(members().map(id => [id, bad[id] ?? "ok"])), dirty, held: [...held], listed: await listed(), denied,
+      keeps: [...keeps],
     };
     observations.push(o);
     writeFileSync(join(f.root, "observations.json"), JSON.stringify(observations, null, 2));

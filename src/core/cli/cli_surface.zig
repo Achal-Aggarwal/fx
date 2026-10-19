@@ -3177,6 +3177,7 @@ fn runSessionConvert(alloc: Allocator, deps: RunDeps, format: output_contracts.O
         .id = from.id,
         .member = from.file.member,
         .file = from.file.file,
+        .cause = @tagName(from.file.cause),
         .bytes = from.file.bytes,
         .limit = session_adapter.ConvertReport.file_limit_bytes,
     };

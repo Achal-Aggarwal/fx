@@ -25,6 +25,8 @@
 (*          whether the v1 writer's own recover salvages them              *)
 (*   held   the members a still-running older build has open               *)
 (*   denied the driver made the file system refuse deletes in this step    *)
+(*   keeps  the members whose v1 folder keeps something their copy left   *)
+(*          out (D56, D62)                                                 *)
 (* Between observations, only the actions of that step's kind may run,   *)
 (* any number of them; a request step makes exactly its requests, by     *)
 (* process p1 (and p2 for open2). Accepted when some behavior of          *)
@@ -84,6 +86,7 @@ Match(o, n) ==
     /\ Dirty = o.dirty
     /\ Listed = o.listed
     /\ bad = o.bad
+    /\ keeps = o.keeps
     /\ {i \in Ids : v1lock[i] = "writer"} = o.held
     /\ reqs = ReqCount(n)
     /\ \A p \in Procs : req[p] = NoReq /\ conv[p] = Idle

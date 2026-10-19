@@ -403,7 +403,7 @@ reused as ideas; no v1 code is shared.
 | Derived file `index.jsonl` | Listing and `.last` or `.last_opened` without opening every session | `session_catalog_cache.zig` (`.resume-catalog`), v1 `continue/` files | Keyed to stat fingerprints of v1 files; the remembered session lives in a separate file | Written by the manager on create, open, title, workspace or language change, close and delete; rebuilt by scanning logs | Replaces `.resume-catalog` and `continue/` |
 | Folder `blobs/` per session | Large bodies kept out of the log and shared with forks through hard links | `result_store.zig`, `command_replay_store.zig`, the `images/` dir, `web_fetch_artifacts.zig` | Four stores with their own formats, and no fork rule | Written before the line that references it; removed with its session | Replaces those four stores (D6) |
 | L0 `storage_js` | wasm persistence without changing the SDK (D9) | `js_host_session_store.zig` | It stores whole v1 state snapshots, not a log | Created by the wasm host profile; commits at durability points | Replaces `js_host_session_store.zig` |
-| fx v1 converter | Carry v1 sessions into v2 under the same ids (D8) | `session_store.zig::migrateLegacyStorageOnly` | It migrates only between v1 formats | fx background task on the first v2 run; writes through `open(.import)` | Temporary; deleted with the v1 reader one release after v2 becomes the default |
+| fx v1 converter | Carry v1 sessions into v2 under the same ids (D8) | `session_store.zig::migrateLegacyStorageOnly` | It migrates only between v1 formats | Converts a v1 family when it is first opened, or every family through `fx sessions convert` (D59, D61); writes through `open(.import)` | Kept with v1's read path, with no release set for its removal (D65) |
 
 ## Durable State And Schema
 
@@ -463,7 +463,8 @@ reused as ideas; no v1 code is shared.
     and children.
   - It is crash-safe (staged in `.tmp`) and safe to rerun (Exists means
     skip).
-  - v1 files are left untouched.
+  - A family's v1 folders are removed once its v2 copy is durable (D60),
+    except one that keeps a file the conversion left out (D56, D62).
   - wasm v1 snapshots are converted the same way through `sessionStore`.
   - A session converted earlier and then continued in an old fx binary is
     not re-imported, because its id already exists; the newer turns stay
@@ -614,12 +615,12 @@ The figures are medians from 2026-09-27 on a Mac (APFS, SSD).
 - **Rollback:**
   - Before the default flips, switching back to v1 hides v2 sessions but
     loses nothing.
-  - After the conversion, a downgraded fx sees only the v1 sessions not yet
-    converted, since a converted session's v1 folder is removed (D60), and
-    nothing done in v2.
-- **Removal condition:** v1, the converter and the v1 reader are deleted one
-  release after v2 becomes the default. That requires the E2E session suite,
-  the SDK resume test and a dogfood window to pass with no v2 regression.
+  - After the conversion, a downgraded fx sees only the v1 folders a
+    conversion did not remove (D60): the sessions not yet converted and
+    those that keep a file the conversion left out (D56, D62). It sees nothing
+    done in v2.
+- **Removal condition:** none. The converter and v1's read path stay, so a
+  user can open a v1 session after any number of releases (D65).
 
 ## Reliability And Recovery
 
@@ -1140,7 +1141,10 @@ D59 replaces D55's import at start with conversion on open):
   handles mapped as D47 maps them; ACP client prompts and tool identities
   as D46's settings; hosted terminal state into `~/.fx/terminal/{id}`
   (D45), whatever its folders' modes, as v1 made each private when it
-  opened it; `-c`'s remembered app session as v2's last-opened when v2 has
+  opened it, while an entry the copy can't take (a link, a FIFO, a file
+  that does not open, or nesting deeper than 8 folders) is left out and
+  named, and the member's v1 folder keeps it, as D62 keeps a side file
+  (2026-10-19); `-c`'s remembered app session as v2's last-opened when v2 has
   none; and a `recovery.json` open turn as an interrupted turn with its
   saved pieces (D1), exactly when v1 would show it: v1 drops a checkpoint
   whose turn is not open in its log. It carried unsettled usage markers
@@ -1262,7 +1266,11 @@ Settled for the converter (2026-10-06):
   family had peaked at 3.6 GB); families with children are read twice.
   A side file over v2's per-file limit (one real 16.8 GB command replay)
   is left out, named in the trace and the convert output, and the rest of
-  the family converts. The v2 listing must stay fast at the size
+  the family converts. That member's v1 folder is then kept rather than
+  removed (D60), so the file stays where it was, and the notice and the
+  convert output name the folder (2026-10-19). `V1Conversion.tla`'s
+  `keeps` holds such members, and `NoLossOnDelete` checks that no
+  conversion or cleanup removes their folders. The v2 listing must stay fast at the size
   conversion creates (about 14,000 sessions took 1.9 s a page): fixed in
   this change, gated by the manager's benchmark. A usage marker move came
   with this decision and went with fx's usage ledger. **Why:** the real

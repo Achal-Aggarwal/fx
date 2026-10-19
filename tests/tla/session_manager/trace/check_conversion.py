@@ -109,14 +109,14 @@ def model_obs(request):
             base, _ = by_model("base", 0, nat)
             extra, _ = by_model("extra", 0, nat)
             bad, _ = by_model("bad", "ok", damage)
-            listed, held, denied = o["listed"], o.get("held", []), o.get("denied", False)
+            listed, held, denied, keeps = o["listed"], o.get("held", []), o.get("denied", False), o.get("keeps", [])
             if not isinstance(o["dirty"], bool) or not isinstance(listed, list) or not isinstance(held, list) \
-                    or not isinstance(denied, bool):
-                raise Inconclusive(f"observation {n}: dirty, listed, held or denied is malformed")
+                    or not isinstance(denied, bool) or not isinstance(keeps, list):
+                raise Inconclusive(f"observation {n}: dirty, listed, held, denied or keeps is malformed")
             if denied and k not in REQUESTS:
                 raise Inconclusive(f"observation {n}: deletes can only be refused during a request")
-            if any(names.get(i) not in member for i in held):
-                raise Inconclusive(f"observation {n}: held names an id that is not a v1 member")
+            if any(names.get(i) not in member for i in held + keeps):
+                raise Inconclusive(f"observation {n}: held or keeps names an id that is not a v1 member")
             unknown = [i for i in listed if i not in names]
             out.append({
                 "k": k, "r": r, "ans": ans, "ans2": ans2,
@@ -128,6 +128,7 @@ def model_obs(request):
                 "dirty": o["dirty"],
                 "denied": denied,
                 "held": sorted(names[i] for i in held),
+                "keeps": sorted(names[i] for i in keeps),
                 # An id the run does not know can never match the model's listing.
                 "listed": sorted({names[i] for i in listed if i in names} | ({"unknown"} if unknown else set())),
             })
@@ -146,6 +147,7 @@ def data_module(obs):
                 + ", dirty |-> " + ("TRUE" if o["dirty"] else "FALSE")
                 + ", denied |-> " + ("TRUE" if o["denied"] else "FALSE")
                 + ", held |-> {" + ", ".join(tla_str(i) for i in o["held"]) + "}"
+                + ", keeps |-> {" + ", ".join(tla_str(i) for i in o["keeps"]) + "}"
                 + ", listed |-> {" + ", ".join(tla_str(i) for i in o["listed"]) + "}]")
     body = ",\n    ".join(rec(o) for o in obs)
     return f"---- MODULE ConversionData ----\nEXTENDS TLC, Integers, FiniteSets\nObs == <<\n    {body}\n>>\n====\n"
@@ -216,13 +218,13 @@ def selftest():
     ids = {"root": "R", "child": None, "fresh": []}
 
     def ob(k, v1=0, pub="none", base=0, extra=0, ans="none", dirty=False, listed=None, bad="ok", r="R", held=(),
-           denied=False, ans2="none", salvaged=None):
+           denied=False, ans2="none", salvaged=None, keeps=()):
         # `salvaged`: the status of the fresh id S a salvage copies into.
         fresh = {} if salvaged is None else {"S": salvaged}
         return {"k": k, "r": r, "ans": ans, "ans2": ans2, "v1": {"R": v1}, "pub": {"R": pub, **fresh},
                 "base": {"R": base, **{i: 0 for i in fresh}}, "extra": {"R": extra, **{i: 0 for i in fresh}},
                 "bad": {"R": bad}, "dirty": dirty, "held": list(held),
-                "listed": ["R"] if listed is None else listed, "denied": denied}
+                "listed": ["R"] if listed is None else listed, "denied": denied, "keeps": list(keeps)}
     made = ob("create", v1=1)
     kept = ob("open", v1=1, pub="import", base=1, ans="opened", denied=True)
     cases = [
@@ -263,6 +265,11 @@ def selftest():
          [made, ob("list", v1=1, pub="import", base=1), ob("open", pub="import", base=1, ans="opened")], "REJECTED"),
         ("planted: the v1 folder stays though no delete was refused",
          [made, ob("open", v1=1, pub="import", base=1, ans="opened")], "REJECTED"),
+        ("a v1 folder keeping a file its copy left out stays after the conversion and the next open (D62)",
+         [ob("create", v1=1, keeps=["R"]), ob("open", v1=1, pub="import", base=1, ans="opened", keeps=["R"]),
+          ob("open", v1=1, pub="import", base=1, ans="opened", keeps=["R"])], "ACCEPTED"),
+        ("planted: a v1 folder keeping a file its copy left out is deleted",
+         [ob("create", v1=1, keeps=["R"]), ob("open", pub="import", base=1, ans="opened", keeps=["R"])], "REJECTED"),
         ("planted: a leftover an older build changed is deleted",
          [made, kept, ob("write", v1=2, pub="import", base=1), ob("open", pub="import", base=1, ans="opened")],
          "REJECTED"),

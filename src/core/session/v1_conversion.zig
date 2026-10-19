@@ -165,8 +165,9 @@ pub const Stray = struct {
     /// The parent its `subagent/owner.json` or `subagent/control.json`
     /// names; null when it names none.
     parent: ?[]u8,
-    /// Whether that parent is itself a v1 child.
-    parent_is_child: bool,
+    /// What v1 holds for that parent: nothing, a v1 child, or a folder
+    /// whose kind can't be read.
+    parent_kind: enum { absent, child, unreadable },
 
     pub fn deinit(stray: Stray, alloc: Allocator) void {
         alloc.free(stray.id);
@@ -196,13 +197,16 @@ pub fn strayChildren(alloc: Allocator, home: []const u8) ![]Stray {
             else => continue,
         };
         errdefer if (parent) |value| alloc.free(value);
-        const parent_kind: Kind = if (parent) |value| kindOf(&store, alloc, value) catch .absent else .absent;
+        const parent_kind: ?Kind = if (parent) |value| kindOf(&store, alloc, value) catch null else .absent;
         if (parent_kind == .root) {
             if (parent) |value| alloc.free(value);
             continue;
         }
         try strays.ensureUnusedCapacity(alloc, 1);
-        strays.appendAssumeCapacity(.{ .id = try alloc.dupe(u8, id), .parent = parent, .parent_is_child = parent_kind == .child });
+        strays.appendAssumeCapacity(.{ .id = try alloc.dupe(u8, id), .parent = parent, .parent_kind = if (parent_kind) |kind| switch (kind) {
+            .child => .child,
+            else => .absent,
+        } else .unreadable });
     }
     return strays.toOwnedSlice(alloc);
 }
