@@ -1927,6 +1927,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .publish_deferred_tool_completion = publishDeferredToolCompletion,
         .propagate_history_turn = propagateHistoryTurn,
+        .image_blob_dir = if (session.v2) |v2| v2.blobsPath() else null,
         .append_turn_piece = if (session.v2 != null)
             appendTurnPiece
         else if (session.journal != null)

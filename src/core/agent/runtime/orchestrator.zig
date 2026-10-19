@@ -7510,7 +7510,7 @@ fn processQueuedPromptLoop(
             const steering_messages = try runtime_execution_memory.rewrapRestoredSteering(overlay_arena, image_projection.messages);
             // After the steering rewrap, which recognizes a parent's steering
             // by how its text starts.
-            const located_messages = try image_attachments.noteAttachmentLocations(overlay_arena, steering_messages);
+            const located_messages = try image_attachments.noteAttachmentLocations(overlay_arena, steering_messages, deps.image_blob_dir);
             const request_messages = try with_replyable_conversation_tail(overlay_arena, located_messages);
             if (request_messages.ptr != located_messages.ptr) {
                 debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{located_messages.len});

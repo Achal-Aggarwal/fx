@@ -1196,6 +1196,9 @@ pub const Session = struct {
     /// `~/.fx/session-files/{id}`, owned: where an older session kept its
     /// side files, read once by the move (D47).
     files_path: []u8,
+    /// The folder of this session's blobs once it is published, owned: each
+    /// prompt image is the file named by its hash there (D79).
+    blobs_path: []u8,
     /// The session's blobs, shared with every capability over it (D44).
     host: *BlobHost,
     capability: ?session_child_store.SessionChildCapability = null,
@@ -1426,15 +1429,23 @@ pub const Session = struct {
     fn init(alloc: Allocator, store: *Store, handle: sm.Session, fresh: bool) !*Session {
         const files_path = try std.Io.Dir.path.join(alloc, &.{ store.home, profile_paths.root_dir_name, files_dir_name, handle.id() });
         errdefer alloc.free(files_path);
+        const blobs_path = try std.Io.Dir.path.join(alloc, &.{ store.manager.root_path, handle.id(), "blobs" });
+        errdefer alloc.free(blobs_path);
         const host = try BlobHost.create(alloc, store, handle);
         errdefer BlobHost.release(host);
         const self = try alloc.create(Session);
-        self.* = .{ .alloc = alloc, .store = store, .handle = handle, .files_path = files_path, .host = host, .fresh = fresh };
+        self.* = .{ .alloc = alloc, .store = store, .handle = handle, .files_path = files_path, .blobs_path = blobs_path, .host = host, .fresh = fresh };
         return self;
     }
 
     pub fn id(self: *const Session) []const u8 {
         return self.handle.id();
+    }
+
+    /// Where requests say a prompt image is saved (D79): the blob a turn's
+    /// user item keeps it as, written before any of the turn's tools run.
+    pub fn blobsPath(self: *const Session) []const u8 {
+        return self.blobs_path;
     }
 
     /// Appends through the manager; a host session also traces the turn and
@@ -1546,6 +1557,7 @@ pub const Session = struct {
         if (self.instructions) |value| alloc.free(value);
         if (self.first_title) |value| alloc.free(value);
         alloc.free(self.files_path);
+        alloc.free(self.blobs_path);
         alloc.destroy(self);
     }
 
@@ -1607,7 +1619,7 @@ pub const Session = struct {
                         kept = try a.dupe(types.ImageAttachment, user.images);
                     }
                     const hash = try self.handle.putBlob(bytes);
-                    kept.?[index].snapshot_path = try std.Io.Dir.path.join(a, &.{ self.store.manager.root_path, self.id(), "blobs", &hash });
+                    kept.?[index].snapshot_path = try std.Io.Dir.path.join(a, &.{ self.blobs_path, &hash });
                 }
                 if (kept) |list| user.images = list;
             },
@@ -1866,7 +1878,7 @@ pub const Session = struct {
     /// `blobs` and the blob each kept prompt image names, so every blob is
     /// listed on an item of the turn that stored it (D44, D79).
     fn promptImageBlobs(self: *Session, a: Allocator, blobs: []const []const u8, images: []const types.ImageAttachment) ![]const []const u8 {
-        const folder = try std.Io.Dir.path.join(a, &.{ self.store.manager.root_path, self.id(), "blobs" });
+        const folder = self.blobs_path;
         var list: std.ArrayList([]const u8) = .empty;
         for (images) |image| {
             const path = image.snapshot_path orelse continue;

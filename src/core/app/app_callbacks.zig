@@ -336,6 +336,10 @@ pub fn Bindings(comptime App: type) type {
                     if (app.session_persistence.v2 != null) agentAppendTurnPiece else null
                 else
                     null,
+                .image_blob_dir = if (comptime @hasField(App, "session_persistence"))
+                    if (app.session_persistence.v2) |v2| v2.blobsPath() else null
+                else
+                    null,
                 .propagate_grant = agentPropagateGrant,
                 .push_event = agentPushEvent,
                 .push_text = agentPushText,

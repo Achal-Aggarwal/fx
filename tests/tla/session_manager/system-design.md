@@ -1401,8 +1401,15 @@ Settled while removing v1 (2026-10-17):
   notice for an image too large to send names `snapshot_path` whenever
   it is set: in the running process, the copy fx captured in its
   temporary folder, since a new session has no folder until its first
-  turn starts; after a resume, the blob. **Why:** the model can read the
-  original to make a smaller copy, as v1's `images/` folder let it.
+  turn starts; after a resume, the blob. Each request names the blob of
+  every prompt image it sends, as `[Image #N (type) is saved at
+  "<path>".]` ahead of the prompt, in the running process and after a
+  resume alike: the blob is the file named by the image's hash in the
+  session's blob folder, and the turn writes it with the user item before
+  any of its tools runs, so the model can open the file the note names. A
+  recalled image has the same bytes, so it names the same blob. **Why:**
+  the model can read the original to make a smaller copy, or open the
+  image it sees with tools, as v1's `images/` folder let it.
   **Alternative:** tell the model no local file is available.
 - **D80 Decision:** when fx is killed while a response is being retried,
   the reopened session shows the turn's finished pieces, such as a tool
@@ -1440,8 +1447,11 @@ Settled while removing v1 (2026-10-17):
 - **D84 Decision:** recalling a prompt from the input history uses the
   image bytes saved with the prompt, checked against their digest, so a
   damaged or deleted captured file no longer refuses the recall. The
-  composer tests pin that the recall succeeds. **Why:** the saved bytes
-  are the prompt's image; the captured file is a temporary copy.
+  recalled image keeps those bytes inline and writes no file, so its turn
+  saves it as a blob as it does any prompt image (D79); a copy in the
+  temporary folder would be gone once fx exits. The composer tests pin
+  that the recall succeeds and names the same blob. **Why:** the saved
+  bytes are the prompt's image; the captured file is a temporary copy.
   **Alternative:** read the captured file again, as v1 did.
 - **D85 Decision:** `Wiring.tla` models one store. The backend choice
   (`Backends`, `backend`, `wrote`, `OneBackend`) and the usage ledger
