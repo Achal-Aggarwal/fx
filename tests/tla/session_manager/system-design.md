@@ -1455,6 +1455,14 @@ Settled while removing v1 (2026-10-17):
   those steps, keeps the whole turn. **Why:** the steps the summary covers
   reached the model a second time, up to 170 messages in real sessions,
   enough to fill the window on resume. **Alternative:** keep whole turns.
+- **D88 Decision:** a v1 subagent whose parent is not a v1 root, such as
+  a subagent's own subagent from before v0.0.8 (since then a subagent has
+  no subagent tool, so no fx opens one), or one whose parent is gone or
+  does not list it, is kept as it is. `fx sessions convert` names each
+  under `kept` and `fx doctor` names each too, with the reason, and its
+  family converts without it. **Why:** no v1 session is left unexplained.
+  **Alternative:** convert descendants at every depth, for sessions no
+  build opens.
 
 ## Design Risks And Failure Behavior
 

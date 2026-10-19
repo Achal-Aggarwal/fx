@@ -50,6 +50,58 @@ function olderReplies(f: Fixture, [tool, input]: [string, object]) {
   });
 }
 
+// A subagent's own subagent, which fx v0.0.7 still let a subagent create:
+// the parent creates "helper", whose first turn creates "inner" and waits
+// for it. No fx opens "inner" now (a subagent has had no subagent tool since
+// v0.0.8), so conversion keeps it as it is and names it (D88); the family
+// around it converts as any family does.
+function nestedReplies(f: Fixture) {
+  f.setRespond(body => {
+    const childOf = (call: string) => /\\"child_id\\":\\"([^\\"]+)\\"/.exec(body)?.[1] ?? `missing-${call}`;
+    const wait = (call: string, id: string) =>
+      fakeGatewayToolCall(call, "subagent", { command: { inspect: { id, sections: ["status"], wait: { until: "settled", timeout_ms: 20_000 } } } });
+    if (body.includes("conv-inner-create")) return body.includes("conv-inner-wait") ? fakeGatewayFinalText("CONV_HELPER_DONE") : wait("conv-inner-wait", childOf("inner"));
+    if (body.includes("conv-old-create")) return body.includes("conv-old-wait") ? fakeGatewayFinalText("CONV_PARENT_DONE") : wait("conv-old-wait", childOf("helper"));
+    if (body.includes("Report the nested marker.")) return fakeGatewayFinalText("CONV_INNER_ANSWER");
+    if (body.includes("Make a helper of your own.")) {
+      return fakeGatewayToolCall("conv-inner-create", "subagent", { command: { create: { name: "inner", mode: "persistent", prompt: "Report the nested marker." } } });
+    }
+    return fakeGatewayToolCall("conv-old-create", "subagent", { command: { create: { name: "helper", mode: "persistent", prompt: "Make a helper of your own." } } });
+  });
+}
+
+scenario("a subagent's own subagent, written by fx v0.0.7, is kept as it is and named, and its family converts (D88)", async f => {
+  const older = olderRelease("v0.0.7");
+  nestedReplies(f);
+  const run = await f.fx(false, ["ask", "--json", "--auto", "CONV_NESTED"], f.home, { FX_PERMISSION_MODE: "auto" }, older);
+  assert.equal(run.code, 0, `fx v0.0.7 ask failed: ${run.stderr}${run.stdout}`);
+  const id: string = JSON.parse(run.stdout).session_id;
+  const parentOf = (n: string) => {
+    const control = join(f.v1Root, n, "subagent/control.json");
+    return existsSync(control) ? JSON.parse(readFileSync(control, "utf8")).parent_id : null;
+  };
+  const ids = readdirSync(f.v1Root).filter(n => existsSync(join(f.v1Root, n, "session.json")));
+  const helper = ids.find(n => parentOf(n) === id);
+  const inner = helper && ids.find(n => parentOf(n) === helper);
+  assert(helper && inner, `Owned fault boundary not reached: fx v0.0.7 wrote no subagent of a subagent: ${ids.join(", ")}`);
+  const kept = f.fingerprint(inner);
+  const o = observer(f, id, f.home, true);
+  await o.observe("create");
+  assert.equal(o.childId, helper, "the observer did not find the family's own child");
+  await o.observe("list");
+  plainReplies(f);
+  await o.observe("open", await openVia(f, id, "ask"));
+  await o.observe("list");
+  await requireAccepted(o, "older-v0.0.7-nested");
+
+  const converted = await convertAll(f);
+  const reason = `it is a subagent of the earlier subagent ${helper}, which no fx opens`;
+  expect(JSON.parse(converted.run.stdout).kept).toEqual([{ id: inner, reason }]);
+  expect(f.fingerprint(inner)).toBe(kept);
+  const doctor = await f.fx(true, ["doctor"]);
+  expect(doctor.stdout).toContain(`session ${inner}, a subagent an older fx saved, is kept as it is: ${reason}`);
+});
+
 for (const { name, tag, family, marker, private: hidden, run: command } of FORMATS) {
   scenario(`${name}, written by fx ${tag}, converts and the model sees the same`, async f => {
     const older = olderRelease(tag);

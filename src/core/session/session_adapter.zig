@@ -659,6 +659,8 @@ pub const Doctor = struct {
     unconverted: usize = 0,
     /// Those of them that can't be converted, among the checked ones.
     stuck: std.ArrayList(Stuck) = .empty,
+    /// Each v1 subagent no conversion takes, kept as it is (D88).
+    kept_children: []KeptChild = &.{},
 
     pub const Stuck = struct {
         id: []u8,
@@ -677,6 +679,7 @@ pub const Doctor = struct {
             alloc.free(stuck.reason);
         }
         report.stuck.deinit(alloc);
+        freeKeptChildren(alloc, report.kept_children);
         report.* = undefined;
     }
 };
@@ -720,6 +723,7 @@ pub fn doctor(store: *Store, alloc: Allocator, limit: usize, now_ms: i64) !Docto
         cursor = page.next orelse break;
     }
     try doctorV1(store, alloc, &report, limit);
+    report.kept_children = try keptChildren(store, alloc);
     try store.sweepFiles(alloc, &report, now_ms);
     return report;
 }
@@ -3416,6 +3420,8 @@ pub const ConvertReport = struct {
     skipped: std.ArrayList(Skipped) = .empty,
     /// Each side file a converted family was converted without (D62).
     left_out: std.ArrayList(LeftOutFile) = .empty,
+    /// Each v1 subagent no conversion takes, kept as it is (D88).
+    kept_children: []KeptChild = &.{},
 
     pub const LeftOutFile = struct {
         /// The family's root.
@@ -3445,6 +3451,7 @@ pub const ConvertReport = struct {
             entry.file.deinit(alloc);
         }
         report.left_out.deinit(alloc);
+        freeKeptChildren(alloc, report.kept_children);
         report.* = undefined;
     }
 
@@ -3529,7 +3536,69 @@ pub fn convertAll(store: *Store, alloc: Allocator) !ConvertReport {
             conversion.left_out.clearRetainingCapacity();
         }
     }
+    // After every family converted, so a child its root left behind is named.
+    report.kept_children = try keptChildren(store, alloc);
     return report;
+}
+
+/// A session an older fx saved as a subagent that no conversion takes, and
+/// why no fx opens it (D88). Its v1 folder is kept as it is.
+pub const KeptChild = struct {
+    id: []u8,
+    reason: []u8,
+};
+
+pub fn freeKeptChildren(alloc: Allocator, kept: []KeptChild) void {
+    for (kept) |child| {
+        alloc.free(child.id);
+        alloc.free(child.reason);
+    }
+    alloc.free(kept);
+}
+
+/// Each v1 child whose parent is not a v1 root, with why no fx opens it
+/// (D88): a child of an earlier subagent, which v1 never let a subagent
+/// message, or one whose parent is gone or does not list it. Reads only.
+/// Caller owns the result; free it with `freeKeptChildren`.
+fn keptChildren(store: *Store, alloc: Allocator) ![]KeptChild {
+    const strays = v1_conversion.strayChildren(alloc, store.home) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            debug_trace.logf("convert", "action=ChildrenUnlisted err={s}", .{@errorName(err)});
+            return &.{};
+        },
+    };
+    defer {
+        for (strays) |stray| stray.deinit(alloc);
+        alloc.free(strays);
+    }
+    var kept: std.ArrayList(KeptChild) = .empty;
+    errdefer {
+        for (kept.items) |child| {
+            alloc.free(child.id);
+            alloc.free(child.reason);
+        }
+        kept.deinit(alloc);
+    }
+    try kept.ensureTotalCapacity(alloc, strays.len);
+    for (strays) |stray| {
+        const reason = if (stray.parent) |parent| blk: {
+            const role: ?sm.Role = if (stray.parent_is_child) .child else if (store.manager.peek(alloc, parent)) |peeked_value| role: {
+                var peeked = peeked_value;
+                defer peeked.deinit(alloc);
+                break :role peeked.role;
+            } else |_| null;
+            const r = role orelse break :blk try alloc.print("its parent session {s} is gone, so no fx opens it", .{parent});
+            break :blk switch (r) {
+                .child => try alloc.print("it is a subagent of the earlier subagent {s}, which no fx opens", .{parent}),
+                .root => try alloc.print("its parent {s} does not list it, so no fx opens it", .{parent}),
+            };
+        } else try alloc.dupe(u8, "it names no parent session, so no fx opens it");
+        errdefer alloc.free(reason);
+        debug_trace.logf("convert", "action=KeptChild session={s} reason=\"{s}\"", .{ stray.id, reason });
+        kept.appendAssumeCapacity(.{ .id = try alloc.dupe(u8, stray.id), .reason = reason });
+    }
+    return kept.toOwnedSlice(alloc);
 }
 
 const ConversionStorageError = error{ NoSpaceLeft, AccessDenied, ReadOnlyFileSystem, FileTooBig, SessionStoreUnavailable };
@@ -7423,6 +7492,49 @@ test "a conversion past its slow mark tells the host once (D61)" {
     slow.phase();
     slow.phase();
     try testing.expectEqual(@as(usize, 1), told);
+}
+
+test "fx sessions convert keeps a v1 subagent's own subagent as it is, and fx doctor names it too (D88)" {
+    const alloc = testing.allocator;
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var v1 = try V1Home.init(&t);
+    defer v1.deinit();
+    const family = try v1.fixture("family", 3);
+    const a = v1.arena.allocator();
+    // The second child becomes the first's own subagent, as fx made them
+    // before a subagent lost the subagent tool.
+    var registry = try std.json.parseFromSliceLeaky(std.json.Value, a, try v1.file(family[0], "subagent", "children.json"), .{});
+    const children = &registry.object.getPtr("children").?.array;
+    for (children.items, 0..) |child, index| {
+        if (std.mem.eql(u8, child.object.get("id").?.string, family[2])) {
+            _ = children.orderedRemove(index);
+            break;
+        }
+    } else return error.TestUnexpectedResult;
+    try v1.put(family[0], "subagent", "children.json", try std.json.Stringify.valueAlloc(a, registry, .{}));
+    try v1.put(family[2], "subagent", "owner.json", try a.print("{{\"schema_version\":1,\"parent_id\":\"{s}\"}}", .{family[1]}));
+    const before = try v1.tree(family[2], ".");
+
+    var report = try convertAll(&t.store, alloc);
+    defer report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), report.converted);
+    try testing.expectEqual(@as(usize, 0), report.skipped.items.len);
+    const reason = try a.print("it is a subagent of the earlier subagent {s}, which no fx opens", .{family[1]});
+    try testing.expectEqual(@as(usize, 1), report.kept_children.len);
+    try testing.expectEqualStrings(family[2], report.kept_children[0].id);
+    try testing.expectEqualStrings(reason, report.kept_children[0].reason);
+    // Its folder is as it was.
+    const after = try v1.tree(family[2], ".");
+    try testing.expectEqual(before.count(), after.count());
+    for (before.keys(), before.values()) |path, bytes| try testing.expectEqualStrings(bytes, after.get(path).?);
+
+    var doctor_report = try doctor(&t.store, alloc, 64, 0);
+    defer doctor_report.deinit(alloc);
+    try testing.expectEqual(@as(usize, 1), doctor_report.kept_children.len);
+    try testing.expectEqualStrings(family[2], doctor_report.kept_children[0].id);
+    try testing.expectEqualStrings(reason, doctor_report.kept_children[0].reason);
 }
 
 test "fx sessions convert converts every v1 family, and counts what it skipped (D61)" {

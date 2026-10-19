@@ -272,6 +272,10 @@ fn appendStateChecks(checks: *std.ArrayList(Check), alloc: Allocator) !void {
         try appendCheckOwned(checks, alloc, "session", .warn, detail);
     }
     for (report.stuck.items) |stuck| try appendStuckCheck(checks, alloc, stuck);
+    for (report.kept_children) |kept| {
+        const detail = try alloc.print("session {s}, a subagent an older fx saved, is kept as it is: {s}", .{ kept.id, kept.reason });
+        try appendCheckOwned(checks, alloc, "session", .ok, detail);
+    }
     // The limit covers v1's unconverted sessions too (D73).
     if (report.checked < report.sessions + report.unconverted) try appendSessionDiagnosticsTruncatedCheck(checks, alloc, report.checked);
     if (report.removed > 0) {

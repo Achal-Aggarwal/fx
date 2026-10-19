@@ -3180,7 +3180,17 @@ fn runSessionConvert(alloc: Allocator, deps: RunDeps, format: output_contracts.O
         .bytes = from.file.bytes,
         .limit = session_adapter.ConvertReport.file_limit_bytes,
     };
-    const snapshot: output_contracts.SessionConvertSnapshot = .{ .converted = report.converted, .busy = report.busy, .unreadable = report.unreadable, .skipped = skipped, .left_out = left_out };
+    const kept = try alloc.alloc(output_contracts.SessionConvertSnapshot.Kept, report.kept_children.len);
+    defer alloc.free(kept);
+    for (report.kept_children, kept) |from, *to| to.* = .{ .id = from.id, .reason = from.reason };
+    const snapshot: output_contracts.SessionConvertSnapshot = .{
+        .converted = report.converted,
+        .busy = report.busy,
+        .unreadable = report.unreadable,
+        .skipped = skipped,
+        .left_out = left_out,
+        .kept = kept,
+    };
     const text = try snapshot.render(alloc, format);
     defer alloc.free(text);
     try writeFormattedOutput(deps, text, format);

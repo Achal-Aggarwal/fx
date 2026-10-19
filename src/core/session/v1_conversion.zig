@@ -158,6 +158,74 @@ pub fn rootIds(alloc: Allocator, home: []const u8) ![]Root {
     return roots.toOwnedSlice(alloc);
 }
 
+/// A v1 child that no root's conversion takes (D88), and the parent it
+/// names, which is not a v1 root.
+pub const Stray = struct {
+    id: []u8,
+    /// The parent its `subagent/owner.json` or `subagent/control.json`
+    /// names; null when it names none.
+    parent: ?[]u8,
+    /// Whether that parent is itself a v1 child.
+    parent_is_child: bool,
+
+    pub fn deinit(stray: Stray, alloc: Allocator) void {
+        alloc.free(stray.id);
+        if (stray.parent) |parent| alloc.free(parent);
+    }
+};
+
+/// Every v1 child whose parent is not a v1 root, which a conversion leaves
+/// as it is (D88): a child of an earlier subagent, or one whose parent is
+/// gone or already converted. A folder whose kind or parent cannot be read
+/// is left out; `rootIds` reports the first. Fails only when v1's sessions
+/// folder cannot be listed. Caller owns the result.
+pub fn strayChildren(alloc: Allocator, home: []const u8) ![]Stray {
+    var store = try session_store.Store.initReadOnlyFromHome(alloc, home, "/");
+    defer store.deinit(alloc);
+    var strays: std.ArrayList(Stray) = .empty;
+    errdefer {
+        for (strays.items) |stray| stray.deinit(alloc);
+        strays.deinit(alloc);
+    }
+    var candidates = store.readOnlyCandidates();
+    while (try candidates.nextId(alloc, null)) |id| {
+        defer alloc.free(id);
+        if ((kindOf(&store, alloc, id) catch continue) != .child) continue;
+        const parent = parentOf(&store, alloc, id) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => continue,
+        };
+        errdefer if (parent) |value| alloc.free(value);
+        const parent_kind: Kind = if (parent) |value| kindOf(&store, alloc, value) catch .absent else .absent;
+        if (parent_kind == .root) {
+            if (parent) |value| alloc.free(value);
+            continue;
+        }
+        try strays.ensureUnusedCapacity(alloc, 1);
+        strays.appendAssumeCapacity(.{ .id = try alloc.dupe(u8, id), .parent = parent, .parent_is_child = parent_kind == .child });
+    }
+    return strays.toOwnedSlice(alloc);
+}
+
+/// The parent v1's child `id` names in `subagent/owner.json`, or in
+/// schema 3's `subagent/control.json`; null when it names none. Owned.
+fn parentOf(store: *session_store.Store, alloc: Allocator, id: []const u8) !?[]u8 {
+    var dir = (try openMemberDir(store, id)) orelse return null;
+    defer dir.close();
+    var subagent = (try io_mod.openRealDirIfPresent(&dir, subagent_dir)) orelse return null;
+    defer subagent.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "owner.json", "control.json" }) |name| {
+        const bytes = (try readFileIfPresent(a, &subagent, name, child_state.max_state_bytes + 1)) orelse continue;
+        const Named = struct { parent_id: ?[]const u8 = null };
+        const named = std.json.parseFromSliceLeaky(Named, a, bytes, .{ .ignore_unknown_fields = true }) catch continue;
+        if (named.parent_id) |parent| return try alloc.dupe(u8, parent);
+    }
+    return null;
+}
+
 /// The session v1 remembered for `workspace` (`-c`), or null when it
 /// remembers none. A bookmark fx cannot read is `RememberedSessionUnavailable`,
 /// so `-c` says so, as v1 did (D86). Reads only. Caller owns it.

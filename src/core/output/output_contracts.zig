@@ -1530,6 +1530,14 @@ pub const SessionConvertSnapshot = struct {
     /// Each side file a converted session was converted without, being
     /// larger than the new store keeps in one file.
     left_out: []const LeftOut = &.{},
+    /// Each subagent an older fx saved that no conversion takes, kept as it
+    /// is, with why no fx opens it.
+    kept: []const Kept = &.{},
+
+    pub const Kept = struct {
+        id: []const u8,
+        reason: []const u8,
+    };
 
     pub const Skipped = struct {
         id: []const u8,
@@ -1572,6 +1580,7 @@ pub const SessionConvertSnapshot = struct {
             if (!std.mem.eql(u8, left.member, left.id)) try out.writer.print(" of its subagent {s}", .{left.member});
             try out.writer.print(", which is {d} bytes, more than the {d} the new store keeps in one file\n", .{ left.bytes, left.limit });
         }
+        for (self.kept) |kept| try out.writer.print("{s}: kept as it is: {s}\n", .{ kept.id, kept.reason });
         return out.toOwnedSlice();
     }
 
@@ -1602,7 +1611,9 @@ pub const SessionConvertSnapshot = struct {
             if (index > 0) try out.writer.writeByte(',');
             try std.json.Stringify.value(left, .{}, &out.writer);
         }
-        try out.writer.writeAll("]}");
+        try out.writer.writeAll("],\"kept\":");
+        try std.json.Stringify.value(self.kept, .{}, &out.writer);
+        try out.writer.writeByte('}');
         return out.toOwnedSlice();
     }
 };
@@ -1626,7 +1637,7 @@ test "fx sessions convert names each file it left out, in text and JSON" {
     try std.testing.expectEqualStrings(
         "{\"kind\":\"sessions_convert\",\"converted\":1,\"busy\":0,\"unreadable\":0,\"skipped\":[],\"left_out\":[" ++
             "{\"id\":\"root\",\"member\":\"root\",\"file\":\"logs/commands/replay.bin\",\"bytes\":600,\"limit\":512}," ++
-            "{\"id\":\"root\",\"member\":\"kid\",\"file\":\"tool-results/big.txt\",\"bytes\":700,\"limit\":512}]}",
+            "{\"id\":\"root\",\"member\":\"kid\",\"file\":\"tool-results/big.txt\",\"bytes\":700,\"limit\":512}],\"kept\":[]}",
         json,
     );
 }
@@ -1646,7 +1657,28 @@ test "fx sessions convert renders its counts and each skip as text and JSON from
     const json = try snapshot.render(alloc, .json);
     defer alloc.free(json);
     try std.testing.expectEqualStrings(
-        "{\"kind\":\"sessions_convert\",\"converted\":2,\"busy\":1,\"unreadable\":1,\"error\":\"SessionBusy\",\"skipped\":[{\"id\":\"held\",\"error\":\"SessionBusy\"},{\"id\":\"torn\",\"error\":\"InvalidSessionFormat\",\"reason\":\"events.jsonl line 3 is not valid JSON\"}],\"left_out\":[]}",
+        "{\"kind\":\"sessions_convert\",\"converted\":2,\"busy\":1,\"unreadable\":1,\"error\":\"SessionBusy\",\"skipped\":[{\"id\":\"held\",\"error\":\"SessionBusy\"},{\"id\":\"torn\",\"error\":\"InvalidSessionFormat\",\"reason\":\"events.jsonl line 3 is not valid JSON\"}],\"left_out\":[],\"kept\":[]}",
+        json,
+    );
+}
+
+test "fx sessions convert names each subagent it keeps as it is, in text and JSON (D88)" {
+    const alloc = std.testing.allocator;
+    const snapshot: SessionConvertSnapshot = .{ .converted = 1, .busy = 0, .unreadable = 0, .skipped = &.{}, .kept = &.{
+        .{ .id = "grandchild", .reason = "it is a subagent of the earlier subagent child, which no fx opens" },
+    } };
+    const text = try snapshot.render(alloc, .text);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings(
+        "converted 1, busy 0, unreadable 0\n" ++
+            "grandchild: kept as it is: it is a subagent of the earlier subagent child, which no fx opens\n",
+        text,
+    );
+    const json = try snapshot.render(alloc, .json);
+    defer alloc.free(json);
+    try std.testing.expectEqualStrings(
+        "{\"kind\":\"sessions_convert\",\"converted\":1,\"busy\":0,\"unreadable\":0,\"skipped\":[],\"left_out\":[]," ++
+            "\"kept\":[{\"id\":\"grandchild\",\"reason\":\"it is a subagent of the earlier subagent child, which no fx opens\"}]}",
         json,
     );
 }
