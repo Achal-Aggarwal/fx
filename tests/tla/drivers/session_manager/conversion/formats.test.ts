@@ -50,6 +50,31 @@ function olderReplies(f: Fixture, [tool, input]: [string, object]) {
   });
 }
 
+// A session in v1's current format whose tool result v1 kept in
+// tool-results/, as the last v1 build writes it: v1 shows the result's text
+// bare, and the converted copy shows it with its handle and keeps the body
+// as a blob (D44, D47).
+scenario("a current-format session with a side file, written by the last v1 build, converts and the model sees the same", async f => {
+  writeFileSync(join(f.workspace, "big.txt"), Array.from({ length: 4000 }, (_, n) => `line ${n} of a file read into a side file\n`).join(""));
+  olderReplies(f, ["read_file", { path: "big.txt" }]);
+  const run = await f.fx(false, ["ask", "--json", "--auto", "CONV_FIRST"], f.home, { FX_PERMISSION_MODE: "auto" });
+  assert.equal(run.code, 0, `the last v1 build's ask failed: ${run.stderr}${run.stdout}`);
+  const id: string = JSON.parse(run.stdout).session_id;
+  const results = join(f.v1Root, id, "tool-results");
+  assert(existsSync(results) && readdirSync(results).length > 0, `the last v1 build kept no side file: ${readdirSync(join(f.v1Root, id)).join(", ")}`);
+  const o = observer(f, id, f.home, false);
+  await o.observe("create");
+  const snapshot = join(f.root, "snapshot");
+  cpSync(f.home, snapshot, { recursive: true });
+  await o.observe("list");
+  plainReplies(f);
+  await o.observe("open", await openVia(f, id, "ask"));
+  await o.observe("list");
+  Object.assign(o.content, await compareContinuations(f, snapshot, id, false, false, true));
+  await requireAccepted(o, "current-side-file");
+  expect(o.matchedBlobs.length, "the observer matched no v2 blob to v1's side file").toBeGreaterThan(0);
+});
+
 // A subagent's own subagent, which fx v0.0.7 still let a subagent create:
 // the parent creates "helper", whose first turn creates "inner" and waits
 // for it. No fx opens "inner" now (a subagent has had no subagent tool since

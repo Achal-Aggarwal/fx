@@ -383,11 +383,12 @@ export function observer(f: Fixture, rootId: string, homeDir = f.home, older = f
     if (run.code !== 0) return null;
     return JSON.parse(run.stdout).history ?? null;
   }
-  // An older format's tool results: v1's migration keeps each body in
-  // tool-results/<handle> and its history shows the text bare, while v2 keeps
-  // the body as a blob named by its hash (D44, D47) and its history shows the
-  // same text wrapped with that handle. The wrapper is dropped only when v1's
-  // body has the stored size and the v2 blob holds exactly its bytes.
+  // A tool result v1 keeps in tool-results/<handle>, as the current format
+  // does and v1's migration does for an older one: v1's history shows its
+  // text bare, while v2 keeps the body as a blob named by its hash (D44, D47)
+  // and its history shows the same text wrapped with that handle. The
+  // wrapper is dropped only when v1's body has the stored size and the v2
+  // blob holds exactly its bytes.
   const bodies = new Map<string, Buffer>();   // v1's result bodies, by handle
   const matched = new Set<string>();          // v2 blobs found equal to them
   const PREVIEW = /^<tool_result_preview handle="([^"]+)" stored_bytes="(\d+)">\n([\s\S]*)\n<\/tool_result_preview>\n<tool_result_handle>\1<\/tool_result_handle>\n[^\n]*$/;
@@ -402,20 +403,23 @@ export function observer(f: Fixture, rootId: string, homeDir = f.home, older = f
       return m[3];
     });
   }
+  function keepBodies(home: string, id: string) {
+    const results = join(home, ".fx/sessions", id, "tool-results");
+    if (existsSync(results)) for (const name of readdirSync(results)) bodies.set(name, readFileSync(join(results, name)));
+  }
   // v1's history of the root. An older format is read on a private copy
   // after v1's own `fx session migrate`, the step v1 takes before it writes,
   // keeping the result bodies that migration wrote; the observed profile
   // stays as it is.
   async function reference(id: string): Promise<unknown[] | null> {
-    if (!older) return history(false, id);
+    if (!older) { keepBodies(homeDir, id); return history(false, id); }
     const copy = mkdtempSync(join(f.root, "reference-"));
     try {
       cpSync(homeDir, copy, { recursive: true });
       makePrivate(copy);
       const migrated = await f.fx(false, ["session", "migrate", id, "--json"], copy);
       assert.equal(migrated.code, 0, `v1 could not migrate ${id}: ${migrated.stderr}${migrated.stdout}`);
-      const results = join(copy, ".fx/sessions", id, "tool-results");
-      if (existsSync(results)) for (const name of readdirSync(results)) bodies.set(name, readFileSync(join(results, name)));
+      keepBodies(copy, id);
       return await history(false, id, copy);
     } finally { rmSync(copy, { recursive: true, force: true }); }
   }
@@ -456,7 +460,7 @@ export function observer(f: Fixture, rootId: string, homeDir = f.home, older = f
       if (id === rootId) {
         // The v1 version whose history the v2 copy starts with, by the real readers.
         const read = await history(true, id);
-        const copy = older && read ? unwrapped(id, read) : read;
+        const copy = read && unwrapped(id, read);
         const known = histories.get(id) ?? [];
         base[id] = -1;
         for (let n = known.length; n >= 1; n--) {
