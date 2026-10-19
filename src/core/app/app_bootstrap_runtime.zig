@@ -345,10 +345,12 @@ pub fn Runtime(comptime App: type) type {
                 for (mcp_servers.items) |server| app.alloc.free(server.name);
                 mcp_servers.deinit(app.alloc);
             }
-            if (comptime @hasDecl(App, "mcpHostStatuses")) {
+            // Names, states and tool counts only: the first frame never waits
+            // for saved logins to be read.
+            if (comptime @hasDecl(App, "mcpHostStatusesNow")) {
                 var statuses_arena: std.heap.ArenaAllocator = .init(app.alloc);
                 defer statuses_arena.deinit();
-                const statuses = app.mcpHostStatuses(statuses_arena.allocator()) catch |err| blk: {
+                const statuses = app.mcpHostStatusesNow(statuses_arena.allocator()) catch |err| blk: {
                     debug_trace.logf("bootstrap", "session assembly mcp statuses failed err={s}", .{@errorName(err)});
                     break :blk null;
                 };

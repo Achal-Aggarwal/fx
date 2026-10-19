@@ -1662,6 +1662,10 @@ const App = struct {
         return self.mcp.hostStatuses(alloc);
     }
 
+    pub fn mcpHostStatusesNow(self: *App, alloc: Allocator) Allocator.Error!?[]mcp_host.Status {
+        return self.mcp.hostStatusesNow(alloc);
+    }
+
     pub fn refreshMcpHostStatus(self: *App) void {
         if (self.mcp.refreshHostStatus(io_mod.milliTimestamp())) RenderAppRuntime.requestActiveSurfaceFrame(self, .footer);
     }

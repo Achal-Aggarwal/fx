@@ -195,6 +195,15 @@ pub const State = struct {
         return try lease.host.runtime.statuses(alloc);
     }
 
+    /// `hostStatuses` without waiting for saved logins to be read, for
+    /// startup, which must not wait for the Keychain: until they are, every
+    /// server reads as signed out.
+    pub fn hostStatusesNow(self: *State, alloc: Allocator) Allocator.Error!?[]mcp_host.Status {
+        const lease = self.leaseHost() orelse return null;
+        defer lease.deinit();
+        return try lease.host.runtime.statusesNow(alloc);
+    }
+
     fn releaseHost(self: *State, h: *mcp_host.Host) void {
         self.host_mutex.lockUncancelable(io_mod.getIo());
         h.leases -= 1;
