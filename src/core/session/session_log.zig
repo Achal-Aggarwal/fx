@@ -31,14 +31,16 @@ const manifest_file = "session.json";
 const permission_state_file = "permissions.json";
 const recovery_checkpoint_file = "recovery.json";
 
-const ConversationProgress = struct {
+/// Counts a turn's steps and steering as its frames arrive, as a context cut
+/// counts them.
+pub const ConversationProgress = struct {
     point: types.ContextHistoryCut = .{},
     pending: usize = 0,
     coverage: u64 = 0,
     reached: bool = false,
     pending_assistant: ?struct { seq: u64, has_replay: bool } = null,
 
-    fn observe(self: *ConversationProgress, seq: u64, event: session_event.ConversationEvent, cut: ?types.ContextHistoryCut) !void {
+    pub fn observe(self: *ConversationProgress, seq: u64, event: session_event.ConversationEvent, cut: ?types.ContextHistoryCut) !void {
         if (self.pending_assistant) |assistant| {
             const standalone = switch (event) {
                 .assistant, .context_checkpoint, .interrupted => true,

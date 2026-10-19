@@ -434,6 +434,8 @@ const Step = union(enum) {
 
 const Framed = struct {
     events: []const Event,
+    /// Each event's seq, for a compaction's coverage.
+    seqs: []const u64,
     /// No end piece: converted as an interrupted, failed turn, as v2's own
     /// reopen keeps one (D1, D77). v1's next writable open discarded it.
     open: bool,
@@ -452,6 +454,10 @@ const Compacted = struct {
     /// The member's turn (from 0) the compaction keeps from when that turn
     /// precedes this step; null keeps the turns after it.
     keep_from: ?usize,
+    /// The steps and steering messages of the first kept turn that the
+    /// summary covers, which v1 left out of that turn (D87).
+    keep_tool_steps: usize = 0,
+    keep_steering: usize = 0,
     ts_ms: u64,
 };
 
@@ -653,9 +659,12 @@ const FrameReader = struct {
     steps: std.ArrayList(Step) = .empty,
     /// The seq of each written turn's last frame, for compaction coverage.
     turn_last_seq: std.ArrayList(u64) = .empty,
-    /// The open turn's events, and the compactions inside it, which go
-    /// before it (`Compacted.keep_from`).
+    /// Where each written turn's step sits in `steps`.
+    turn_steps: std.ArrayList(usize) = .empty,
+    /// The open turn's events and their seqs, and the compactions inside
+    /// it, which go before it (`Compacted.keep_from`).
     open: std.ArrayList(Event) = .empty,
+    open_seqs: std.ArrayList(u64) = .empty,
     open_user_seq: ?u64 = null,
     deferred: std.ArrayList(Step) = .empty,
     compactions: usize = 0,
@@ -721,27 +730,27 @@ const FrameReader = struct {
                 reader.open_user_seq = seq;
                 var user = value;
                 user.images = try withImages(a, reader.dir, reader.id, value.images, reader.problem);
-                try reader.open.append(a, .{ .user = user });
+                try reader.keep(.{ .user = user }, seq);
             },
             .assistant => |value| {
                 try reader.requireOpen();
                 try reader.builder.appendAssistant(value);
-                try reader.open.append(a, event);
+                try reader.keep(event, seq);
             },
             .tool_call => |value| {
                 try reader.requireOpen();
                 try reader.builder.appendToolCall(value);
-                try reader.open.append(a, event);
+                try reader.keep(event, seq);
             },
             .tool_result => |value| {
                 try reader.requireOpen();
                 try reader.builder.appendToolResult(value);
-                try reader.open.append(a, event);
+                try reader.keep(event, seq);
             },
             .steering => |value| {
                 try reader.requireOpen();
                 try reader.builder.appendSteering(value.text);
-                try reader.open.append(a, event);
+                try reader.keep(event, seq);
             },
             // The builder only checks the turn; its copy lives in the arena.
             .turn_completed => |value| {
@@ -767,17 +776,34 @@ const FrameReader = struct {
                         prior += 1;
                     } else if (keep_from == null) keep_from = index;
                 }
+                // The first kept turn can be partly covered: v1 kept its
+                // prompt and the frames after the coverage (D87).
+                const covered: types.ContextHistoryCut = if (keep_from) |index| blk: {
+                    const turn = reader.steps.items[reader.turn_steps.items[index]].framed;
+                    break :blk try coveredSteps(turn.events, turn.seqs, checkpoint.covers_through_seq);
+                } else if (reader.open_user_seq != null)
+                    try coveredSteps(reader.open.items, reader.open_seqs.items, checkpoint.covers_through_seq)
+                else
+                    .{};
                 const step: Step = .{ .compacted = .{
                     .summary = checkpoint.summary,
                     .removed_turn_count = prior,
                     .compaction_count = reader.compactions,
                     .keep_from = keep_from,
+                    .keep_tool_steps = covered.tool_steps,
+                    .keep_steering = covered.steering,
                     .ts_ms = reader.last_ts,
                 } };
-                // Inside a turn it goes before that turn, which v2 keeps whole.
+                // Inside a turn it goes before that turn.
                 if (reader.open_user_seq != null) try reader.deferred.append(a, step) else try reader.steps.append(a, step);
             },
         }
+    }
+
+    /// Adds `event` to the open turn.
+    fn keep(reader: *FrameReader, event: Event, seq: u64) !void {
+        try reader.open.append(reader.arena, event);
+        try reader.open_seqs.append(reader.arena, seq);
     }
 
     fn requireOpen(reader: *const FrameReader) error{InvalidConversationFrame}!void {
@@ -786,9 +812,15 @@ const FrameReader = struct {
 
     /// Ends the open turn with `event`, its end piece.
     fn end(reader: *FrameReader, event: Event, seq: u64) !void {
-        try reader.open.append(reader.arena, event);
+        try reader.keep(event, seq);
         try reader.flushDeferred();
-        try reader.steps.append(reader.arena, .{ .framed = .{ .events = try reader.open.toOwnedSlice(reader.arena), .open = false, .ts_ms = reader.last_ts } });
+        try reader.turn_steps.append(reader.arena, reader.steps.items.len);
+        try reader.steps.append(reader.arena, .{ .framed = .{
+            .events = try reader.open.toOwnedSlice(reader.arena),
+            .seqs = try reader.open_seqs.toOwnedSlice(reader.arena),
+            .open = false,
+            .ts_ms = reader.last_ts,
+        } });
         try reader.turn_last_seq.append(reader.arena, seq);
         reader.open_user_seq = null;
     }
@@ -808,6 +840,15 @@ const FrameReader = struct {
             error.OutOfMemory => return err,
             else => return reader.problem.set("recovery.json can't be read ({s})", .{@errorName(err)}),
         };
+        // v1 shows the recovery checkpoint's turn whole, in place of the open
+        // one a compaction inside it covered part of.
+        if (checkpoint != null and reader.open_user_seq != null) for (reader.deferred.items) |*step| switch (step.*) {
+            .compacted => |*compacted| {
+                compacted.keep_tool_steps = 0;
+                compacted.keep_steering = 0;
+            },
+            else => {},
+        };
         try reader.flushDeferred();
         if (reader.open_user_seq == null) {
             if (checkpoint != null) debug_trace.logf("convert", "action=RecoveryDropped session={s} reason=turn_not_open", .{reader.id});
@@ -823,9 +864,31 @@ const FrameReader = struct {
             try reader.steps.append(a, .{ .whole = .{ .turn = kept.interruptedTurn(), .ts_ms = reader.last_ts } });
             return;
         }
-        try reader.steps.append(a, .{ .framed = .{ .events = try reader.open.toOwnedSlice(a), .open = true, .ts_ms = reader.last_ts } });
+        try reader.steps.append(a, .{ .framed = .{
+            .events = try reader.open.toOwnedSlice(a),
+            .seqs = try reader.open_seqs.toOwnedSlice(a),
+            .open = true,
+            .ts_ms = reader.last_ts,
+        } });
     }
 };
+
+/// How much of a turn a checkpoint summarized: its steps and steering
+/// messages through `coverage`, counted as v1's writer counted them when it
+/// chose that coverage (`session_log.ConversationProgress`).
+fn coveredSteps(events: []const Event, seqs: []const u64, coverage: u64) !types.ContextHistoryCut {
+    var progress: session_log.ConversationProgress = .{};
+    for (events, seqs) |event, seq| {
+        if (seq > coverage) break;
+        try progress.observe(seq, event, null);
+    }
+    // A coverage that ends at a reply with no tool call ends at that reply's
+    // own seq, which the progress counts only once a later frame arrives.
+    if (progress.pending_assistant) |assistant| {
+        if (assistant.seq == coverage) progress.point.tool_steps += 1;
+    }
+    return .{ .tool_steps = progress.point.tool_steps, .steering = progress.point.steering };
+}
 
 /// Schema 3 and the legacy snapshots, through v1's older reader (D61).
 fn readOlderFormat(a: Allocator, store: *session_store.Store, locked: *Locked, member: *Member, problem: *Problem) !void {
@@ -1145,6 +1208,32 @@ fn readFileIfPresent(a: Allocator, dir: *io_mod.VerifiedDir, name: []const u8, m
 fn describe(a: Allocator, bytes: []const u8, err: anyerror) []const u8 {
     if (!(std.json.validate(a, bytes) catch false)) return "is not valid JSON";
     return @errorName(err);
+}
+
+test "a checkpoint inside a turn covers that turn's steps and steering as v1's writer counted them (D87)" {
+    const result = struct {
+        fn of(id: []const u8) Event {
+            return .{ .tool_result = .{ .call_id = id, .tool_name = "shell", .status = .success, .artifact_ref = "", .stored_bytes = 0, .completeness = .complete } };
+        }
+    };
+    const events = [_]Event{
+        .{ .user = .{ .text = "go" } },
+        .{ .assistant = .{ .text = "plan" } },
+        .{ .tool_call = .{ .call_id = "c1", .tool_name = "shell", .arguments_json = "{}" } },
+        result.of("c1"),
+        .{ .steering = .{ .text = "faster" } },
+        .{ .assistant = .{ .text = "a reply with no tool call" } },
+        .{ .assistant = .{ .text = "then one more" } },
+        .{ .tool_call = .{ .call_id = "c2", .tool_name = "shell", .arguments_json = "{}" } },
+        result.of("c2"),
+    };
+    const seqs = [_]u64{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    // Each coverage v1's writer can choose: a step's last result, a
+    // steering message, and a reply with no tool call, at its own seq.
+    try std.testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 1 }, try coveredSteps(&events, &seqs, 4));
+    try std.testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 1, .steering = 1 }, try coveredSteps(&events, &seqs, 5));
+    try std.testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 2, .steering = 1 }, try coveredSteps(&events, &seqs, 6));
+    try std.testing.expectEqual(types.ContextHistoryCut{ .tool_steps = 3, .steering = 1 }, try coveredSteps(&events, &seqs, 9));
 }
 
 test "an older turn the current event format cannot keep names its file, turn and cause" {

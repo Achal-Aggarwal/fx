@@ -193,6 +193,42 @@ async function unfinished(f: Fixture): Promise<Made> {
   };
 }
 
+// A v1 turn that compacts between two of its tool steps. The first step's
+// reply overflows the window, so the turn's next request compacts inside the
+// turn; v1 then shows the model the summary, the turn's prompt and only the
+// steps after the cut (D87). Read back by what the next turn shows the model.
+async function midTurn(f: Fixture): Promise<Made> {
+  plainReplies(f);
+  const id = (await f.v1Ask(["CONV_FIRST"])).session_id;
+  f.setRespond(body => {
+    const request = JSON.parse(body);
+    if (request.toolChoice?.type === "none" && request.tools?.length === 0) return fakeGatewayFinalText("CONV_SUMMARY");
+    if (body.includes("<compacted_conversation>")) {
+      return body.includes("conv-step-two") ? fakeGatewayFinalText("CONV_TURN_DONE")
+        : fakeGatewayToolCall("conv-step-two", "shell", { request: { action: "run", command: "echo CONV_STEP_TWO" } });
+    }
+    return fakeGatewaySse([
+      { type: "text-delta", id: "answer_1", delta: "older narrative alpha beta gamma delta\n".repeat(20_000) },
+      { type: "tool-call", toolCallId: "conv-step-one", toolName: "shell", input: { request: { action: "run", command: "echo CONV_STEP_ONE" } } },
+      { type: "finish", finishReason: { unified: "tool-calls", raw: "tool-calls" } },
+    ]);
+  });
+  await f.v1Ask(["--resume-id", id, "CONV_LONG"]);
+  const events = readFileSync(join(f.v1Root, id, "events.jsonl"), "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line).event);
+  const checkpoint = events.findIndex(event => "context_checkpoint" in event);
+  const stepOne = events.findIndex(event => event.tool_result?.call_id === "conv-step-one");
+  const stepTwo = events.findIndex(event => event.tool_result?.call_id === "conv-step-two");
+  assert(stepOne >= 0 && stepOne < checkpoint && checkpoint < stepTwo,
+    "Owned fault boundary not reached: no v1 compaction between the turn's two tool steps");
+  return {
+    id, async read(home, v2) {
+      plainReplies(f);
+      const body = (await continued(f, id, home, v2, "CONV_NEXT"))?.find(b => b.includes("CONV_NEXT"));
+      return body ? shown(body, home) : null;
+    },
+  };
+}
+
 // A v1 command output past the inline limit: v1 keeps the result the
 // history names by handle in tool-results/ and the full output it names in
 // turn in logs/commands/. Read back by the model paging both old handles
@@ -223,4 +259,5 @@ export const KINDS: Record<string, { name: string; make(f: Fixture): Promise<Mad
   terminal: { name: "hosted terminal state", make: terminal, via: "ask", shows: /ended when the fx process that started it exited/ },
   unfinished: { name: "unfinished reply in recovery.json", make: unfinished, via: "ask", shows: /CONV_PARTIAL_REPLY.*turn_aborted/ },
   side: { name: "tool-result side files and their handles", make: sideFile, via: "ask", shows: /total_bytes.*output_delta.*150001/ },
+  midturn: { name: "cut of a compaction inside a turn", make: midTurn, via: "ask", shows: /CONV_LONG.*CONV_STEP_TWO.*CONV_TURN_DONE/ },
 };

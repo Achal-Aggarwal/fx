@@ -320,8 +320,9 @@ manager:
 - **Settings:** `set` replaces the whole value, so the adapter writes fx's
   merged preferences. `title` holds a JSON string; whether a title was
   generated or typed stays in fx's `prefs`.
-- **Compaction:** `compacted.data` names the seq of the first kept line when
-  fx keeps a tail; the adapter reads back to it from `compaction_offset`.
+- **Compaction:** `compacted.data` names the first turn fx keeps, which the
+  adapter reads back to from `compaction_offset`, and how many of that
+  turn's steps and steering messages the summary covers (D87).
 - **Order:** `turn_started` comes before `put_blob`, which refuses earlier.
 - **Subagents (D22):** names, the agent, the request fingerprint and failure
   text go in child `data`; a child's instructions go in the child's own
@@ -1442,6 +1443,18 @@ Settled while removing v1 (2026-10-17):
   A missing bookmark still means no remembered session. **Why:** the user
   learns what happened and what to do instead of seeing an error name.
   **Alternative:** treat an unreadable bookmark as none.
+- **D87 Decision:** a compaction inside a turn keeps that turn from where
+  the summary ends. Its `compacted` line saves the steps and steering
+  messages of the first kept turn that the summary covers
+  (`keep_tool_steps`, `keep_steering`), and a resume leaves them out of
+  that turn, as fx's history does once it compacts; a later cut inside
+  the same turn counts on from there. The converter takes the same counts
+  from a v1 checkpoint's coverage, as v1's writer counted them, so a
+  converted session shows the model the turn's prompt and the steps after
+  the summary, as v1 did. A line without them, or a turn that no longer has
+  those steps, keeps the whole turn. **Why:** the steps the summary covers
+  reached the model a second time, up to 170 messages in real sessions,
+  enough to fill the window on resume. **Alternative:** keep whole turns.
 
 ## Design Risks And Failure Behavior
 

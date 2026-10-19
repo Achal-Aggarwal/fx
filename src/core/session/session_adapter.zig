@@ -58,6 +58,7 @@ const artifact_digest = @import("artifact_digest.zig");
 const session_permission_state = @import("../permissions/session_permission_state.zig");
 const model_provider = @import("../config/model_provider.zig");
 const text_utils = @import("../shared/text_utils.zig");
+const history_range = @import("../shared/history_range.zig");
 
 const Allocator = std.mem.Allocator;
 const Event = session_event.ConversationEvent;
@@ -1193,6 +1194,8 @@ pub const Session = struct {
     /// The v2 turn behind each of fx's history turns, in order; null for a
     /// compacted summary.
     turn_numbers: std.ArrayList(?u64) = .empty,
+    /// What fx's history leaves out of its first kept turn (D87).
+    trim: Trim = .{},
     /// The language tag last written, owned.
     language: ?[]u8 = null,
     /// Started in this process: its first commit may name it.
@@ -1972,23 +1975,39 @@ pub const Session = struct {
         const cut = retained_from orelse types.ContextHistoryCut{ .turns = self.turn_numbers.items.len };
         const first_kept = turnSlot(self.turn_numbers.items, cut.turns);
         var keep_from: ?u64 = null;
-        for (self.turn_numbers.items[first_kept..]) |number| {
+        // Whether `keep_from` is the turn the cut falls in.
+        var cut_turn = false;
+        for (self.turn_numbers.items[first_kept..], 0..) |number, slot| {
             if (number) |n| {
                 keep_from = n;
+                cut_turn = slot == 0;
                 break;
             }
         }
-        if (keep_from == null and active_prefix and self.turn_open) keep_from = self.last_turn;
-        if (cut.tool_steps != 0 or cut.steering != 0) {
-            debug_trace.logf("session", "event=sessions_v2_compaction_cut session={s} kept=whole_turn tool_steps={d} steering={d}", .{ self.id(), cut.tool_steps, cut.steering });
+        if (keep_from == null and active_prefix and self.turn_open) {
+            keep_from = self.last_turn;
+            cut_turn = true;
+        }
+        // A cut inside a turn counts from where fx's view of that turn starts,
+        // past what an earlier compaction inside it covered (D87).
+        const trim: Trim = if (!cut_turn) .{} else if (self.trim.turn == keep_from) .{
+            .turn = keep_from,
+            .tool_steps = self.trim.tool_steps + cut.tool_steps,
+            .steering = self.trim.steering + cut.steering,
+        } else .{ .turn = keep_from, .tool_steps = cut.tool_steps, .steering = cut.steering };
+        if (trim.tool_steps != 0 or trim.steering != 0) {
+            debug_trace.logf("session", "event=sessions_v2_compaction_cut session={s} turn={?d} tool_steps={d} steering={d}", .{ self.id(), trim.turn, trim.tool_steps, trim.steering });
         }
         const data: CompactedData = .{
             .summary = summary.summary,
             .removed_turn_count = summary.removed_turn_count,
             .compaction_count = summary.compaction_count,
             .keep_from_turn = keep_from,
+            .keep_tool_steps = trim.tool_steps,
+            .keep_steering = trim.steering,
         };
         _ = try self.write(&.{.{ .compacted = try jsonValue(arena.allocator(), data) }});
+        self.trim = if (trim.tool_steps != 0 or trim.steering != 0) trim else .{};
         // fx's history is now the summary, then the retained turns.
         var kept: std.ArrayList(?u64) = .empty;
         errdefer kept.deinit(self.alloc);
@@ -2173,7 +2192,7 @@ pub const Session = struct {
         const state = try self.handle.state(sa);
         self.last_turn = state.last_turn;
         self.turn_numbers.clearRetainingCapacity();
-        var restored = try restoreFrom(self.source(), alloc, sa, state, .{ .alloc = self.alloc, .list = &self.turn_numbers });
+        var restored = try restoreFrom(self.source(), alloc, sa, state, .{ .alloc = self.alloc, .list = &self.turn_numbers, .trim = &self.trim });
         errdefer restored.deinit(alloc);
         if (self.first_title) |value| self.alloc.free(value);
         self.first_title = null;
@@ -3178,6 +3197,8 @@ const Conversion = struct {
                         .removed_turn_count = compacted.removed_turn_count,
                         .compaction_count = compacted.compaction_count,
                         .keep_from_turn = if (compacted.keep_from) |index| turns.items[index] else null,
+                        .keep_tool_steps = compacted.keep_tool_steps,
+                        .keep_steering = compacted.keep_steering,
                     };
                     _ = try session.write(&.{.{ .compacted = try jsonValue(sa, data) }});
                     continue;
@@ -3581,10 +3602,12 @@ fn copyFile(from: std.Io.Dir, to: std.Io.Dir, name: []const u8) !void {
     }
 }
 
-/// Where `restoreFrom` puts the number of the turn behind each history entry.
+/// Where `restoreFrom` puts the number of the turn behind each history entry,
+/// and what the history leaves out of its first kept turn.
 const TurnNumbers = struct {
     alloc: Allocator,
     list: *std.ArrayList(?u64),
+    trim: *Trim,
 };
 
 /// Rebuilds fx's history and settings from `state` and its log: the newest
@@ -3603,6 +3626,7 @@ fn restoreFrom(src: Source, alloc: Allocator, sa: Allocator, state: sm.State, nu
     }
     var from: sm.From = .start;
     var skip_offset: ?u64 = null;
+    var covered: types.ContextHistoryCut = .{};
     if (state.compaction_offset) |offset| {
         const cursor: sm.Cursor = .{ .offset = offset, .seq = state.last_compaction_seq.? };
         var page = try src.read(sa, .{ .at = cursor }, 1);
@@ -3624,11 +3648,37 @@ fn restoreFrom(src: Source, alloc: Allocator, sa: Allocator, state: sm.State, nu
         skip_offset = offset;
         from = .{ .at = cursor };
         if (compacted.keep_from_turn) |turn| from = .{ .at = try src.findTurnStart(sa, cursor, turn) };
+        covered = .{ .tool_steps = compacted.keep_tool_steps, .steering = compacted.keep_steering };
     }
     var sink: RestoreSink = .{ .alloc = alloc, .history = &history, .numbers = numbers };
     try replay(src, alloc, sa, from, skip_offset, ReplaySink.init(&sink));
+    if (numbers) |n| n.trim.* = .{};
+    if (covered.tool_steps != 0 or covered.steering != 0) {
+        if (try trimFirstKept(alloc, sa, &history, covered, src.id)) {
+            if (numbers) |n| n.trim.* = .{ .turn = n.list.items[1], .tool_steps = covered.tool_steps, .steering = covered.steering };
+        }
+    }
     restored.history = try history.toOwnedSlice(alloc);
     return restored;
+}
+
+/// Leaves out of the first kept turn the steps and steering messages a
+/// compaction inside it summarized, as fx's history leaves them out when it
+/// compacts (D87). A turn that does not have them stays whole, with a trace
+/// line, so a resume is never refused for it. Returns whether it trimmed.
+fn trimFirstKept(alloc: Allocator, sa: Allocator, history: *std.ArrayList(types.HistoryTurn), covered: types.ContextHistoryCut, id: []const u8) !bool {
+    if (history.items.len < 2) return false;
+    const kept = history_range.contextHistoryRange(sa, history.items[1..2], covered, null) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            debug_trace.logf("session", "event=sessions_v2_compaction_cut_kept_whole session={s} tool_steps={d} steering={d} reason={s}", .{ id, covered.tool_steps, covered.steering, @errorName(err) });
+            return false;
+        },
+    };
+    const owned = try types.dupeHistoryTurn(alloc, kept[0]);
+    types.freeHistoryTurn(alloc, history.items[1]);
+    history.items[1] = owned;
+    return true;
 }
 
 /// fx's settings from `state`, with an empty history. Caller owns the result.
@@ -4186,6 +4236,20 @@ const CompactedData = struct {
     compaction_count: usize,
     /// The first turn the compaction kept, read back to on resume.
     keep_from_turn: ?u64 = null,
+    /// The steps and steering messages of the first kept turn that the
+    /// summary covers, which fx's history leaves out of that turn, as it
+    /// does when it compacts inside a turn (D87). Older lines have neither,
+    /// and keep the turn whole.
+    keep_tool_steps: usize = 0,
+    keep_steering: usize = 0,
+};
+
+/// What fx's history leaves out of its first kept turn (D87): none, or the
+/// steps and steering messages of `turn` a compaction covers.
+const Trim = struct {
+    turn: ?u64 = null,
+    tool_steps: usize = 0,
+    steering: usize = 0,
 };
 
 /// The compaction line a page read at its cursor starts with, or null when
@@ -5438,6 +5502,79 @@ test "each later compaction keeps only the turns after its cut" {
     try testing.expectEqualStrings("turns one to three", restored.history[0].compacted_summary.summary);
     try testing.expectEqualStrings("four", restored.history[1].assistant.user.text);
     try testing.expectEqualStrings("five", restored.history[2].assistant.user.text);
+}
+
+test "a compaction inside a turn leaves the steps it covers out of that turn on resume, and a second one counts on (D87)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const s = try Session.create(testing.allocator, &t.store, "/w", .ask, testSeed(&model));
+    const result = struct {
+        fn ok(id: []const u8, handle: []const u8) types.PersistedToolResult {
+            return .{ .tool_call_id = @constCast(id), .tool_name = @constCast("shell"), .status = .success, .output = @constCast("ok"), .output_bytes = 2, .output_handle = @constCast(handle), .stored_output_bytes = 2 };
+        }
+    };
+    var calls = [_]types.ToolCall{
+        .{ .id = "call-1", .name = "shell", .arguments_json = "{}" },
+        .{ .id = "call-2", .name = "shell", .arguments_json = "{}" },
+        .{ .id = "call-3", .name = "shell", .arguments_json = "{}" },
+    };
+    var results = [_]types.PersistedToolResult{
+        result.ok("call-1", "result-shell-1.txt"),
+        result.ok("call-2", "result-shell-2.txt"),
+        result.ok("call-3", "result-shell-3.txt"),
+    };
+    var steps = [_]types.ToolExecutionStep{
+        .{ .tool_calls = calls[0..1], .tool_results = results[0..1] },
+        .{ .tool_calls = calls[1..2], .tool_results = results[1..2] },
+        .{ .tool_calls = calls[2..3], .tool_results = results[2..3] },
+    };
+    var steering = [_]types.PersistedSteering{
+        .{ .text = @constCast("after one"), .after_tool_step_count = 1 },
+        .{ .text = @constCast("after two"), .after_tool_step_count = 2 },
+    };
+    try s.commitTurn(.{ .assistant = .{
+        .user = .{ .text = @constCast("three steps") },
+        .assistant = @constCast("done"),
+        .execution = .{ .tool_steps = &steps, .steering = &steering },
+    } }, types.ConversationLanguage.default());
+    var first = "steps one and two".*;
+    try s.commitCompaction(.{ .summary = &first, .removed_turn_count = 0, .compaction_count = 1 }, false, .{ .tool_steps = 2, .steering = 1 });
+    const id = try testing.allocator.dupe(u8, s.id());
+    defer testing.allocator.free(id);
+    s.close();
+
+    // As fx's history after the compaction: the summary, then the turn's
+    // prompt and what came after the cut.
+    {
+        const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+        defer r.close();
+        var restored = try r.restore(testing.allocator);
+        defer restored.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 2), restored.history.len);
+        const kept = restored.history[1].assistant;
+        try testing.expectEqualStrings("three steps", kept.user.text);
+        try testing.expectEqualStrings("done", kept.assistant);
+        try testing.expectEqual(@as(usize, 1), kept.execution.tool_steps.len);
+        try testing.expectEqualStrings("call-3", kept.execution.tool_steps[0].tool_calls[0].id);
+        try testing.expectEqual(@as(usize, 1), kept.execution.steering.len);
+        try testing.expectEqualStrings("after two", kept.execution.steering[0].text);
+        try testing.expectEqual(@as(usize, 0), kept.execution.steering[0].after_tool_step_count);
+        // fx's cut counts from the turn as its history now shows it.
+        var second = "all three steps".*;
+        try r.commitCompaction(.{ .summary = &second, .removed_turn_count = 0, .compaction_count = 2 }, false, .{ .tool_steps = 1, .steering = 1 });
+    }
+    const r = try Session.resumeSession(testing.allocator, &t.store, .{ .id = id }, "/w", .ask);
+    defer r.close();
+    var restored = try r.restore(testing.allocator);
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), restored.history.len);
+    try testing.expectEqualStrings("all three steps", restored.history[0].compacted_summary.summary);
+    const kept = restored.history[1].assistant;
+    try testing.expectEqualStrings("three steps", kept.user.text);
+    try testing.expectEqual(@as(usize, 0), kept.execution.tool_steps.len);
+    try testing.expectEqual(@as(usize, 0), kept.execution.steering.len);
 }
 
 test "resume refuses a session whose compaction line is damaged" {
