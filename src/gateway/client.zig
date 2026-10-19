@@ -263,21 +263,6 @@ pub const ProviderAttemptOwner = enum {
     agent,
 };
 
-pub fn fetchGatewayJson(
-    alloc: std.mem.Allocator,
-    api_key: ?[]const u8,
-    gateway_team: ?[]const u8,
-    url: []const u8,
-) !GatewayJsonResult {
-    var result = try fetchGatewayGetAtUrl(alloc, api_key, gateway_team, url, e2e_gateway_models_url_env);
-    if (failedGatewayJsonStatus(result.status)) |status| {
-        result.deinit(alloc);
-        return .{ .http_status = status };
-    }
-
-    return .{ .success = result.body };
-}
-
 pub fn fetchGatewayGetResult(alloc: std.mem.Allocator, api_key: ?[]const u8, path: []const u8) !GetResult {
     return fetchGatewayGet(alloc, api_key, null, path, e2e_gateway_credits_url_env);
 }
@@ -573,7 +558,7 @@ fn fetchGatewayJsonAtUrlCore(
 }
 
 /// About fifty times today's model catalog. A larger response fails rather
-/// than growing memory on every refresh.
+/// than growing memory without bound.
 const max_gateway_json_bytes: usize = 16 * 1024 * 1024;
 
 /// Returns the caller-owned body, or `error.GatewayJsonResponseTooLarge` when

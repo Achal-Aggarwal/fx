@@ -2378,10 +2378,15 @@ fn fetchModelCatalogResponse(
 
     const api_key = access.authorizationCredential();
     const gateway_team = modelCatalogHeaderTeam(access);
-    return if (cancel_flag) |flag|
-        gateway_client.fetchGatewayJsonCancellable(alloc, api_key, gateway_team, model_catalog_url, flag)
-    else
-        gateway_client.fetchGatewayJson(alloc, api_key, gateway_team, model_catalog_url);
+    // One-shot fetches pass no flag but still get the size cap and deadline.
+    var never_cancelled = std.atomic.Value(bool).init(false);
+    return gateway_client.fetchGatewayJsonCancellable(
+        alloc,
+        api_key,
+        gateway_team,
+        model_catalog_url,
+        cancel_flag orelse &never_cancelled,
+    );
 }
 
 /// The catalog follows the same team contract as `/v1/credits`: it rejects an

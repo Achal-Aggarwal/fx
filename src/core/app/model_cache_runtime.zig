@@ -479,12 +479,13 @@ pub const Runtime = struct {
 
         const now = model_catalog.clockMs();
         self.mutex.lockUncancelable(io_mod.getIo());
-        const elapsed = now - self.last_attempt_ms;
+        // A clock that moved backwards makes every elapsed check due.
+        const elapsed = if (now < self.last_attempt_ms) std.math.maxInt(i64) else now - self.last_attempt_ms;
         const expired = if (refresh_interval_ms) |interval| elapsed >= interval else false;
         const picker_due = trigger == .picker_open and elapsed >= picker_revalidate_floor_ms;
         // A retained catalog whose refresh failed retries once its backoff ends.
         const retry_due = if (self.outcome.last_failure) |failed| failed.failure.retryable else false;
-        const backoff_over = now >= self.retry_not_before_ms;
+        const backoff_over = now < self.last_attempt_ms or now >= self.retry_not_before_ms;
         // A staged revalidation is newer than anything a fetch would start now.
         // A fetch that finished after the join above still holds its thread;
         // the next trigger joins it before starting another.

@@ -174,7 +174,7 @@ pub const CapabilityResolver = struct {
         const access_changed = !std.meta.eql(self.provider_id, provider.provider_id) or
             self.requested_access == null or !std.meta.eql(self.requested_access.?, requested);
         const expired = if (provider.refresh_interval_ms) |interval|
-            now - self.last_attempt_ms >= interval
+            now < self.last_attempt_ms or now - self.last_attempt_ms >= interval
         else
             false;
         if (self.state != .idle and !access_changed and !expired) return;

@@ -69,9 +69,10 @@ pub const Failure = struct {
     }
 };
 
-/// Milliseconds on the clock that times catalog refreshes. It keeps counting
-/// while the machine sleeps, so a catalog goes stale overnight, but ignores
-/// wall-clock changes, so adjusting the clock neither forces nor delays one.
+/// Milliseconds on the clock that times catalog refreshes. Natively it keeps
+/// counting while the machine sleeps, so a catalog goes stale overnight, and
+/// ignores wall-clock changes. The libfx wasm host backs it with wall time, so
+/// callers treat a reading earlier than a stored one as due.
 pub fn clockMs() i64 {
     const timestamp = std.Io.Clock.boot.now(io_mod.getIo());
     return @intCast(@divFloor(timestamp.nanoseconds, std.time.ns_per_ms));
