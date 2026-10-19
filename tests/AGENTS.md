@@ -35,7 +35,7 @@ tests/
     ├── session_manager/   one folder per model area, named after the module it describes,
     ├── mcp/               each with a check.sh; tla/README.md lists them all
     ├── ...
-    ├── lib/               tlc.sh and run-tlc.sh: find TLC and run configs with their verdicts
+    ├── lib/               tlc.sh, tlc.py, and run-tlc.sh: find TLC and run configs with their verdicts
     └── drivers/           Bun drivers that run real code and have TLC check each run
         ├── lib/           tlc.ts and context.ts, shared by every driver
         └── <area>/        one folder per model area
@@ -79,7 +79,7 @@ python3 -m scripts.pgso.corpus --manifest scripts/pgso/corpus.json --list   # fr
 Every TLA+ spec, its TLC checker, the Bun drivers that walk code along a spec, and the design record a spec checks live in `tests/tla/`, and nowhere else. `tests/tla/README.md` lists the requirements and commands.
 
 - Name a model's folder after the module it describes: `session_manager/` for `src/core/session_manager/`, `mcp_host/` for `src/core/mcp_host/`, and `sdk/` for libfx.
-- Give each folder a `check.sh` that runs every config and exits non-zero when one misses its expected verdict. Configs that must fail, such as witnesses and planted mutations, are part of that contract, so encode their verdicts in `check.sh`. Source `../lib/tlc.sh` and list each config with its verdict for `tlc_verdicts`, rather than finding TLC yourself.
+- Give each folder a `check.sh` that runs every config and exits non-zero when one misses its expected verdict. Configs that must fail, such as witnesses and planted mutations, are part of that contract, so encode their verdicts in `check.sh`. Source `../lib/tlc.sh` and list each config with its verdict for `tlc_verdicts`, rather than finding TLC yourself. A Python checker gets Java and the jar from `toolchain()` in `lib/tlc.py`.
 - Put Bun drivers in `tests/tla/drivers/<area>/`. They run the code under test, from `zig-out/bin/fx` or by relative import, and have TLC check each run. Use `drivers/lib/tlc.ts` to run TLC and `drivers/lib/context.ts` for the binary, the output folder, and the `tests/e2e/` helpers. Every fx process a driver starts sets `FX_SOUND=0`. Generated output, such as `tests/tla/sdk/graphs/`, goes to the temp folder or is ignored by git.
 - A model of code that has not landed says so at the top, and the drivers that need that code run only behind an explicit flag, such as `--next` or `FX_TLA_NEXT_MCP=1`. `tests/tla/README.md` lists them. Remove the flag in the change that lands the code.
 - When a change alters behavior that a spec models, update the spec in the same change and run its checker. CI runs only the `sdk/` model and its drivers; run the others yourself.

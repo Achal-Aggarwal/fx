@@ -12,8 +12,9 @@
 \* fail. A read writes nothing. v1's logins (mcp_auth_store.zig) are never
 \* taken over: v1 and MCP-v2 refreshing one login apart, neither seeing
 \* the other's saves, would sign it out.
-\* Operations: get (config.resolve -> Runtime.savedCredential, for every
-\* HTTP server, whenever a host starts: `fx mcp list`, `fx ask`, the shell),
+\* Operations: get (Store.snapshot from Runtime.restoreCredentials, one read
+\* for every HTTP server, on the owner thread whenever a host starts:
+\* `fx mcp list`, `fx ask`, the shell),
 \* put (a `credential` event after a sign-in or refresh), remove (logout:
 \* runtime.zig `.logout`; verbs.zig remove and logout).
 \*
@@ -70,8 +71,8 @@ Write(e, fresh) ==
 
 Same == UNCHANGED <<kind, entries, taken, overwritten>>
 
-\* Store.get, from config.resolve when a host starts. An unreadable document
-\* gives no login and stays as it is.
+\* Store.snapshot, from Runtime.restoreCredentials when a host starts. An
+\* unreadable document gives no login and stays as it is.
 Get ==
     /\ Same
     /\ UNCHANGED <<v1, loggedOut, kept>>

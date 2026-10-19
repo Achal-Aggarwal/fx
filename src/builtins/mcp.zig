@@ -690,7 +690,7 @@ pub fn loadHost(
     }
     const h = try mcp_host.Host.create(alloc, io_mod.getIo(), loaded.configs.items, &inherited, .{
         .client_version = build_options.app_version,
-        .credentials = .detect(alloc, home),
+        .credentials = .{ .detect = home },
         .workspace_root = workspace_root,
         .questions = extras.questions,
         .notify = extras.notify,

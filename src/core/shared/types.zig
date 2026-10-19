@@ -246,6 +246,10 @@ pub const ToolLifecycleEvent = union(enum) {
         activity_kind: ToolActivityKind,
         arguments_json: ?[]const u8 = null,
         place_after_current_transcript: bool = false,
+        /// The call's `ToolCall.resolved_display_target`, for hosts that
+        /// title a call when it starts. Borrowed for this push only; copies
+        /// omit it.
+        resolved_display_target: ?[]const u8 = null,
     },
     progress: struct {
         id: ToolLifecycleId,
@@ -333,6 +337,9 @@ pub const ModelRecoveryAction = enum {
     /// Silence detected; checking liveness before doing anything else.
     checking_liveness,
     paused,
+    /// The final reply finished before its turn was saved as done; recovery
+    /// delivers that saved reply without another model request.
+    delivering_response,
 };
 
 pub const ModelRecoveryRequiredAction = enum {
@@ -551,6 +558,7 @@ pub const RouteRecoveryStatus = struct {
             .waiting_for_connectivity => "waiting for connection",
             .checking_liveness => "checking the connection",
             .paused => "recovery paused",
+            .delivering_response => "delivering saved response",
         };
         // Connectivity waits and liveness probes are un-budgeted: no attempt
         // counter and no raw error names, just the honest current state.
@@ -953,6 +961,10 @@ pub const ToolCall = struct {
     provenance: ToolExecutionProvenance = .fx_local,
     /// Borrowed only for this action. Copies and durable/provider encodings omit it.
     resolved_skill: ?*const skill_contract.PreparedSkill = null,
+    /// What this action works on, resolved from earlier results, such as the
+    /// command whose saved output a `read_tool_result` call reads. Borrowed
+    /// only for this action. Copies and durable/provider encodings omit it.
+    resolved_display_target: ?[]const u8 = null,
 };
 
 pub const WebSearchProgress = union(enum) {
@@ -1306,11 +1318,23 @@ pub const ExecutionMemory = struct {
 
 /// Image bytes returned by a tool; never a grant to read a user file.
 pub const ToolImage = struct {
-    /// Owned encoded bytes; empty only when a valid source_ref is present.
+    /// Owned encoded bytes; empty only when a valid source_ref is present, or
+    /// when the session dropped the image (`droppedFromSession`).
     data: []u8,
     mime_type: []u8,
     /// Owned opaque host reference, never filesystem or network authority.
     source_ref: ?[]u8 = null,
+    /// The image's name in a libfx host's store, the lowercase hex SHA-256
+    /// of its decoded bytes, when the host stored them before it sent the
+    /// result. Writers that name stored images write this instead of `data`.
+    name: ?[64]u8 = null,
+
+    /// Whether the session no longer holds this image: a libfx session with
+    /// an image store keeps only its newest images, and an older one keeps
+    /// its name, without its bytes.
+    pub fn droppedFromSession(self: ToolImage) bool {
+        return self.data.len == 0 and self.name != null;
+    }
 };
 
 pub fn freeToolImages(alloc: std.mem.Allocator, images: []const ToolImage) void {
@@ -1342,6 +1366,7 @@ pub fn dupeToolImages(alloc: std.mem.Allocator, images: []const ToolImage) ![]To
             .data = data,
             .mime_type = mime_type,
             .source_ref = if (image.source_ref) |source_ref| try alloc.dupe(u8, source_ref) else null,
+            .name = image.name,
         };
         initialized += 1;
     }
@@ -1494,6 +1519,13 @@ pub const ImageAttachment = struct {
     inline_data: ?[]u8 = null,
     /// Owned opaque host reference, never filesystem or network authority.
     source_ref: ?[]u8 = null,
+
+    /// Whether the session no longer holds this image: a libfx session with
+    /// an image store keeps only its newest images, and an older one keeps
+    /// its digest, which names it in the host's store, without its bytes.
+    pub fn droppedFromSession(self: ImageAttachment) bool {
+        return self.inline_data == null and self.snapshot_path == null and self.snapshot_sha256 != null;
+    }
 };
 
 pub const UserTurn = struct {
@@ -3080,12 +3112,19 @@ test "dupeToolCall preserves argument integrity" {
     try std.testing.expectEqual(ToolArgumentIntegrity.malformed_json, copy.argument_integrity);
 }
 
-test "dupeToolCall drops action scoped skill bindings" {
+test "dupeToolCall drops action scoped bindings" {
     const skill: skill_contract.PreparedSkill = .{ .skill = .{ .name = "workflow", .description = "", .path = "/skills/workflow", .source = .global_fx } };
-    const source: ToolCall = .{ .id = "skill", .name = "skill", .arguments_json = "{\"location\":\"/skills/workflow\"}", .resolved_skill = &skill };
+    const source: ToolCall = .{
+        .id = "skill",
+        .name = "skill",
+        .arguments_json = "{\"location\":\"/skills/workflow\"}",
+        .resolved_skill = &skill,
+        .resolved_display_target = "more output from zig build test",
+    };
     const copy = try dupeToolCall(std.testing.allocator, source);
     defer freeToolCall(std.testing.allocator, copy);
     try std.testing.expect(copy.resolved_skill == null);
+    try std.testing.expect(copy.resolved_display_target == null);
     try std.testing.expectEqualStrings(source.arguments_json, copy.arguments_json);
 }
 
