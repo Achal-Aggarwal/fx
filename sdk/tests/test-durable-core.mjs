@@ -2256,7 +2256,76 @@ if (durabilityKind !== "memory") {
     const after = await ours.read();
     assert.deepEqual(after, await fresh());
     assert.deepEqual(after.map(({ entry }) => entry.k), ["input", "checkpoint"]);
+    // A view many entries behind reads only back to the newest checkpoint
+    // among them, not every entry since the view.
+    let last;
+    for (let index = 0; index < 15; index += 1) {
+      last = await theirs.append({ k: "input", key: `cancel:cnl_burst${index}`, type: "cancel", messageId: `cnl_burst${index}` });
+    }
+    await theirs.append({ k: "checkpoint", through: last, data: "", pending: [], recent: [] });
+    lists.length = 0;
+    const behind = await ours.read();
+    assert.equal(lists.length, 1, "the read stops at the checkpoint on its first page");
+    assert.deepEqual(behind, await fresh());
+    assert.deepEqual(behind.map(({ entry }) => entry.k), ["checkpoint"]);
     for (const closing of [agent, other]) await closing.close();
+  });
+
+  test("a server whose listing skips a slot keeps no view past it, and reads the entry once the World shows it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "libfx-log-gap-"));
+    dirs.push(dir);
+    // Slots the World's listings leave out, as a World can list a newer
+    // write before an earlier one has landed.
+    const hidden = new Set();
+    const hiding = async () => {
+      const base = await durabilityAt(dir);
+      return {
+        ...base,
+        world: async () => {
+          const world = await base.world();
+          const list = world.events.list.bind(world.events);
+          const events = Object.assign(Object.create(world.events), {
+            async list(...args) {
+              const page = await list(...args);
+              const slot = (event) => Number(/_(\d{26})$/.exec(String(event.eventId))?.[1]);
+              return { ...page, data: page.data.filter((event) => !hidden.has(slot(event))) };
+            },
+          });
+          return Object.assign(Object.create(world), { events });
+        },
+      };
+    };
+    const internals = (agent) => agent[Symbol.for("libfx.durableInternals")];
+    const agent = createAgent({ durability: await hiding() });
+    const session = agent.session();
+    for (const input of ["omega", "psi"]) assert.equal((await textOf(session.prompt(input))).result.stopReason, "end_turn");
+    await untilIdle(agent);
+    const ours = await internals(agent).openLog(session.id);
+    await ours.read();
+    assert.ok(Number.isSafeInteger(ours.newest()));
+    const other = createAgent({ durability: await durabilityAt(dir) });
+    const theirs = await internals(other).openLog(session.id);
+    // Another server writes two inputs, and the first does not list yet.
+    hidden.add(Number(await theirs.append({ k: "input", key: "cancel:cnl_late", type: "cancel", messageId: "cnl_late" })));
+    await theirs.append({ k: "input", key: "cancel:cnl_next", type: "cancel", messageId: "cnl_next" });
+    const ids = (entries) => entries.map(({ entry }) => entry.messageId);
+    const gapped = await ours.read();
+    assert.ok(ids(gapped).includes("cnl_next") && !ids(gapped).includes("cnl_late"));
+    assert.equal(ours.newest(), null, "a read that skipped a slot hands no worker its view");
+    // A server's first, whole read keeps no view past the gap either.
+    const late = createAgent({ durability: await hiding() });
+    const latecomer = await internals(late).openLog(session.id);
+    assert.ok(!ids(await latecomer.read()).includes("cnl_late"));
+    assert.equal(latecomer.newest(), null);
+    hidden.clear();
+    const fresh = createAgent({ durability: await durabilityAt(dir) });
+    const whole = await (await internals(fresh).openLog(session.id)).read();
+    assert.ok(ids(whole).includes("cnl_late"));
+    for (const log of [ours, latecomer]) {
+      assert.deepEqual(await log.read(), whole, "the entry is read once the World lists it");
+      assert.ok(Number.isSafeInteger(log.newest()));
+    }
+    for (const closing of [agent, other, late, fresh]) await closing.close();
   });
 }
 

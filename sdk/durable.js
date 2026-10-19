@@ -765,6 +765,10 @@ const missingStreamFastMs = 2000;
 // Runs whose log views one backend keeps, least recently read dropped first.
 const maxLogViews = 32;
 
+// Whether a newest-first listing showed every slot from the lowest it
+// listed to the newest. Pure.
+const gapless = (read) => read.listed === 0 || read.newest - read.lowest + 1 === read.listed;
+
 /**
  * A run's log view extended by the entries listed after it, as a full read
  * returns the log: every entry after the newest checkpoint's `through`.
@@ -1091,17 +1095,17 @@ function createWorldBackend(world, durability) {
         // The newest chained entry read: the chain's head, unless the read
         // stopped before reaching any.
         let newestChained;
-        // The newest slot this read listed, and how many slots above
-        // `stopBelow` it listed, entries or not. Unlike `known`, which this
-        // object's own writes also raise, these say only what the listing
-        // showed.
+        // The newest and lowest slots this read listed above `stopBelow`,
+        // entries or not, and how many. Unlike `known`, which this object's
+        // own writes also raise, these say only what the listing showed.
         let newest = stopBelow;
+        let lowest = Infinity;
         let listed = 0;
         // Ends the read. `head` is where the chain's head is when the read
         // found no chained entry, or undefined when the read does not show.
         const done = (head) => {
           noteSnapshot(snapshot, newestChained ?? head);
-          return { events, through, snapshot, newest, listed };
+          return { events, through, snapshot, newest, lowest, listed };
         };
         // A session's newest checkpoint is usually among its last few
         // entries, so a read starts with a small page and fetches more only
@@ -1115,7 +1119,7 @@ function createWorldBackend(world, durability) {
             if (!missingRun(error)) throw error;
             // The run's creation starts its count.
             if (stopBelow === 0) noteSnapshot({ seq: 0, seqInBand: inBandAtRunCreation }, "null");
-            return { events, through, newest, listed, missing: true };
+            return { events, through, newest, lowest, listed, missing: true };
           }
           snapshot ??= page.snapshot;
           for (const event of page.data) {
@@ -1123,6 +1127,7 @@ function createWorldBackend(world, durability) {
             if (slot > known) known = slot;
             if (slot <= stopBelow) return done(undefined);
             if (slot > newest) newest = slot;
+            if (slot < lowest) lowest = slot;
             listed += 1;
             // The checkpoint stands for the entries through its `through`,
             // the last of them the chain's head.
@@ -1140,32 +1145,47 @@ function createWorldBackend(world, durability) {
           cursor = page.cursor;
         }
       };
+      // The newest slot the last read() returned every entry through, or
+      // null when that read could not show it had them all.
+      let covered = null;
       const fullRead = async () => {
-        const { events, through, newest } = await newestFirst(0, true);
-        const entries = events.reverse();
-        rememberView(runId, { entries: entries.slice(), known: newest, through: through ?? 0 });
+        const read = await newestFirst(0, true);
+        const entries = read.events.reverse();
+        // A listing that skipped a slot may show a later write before an
+        // earlier one lands. The entries go back as they are, as every read
+        // returned them before, but no view keeps the gap for later reads.
+        if (!read.missing && gapless(read)) {
+          rememberView(runId, { entries: entries.slice(), known: read.newest, through: read.through ?? 0 });
+          covered = read.newest;
+        } else {
+          logViews.delete(runId);
+          covered = null;
+        }
         return entries;
       };
       return {
-        // The newest slot of the run this session object has seen.
-        newest: () => known,
+        newest: () => covered,
         async read() {
           const view = logViews.get(runId);
           if (!view) return fullRead();
           if (view.known > known) known = view.known;
-          const since = await newestFirst(view.known, false);
+          const since = await newestFirst(view.known, true);
           if (since.missing) {
             logViews.delete(runId);
+            covered = null;
             return [];
           }
-          // A listing that skipped a slot may show a later write before an
-          // earlier one, and a checkpoint covering less than the view starts
-          // after is not one the view can stand for: read the log whole.
-          const next = since.listed === since.newest - view.known ? extendLogView(view, since.events.reverse()) : null;
+          // The newer listing must have skipped no slot and must reach the
+          // view or a checkpoint that stands for what lies between; and a
+          // checkpoint covering less than the view starts after is not one
+          // the view can stand for. Otherwise read the log whole.
+          const reaches = since.listed === 0 || since.lowest === view.known + 1 || (since.through !== null && since.lowest <= since.through);
+          const next = reaches && gapless(since) ? extendLogView(view, since.events.reverse()) : null;
           if (!next) return fullRead();
           // The in-band count at the chain's head, as a full read notes it.
           noteSnapshot(since.snapshot, next.head);
           rememberView(runId, { entries: next.entries, known: since.newest, through: next.through });
+          covered = since.newest;
           return next.entries.slice();
         },
         async readSince(cursor) {
@@ -1528,8 +1548,9 @@ const messageIdInUse = (message) => Object.assign(
   { code: "FX_MESSAGE_ID_IN_USE" },
 );
 
-// Writes what a message adds to its session, in order, and returns how many
-// entries it wrote. Only the sender calls it, before it queues the message.
+// Writes what a message adds to its session, in order, and returns each
+// entry it wrote with the slot it took. Only the sender calls it, before it
+// queues the message.
 // A message that reuses another input's id writes nothing and throws.
 async function recordMessage(log, state, message) {
   if (idInUse(state, message)) throw messageIdInUse(message);
@@ -1542,10 +1563,10 @@ async function recordMessage(log, state, message) {
 /**
  * The log a sender read and then extended with its own entries, as the
  * worker it starts in the same request may use it instead of reading the
- * log again. Only when the sender wrote something and every entry it wrote
- * took the slot right after the newest one it had seen: then nothing landed
- * in between, so the view holds every input that comes before this
- * message's. Null otherwise. Pure.
+ * log again. Only when the sender's read showed every entry through slot
+ * `newestSeen`, and every entry the sender then wrote took the next slot:
+ * then nothing landed in between, so the view holds every input that comes
+ * before this message's. Null otherwise. Pure.
  */
 export function handoffEntries(read, newestSeen, appended) {
   if (!Number.isSafeInteger(newestSeen) || appended.length === 0) return null;
