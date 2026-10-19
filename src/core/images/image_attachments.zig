@@ -250,8 +250,10 @@ pub fn createTempSnapshotDir(alloc: std.mem.Allocator) ![]u8 {
     for (0..16) |_| {
         var suffix: u64 = undefined;
         io_mod.getIo().random(std.mem.asBytes(&suffix));
+        // Fixed width, so the model's note naming a snapshot here is the
+        // same length in every process.
         const path = try alloc.print(
-            "{s}/fx-image-snapshots-{x}",
+            "{s}/fx-image-snapshots-{x:0>16}",
             .{ temp_root, suffix },
         );
         errdefer alloc.free(path);
@@ -994,6 +996,34 @@ pub fn withholdOversizedAttachments(
         projected[index].content = try std.mem.concat(arena, u8, &.{ notice.written(), message.content orelse "" });
     }
     return .{ .messages = result orelse messages };
+}
+
+/// Names the saved file behind each image a request sends, so the model can
+/// open the image it sees with tools instead of searching the disk for it.
+/// Only the session's own snapshot is named, never the path the user attached
+/// from: that file can change after it was attached, and the snapshot holds
+/// the bytes the model sees. Returns `messages` itself when no image has a
+/// saved file, otherwise a copy allocated in `arena`. History is not modified.
+pub fn noteAttachmentLocations(arena: std.mem.Allocator, messages: []const types.ChatMessage) ![]const types.ChatMessage {
+    var result: ?[]types.ChatMessage = null;
+    for (messages, 0..) |message, index| {
+        var notes: std.Io.Writer.Allocating = .init(arena);
+        for (message.images) |image| {
+            // Inline bytes own the image; a snapshot beside them lasts only
+            // as long as the process.
+            if (image.inline_data != null) continue;
+            const path = image.snapshot_path orelse continue;
+            // Quoted, because a home folder can hold spaces or brackets.
+            notes.writer.print("[Image #{d} ({s}) is saved at ", .{ image.id, image.media_type }) catch return error.OutOfMemory;
+            std.json.Stringify.value(path, .{}, &notes.writer) catch return error.OutOfMemory;
+            notes.writer.writeAll(".]\n") catch return error.OutOfMemory;
+        }
+        if (notes.written().len == 0) continue;
+        const projected = result orelse try arena.dupe(types.ChatMessage, messages);
+        result = projected;
+        projected[index].content = try std.mem.concat(arena, u8, &.{ notes.written(), message.content orelse "" });
+    }
+    return result orelse messages;
 }
 
 fn syncSnapshotDirectory(snapshot_dir: std.Io.Dir) !void {
@@ -3139,6 +3169,88 @@ test "requests leave out images the session dropped, each with a note" {
     // A request without dropped images passes through untouched.
     const kept = [_]types.ChatMessage{.{ .role = .user, .content = "[Image #2]", .images = images[1..] }};
     try std.testing.expect((try withholdDroppedImages(arena, &kept)).ptr == (&kept).ptr);
+}
+
+test "requests name the saved file of each attached image, never its source" {
+    const alloc = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "Clean Shot.png", .data = &image_data.testPngHeader(10, 10) });
+    const source_path = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "Clean Shot.png");
+    defer alloc.free(source_path);
+    const attached = try testCapturedAttachment(alloc, &tmp, source_path, 1, "image/png");
+    defer types.freeImageAttachment(alloc, attached);
+    // A pasted image shows its own snapshot.
+    var pasted = attached;
+    pasted.id = 2;
+    pasted.path = attached.snapshot_path.?;
+    // Recalling a prompt saves another snapshot of the same bytes.
+    const recalled_file = try cloneVerifiedImageAttachment(alloc, attached, 3);
+    defer discardImageAttachment(alloc, recalled_file);
+    const recalled_paste = try cloneVerifiedImageAttachment(alloc, pasted, 4);
+    defer discardImageAttachment(alloc, recalled_paste);
+    // Inline bytes own the image, and any snapshot beside them is temporary.
+    var inline_bytes = attached;
+    inline_bytes.id = 5;
+    inline_bytes.inline_data = @constCast("png");
+    const in_memory: types.ImageAttachment = .{ .id = 6, .path = @constCast("inline://image-6"), .media_type = @constCast("image/png"), .snapshot_sha256 = attached.snapshot_sha256, .inline_data = @constCast("png") };
+
+    const images = [_]types.ImageAttachment{ attached, pasted, recalled_file, recalled_paste, inline_bytes, in_memory };
+    const prompt = "[Image #1] [Image #2] [Image #3] [Image #4] [Image #5] [Image #6]";
+    const messages = [_]types.ChatMessage{
+        .{ .role = .user, .content = prompt, .images = &images },
+        .{ .role = .assistant, .content = "ok" },
+    };
+    const projected = try noteAttachmentLocations(arena, &messages);
+
+    const expected = try arena.print(
+        "[Image #1 (image/png) is saved at \"{s}\".]\n" ++
+            "[Image #2 (image/png) is saved at \"{s}\".]\n" ++
+            "[Image #3 (image/png) is saved at \"{s}\".]\n" ++
+            "[Image #4 (image/png) is saved at \"{s}\".]\n" ++
+            prompt,
+        .{ attached.snapshot_path.?, attached.snapshot_path.?, recalled_file.snapshot_path.?, recalled_paste.snapshot_path.? },
+    );
+    try std.testing.expectEqualStrings(expected, projected[0].content.?);
+    try std.testing.expect(std.mem.find(u8, projected[0].content.?, source_path) == null);
+    try std.testing.expectEqual(@as(usize, 6), projected[0].images.len);
+    try std.testing.expectEqualStrings("ok", projected[1].content.?);
+    try std.testing.expectEqualStrings(prompt, messages[0].content.?);
+    // A request whose images have no saved file passes through untouched.
+    const unsaved = [_]types.ChatMessage{.{ .role = .user, .content = "[Image #5] [Image #6]", .images = images[4..] }};
+    try std.testing.expect((try noteAttachmentLocations(arena, &unsaved)).ptr == (&unsaved).ptr);
+}
+
+test "temporary snapshot folders have names of one length" {
+    const alloc = std.testing.allocator;
+    for (0..8) |_| {
+        const path = try createTempSnapshotDir(alloc);
+        defer alloc.free(path);
+        defer cleanupSnapshotDir(path);
+        try std.testing.expectEqual(@as(usize, "fx-image-snapshots-".len + 16), std.Io.Dir.path.basename(path).len);
+    }
+}
+
+test "image location notes quote the saved path" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const images = [_]types.ImageAttachment{.{
+        .id = 7,
+        .path = @constCast("/Users/example/Shots/shot.png"),
+        .media_type = @constCast("image/jpeg"),
+        .snapshot_path = @constCast("/Users/example/fx \"home\"]\n/sessions/s/images/image-7-0123456789abcdef.bin"),
+    }};
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "[Image #7]", .images = &images }};
+    const projected = try noteAttachmentLocations(arena, &messages);
+    try std.testing.expectEqualStrings(
+        "[Image #7 (image/jpeg) is saved at \"/Users/example/fx \\\"home\\\"]\\n/sessions/s/images/image-7-0123456789abcdef.bin\".]\n[Image #7]",
+        projected[0].content.?,
+    );
 }
 
 test "requests leave out tool images the session dropped, with one note per result" {

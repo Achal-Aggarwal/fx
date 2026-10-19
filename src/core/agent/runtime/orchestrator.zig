@@ -7508,9 +7508,12 @@ fn processQueuedPromptLoop(
             // Saved turns keep steering without its envelope; the model gets it
             // back as the live update it saw when the turn took it.
             const steering_messages = try runtime_execution_memory.rewrapRestoredSteering(overlay_arena, image_projection.messages);
-            const request_messages = try with_replyable_conversation_tail(overlay_arena, steering_messages);
-            if (request_messages.ptr != steering_messages.ptr) {
-                debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{steering_messages.len});
+            // After the steering rewrap, which recognizes a parent's steering
+            // by how its text starts.
+            const located_messages = try image_attachments.noteAttachmentLocations(overlay_arena, steering_messages);
+            const request_messages = try with_replyable_conversation_tail(overlay_arena, located_messages);
+            if (request_messages.ptr != located_messages.ptr) {
+                debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{located_messages.len});
             }
             // Tool images withheld because the catalog could not confirm image
             // input are invisible in the transcript otherwise. Tell the user

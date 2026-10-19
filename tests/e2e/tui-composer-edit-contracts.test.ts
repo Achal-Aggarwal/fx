@@ -218,9 +218,20 @@ function userParts(requestIndex = 0): Array<{
   return message?.content ?? [];
 }
 
-function finalUserText(requestIndex = 0): string {
+// The request names each attached image's saved file ahead of the prompt.
+const IMAGE_LOCATION_NOTES = /^(\[Image #\d+ \(image\/[a-z]+\) [^\n]*\]\n)+/;
+
+function requestUserText(requestIndex: number): string {
   return userParts(requestIndex).find((part) => part.type === "text")?.text ??
     "";
+}
+
+function finalUserText(requestIndex = 0): string {
+  return requestUserText(requestIndex).replace(IMAGE_LOCATION_NOTES, "");
+}
+
+function imageLocationNotes(requestIndex = 0): string {
+  return requestUserText(requestIndex).match(IMAGE_LOCATION_NOTES)?.[0] ?? "";
 }
 
 function nestedText(content: unknown): string {
@@ -876,6 +887,20 @@ tmuxTest(
     expect(finalUserText(1)).toBe("[Image #2] describe history image");
     expect(userParts(0).filter((part) => part.type === "file")).toHaveLength(1);
     expect(userParts(1).filter((part) => part.type === "file")).toHaveLength(1);
+    // Each turn names the session copy of its image, not the pasted path.
+    const savedPaths = [0, 1].map((requestIndex) => {
+      const note = imageLocationNotes(requestIndex).match(
+        /^\[Image #(\d+) \(image\/png\) is saved at ("(?:[^"\\]|\\.)*")\.\]\n$/,
+      );
+      expect(note).not.toBeNull();
+      expect(note![1]).toBe(String(requestIndex + 1));
+      expect(gateway!.requests[requestIndex]!.body).not.toContain(fixtureImagePath!);
+      const saved = JSON.parse(note![2]!) as string;
+      expect(saved.startsWith(join(root!, "home", ".fx", "sessions"))).toBe(true);
+      expect(readFileSync(saved)).toEqual(readFileSync(fixtureImagePath!));
+      return saved;
+    });
+    expect(savedPaths[1]).not.toBe(savedPaths[0]);
     expectCleanRuntime(active);
   },
   TIMEOUT,
