@@ -1271,7 +1271,6 @@ test "subagent feedback waits for admitted work to install its worker" {
         io_mod.sleep(std.time.ns_per_ms);
     }
     try std.testing.expect(admitted);
-    try std.testing.expect(!runtime.managed.hasRunningWork());
     second_thread = try std.Thread.spawn(.{}, Call.run, .{&second});
     try second.entered.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(5) } });
     try std.testing.expectError(error.Timeout, second.done.waitTimeout(io_mod.getIo(), .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(100) } }));

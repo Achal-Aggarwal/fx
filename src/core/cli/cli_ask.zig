@@ -4498,31 +4498,6 @@ fn testProcessQueuedPromptUnauthorized(_: *agent_runtime.Agent, deps: *const age
     );
 }
 
-fn testProcessQueuedPromptUnauthorizedThenHistory(agent: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
-    try testProcessQueuedPromptUnauthorized(agent, deps, semantic_presentation, lifecycle, cfg, job);
-    const ctx: *AskContext = @ptrCast(@alignCast(deps.ctx));
-    const turn = try session_runtime.makeAssistantTurn(ctx.alloc, job.prompt, "retained response");
-    defer types.freeHistoryTurn(ctx.alloc, turn);
-    try deps.propagate_history_turn(deps.ctx, turn);
-}
-
-fn testProcessQueuedPromptToolThenUnauthorized(agent: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
-    try deps.push_tool_lifecycle(deps.ctx, .{
-        .authoritative_started = .{
-            .id = .{ .turn_id = job.turn_id, .call_id = "read_1" },
-            .reconciles_provisional_call_id = null,
-            .tool_name = "read_file",
-            .activity_kind = .read,
-        },
-    });
-    try testProcessQueuedPromptUnauthorized(agent, deps, semantic_presentation, lifecycle, cfg, job);
-}
-
-fn testProcessQueuedPromptUnauthorizedThenError(agent: *agent_runtime.Agent, deps: *const agent_runtime.AgentRuntimeDeps, semantic_presentation: ?agent_runtime.SemanticPresentationSink, lifecycle: agent_runtime.LifecycleContext, cfg: agent_runtime.Config, job: worker_runtime.QueuedPrompt) !void {
-    try testProcessQueuedPromptUnauthorized(agent, deps, semantic_presentation, lifecycle, cfg, job);
-    return error.InjectedPromptFailure;
-}
-
 var test_initialize_session_store_calls: usize = 0;
 var test_image_preflight_startup_calls: usize = 0;
 var test_image_preflight_process_calls: usize = 0;

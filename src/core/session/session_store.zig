@@ -1,12 +1,9 @@
 const std = @import("std");
-const testing_allocator = @import("../shared/testing_allocator.zig");
 const config_runtime = @import("../config/config_runtime.zig");
-const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const image_attachments = @import("../images/image_attachments.zig");
 const io_mod = @import("../shared/io.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
-const core_types = @import("../shared/types.zig");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
 const session_child_store = @import("session_child_store.zig");
@@ -17,7 +14,6 @@ const session_replay = @import("session_replay.zig");
 const session_projection = @import("session_projection.zig");
 const session_display_metadata = @import("session_display_metadata.zig");
 const subagent_child_state = @import("../subagent/child_state.zig");
-const text_utils = @import("../shared/text_utils.zig");
 const Allocator = std.mem.Allocator;
 
 const authority_module = @import("session_authority.zig");
@@ -26,46 +22,25 @@ const migration = @import("session_migration.zig");
 const paths = @import("session_store_paths.zig");
 const store_types = @import("session_store_types.zig");
 const summary_codec = @import("session_summary_codec.zig");
-const sort_utils = @import("../shared/sort_utils.zig");
 
 const classifyAuthority = authority_module.classifyAuthority;
-const classifyAuthorityAllowingLargeLegacy = authority_module.classifyAuthorityAllowingLargeLegacy;
-const deleteSessionEntry = authority_module.deleteSessionEntry;
 const openSessionFile = authority_module.openSessionFile;
 const readExactLegacyFile = authority_module.readExactLegacyFile;
 const requireAuthorityFenceAbsent = authority_module.requireAuthorityFenceAbsent;
-const DiscoveryCandidateMetadata = discovery.DiscoveryCandidateMetadata;
 const DiscoveryMode = discovery.DiscoveryMode;
 const ReadOnlyCandidate = discovery.ReadOnlyCandidate;
-const appendDoctorDiagnostic = discovery.appendDoctorDiagnostic;
 const classifyReadOnlyCandidate = discovery.classifyReadOnlyCandidate;
-const freeDoctorDiagnostics = discovery.freeDoctorDiagnostics;
-const inspectDoctorSession = discovery.inspectDoctorSession;
-const logDiscovery = discovery.logDiscovery;
-const logDiscoveryError = discovery.logDiscoveryError;
 const storageFormatForLegacy = discovery.storageFormatForLegacy;
 const summaryFromState = discovery.summaryFromState;
 const retired_latest_sessions_dir = "latest";
 const LegacyStoredSession = migration.LegacyStoredSession;
-const MigrationPreferenceSource = migration.MigrationPreferenceSource;
 const legacyToDurableState = migration.legacyToDurableState;
 const loadSchemaV3ReadOnly = migration.loadSchemaV3ReadOnly;
-const migrateLegacyLocked = migration.migrateLegacyLocked;
-const migrateSchemaV3Locked = migration.migrateSchemaV3Locked;
 const normalizeWorkspaceRoot = paths.normalizeWorkspaceRoot;
 pub const sessionDirPath = paths.sessionDirPath;
 const sessionJsonPath = paths.sessionJsonPath;
 pub const validateSessionId = paths.validateSessionId;
-const validateWorkspaceRoot = paths.validateWorkspaceRoot;
 pub const generateSessionId = paths.generateSessionId;
-pub const CandidateStorage = store_types.CandidateStorage;
-pub const DiscoveryCause = store_types.DiscoveryCause;
-pub const DoctorDiagnostic = store_types.DoctorDiagnostic;
-pub const DoctorInspectionResult = store_types.DoctorInspectionResult;
-const DoctorInspectionOptions = store_types.DoctorInspectionOptions;
-pub const DoctorIssueKind = store_types.DoctorIssueKind;
-pub const LoadedWritableSession = store_types.LoadedWritableSession;
-pub const ProjectionState = store_types.ProjectionState;
 
 /// The process's temporary folder for captured prompt images, made on first
 /// use. The turn keeps the bytes (D44); until the prompt is saved, a
@@ -80,114 +55,6 @@ pub const ResumeOptions = store_types.ResumeOptions;
 pub const ResumeTarget = store_types.ResumeTarget;
 pub const SessionRecoveryResult = store_types.SessionRecoveryResult;
 pub const SessionSummary = store_types.SessionSummary;
-pub const HistoryPage = store_types.HistoryPage;
-
-pub const LoadHistoryPageError = error{
-    OutOfMemory,
-    InvalidSessionId,
-    InvalidHistoryPageLimit,
-    InvalidHistoryPageCursor,
-    StaleHistoryPageCursor,
-    SessionNotFound,
-    SessionPathUnsafe,
-    SessionStoreUnavailable,
-    UnsupportedSessionFormat,
-    CorruptSession,
-};
-
-const HistoryPageCursor = struct {
-    session_id: []const u8,
-    history_len: usize,
-    revision_ms: i64,
-    prefix_digest: [32]u8,
-    start: usize,
-};
-
-const ConversationHistoryPageCursor = struct {
-    session_id: []const u8,
-    history_len: usize,
-    start: usize,
-};
-
-fn parseConversationHistoryPageCursor(
-    raw: []const u8,
-) LoadHistoryPageError!ConversationHistoryPageCursor {
-    if (raw.len == 0 or raw.len > 512) return error.InvalidHistoryPageCursor;
-    var fields = std.mem.splitScalar(u8, raw, ':');
-    if (!std.mem.eql(u8, fields.next() orelse return error.InvalidHistoryPageCursor, "v3")) {
-        return error.InvalidHistoryPageCursor;
-    }
-    const session_id = fields.next() orelse return error.InvalidHistoryPageCursor;
-    const history_len = std.fmt.parseInt(
-        usize,
-        fields.next() orelse return error.InvalidHistoryPageCursor,
-        10,
-    ) catch return error.InvalidHistoryPageCursor;
-    const start = std.fmt.parseInt(
-        usize,
-        fields.next() orelse return error.InvalidHistoryPageCursor,
-        10,
-    ) catch return error.InvalidHistoryPageCursor;
-    if (fields.next() != null or start > history_len) {
-        return error.InvalidHistoryPageCursor;
-    }
-    validateSessionId(session_id) catch return error.InvalidHistoryPageCursor;
-    return .{
-        .session_id = session_id,
-        .history_len = history_len,
-        .start = start,
-    };
-}
-
-fn formatConversationHistoryPageCursor(
-    buffer: []u8,
-    cursor: ConversationHistoryPageCursor,
-) ![]u8 {
-    return std.mem.print(buffer, "v3:{s}:{d}:{d}", .{
-        cursor.session_id,
-        cursor.history_len,
-        cursor.start,
-    });
-}
-
-fn parseHistoryPageCursor(raw: []const u8) LoadHistoryPageError!HistoryPageCursor {
-    if (raw.len == 0 or raw.len > 512) return error.InvalidHistoryPageCursor;
-    var fields = std.mem.splitScalar(u8, raw, ':');
-    if (!std.mem.eql(u8, fields.next() orelse return error.InvalidHistoryPageCursor, "v2")) return error.InvalidHistoryPageCursor;
-    const session_id = fields.next() orelse return error.InvalidHistoryPageCursor;
-    const history_len = std.fmt.parseInt(usize, fields.next() orelse return error.InvalidHistoryPageCursor, 10) catch return error.InvalidHistoryPageCursor;
-    const revision_ms = std.fmt.parseInt(i64, fields.next() orelse return error.InvalidHistoryPageCursor, 10) catch return error.InvalidHistoryPageCursor;
-    const digest_hex = fields.next() orelse return error.InvalidHistoryPageCursor;
-    const start = std.fmt.parseInt(usize, fields.next() orelse return error.InvalidHistoryPageCursor, 10) catch return error.InvalidHistoryPageCursor;
-    if (fields.next() != null) return error.InvalidHistoryPageCursor;
-    if (digest_hex.len != 64 or revision_ms < 0 or start > history_len) return error.InvalidHistoryPageCursor;
-    validateSessionId(session_id) catch return error.InvalidHistoryPageCursor;
-    var prefix_digest: [32]u8 = undefined;
-    _ = std.fmt.hexToBytes(&prefix_digest, digest_hex) catch return error.InvalidHistoryPageCursor;
-    const cursor: HistoryPageCursor = .{ .session_id = session_id, .history_len = history_len, .revision_ms = revision_ms, .prefix_digest = prefix_digest, .start = start };
-    var canonical: [512]u8 = undefined;
-    const encoded = formatHistoryPageCursor(&canonical, cursor) catch return error.InvalidHistoryPageCursor;
-    if (!std.mem.eql(u8, raw, encoded)) return error.InvalidHistoryPageCursor;
-    return cursor;
-}
-
-fn formatHistoryPageCursor(buffer: []u8, cursor: HistoryPageCursor) ![]u8 {
-    return std.mem.print(buffer, "v2:{s}:{d}:{d}:{x}:{d}", .{ cursor.session_id, cursor.history_len, cursor.revision_ms, cursor.prefix_digest, cursor.start });
-}
-
-fn duplicateHistoryPage(alloc: Allocator, turns: []const session.HistoryTurn) ![]session.HistoryTurn {
-    const copy = try alloc.alloc(session.HistoryTurn, turns.len);
-    var copied: usize = 0;
-    errdefer {
-        for (copy[0..copied]) |turn| session.freeHistoryTurn(alloc, turn);
-        alloc.free(copy);
-    }
-    for (turns) |turn| {
-        copy[copied] = try session.dupeHistoryTurn(alloc, turn);
-        copied += 1;
-    }
-    return copy;
-}
 
 fn latestCheckpointHistoryIndex(history: []const session.HistoryTurn) usize {
     var result: usize = 0;
@@ -197,79 +64,14 @@ fn latestCheckpointHistoryIndex(history: []const session.HistoryTurn) usize {
     return result;
 }
 
-fn historyPrefixDigest(turns: []const session.HistoryTurn) error{ WriteFailed, NoSpaceLeft, InvalidSessionFormat }![32]u8 {
-    var buffer: [256]u8 = undefined;
-    var hashing: std.Io.Writer.Hashing(std.crypto.hash.sha2.Sha256) = .init(&buffer);
-    try hashing.writer.writeAll("fx.history-page-prefix.v2\x00");
-    for (turns) |turn| {
-        try session_codec.writeHistoryTurn(&hashing.writer, turn);
-        // Canonical JSON never contains a literal NUL, so this makes the
-        // concatenation unambiguous without introducing another serializer.
-        try hashing.writer.writeByte(0);
-    }
-    try hashing.writer.flush();
-    return hashing.hasher.finalResult();
-}
-
-fn mapHistoryPageLoadError(err: anyerror) LoadHistoryPageError {
-    return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.InvalidSessionId => error.InvalidSessionId,
-        error.SessionNotFound => error.SessionNotFound,
-        error.SessionPathUnsafe => error.SessionPathUnsafe,
-        error.UnsupportedSessionFormat, error.UnsupportedSessionSchema => error.UnsupportedSessionFormat,
-        error.InvalidSessionFormat,
-        error.InvalidDurableField,
-        error.InvalidDurableBytes,
-        error.InvalidSessionIndex,
-        => error.CorruptSession,
-        // `loadReadOnly` intentionally has an inferred upstream error set.
-        // Its uncategorized I/O and replay failures are unavailable storage,
-        // never evidence that the committed session itself is corrupt.
-        else => error.SessionStoreUnavailable,
-    };
-}
-
-const HistoryPageWindow = struct {
-    start: usize,
-    end: usize,
-};
-
-fn selectHistoryPageWindow(history_len: usize, exclusive_end: usize, limit: usize) HistoryPageWindow {
-    std.debug.assert(exclusive_end <= history_len);
-    return .{ .start = exclusive_end -| limit, .end = exclusive_end };
-}
-pub const LoadSubagentBootstrapError = error{
-    OutOfMemory,
-    InvalidSessionId,
-    SessionNotFound,
-    SessionPathUnsafe,
-    SessionMetadataUnavailable,
-};
-pub const ListSubagentControlIdsError = error{
-    OutOfMemory,
-    SessionStoreUnavailable,
-};
-pub const SubagentBootstrapMetadata = struct {
-    name: []u8,
-    preferences: session_codec.DurableSessionPreferences,
-};
 pub const ResumableSessionContinuation = store_types.ResumableSessionContinuation;
 pub const ResumableSessionPage = store_types.ResumableSessionPage;
 pub const SessionListScope = store_types.SessionListScope;
 pub const SessionListPage = store_types.SessionListPage;
 pub const session_list_default_limit: usize = 100;
 pub const session_list_max_limit: usize = 100;
-const ResumableSessionScope = enum {
-    all_workspaces,
-    current_workspace,
-};
-pub const StorageFormat = store_types.StorageFormat;
 const automatic_legacy_max_bytes = store_types.automatic_legacy_max_bytes;
 const StoreContext = store_types.StoreContext;
-const freeSummaries = summary_codec.freeSummaries;
-const resumablePageFromSummaries = summary_codec.resumablePageFromSummaries;
-const sortSummariesNewestFirst = summary_codec.sortSummariesNewestFirst;
 
 /// Borrows its store's directory handles. The caller owns each returned candidate.
 pub const CandidateIterator = struct {
@@ -318,23 +120,6 @@ test {
     _ = discovery;
 }
 
-fn retainWorkspaceSummaries(alloc: Allocator, summaries: *std.ArrayList(SessionSummary), workspace_root: []const u8) void {
-    var write_index: usize = 0;
-    for (summaries.items, 0..) |*summary, read_index| {
-        const summary_workspace = summary.workspace_root orelse {
-            summary.deinit(alloc);
-            continue;
-        };
-        if (!std.mem.eql(u8, summary_workspace, workspace_root)) {
-            summary.deinit(alloc);
-            continue;
-        }
-        if (write_index != read_index) summaries.items[write_index] = summary.*;
-        write_index += 1;
-    }
-    summaries.items.len = write_index;
-}
-
 pub const default_resume_page_limit: usize = 10;
 
 pub const Store = struct {
@@ -345,7 +130,6 @@ pub const Store = struct {
     // How many sessions one resume page yields before flagging `has_more`.
     // Carried on the value so it propagates through the by-value page chain;
     // the UI sets it from the visible screen height.
-    resume_page_limit: usize = default_resume_page_limit,
 
     /// Narrow, copyable view of this store for the discovery/migration helpers,
     /// so they depend on `StoreContext` instead of the full facade.
@@ -447,21 +231,6 @@ pub const Store = struct {
         return .{ .dir = directory };
     }
 
-    /// Consumes an exact writable session on every return. Policy checks such
-    /// as terminal one-off admission remain with the caller that owns them.
-    pub fn deleteCommittedSession(
-        self: Store,
-        alloc: Allocator,
-        loaded: *LoadedWritableSession,
-    ) PristineDiscardDisposition {
-        return self.deleteWriterOwnedSession(
-            alloc,
-            loaded,
-            "committed_session_delete",
-            true,
-        );
-    }
-
     /// Loads a session's full durable state read-only. Caller owns the state.
     pub fn loadReadOnly(
         self: Store,
@@ -486,158 +255,6 @@ pub const Store = struct {
         return self.canonical_root.loadListedLegacyChildIdentity(alloc, session_id);
     }
 
-    /// Reads one bounded chronological history page without acquiring the
-    /// session writer lock. The cursor is opaque and anchored to the history
-    /// length that produced it, so later appends cannot duplicate older pages.
-    pub fn loadHistoryPage(
-        self: Store,
-        alloc: Allocator,
-        session_id: []const u8,
-        cursor: ?[]const u8,
-        limit: usize,
-    ) LoadHistoryPageError!store_types.HistoryPage {
-        validateSessionId(session_id) catch return error.InvalidSessionId;
-        if (limit == 0 or limit > 100) return error.InvalidHistoryPageLimit;
-        if (cursor) |raw| {
-            if (std.mem.startsWith(u8, raw, "v3:")) {
-                _ = try parseConversationHistoryPageCursor(raw);
-            } else {
-                _ = try parseHistoryPageCursor(raw);
-            }
-        }
-        var session_dir = self.openSessionDir(session_id) catch |err|
-            return mapHistoryPageLoadError(err);
-        defer session_dir.close();
-        if (session_log.hasConversationMetadata(alloc, &session_dir) catch |err|
-            return mapHistoryPageLoadError(err))
-        {
-            var candidate = classifyReadOnlyCandidate(
-                alloc,
-                &session_dir,
-                session_id,
-            ) catch |err| return mapHistoryPageLoadError(err);
-            defer candidate.deinit(alloc);
-            const snapshot = if (cursor) |raw|
-                try parseConversationHistoryPageCursor(raw)
-            else
-                ConversationHistoryPageCursor{
-                    .session_id = candidate.summary.id,
-                    .history_len = candidate.summary.history_len,
-                    .start = candidate.summary.history_len,
-                };
-            if (!std.mem.eql(u8, snapshot.session_id, session_id)) {
-                return error.InvalidHistoryPageCursor;
-            }
-            if (snapshot.history_len > candidate.summary.history_len) {
-                return error.StaleHistoryPageCursor;
-            }
-            const window = selectHistoryPageWindow(
-                snapshot.history_len,
-                snapshot.start,
-                limit,
-            );
-            const turns = session_log.loadConversationHistoryRange(
-                alloc,
-                &session_dir,
-                window.start,
-                window.end,
-            ) catch |err| return mapHistoryPageLoadError(err);
-            errdefer session.freeHistoryTurnSlice(alloc, turns);
-            resolveSessionSnapshotLocators(
-                alloc,
-                turns,
-                null,
-                self.sessions_dir,
-                session_id,
-            ) catch |err| return mapHistoryPageLoadError(err);
-            const next_cursor = if (window.start > 0) blk: {
-                var encoded: [512]u8 = undefined;
-                const raw = formatConversationHistoryPageCursor(&encoded, .{
-                    .session_id = session_id,
-                    .history_len = snapshot.history_len,
-                    .start = window.start,
-                }) catch return error.SessionStoreUnavailable;
-                break :blk try alloc.dupe(u8, raw);
-            } else null;
-            errdefer if (next_cursor) |value| alloc.free(value);
-            return .{
-                .session_id = try alloc.dupe(u8, session_id),
-                .revision_ms = candidate.summary.updated_at_ms,
-                .history_len = snapshot.history_len,
-                .turns = turns,
-                .next_cursor = next_cursor,
-            };
-        }
-        const position = if (cursor) |raw| try parseHistoryPageCursor(raw) else null;
-        if (position) |value| {
-            if (!std.mem.eql(u8, value.session_id, session_id)) return error.InvalidHistoryPageCursor;
-        }
-
-        var state = self.loadReadOnly(alloc, session_id) catch |err| return mapHistoryPageLoadError(err);
-        defer state.deinit(alloc);
-
-        const snapshot: HistoryPageCursor = if (position) |value| blk: {
-            if (value.history_len > state.history.len)
-                return error.StaleHistoryPageCursor;
-            const digest = historyPrefixDigest(state.history[0..value.history_len]) catch return error.SessionStoreUnavailable;
-            if (!std.mem.eql(u8, &value.prefix_digest, &digest)) return error.StaleHistoryPageCursor;
-            break :blk value;
-        } else .{
-            .session_id = state.id,
-            .history_len = state.history.len,
-            .revision_ms = state.updated_at_ms,
-            .prefix_digest = historyPrefixDigest(state.history) catch return error.SessionStoreUnavailable,
-            .start = state.history.len,
-        };
-        const window = selectHistoryPageWindow(state.history.len, snapshot.start, limit);
-        const turns = try duplicateHistoryPage(alloc, state.history[window.start..window.end]);
-        errdefer session.freeHistoryTurnSlice(alloc, turns);
-        const next_cursor = if (window.start > 0) blk: {
-            var encoded: [512]u8 = undefined;
-            const raw = formatHistoryPageCursor(&encoded, .{
-                .session_id = snapshot.session_id,
-                .history_len = snapshot.history_len,
-                .revision_ms = snapshot.revision_ms,
-                .prefix_digest = snapshot.prefix_digest,
-                .start = window.start,
-            }) catch return error.SessionStoreUnavailable;
-            break :blk try alloc.dupe(u8, raw);
-        } else null;
-        errdefer if (next_cursor) |value| alloc.free(value);
-        return .{
-            .session_id = try alloc.dupe(u8, state.id),
-            .revision_ms = snapshot.revision_ms,
-            .history_len = snapshot.history_len,
-            .turns = turns,
-            .next_cursor = next_cursor,
-        };
-    }
-
-    /// Opens read-only managed-child storage for a session, validating it loads.
-    pub fn openChildCapabilityReadOnly(
-        self: Store,
-        alloc: Allocator,
-        session_id: []const u8,
-    ) !session_child_store.SessionChildCapability {
-        var detail = try self.loadReadOnlyDetail(alloc, session_id, .{});
-        detail.deinit(alloc);
-
-        var session_dir = try self.openSessionDir(session_id);
-        defer session_dir.close();
-        const display_path = try sessionDirPath(
-            alloc,
-            self.sessions_dir,
-            session_id,
-        );
-        defer alloc.free(display_path);
-        return session_child_store.SessionChildCapability.init(
-            alloc,
-            session_dir.dir,
-            display_path,
-            .read_only,
-        );
-    }
-
     /// Opens verified read-only storage restricted to subagent control files.
     /// The caller has already classified the session; no history is replayed.
     pub fn openListedSubagentControlReadOnly(
@@ -652,152 +269,6 @@ pub const Store = struct {
         return session_child_store.SessionChildCapability.initLegacySubagentControl(alloc, session_dir.dir, display);
     }
 
-    /// Returns owned session metadata needed to initialize a control record.
-    /// This validates ordinary-session visibility without replaying transcript history.
-    pub fn loadSubagentBootstrapMetadata(
-        self: Store,
-        alloc: Allocator,
-        session_id: []const u8,
-    ) LoadSubagentBootstrapError!SubagentBootstrapMetadata {
-        validateSessionId(session_id) catch return error.InvalidSessionId;
-        var session_dir = self.openSessionDir(session_id) catch |err| return switch (err) {
-            error.InvalidSessionId => error.InvalidSessionId,
-            error.SessionNotFound => error.SessionNotFound,
-            error.SessionPathUnsafe => error.SessionPathUnsafe,
-            else => error.SessionMetadataUnavailable,
-        };
-        defer session_dir.close();
-        var candidate = classifyReadOnlyCandidate(
-            alloc,
-            &session_dir,
-            session_id,
-        ) catch |err| return switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.SessionNotFound => error.SessionNotFound,
-            error.SessionPathUnsafe => error.SessionPathUnsafe,
-            else => error.SessionMetadataUnavailable,
-        };
-        defer candidate.deinit(alloc);
-
-        const name_source = candidate.summary.title orelse session_id;
-        const name = try alloc.dupe(u8, name_source);
-        errdefer alloc.free(name);
-        return .{
-            .name = name,
-            .preferences = switch (candidate.storage) {
-                .conversation => self.loadConversationPreferences(
-                    alloc,
-                    &session_dir,
-                    session_id,
-                ) catch |err| return switch (err) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    error.SessionNotFound => error.SessionNotFound,
-                    error.SessionPathUnsafe => error.SessionPathUnsafe,
-                    else => error.SessionMetadataUnavailable,
-                },
-                .schema_v3 => self.loadSubagentManifestPreferences(
-                    alloc,
-                    &session_dir,
-                    session_id,
-                ) catch |err| return switch (err) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    error.SessionNotFound => error.SessionNotFound,
-                    error.SessionPathUnsafe => error.SessionPathUnsafe,
-                    else => error.SessionMetadataUnavailable,
-                },
-                .legacy_v1, .legacy_v2 => self.loadSubagentLegacyPreferences(
-                    alloc,
-                    candidate.summary.workspace_root orelse self.workspace_root,
-                ) catch |err| return switch (err) {
-                    error.OutOfMemory => error.OutOfMemory,
-                    else => error.SessionMetadataUnavailable,
-                },
-            },
-        };
-    }
-
-    fn loadConversationPreferences(
-        self: Store,
-        alloc: Allocator,
-        session_dir: *io_mod.VerifiedDir,
-        session_id: []const u8,
-    ) !session_codec.DurableSessionPreferences {
-        _ = self;
-        var file = openSessionFile(session_dir, "session.json", .read_only) catch |err| switch (err) {
-            error.FileNotFound => return error.SessionNotFound,
-            error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
-            else => return err,
-        };
-        defer file.close(io_mod.getIo());
-        const bytes = try io_mod.readFileToEnd(
-            alloc,
-            &file,
-            session_codec.max_session_metadata_bytes,
-        );
-        defer alloc.free(bytes);
-        var metadata = try session_codec.decodeSessionMetadata(alloc, bytes);
-        defer metadata.deinit();
-        if (!std.mem.eql(u8, metadata.value.id, session_id)) {
-            return error.InvalidSessionMetadata;
-        }
-        return .{
-            .provider = model_provider.parse(metadata.value.provider) orelse
-                return error.InvalidSessionMetadata,
-            .model = try alloc.dupe(u8, metadata.value.model),
-            .effort = core_types.ReasoningEffort.parse(metadata.value.effort) orelse
-                return error.InvalidSessionMetadata,
-            .fast_mode = metadata.value.fast_mode,
-            .ultrafast_mode = metadata.value.ultrafast_mode orelse false,
-        };
-    }
-
-    fn loadSubagentManifestPreferences(
-        self: Store,
-        alloc: Allocator,
-        session_dir: *io_mod.VerifiedDir,
-        session_id: []const u8,
-    ) !session_codec.DurableSessionPreferences {
-        _ = self;
-        var file = openSessionFile(session_dir, "session.json", .read_only) catch |err| switch (err) {
-            error.FileNotFound => return error.SessionNotFound,
-            error.NotDir, error.SymLinkLoop => return error.SessionPathUnsafe,
-            else => return err,
-        };
-        defer file.close(io_mod.getIo());
-        const bytes = try io_mod.readFileToEnd(
-            alloc,
-            &file,
-            session_projection.manifest_max_bytes,
-        );
-        defer alloc.free(bytes);
-        var manifest = try session_projection.decodeManifest(alloc, bytes);
-        defer manifest.deinit(alloc);
-        if (!std.mem.eql(u8, manifest.id, session_id)) return error.InvalidSessionFormat;
-        return manifest.preferences.dupe(alloc);
-    }
-
-    fn loadSubagentLegacyPreferences(
-        self: Store,
-        alloc: Allocator,
-        workspace_root: []const u8,
-    ) !session_codec.DurableSessionPreferences {
-        var detailed = try config_runtime.loadMergedSettingsDetailedFromHome(
-            alloc,
-            self.home_dir,
-            workspace_root,
-        );
-        defer detailed.deinit(alloc);
-        return .{
-            .model = try alloc.dupe(
-                u8,
-                detailed.settings.models.get(.gateway) orelse "anthropic/claude-opus-4.7",
-            ),
-            .effort = detailed.settings.effort orelse .auto,
-            .fast_mode = detailed.settings.fast_mode orelse false,
-            .ultrafast_mode = detailed.settings.ultrafast_mode orelse false,
-        };
-    }
-
     /// Loads a session's summary, state, and storage format read-only, handling
     /// both schema-v3 and legacy snapshots. Caller owns the returned detail.
     pub fn loadReadOnlyDetail(
@@ -806,26 +277,12 @@ pub const Store = struct {
         session_id: []const u8,
         options: ResumeOptions,
     ) !ReadOnlyDetail {
-        return self.loadReadOnlyDetailWithHistoryErrors(alloc, session_id, options, false);
-    }
-
-    fn loadReadOnlyDetailWithHistoryErrors(
-        self: Store,
-        alloc: Allocator,
-        session_id: []const u8,
-        options: ResumeOptions,
-        comptime classify_history_errors: bool,
-    ) !ReadOnlyDetail {
         try validateSessionId(session_id);
         var session_dir = try self.openSessionDir(session_id);
         defer session_dir.close();
         if (try session_log.hasConversationMetadata(alloc, &session_dir)) {
-            var state = if (classify_history_errors)
-                try session_log.loadConversationDetailState(alloc, &session_dir, session_id)
-            else blk: {
-                var root = self.canonical_root;
-                break :blk try root.loadReadOnly(alloc, session_id, options.log);
-            };
+            var root = self.canonical_root;
+            var state = try root.loadReadOnly(alloc, session_id);
             errdefer state.deinit(alloc);
             const archive = try session_log.loadConversationArchive(
                 alloc,
@@ -931,230 +388,6 @@ pub const Store = struct {
         return discovery.classifyFencedLegacyCandidate(alloc, &dir, session_id, cancelled);
     }
 
-    /// Invalidates the derived resume catalog after managed child ownership
-    /// changes. The relationship index remains the canonical authority.
-    /// Returns owned IDs for every readable ordinary session. Caller frees each
-    /// ID and the list with the allocator passed here.
-    pub fn listSubagentControlSessionIds(
-        self: Store,
-        alloc: Allocator,
-    ) ListSubagentControlIdsError!std.ArrayList([]u8) {
-        const scan = self.scanSessionSummariesWithDiagnostics(alloc, .read_only_list, false) catch |err| {
-            return switch (err) {
-                error.OutOfMemory => error.OutOfMemory,
-                else => error.SessionStoreUnavailable,
-            };
-        };
-        var summaries = scan.summaries;
-        defer freeSummaries(alloc, &summaries);
-        var ids: std.ArrayList([]u8) = .empty;
-        errdefer {
-            for (ids.items) |id| alloc.free(id);
-            ids.deinit(alloc);
-        }
-        for (summaries.items) |summary| {
-            const id = try alloc.dupe(u8, summary.id);
-            errdefer alloc.free(id);
-            try ids.append(alloc, id);
-        }
-        return ids;
-    }
-
-    /// Lists readable sessions for this store's workspace newest-first. Caller frees each item and the list.
-    pub fn listForWorkspace(self: Store, alloc: Allocator) anyerror!std.ArrayList(SessionSummary) {
-        const scan = try self.scanSessionSummariesWithDiagnostics(alloc, .read_only_list, false);
-        var summaries = scan.summaries;
-        errdefer freeSummaries(alloc, &summaries);
-        retainWorkspaceSummaries(alloc, &summaries, self.workspace_root);
-        return summaries;
-    }
-
-    /// Lists session candidates for workspace-owned managed children. Child
-    /// payloads remain the authority for child ownership.
-    pub fn listManagedChildCandidatesForWorkspace(self: Store, alloc: Allocator) anyerror!std.ArrayList(SessionSummary) {
-        return self.listForWorkspace(alloc);
-    }
-
-    /// Lists up to ten resumable sessions after filtering the current and empty sessions.
-    pub fn listResumablePage(
-        self: Store,
-        alloc: Allocator,
-        active_id: ?[]const u8,
-        continuation: ?ResumableSessionContinuation,
-    ) !ResumableSessionPage {
-        return self.listResumablePageForScope(
-            alloc,
-            .all_workspaces,
-            active_id,
-            continuation,
-        );
-    }
-
-    pub fn listResumableWorkspacePage(
-        self: Store,
-        alloc: Allocator,
-        active_id: ?[]const u8,
-        continuation: ?ResumableSessionContinuation,
-    ) !ResumableSessionPage {
-        return self.listResumablePageForScope(
-            alloc,
-            .current_workspace,
-            active_id,
-            continuation,
-        );
-    }
-
-    fn listResumablePageForScope(
-        self: Store,
-        alloc: Allocator,
-        scope: ResumableSessionScope,
-        active_id: ?[]const u8,
-        continuation: ?ResumableSessionContinuation,
-    ) !ResumableSessionPage {
-        return self.listResumablePageFromDiscoveryForScope(alloc, scope, active_id, continuation);
-    }
-
-    /// Rewrites the cached title for one indexed session. The index freezes
-    /// display metadata once present, so a rename must update it here or the
-    /// resume picker keeps serving the previously derived title.
-    fn listResumablePageFromDiscoveryForScope(
-        self: Store,
-        alloc: Allocator,
-        scope: ResumableSessionScope,
-        active_id: ?[]const u8,
-        continuation: ?ResumableSessionContinuation,
-    ) !ResumableSessionPage {
-        var summaries = try self.scanSessionSummaries(alloc, .read_only_list);
-        defer freeSummaries(alloc, &summaries);
-        return try self.resumablePageFromSummariesForScope(
-            alloc,
-            scope,
-            summaries.items,
-            active_id,
-            continuation,
-        );
-    }
-
-    fn resumablePageFromSummariesForScope(
-        self: Store,
-        alloc: Allocator,
-        scope: ResumableSessionScope,
-        summaries: []const SessionSummary,
-        active_id: ?[]const u8,
-        continuation: ?ResumableSessionContinuation,
-    ) !ResumableSessionPage {
-        const workspace_root = switch (scope) {
-            .all_workspaces => null,
-            .current_workspace => self.workspace_root,
-        };
-        return try resumablePageFromSummaries(
-            alloc,
-            summaries,
-            workspace_root,
-            active_id,
-            continuation,
-            self.resume_page_limit,
-        );
-    }
-
-    /// Takes ownership of `page` and refreshes stale display rows when the
-    /// source is small enough for bounded first-paint work. Large histories
-    /// keep their honest fallback title instead of blocking the whole page.
-    fn displayMetadataReplaySourceBytes(self: Store, session_id: []const u8) !u64 {
-        var session_dir = try self.openSessionDir(session_id);
-        defer session_dir.close();
-        var events = openSessionFile(&session_dir, "events.jsonl", .read_only) catch |err| switch (err) {
-            error.FileNotFound => {
-                var legacy = try openSessionFile(&session_dir, "session.json", .read_only);
-                defer legacy.close(io_mod.getIo());
-                return (try legacy.stat(io_mod.getIo())).size;
-            },
-            else => return err,
-        };
-        defer events.close(io_mod.getIo());
-        return (try events.stat(io_mod.getIo())).size;
-    }
-
-    /// Fills display metadata from an existing frozen sidecar so hydration
-    /// replays the event log only when no sidecar is readable.
-    /// Returns the single newest readable session summary, or
-    /// `error.NoSavedSessions`. Caller owns it.
-    pub fn latestReadOnlySummary(
-        self: Store,
-        alloc: Allocator,
-    ) !SessionSummary {
-        var summaries = try self.scanSessionSummaries(
-            alloc,
-            .global_read_only_last,
-        );
-        defer summaries.deinit(alloc);
-        if (summaries.items.len == 0) return error.NoSavedSessions;
-        const latest = summaries.orderedRemove(0);
-        for (summaries.items) |*summary| summary.deinit(alloc);
-        return latest;
-    }
-
-    /// Returns the newest readable session summary for this store's workspace, or
-    /// `error.NoSavedSessions`. Caller owns it.
-    pub fn latestReadOnlyWorkspaceSummary(
-        self: Store,
-        alloc: Allocator,
-    ) !SessionSummary {
-        return self.latestReadOnlyWorkspaceSummaryFor(
-            alloc,
-            self.workspace_root,
-        );
-    }
-
-    fn latestReadOnlyWorkspaceSummaryFor(
-        self: Store,
-        alloc: Allocator,
-        workspace_root: []const u8,
-    ) !SessionSummary {
-        var scan = try self.scanSessionSummariesWithDiagnostics(
-            alloc,
-            .global_read_only_last,
-            true,
-        );
-        defer scan.summaries.deinit(alloc);
-        retainWorkspaceSummaries(alloc, &scan.summaries, workspace_root);
-        if (scan.summaries.items.len == 0) {
-            if (scan.skipped_invalid > 0) return error.NoReadableSessions;
-            return error.NoSavedSessions;
-        }
-        const latest = scan.summaries.orderedRemove(0);
-        for (scan.summaries.items) |*summary| summary.deinit(alloc);
-        return latest;
-    }
-
-    fn scanSessionSummaries(
-        self: Store,
-        alloc: Allocator,
-        mode: DiscoveryMode,
-    ) !std.ArrayList(SessionSummary) {
-        const scan = try self.scanSessionSummariesWithDiagnostics(alloc, mode, true);
-        return scan.summaries;
-    }
-
-    /// Runs `doctor` over every session and returns one diagnostic per problem
-    /// found. Caller frees the list.
-    pub fn inspectForDoctor(
-        self: Store,
-        alloc: Allocator,
-    ) !std.ArrayList(DoctorDiagnostic) {
-        var result = try self.inspectForDoctorReportWithOptions(alloc, .{}, null);
-        return result.takeDiagnostics();
-    }
-
-    fn inspectForDoctorWithOptions(
-        self: Store,
-        alloc: Allocator,
-        options: DoctorInspectionOptions,
-    ) !std.ArrayList(DoctorDiagnostic) {
-        var result = try self.inspectForDoctorReportWithOptions(alloc, options, null);
-        return result.takeDiagnostics();
-    }
-
     fn openSessionDir(
         self: Store,
         session_id: []const u8,
@@ -1217,14 +450,7 @@ pub const Store = struct {
         try requireAuthorityFenceAbsent(alloc, session_dir, session_id);
 
         const schema = try session_json.parseLegacySchemaVersion(alloc, bytes);
-        var state = try legacyToDurableState(
-            self.ctx(),
-            alloc,
-            &legacy,
-            self.workspace_root,
-            .preserved_workspace,
-            options.seed_preferences,
-        );
+        var state = try legacyToDurableState(self.ctx(), alloc, &legacy);
         errdefer state.deinit(alloc);
         // The oldest format saved some images without an id; number them as
         // v1's resume did (D69).
@@ -1242,9 +468,6 @@ pub const Store = struct {
             .storage_format = storageFormatForLegacy(schema),
         };
     }
-
-    // Keep cold fallible constructors behind noinline out-parameter boundaries
-    // so error returns do not materialize the full LoadedWritableSession payload.
 
     /// A damaged session's recoverable part (`recoverableState`).
     pub const Recoverable = struct {
@@ -1379,12 +602,6 @@ pub const Store = struct {
         const title = if (metadata) |current| if (current.value.title) |value| try alloc.dupe(u8, value) else null else null;
         return .{ .state = recovered, .boundary = current_boundary, .title = title };
     }
-};
-
-pub const PristineDiscardDisposition = enum {
-    discarded,
-    retained,
-    indeterminate,
 };
 
 fn canonicalSnapshotLeaf(image: session.ImageAttachment, stored: []const u8) ![]const u8 {
@@ -1836,82 +1053,6 @@ fn readFixtureFile(
     return io_mod.readFileToEnd(alloc, &file, max_bytes);
 }
 
-const LatestBarrierFailure = struct {
-    injected_error: anyerror,
-    completed_count: usize = 0,
-
-    fn callback(context: ?*anyopaque, boundary: session_log.Boundary) !void {
-        const self: *LatestBarrierFailure = @ptrCast(@alignCast(context.?));
-        switch (boundary) {
-            .latest_barrier_completed => {
-                self.completed_count += 1;
-                return self.injected_error;
-            },
-        }
-    }
-
-    fn options(self: *LatestBarrierFailure) ResumeOptions {
-        return .{
-            .log = .{
-                .test_controls = .{
-                    .context = self,
-                    .boundary_fn = callback,
-                },
-            },
-        };
-    }
-};
-
-fn waitForTestFlag(flag: *const std.atomic.Value(bool)) !void {
-    const deadline_ms = io_mod.milliTimestamp() + 5000;
-    while (!flag.load(.seq_cst)) {
-        if (io_mod.milliTimestamp() >= deadline_ms) return error.TestTimedOut;
-        std.Thread.yield() catch std.atomic.spinLoopHint();
-    }
-}
-
-fn waitForTestFlagInCallback(flag: *const std.atomic.Value(bool)) bool {
-    waitForTestFlag(flag) catch return false;
-    return true;
-}
-
-const ResumeInterleavingControl = struct {
-    pause_on_session: bool = false,
-    barrier_completed_count: std.atomic.Value(usize) = .init(0),
-    session_opened: std.atomic.Value(bool) = .init(false),
-    release_session: std.atomic.Value(bool) = .init(false),
-    timed_out: std.atomic.Value(bool) = .init(false),
-
-    fn boundary(context: ?*anyopaque, point: session_log.Boundary) !void {
-        const self: *ResumeInterleavingControl = @ptrCast(@alignCast(context.?));
-        switch (point) {
-            .latest_barrier_completed => _ = self.barrier_completed_count.fetchAdd(1, .seq_cst),
-        }
-    }
-
-    fn lock(context: ?*anyopaque, kind: session_log.LockKind) void {
-        const self: *ResumeInterleavingControl = @ptrCast(@alignCast(context.?));
-        _ = kind;
-        if (!self.pause_on_session) return;
-        if (self.session_opened.swap(true, .seq_cst)) return;
-        if (!waitForTestFlagInCallback(&self.release_session)) {
-            self.timed_out.store(true, .seq_cst);
-        }
-    }
-
-    fn options(self: *ResumeInterleavingControl) ResumeOptions {
-        return .{
-            .log = .{
-                .test_controls = .{
-                    .context = self,
-                    .boundary_fn = boundary,
-                    .lock_fn = lock,
-                },
-            },
-        };
-    }
-};
-
 test "missing session ID error and unsupported schema error" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1984,65 +1125,6 @@ test "exact legacy read does not create state" {
         error.FileNotFound,
         std.Io.Dir.accessAbsolute(io_mod.getIo(), commit_lock, .{}),
     );
-}
-
-test "history page streaming digest has fixed memory and cursor parser fuzz coverage" {
-    const repeated = session.HistoryTurn{ .assistant = .{
-        .user = .{ .text = @constCast("large-history") },
-        .assistant = @constCast("response"),
-    } };
-    var large: [4096]session.HistoryTurn = undefined;
-    @memset(&large, repeated);
-    const digest = try historyPrefixDigest(&large);
-    try std.testing.expect(!std.mem.allEqual(u8, &digest, 0));
-
-    var oversized: [513]u8 = undefined;
-    @memset(&oversized, '0');
-    try std.testing.expectError(error.InvalidHistoryPageCursor, parseHistoryPageCursor(&oversized));
-    var bytes: [512]u8 = undefined;
-    var random_state: u64 = 0x9e3779b97f4a7c15;
-    for (0..2048) |_| {
-        random_state = random_state *% 6364136223846793005 +% 1442695040888963407;
-        const len = @as(usize, @intCast((random_state >> 32) % bytes.len)) + 1;
-        for (bytes[0..len]) |*byte| {
-            random_state = random_state *% 6364136223846793005 +% 1442695040888963407;
-            byte.* = @truncate(random_state >> 24);
-        }
-        if (parseHistoryPageCursor(bytes[0..len])) |parsed| {
-            var canonical: [512]u8 = undefined;
-            const encoded = try formatHistoryPageCursor(&canonical, parsed);
-            try std.testing.expectEqualSlices(u8, bytes[0..len], encoded);
-            try std.testing.expect(parsed.start <= parsed.history_len);
-            try std.testing.expect(parsed.revision_ms >= 0);
-        } else |err| {
-            try std.testing.expectEqual(error.InvalidHistoryPageCursor, err);
-        }
-    }
-}
-
-test "history page digest rejects invalid review feedback" {
-    var calls = [_]session.ToolCall{.{ .id = "review", .name = "shell", .arguments_json = "{}" }};
-    var results = [_]session.PersistedToolResult{.{
-        .tool_call_id = @constCast("review"),
-        .tool_name = @constCast("shell"),
-        .status = .success,
-        .output = @constCast("held"),
-        .output_bytes = 4,
-        .stored_output_bytes = 4,
-        .review_feedback = true,
-    }};
-    var steps = [_]session.ToolExecutionStep{.{ .tool_calls = &calls, .tool_results = &results }};
-    const turns = [_]session.HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("inspect") },
-        .assistant = @constCast("held"),
-        .execution = .{ .tool_steps = &steps },
-    } }};
-    try std.testing.expectError(error.InvalidSessionFormat, historyPrefixDigest(&turns));
-    results[0].status = .failure;
-    const marked = try historyPrefixDigest(&turns);
-    results[0].review_feedback = false;
-    const ordinary = try historyPrefixDigest(&turns);
-    try std.testing.expect(!std.mem.eql(u8, &marked, &ordinary));
 }
 
 test "remembered session IDs are bounded and unambiguous" {

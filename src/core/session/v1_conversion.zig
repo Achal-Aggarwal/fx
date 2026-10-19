@@ -260,7 +260,7 @@ pub fn listRoots(alloc: Allocator, home: []const u8, active_id: ?[]const u8) !se
     var store = try session_store.Store.initReadOnlyFromHome(alloc, home, "/");
     defer store.deinit(alloc);
     const sessions = &(store.canonical_root.sessions orelse return .{});
-    var catalog = try session_catalog_cache.listActionableCatalog(store, alloc, active_id, null, null);
+    var catalog = try session_catalog_cache.listActionableCatalog(store, alloc, active_id);
     errdefer catalog.deinit(alloc);
     for (catalog.invalid_ids.items) |id| {
         const kind = kindOf(&store, alloc, id) catch |err| switch (err) {

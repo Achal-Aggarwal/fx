@@ -5,7 +5,6 @@ const io_mod = @import("../shared/io.zig");
 const session = @import("session.zig");
 const session_codec = @import("session_codec.zig");
 const session_event = @import("session_event.zig");
-const session_projection = @import("session_projection.zig");
 const session_replay = @import("session_replay.zig");
 const Allocator = std.mem.Allocator;
 
@@ -14,16 +13,12 @@ const paths = @import("session_store_paths.zig");
 const types = @import("session_store_types.zig");
 
 const openSessionFile = authority_module.openSessionFile;
-const readExactLegacyFile = authority_module.readExactLegacyFile;
 const validateWorkspaceRoot = paths.validateWorkspaceRoot;
-const LoadedWritableSession = types.LoadedWritableSession;
-const ResumeOptions = types.ResumeOptions;
-const automatic_legacy_max_bytes = types.automatic_legacy_max_bytes;
 const StoreContext = types.StoreContext;
 
-// Temporary read-only compatibility boundary. Remove this module's v1-v3
-// decoders once the supported upgrade window no longer includes schema v3.
-// Current sessions never write any of these formats.
+// The read path for v1's legacy and schema-3 formats, which the converter
+// and salvage use. No release is set for its removal (D65), and nothing
+// writes these formats.
 
 pub const LegacyStoredSession = struct {
     id: []u8,
@@ -44,14 +39,6 @@ pub const LegacyStoredSession = struct {
         self.* = undefined;
     }
 };
-
-pub const MigrationPreferenceSource = enum {
-    requesting_workspace,
-    preserved_workspace,
-};
-
-// Keep fallible construction behind a noinline out-parameter boundary so
-// error returns do not materialize the full LoadedWritableSession payload.
 
 /// Reads one valid schema-v3 committed prefix and converts it directly to the
 /// current conversation format. The v3 log is an import source only; none of
@@ -150,9 +137,6 @@ pub fn legacyToDurableState(
     ctx: StoreContext,
     alloc: Allocator,
     legacy: *LegacyStoredSession,
-    requesting_workspace: []const u8,
-    preference_source: MigrationPreferenceSource,
-    seed_preferences: ?session_codec.DurableSessionPreferences,
 ) !session_codec.DurableSessionState {
     const root = legacy.workspace_root orelse ctx.workspace_root;
     try validateWorkspaceRoot(root);
@@ -163,15 +147,7 @@ pub fn legacyToDurableState(
     errdefer if (legacy.workspace_root == null) alloc.free(origin);
     const current = try alloc.dupe(u8, root);
     errdefer alloc.free(current);
-    const preferences = try loadMigrationPreferences(
-        ctx,
-        alloc,
-        switch (preference_source) {
-            .requesting_workspace => requesting_workspace,
-            .preserved_workspace => root,
-        },
-        seed_preferences,
-    );
+    const preferences = try loadMigrationPreferences(ctx, alloc, root);
     errdefer {
         var owned = preferences;
         owned.deinit(alloc);
@@ -199,9 +175,7 @@ fn loadMigrationPreferences(
     ctx: StoreContext,
     alloc: Allocator,
     workspace_root: []const u8,
-    seed_preferences: ?session_codec.DurableSessionPreferences,
 ) !session_codec.DurableSessionPreferences {
-    if (seed_preferences) |preferences| return preferences.dupe(alloc);
     var detailed = try config_runtime.loadMergedSettingsDetailedFromHome(
         alloc,
         ctx.home_dir,

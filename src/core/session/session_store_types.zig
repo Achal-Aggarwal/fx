@@ -116,10 +116,6 @@ pub const SessionListPage = struct {
     }
 };
 
-/// A resumable writable session handle, re-exported from `session_log` so the
-/// store's public surface is self-contained.
-pub const LoadedWritableSession = session_log.LoadedWritableSession;
-
 /// Selector for a resume request: the most recent session, or a specific id.
 pub const ResumeTarget = union(enum) {
     last,
@@ -130,8 +126,6 @@ pub const ResumeTarget = union(enum) {
 /// `seed_preferences` overrides the merged-config preferences on migration.
 pub const ResumeOptions = struct {
     allow_large_legacy: bool = false,
-    seed_preferences: ?session_codec.DurableSessionPreferences = null,
-    log: session_log.Options = .{},
 };
 
 /// A read-only load of a session: its summary, full durable state, and the
@@ -140,16 +134,6 @@ pub const ReadOnlyDetail = struct {
     summary: SessionSummary,
     state: session_codec.DurableSessionState,
     storage_format: StorageFormat,
-};
-
-/// A bounded, independently-owned chronological slice of canonical history.
-/// The session store remains the authority; callers must deinit this page.
-pub const HistoryPage = struct {
-    session_id: []u8,
-    revision_ms: i64,
-    history_len: usize,
-    turns: []session.HistoryTurn,
-    next_cursor: ?[]u8 = null,
 };
 
 pub const SessionRecoveryStatus = enum {
@@ -172,58 +156,6 @@ pub const SessionRecoveryResult = struct {
         self.* = undefined;
     }
 };
-
-/// One class of integrity problem `doctor` can report for a session.
-pub const DoctorIssueKind = enum {
-    authority_less_creation_orphan,
-    authority_transition_pending,
-    invalid_authority_transition,
-    missing_authority,
-    invalid_authority,
-    commit_intent_pending,
-    invalid_commit_intent,
-    oversized_legacy_snapshot,
-    projection_missing,
-    projection_invalid,
-    projection_stale,
-    commit_watermark_missing,
-    commit_watermark_invalid,
-    commit_watermark_mismatched,
-    canonical_state_invalid,
-    canonical_log_large,
-    canonical_log_compaction_overdue,
-    canonical_log_compaction_failed,
-    cleanup_candidate,
-    unsafe_path,
-};
-
-/// A single `doctor` finding. `bytes`/`growth_*` carry sizes for the size- and
-/// growth-based kinds and are null otherwise. Owns `session_id`.
-pub const DoctorDiagnostic = struct {
-    session_id: []u8,
-    kind: DoctorIssueKind,
-    bytes: ?u64 = null,
-    growth_bytes: ?u64 = null,
-    growth_frames: ?u64 = null,
-};
-
-/// Bounded `doctor` inspection output. Owns `diagnostics`; caller frees with
-/// `deinit`, or moves the list out with `takeDiagnostics`.
-pub const DoctorInspectionResult = struct {
-    diagnostics: std.ArrayList(DoctorDiagnostic) = .empty,
-    inspected_count: usize = 0,
-    truncated: bool = false,
-
-    pub fn takeDiagnostics(self: *DoctorInspectionResult) std.ArrayList(DoctorDiagnostic) {
-        const diagnostics = self.diagnostics;
-        self.diagnostics = .empty;
-        return diagnostics;
-    }
-};
-
-/// Thresholds that decide when committed-log growth is reported as overdue or
-/// failed compaction. Defaults match the historical behavior.
-pub const DoctorInspectionOptions = struct {};
 
 /// Copyable store state shared with discovery and migration without introducing
 /// a dependency on the `Store` facade. `canonical_root` retains value semantics.

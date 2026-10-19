@@ -120,20 +120,6 @@ pub const ConversationWriter = struct {
     failure: ?error{ SessionWriterChanged, SessionPersistenceUncertain, SessionCommitFailed } = null,
     test_sync_ops: if (builtin.is_test) io_mod.DurableOps else void = if (builtin.is_test) .{} else {},
 
-    pub fn pendingToolCallCount(self: *const ConversationWriter) usize {
-        return self.pending_tool_calls.items.len;
-    }
-
-    pub fn readAllForTest(self: *const ConversationWriter, alloc: Allocator) ![]u8 {
-        const size = std.math.cast(usize, self.committed_bytes) orelse
-            return error.ConversationTooLarge;
-        const bytes = try alloc.alloc(u8, size);
-        errdefer mem_utils.free(alloc, bytes);
-        const count = try self.file.readPositionalAll(io_mod.getIo(), bytes, 0);
-        if (count != size) return error.TruncatedConversation;
-        return bytes;
-    }
-
     fn pendingIndex(self: *const ConversationWriter, call_id: []const u8) ?usize {
         for (self.pending_tool_calls.items, 0..) |pending, index| {
             if (std.mem.eql(u8, pending.call_id, call_id)) return index;
@@ -1021,34 +1007,6 @@ pub const ConversationHistoryReader = struct {
     }
 };
 
-pub fn loadConversationHistoryRange(
-    alloc: Allocator,
-    dir: *io_mod.VerifiedDir,
-    start: usize,
-    end: usize,
-) ![]session.HistoryTurn {
-    if (start > end) return error.InvalidHistoryPageCursor;
-    var buffer: [8192]u8 = undefined;
-    var reader = try ConversationHistoryReader.init(alloc, dir, &buffer);
-    defer reader.deinit();
-    var turns: std.ArrayList(session.HistoryTurn) = .empty;
-    errdefer {
-        for (turns.items) |turn| session.freeHistoryTurn(alloc, turn);
-        turns.deinit(alloc);
-    }
-    var turn_index: usize = 0;
-    while (turn_index < end) : (turn_index += 1) {
-        const turn = (try reader.next()) orelse break;
-        if (turn_index >= start) {
-            errdefer session.freeHistoryTurn(alloc, turn);
-            try turns.append(alloc, turn);
-        } else {
-            session.freeHistoryTurn(alloc, turn);
-        }
-    }
-    return turns.toOwnedSlice(alloc);
-}
-
 pub fn loadConversationArchive(
     alloc: Allocator,
     dir: *io_mod.VerifiedDir,
@@ -1846,25 +1804,6 @@ fn externalizeExecutionResults(
     }
 }
 
-pub const Boundary = enum {
-    latest_barrier_completed,
-};
-
-pub const LockKind = enum {
-    session,
-};
-
-pub const TestControls = struct {
-    context: ?*anyopaque = null,
-    boundary_fn: ?*const fn (?*anyopaque, Boundary) anyerror!void = null,
-    lock_fn: ?*const fn (?*anyopaque, LockKind) void = null,
-};
-
-pub const Options = struct {
-    test_controls: TestControls = .{},
-    session_lock_deadline_ms: u64 = lock_deadline_ms,
-};
-
 pub const OpenMode = enum {
     read_only,
     writable,
@@ -1876,49 +1815,6 @@ test {
     _ = session_replay;
     _ = session_permission_state;
 }
-
-pub const WritableSessionDir = struct {
-    dir: io_mod.VerifiedDir,
-    writer_lock: ?io_mod.TimedAdvisoryLock,
-    session_id: []u8,
-    /// True when a leftover owner marker was present at open time: the
-    /// previous owning process exited without deinit (crash or kill). A
-    /// still-live parked owner produces the same signal, so callers must
-    /// treat it as a reason to be careful, never as proof of corruption.
-    previous_owner_died: bool = false,
-
-    pub fn eventLogLengthForTest(self: *WritableSessionDir) !u64 {
-        var file = try openManagedFile(&self.dir, events_file, .read_only);
-        defer file.close(io_mod.getIo());
-        return file.length(io_mod.getIo());
-    }
-};
-
-pub const LoadedWritableSession = struct {
-    pub const ExternalPromptOrigin = enum {
-        root,
-        persistent_child,
-    };
-
-    active_id: []u8,
-    state: session_codec.DurableSessionState,
-    conversation_writer: ConversationWriter,
-    log: WritableSessionDir,
-    freshly_started: bool = false,
-    /// Runtime-only latch set when an open turn without a recovery checkpoint
-    /// outlived the fresh-prompt boundary wait: some stop paths never commit
-    /// the close in-process, so later sends fail fast instead of re-waiting.
-    boundary_wedged: bool = false,
-    child_capability: ?*session_child_store.SessionChildCapability = null,
-    position: CommitPosition,
-    migration_source_schema_version: ?u8 = null,
-    migration_source_bytes: ?u64 = null,
-    /// Runtime-only provenance installed by subagent resume admission. These
-    /// fields are never written into the session event log.
-    external_prompt_origin: ExternalPromptOrigin = .root,
-    external_root_user_messages: [][]u8 = &.{},
-    external_root_user_evidence_complete: bool = false,
-};
 
 /// Drops file evidence an older format kept with an empty path, as v1's
 /// migration does; returns how many. Also used by the v1 converter.
@@ -2072,7 +1968,6 @@ pub const Root = struct {
         self: *Root,
         alloc: Allocator,
         session_id: []const u8,
-        _: Options,
     ) !session_codec.DurableSessionState {
         if (self.sessions == null) return error.SessionNotFound;
         var session_dir = openSessionDir(

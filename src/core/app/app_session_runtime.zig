@@ -5182,19 +5182,6 @@ fn replacePreferences(
     target.* = replacement;
 }
 
-/// The old durable event schema exact-matches preference keys. Omit only an
-/// idempotent default-off patch; a stored true must receive an explicit false.
-fn durableUltrafastEventDelta(stored: bool, requested: ?bool) ?bool {
-    const value = requested orelse return null;
-    return if (!value and !stored) null else value;
-}
-
-test "durable ultrafast event delta omits only default-off patches" {
-    try std.testing.expect(durableUltrafastEventDelta(false, false) == null);
-    try std.testing.expectEqual(@as(?bool, false), durableUltrafastEventDelta(true, false));
-    try std.testing.expectEqual(@as(?bool, true), durableUltrafastEventDelta(false, true));
-}
-
 fn resolveUltrafastMode(preference: bool, process_override: ?bool) bool {
     return process_override orelse preference;
 }
