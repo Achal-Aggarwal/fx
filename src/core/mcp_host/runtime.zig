@@ -754,6 +754,17 @@ pub const Runtime = struct {
         return stopping;
     }
 
+    /// Takes `req` out of the queue; false when it isn't there.
+    fn unqueue(r: *Runtime, req: *Request) bool {
+        r.mutex.lockUncancelable(r.io);
+        defer r.mutex.unlock(r.io);
+        for (r.queue.items, 0..) |queued, k| if (queued == req) {
+            _ = r.queue.orderedRemove(k);
+            return true;
+        };
+        return false;
+    }
+
     fn handle(r: *Runtime, req: *Request) !void {
         switch (req.kind) {
             .tools => |name| {
@@ -785,6 +796,15 @@ pub const Runtime = struct {
                 try r.send(req, i);
             },
             .cancel => |target| {
+                // One still waiting in the queue, held while a retired host's
+                // servers stop, ends here without reaching its server.
+                if (r.unqueue(target)) {
+                    r.finish(target, switch (target.kind) {
+                        .call => .{ .call = .{ .ended = .{ .outcome = .cancelled, .maybe_ran = false, .timed_out = false } } },
+                        else => .{ .failed = error.Cancelled },
+                    });
+                    return r.finish(req, .ok);
+                }
                 var it = r.calls.iterator();
                 while (it.next()) |entry| if (entry.value_ptr.* == target) {
                     try r.engine.cancel(entry.key_ptr.*);
@@ -2079,6 +2099,54 @@ test "while a retired host's servers stop, nothing starts a server, and a cancel
     try testing.expect(std.Io.Clock.awake.now(testing.io).toMilliseconds() - ended_ms < 500);
     lister.join();
     try testing.expect(listed.load(.acquire));
+}
+
+test "a call held while a retired host's servers stop ends when cancelled, and its server never starts" {
+    waitRetired();
+    var f: Fixture = undefined;
+    try f.init();
+    defer f.deinit();
+    const configs = [_]mcp_contract.McpServerConfig{.{ .name = "fake", .command = f.server }};
+    var r: Runtime = undefined;
+    try r.start(testing.allocator, testing.io, &configs, &f.inherited, f.options());
+    defer r.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    const Caller = struct {
+        fn call(runtime: *Runtime, cancel: *std.atomic.Value(bool), out: *?engine.Outcome, done: *std.atomic.Value(bool)) void {
+            defer done.store(true, .release);
+            var ca: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer ca.deinit();
+            const result = runtime.call(ca.allocator(), "fake", "echo", "{\"text\":\"late\"}", cancel, null) catch return;
+            if (result == .ended) out.* = result.ended.outcome;
+        }
+    };
+    retireStarted();
+    var holding = true;
+    defer if (holding) retireEnded();
+    var cancel: std.atomic.Value(bool) = .init(false);
+    var outcome: ?engine.Outcome = null;
+    var done: std.atomic.Value(bool) = .init(false);
+    const caller = try std.Thread.spawn(.{}, Caller.call, .{ &r, &cancel, &outcome, &done });
+    // Nothing may start a server yet, so the call waits in the queue.
+    std.Io.sleep(testing.io, .fromMilliseconds(200), .awake) catch {};
+    const waited = !done.load(.acquire);
+    cancel.store(true, .release);
+    const deadline = std.Io.Clock.awake.now(testing.io).toMilliseconds() + 2_000;
+    while (!done.load(.acquire) and std.Io.Clock.awake.now(testing.io).toMilliseconds() < deadline) {
+        std.Io.sleep(testing.io, .fromMilliseconds(5), .awake) catch {};
+    }
+    // Ended by the cancel, while the retired host's servers still stop.
+    const ended_while_held = done.load(.acquire);
+    retireEnded();
+    holding = false;
+    caller.join();
+    try testing.expect(waited);
+    try testing.expect(ended_while_held);
+    try testing.expectEqual(@as(?engine.Outcome, .cancelled), outcome);
+    std.Io.sleep(testing.io, .fromMilliseconds(200), .awake) catch {};
+    try testing.expectEqual(State.idle, (try r.statuses(arena.allocator()))[0].state);
 }
 
 test "a replaced runtime still in use serves its calls, and holds the others until it's gone" {
