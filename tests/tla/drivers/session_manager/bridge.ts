@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 export type Verdict = "ACCEPTED" | "REJECTED" | "INCONCLUSIVE" | "TOOL_ERROR";
-export type Model = "turns" | "children" | "wiring";
+export type Model = "turns" | "children" | "fork" | "wiring";
 export interface RuntimeEvidence {
   version: 1;
   sessionsRoot: string;

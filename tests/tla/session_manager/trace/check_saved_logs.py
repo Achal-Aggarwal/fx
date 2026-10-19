@@ -18,7 +18,6 @@ accepted.
 import hashlib
 import json
 import os
-import pwd
 import re
 import shutil
 import subprocess
@@ -28,9 +27,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TLA = os.path.dirname(HERE)
-JAVA = os.environ.get("JAVA", "/opt/homebrew/opt/openjdk/bin/java")
-# The account's home, not $HOME: drivers run fx under a disposable HOME.
-JAR = os.environ.get("TLA_JAR", os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".local/share/tla/tla2tools.jar"))
+sys.path.insert(0, os.path.join(os.path.dirname(TLA), "lib"))
+from tlc import toolchain  # noqa: E402
 
 TURN_KINDS = {
     "session_created": "created",
@@ -135,11 +133,12 @@ def run_tlc(module, spec_files, generated, cfg, invariant="NotWritten"):
         for name, text in generated.items():
             open(os.path.join(work, name), "w").write(text)
         open(os.path.join(work, module + ".cfg"), "w").write(cfg)
+        java, jar = toolchain()
         proc = subprocess.run(
             # Its own java.io.tmpdir: TLC unpacks its standard modules there,
             # and parallel runs sharing one folder read each other's
             # half-written files.
-            [JAVA, "-XX:+UseParallelGC", f"-Djava.io.tmpdir={work}", "-cp", JAR, "tlc2.TLC", "-workers", "1", "-deadlock",
+            [java, "-XX:+UseParallelGC", f"-Djava.io.tmpdir={work}", "-cp", jar, "tlc2.TLC", "-workers", "1", "-deadlock",
              "-metadir", os.path.join(work, "states"), "-config", module + ".cfg", module],
             cwd=work, capture_output=True, text=True, timeout=600,
         )

@@ -754,7 +754,7 @@ export type FxAgentOptions = Omit<FxSharedOptions<FxAgentEvent>, "tools"> & FxMo
 
 /** Options for `agent.session()`. Each applies to the turns this session object starts. */
 export interface FxSessionOptions {
-  /** JSON every tool call of those turns receives as `context`. */
+  /** JSON every tool call of those turns receives as `context`, copied when `session()` is called. */
   context?: JsonValue;
   /** The model for those turns instead of the agent's whole model choice: a model ID, or a model object. */
   model?: string | FxModelOptions;
@@ -863,7 +863,11 @@ export type FxStreamLine = (
 export interface FxSession {
   /** The session's id; for a new session, null until its first prompt is accepted. */
   readonly id: string | null;
-  /** Queues `input` as the session's next turn and returns a view of that turn. */
+  /**
+   * Queues `input` as the session's next turn and returns a view of that turn. Throws a
+   * TypeError or RangeError for an input libfx refuses, and stores nothing. A prompt whose
+   * `signal` aborts before it is stored is never stored, and ends `cancelled`.
+   */
   prompt(input: FxSessionPromptInput, options?: FxPromptOptions): FxTurn;
   /** Continues a turn a stopped process left open; its result has the stop reason `idle` when there was none. */
   resume(): FxResumeTurn;
