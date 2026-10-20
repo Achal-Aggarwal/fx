@@ -2273,8 +2273,7 @@ fn writeModelCatalogSummary(writer: *std.Io.Writer, app: anytype) !void {
     if (comptime @hasField(App, "model_cache")) {
         const snapshot = app.model_cache.snapshotForTrace();
         try writer.print("state={s} entries={d}", .{ snapshot.state, snapshot.entries });
-        if (snapshot.last_attempt_ms > 0) {
-            const age_ms = io_mod.milliTimestamp() - snapshot.last_attempt_ms;
+        if (snapshot.last_attempt_age_ms) |age_ms| {
             try writer.print(" last_attempt={d}s ago", .{@divFloor(@max(age_ms, 0), @as(i64, 1000))});
         }
         if (snapshot.failure_category) |category| {
@@ -3739,7 +3738,7 @@ test "trace model catalog summary renders cache state and failure detail" {
     const Snapshot = struct {
         state: []const u8,
         entries: usize,
-        last_attempt_ms: i64,
+        last_attempt_age_ms: ?i64,
         failure_category: ?[]const u8,
         failure_http_status: ?std.http.Status,
         failure_retryable: bool,
@@ -3758,7 +3757,7 @@ test "trace model catalog summary renders cache state and failure detail" {
     var stub: StubApp = .{ .model_cache = .{ .snapshot = .{
         .state = "failed",
         .entries = 0,
-        .last_attempt_ms = 0,
+        .last_attempt_age_ms = null,
         .failure_category = "transport",
         .failure_http_status = .service_unavailable,
         .failure_retryable = true,
@@ -3772,7 +3771,7 @@ test "trace model catalog summary renders cache state and failure detail" {
     stub.model_cache.snapshot = .{
         .state = "ready",
         .entries = 41,
-        .last_attempt_ms = 0,
+        .last_attempt_age_ms = null,
         .failure_category = null,
         .failure_http_status = null,
         .failure_retryable = false,
@@ -3782,6 +3781,12 @@ test "trace model catalog summary renders cache state and failure detail" {
     defer ready.deinit();
     try writeModelCatalogSummary(&ready.writer, &stub);
     try std.testing.expect(std.mem.find(u8, ready.written(), "state=ready entries=41\n") != null);
+
+    stub.model_cache.snapshot.last_attempt_age_ms = 12_500;
+    var aged: std.Io.Writer.Allocating = .init(alloc);
+    defer aged.deinit();
+    try writeModelCatalogSummary(&aged.writer, &stub);
+    try std.testing.expect(std.mem.find(u8, aged.written(), "state=ready entries=41 last_attempt=12s ago\n") != null);
 }
 
 test "trace report file uses private randomized markdown path" {

@@ -230,7 +230,13 @@ describe("configured providers", () => {
       writeFileSync(join(f.workspace, "note.txt"), "fixture contents");
       const result = await runFx(["ask", "--json", "--no-save", "Read note.txt"], { cwd: f.workspace, env: f.env, timeoutMs: 20000 });
       if (result.code !== 0) throw new Error(result.stdout + result.stderr);
-      expect(JSON.parse(result.stdout).output).toBe("recovered");
+      const output = JSON.parse(result.stdout);
+      expect(output.output).toBe("recovered");
+      expect(output.tool_calls.map((call: any) => [call.name, call.status]).sort()).toEqual([
+        ["missing_tool", "error"],
+        ["read_file", "error"],
+        ["read_file", "success"],
+      ]);
       expect(f.requests).toHaveLength(2);
       const messages = f.requests[1].body.messages;
       const replayed = messages.find((message: any) => message.role === "assistant" && message.tool_calls?.length).tool_calls;

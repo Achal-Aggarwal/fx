@@ -324,24 +324,6 @@ pub const DecodedSessionMetadata = std.json.Parsed(SessionMetadata);
 pub const max_permission_state_bytes: usize = 1024 * 1024;
 pub const max_recovery_checkpoint_bytes: usize = context_limits.emergency_ceiling_bytes;
 
-pub fn encodeSessionMetadata(
-    alloc: Allocator,
-    metadata: SessionMetadata,
-) ![]u8 {
-    try validateSessionMetadata(metadata);
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    errdefer out.deinit();
-    try std.json.Stringify.value(
-        metadata,
-        .{ .emit_null_optional_fields = false },
-        &out.writer,
-    );
-    if (out.written().len == 0 or out.written().len > max_session_metadata_bytes) {
-        return error.SessionMetadataTooLarge;
-    }
-    return out.toOwnedSlice() catch return error.OutOfMemory;
-}
-
 pub fn decodeSessionMetadata(
     alloc: Allocator,
     bytes: []const u8,
@@ -6127,60 +6109,6 @@ test "persisted image source refs reject malformed metadata and preserve the byt
     try std.testing.expectEqualStrings(boundary, decoded_user.images[0].source_ref.?);
     try std.testing.expectEqualStrings(boundary, decoded_tools[0].source_ref.?);
     try std.testing.expectEqualStrings("", decoded_tools[0].data);
-}
-
-test "session metadata round trips without conversation or control state" {
-    const alloc = std.testing.allocator;
-    const encoded = try encodeSessionMetadata(alloc, .{
-        .id = "session-1",
-        .origin_workspace_root = "/tmp/origin",
-        .workspace_root = "/tmp/current",
-        .created_at_ms = 10,
-        .updated_at_ms = 20,
-        .conversation_language = "en",
-        .provider = .gateway,
-        .model = "openai/gpt-5.6",
-        .effort = "high",
-        .fast_mode = false,
-        .title = "Compaction work",
-        .subagent_child = false,
-    });
-    defer alloc.free(encoded);
-    try std.testing.expect(std.mem.find(u8, encoded, "history") == null);
-    try std.testing.expect(std.mem.find(u8, encoded, "usage") == null);
-    try std.testing.expect(std.mem.find(u8, encoded, "permission") == null);
-    try std.testing.expect(std.mem.find(u8, encoded, "checkpoint") == null);
-    try std.testing.expect(std.mem.find(u8, encoded, "ultrafast_mode") == null);
-
-    var decoded = try decodeSessionMetadata(alloc, encoded);
-    defer decoded.deinit();
-    try std.testing.expectEqualStrings("session-1", decoded.value.id);
-    try std.testing.expectEqualStrings("/tmp/current", decoded.value.workspace_root);
-    try std.testing.expectEqualStrings("openai/gpt-5.6", decoded.value.model);
-    try std.testing.expect(decoded.value.ultrafast_mode == null);
-    try std.testing.expectEqualStrings("Compaction work", decoded.value.title.?);
-}
-
-test "session metadata persists opted-in ultrafast mode" {
-    const alloc = std.testing.allocator;
-    const encoded = try encodeSessionMetadata(alloc, .{
-        .id = "session-ultrafast",
-        .origin_workspace_root = "/tmp/origin",
-        .workspace_root = "/tmp/current",
-        .created_at_ms = 10,
-        .updated_at_ms = 20,
-        .conversation_language = "en",
-        .provider = .gateway,
-        .model = "openai/gpt-5.6",
-        .effort = "high",
-        .fast_mode = false,
-        .ultrafast_mode = true,
-    });
-    defer alloc.free(encoded);
-    try std.testing.expect(std.mem.find(u8, encoded, "\"ultrafast_mode\":true") != null);
-    var decoded = try decodeSessionMetadata(alloc, encoded);
-    defer decoded.deinit();
-    try std.testing.expectEqual(@as(?bool, true), decoded.value.ultrafast_mode);
 }
 
 test "ultrafast durable preference requires a bool when present" {

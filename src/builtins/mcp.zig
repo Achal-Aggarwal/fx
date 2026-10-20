@@ -517,25 +517,11 @@ fn writeOptionalJsonField(
     try std.json.Stringify.value(value, .{}, writer);
 }
 
-var stable_test_environ: ?*std.process.Environ.Map = null;
-
-fn stableEmptyTestEnviron() !*const std.process.Environ.Map {
-    if (stable_test_environ) |map| return map;
-
-    const alloc = std.heap.page_allocator;
-    const map = try alloc.create(std.process.Environ.Map);
-    map.* = std.process.Environ.Map.init(alloc);
-    stable_test_environ = map;
-    return map;
-}
-
 const TestHome = struct {
     alloc: Allocator,
     map: std.process.Environ.Map,
 
     fn install(alloc: Allocator, home: ?[]const u8) !*TestHome {
-        _ = try stableEmptyTestEnviron();
-
         const self = try alloc.create(TestHome);
         errdefer alloc.destroy(self);
 
@@ -554,9 +540,7 @@ const TestHome = struct {
     }
 
     fn deinit(self: *TestHome) void {
-        if (stable_test_environ) |map| {
-            io_mod.setEnvironMap(map);
-        }
+        io_mod.resetEnvironForTest();
         self.map.deinit();
         const alloc = self.alloc;
         alloc.destroy(self);
