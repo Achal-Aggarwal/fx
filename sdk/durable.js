@@ -771,6 +771,10 @@ const maxLogViewChars = 32 * 1024 * 1024;
 // listed to the newest. Pure.
 const gapless = (read) => read.listed === 0 || read.newest - read.lowest + 1 === read.listed;
 
+// The slot of a run's first event: a World numbers each run's events densely
+// from 1.
+const firstEventSlot = 1;
+
 /**
  * A run's log view extended by the entries listed after it, as a full read
  * returns the log: every entry after the newest checkpoint's `through`.
@@ -1176,7 +1180,10 @@ function createWorldBackend(world, durability) {
         // A listing that skipped a slot may show a later write before an
         // earlier one lands. The entries go back as they are, as every read
         // returned them before, but no view keeps the gap for later reads.
-        if (!read.missing && gapless(read)) {
+        // The listing must also reach the checkpoint it stopped at or the
+        // run's first event, so no slot below what it listed is missing.
+        const reached = read.lowest === firstEventSlot || (read.through !== null && read.lowest <= read.through);
+        if (!read.missing && reached && gapless(read)) {
           rememberView(runId, entries, read.newest, read.through ?? 0);
           covered = read.newest;
         } else {

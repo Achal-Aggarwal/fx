@@ -2306,19 +2306,20 @@ if (durabilityKind !== "memory") {
     const internals = (agent) => agent[Symbol.for("libfx.durableInternals")];
     const agent = createAgent({ durability: await hiding() });
     const session = agent.session();
-    for (const input of ["omega", "psi"]) assert.equal((await textOf(session.prompt(input))).result.stopReason, "end_turn");
+    for (const input of ["omicron", "psi"]) assert.equal((await textOf(session.prompt(input))).result.stopReason, "end_turn");
     await untilIdle(agent);
     const ours = await internals(agent).openLog(session.id);
     await ours.read();
     assert.ok(Number.isSafeInteger(ours.newest()));
     const other = createAgent({ durability: await durabilityAt(dir) });
     const theirs = await internals(other).openLog(session.id);
-    // Another server writes two inputs, and the first does not list yet.
+    // Another server writes three inputs, and the middle one does not list yet.
+    await theirs.append({ k: "input", key: "cancel:cnl_first", type: "cancel", messageId: "cnl_first" });
     hidden.add(Number(await theirs.append({ k: "input", key: "cancel:cnl_late", type: "cancel", messageId: "cnl_late" })));
     await theirs.append({ k: "input", key: "cancel:cnl_next", type: "cancel", messageId: "cnl_next" });
     const ids = (entries) => entries.map(({ entry }) => entry.messageId);
     const gapped = await ours.read();
-    assert.ok(ids(gapped).includes("cnl_next") && !ids(gapped).includes("cnl_late"));
+    assert.ok(ids(gapped).includes("cnl_first") && ids(gapped).includes("cnl_next") && !ids(gapped).includes("cnl_late"));
     assert.equal(ours.newest(), null, "a read that skipped a slot hands no worker its view");
     // A server's first, whole read keeps no view past the gap either.
     const late = createAgent({ durability: await hiding() });
@@ -2326,14 +2327,21 @@ if (durabilityKind !== "memory") {
     assert.ok(!ids(await latecomer.read()).includes("cnl_late"));
     assert.equal(latecomer.newest(), null);
     hidden.clear();
+    // Nor does a whole read that did not reach the run's first event.
+    hidden.add(1);
+    const bottom = createAgent({ durability: await hiding() });
+    const unreached = await internals(bottom).openLog(session.id);
+    await unreached.read();
+    assert.equal(unreached.newest(), null, "a whole read that missed the first slot keeps no view");
+    hidden.clear();
     const fresh = createAgent({ durability: await durabilityAt(dir) });
     const whole = await (await internals(fresh).openLog(session.id)).read();
     assert.ok(ids(whole).includes("cnl_late"));
-    for (const log of [ours, latecomer]) {
+    for (const log of [ours, latecomer, unreached]) {
       assert.deepEqual(await log.read(), whole, "the entry is read once the World lists it");
       assert.ok(Number.isSafeInteger(log.newest()));
     }
-    for (const closing of [agent, other, late, fresh]) await closing.close();
+    for (const closing of [agent, other, late, bottom, fresh]) await closing.close();
   });
 
   test("a write a log makes while its own read lists shows in its next read", async () => {
