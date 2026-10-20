@@ -1663,10 +1663,12 @@ fn shellParseRetryGuidance(output: []const u8) ?[]const u8 {
             text_utils.containsIgnoreCase(trimmed, "parse error") or
             text_utils.containsIgnoreCase(trimmed, "unterminated quoted string"))) continue;
         switch (family) {
-            // Nothing runs after a zsh parse error, so it is the last output.
-            // Output after it means the error came from something else, such
-            // as an `eval` in a startup file or inside the command.
-            .zsh => if (std.mem.trim(u8, lines.rest(), " \t\r\n").len == 0) return zsh_parse_retry_guidance,
+            // zsh checks a whole command before running any of it, so a parse
+            // error in the command itself is its only output. Any other output
+            // means something ran, such as part of the command, a startup file,
+            // or an exit hook, and the error may have come from an `eval` there.
+            // Give no guidance then rather than claim that nothing executed.
+            .zsh => if (std.mem.eql(u8, std.mem.trim(u8, output, " \t\r\n"), trimmed)) return zsh_parse_retry_guidance,
             .line_by_line => return line_shell_parse_retry_guidance,
         }
     }
@@ -2589,10 +2591,14 @@ test "failure guidance detectors match only their signatures" {
     // parsed. A `[[` test missing an operand prints the same text and is dropped too.
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "(eval):3: parse error: condition expected: =\n"));
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "zsh:2: parse error: condition expected: $a\n"));
-    // Output after a zsh parse error means the command ran, so the error came
-    // from elsewhere, such as an `eval` in a startup file.
+    // Other output beside a zsh parse error means something ran, so the error
+    // may have come from an `eval` in a startup file or in the command.
+    // Captured runs can also place later stdout before stderr, so the order
+    // of that output proves nothing.
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "(eval):1: unmatched \"\r\nls: /missing: No such file or directory\r\n"));
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "BEFORE\nzsh:1: unmatched '\nAFTER\n"));
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "RAN\n(eval):1: unmatched \"\n"));
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "zsh:1: unmatched \"\nbye\n"));
     // The `eval` of a bash script the command runs is not the snapshot's.
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(3, "./build.sh: eval: line 4: unexpected EOF while looking for matching `\"'\n"));
     // Ordinary failures keep null guidance.
