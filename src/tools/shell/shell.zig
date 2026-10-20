@@ -1645,7 +1645,10 @@ fn isShellParseErrorOutput(output: []const u8) bool {
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (!hasShellErrorPrefix(trimmed)) continue;
+        // bash 5.2 reports an unclosed quote with only this line; older
+        // versions follow it with `syntax error: unexpected end of file`.
         if (text_utils.containsIgnoreCase(trimmed, "unmatched") or
+            text_utils.containsIgnoreCase(trimmed, "unexpected EOF while looking for matching") or
             text_utils.containsIgnoreCase(trimmed, "syntax error") or
             text_utils.containsIgnoreCase(trimmed, "parse error") or
             text_utils.containsIgnoreCase(trimmed, "unterminated quoted string")) return true;
@@ -2526,6 +2529,15 @@ test "failure guidance detectors match only their signatures" {
     try std.testing.expectEqual(
         shell_parse_retry_guidance,
         failureRetryGuidance(1, "/dev/fd/0: eval: line 2: unexpected EOF while looking for matching `\"'\n/dev/fd/0: eval: line 3: syntax error: unexpected end of file\n"),
+    );
+    // bash 5.2 prints only the unexpected EOF line for an unclosed quote.
+    try std.testing.expectEqual(
+        shell_parse_retry_guidance,
+        failureRetryGuidance(1, "/dev/fd/0: eval: line 40: unexpected EOF while looking for matching `\"'\n"),
+    );
+    try std.testing.expectEqual(
+        shell_parse_retry_guidance,
+        failureRetryGuidance(2, "/bin/bash: -c: line 1: unexpected EOF while looking for matching `\"'\n"),
     );
     try std.testing.expectEqual(
         usage_error_retry_guidance,
