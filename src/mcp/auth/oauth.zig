@@ -328,17 +328,23 @@ pub fn tokenFailure(a: Allocator, status: u16, raw: []const u8) Allocator.Error!
     return a.dupe(u8, "its token response has no access_token");
 }
 
+/// The errors that refuse a refresh for good: RFC 6749 §5.2's for a grant or
+/// client the server no longer accepts, and Slack's for a dead refresh token.
+const refresh_refusals = [_][]const u8{ "invalid_grant", "invalid_client", "unauthorized_client", "invalid_refresh_token" };
+
 /// Whether a token endpoint's answer to a refresh refuses it for good, so
-/// the refresh token is dropped: an answer that names an error, at 200 or a
-/// 4xx other than 429. RFC 6749 §5.2 sends its errors with 400 or 401, and
-/// Slack sends its own with 200 and `ok:false`; none can pass on a retry. A
-/// 429, a 5xx, or an answer naming no error may.
+/// the refresh token is dropped: an answer at 200 or a 4xx other than 429
+/// that names one of `refresh_refusals`. RFC 6749 sends its errors with 400
+/// or 401, and Slack sends its own with 200 and `ok:false`. Any other error,
+/// such as Slack's `internal_error`, a 429, a 5xx, or an answer naming no
+/// error may pass on a retry, so the tokens stay.
 pub fn refusesRefresh(status: u16, raw: []const u8) bool {
     if (status != 200 and (status < 400 or status >= 500 or status == 429)) return false;
     var f: [1]?[]const u8 = undefined;
     wire.objectFields(raw, &.{"error"}, &f) catch return false;
     const code = wire.plainString(f[0] orelse return false) orelse return false;
-    return code.len != 0;
+    for (refresh_refusals) |refusal| if (std.mem.eql(u8, code, refusal)) return true;
+    return false;
 }
 
 // ---- Scopes ----
@@ -531,14 +537,24 @@ test "token responses: Bearer only, refresh and expiry optional" {
     try testing.expectEqualStrings("a b~", (try parseToken(a, "{\"access_token\":\"a b~\",\"token_type\":\"Bearer\"}")).access);
 }
 
-test "a refresh answer naming an error refuses it, at 200 or a 4xx other than 429" {
+test "a refresh answer refuses it only for a grant, client or token the server won't take, at 200 or a 4xx other than 429" {
     try testing.expect(refusesRefresh(400, "{\"error\":\"invalid_grant\"}"));
     try testing.expect(refusesRefresh(401, "{\"error\":\"invalid_client\"}"));
-    // Slack's refusals: HTTP 200 with ok:false.
-    try testing.expect(refusesRefresh(200, "{\"ok\":false,\"error\":\"bad_client_secret\"}"));
+    try testing.expect(refusesRefresh(400, "{\"error\":\"unauthorized_client\"}"));
+    // Slack's refusal: HTTP 200 with ok:false.
     try testing.expect(refusesRefresh(200, "{\"ok\":false,\"error\":\"invalid_refresh_token\"}"));
+    // Slack's errors that pass on a retry keep the tokens.
+    for ([_][]const u8{ "internal_error", "service_unavailable", "request_timeout", "fatal_error", "bad_client_secret" }) |code| {
+        var buf: [96]u8 = undefined;
+        const body = try std.mem.print(&buf, "{{\"ok\":false,\"error\":\"{s}\"}}", .{code});
+        try testing.expect(!refusesRefresh(200, body));
+    }
+    try testing.expect(!refusesRefresh(400, "{\"error\":\"invalid_request\"}"));
+    try testing.expect(!refusesRefresh(400, "{\"error\":\"temporarily_unavailable\"}"));
     // Passing: rate limited, unavailable, or nothing named.
     try testing.expect(!refusesRefresh(429, "{\"error\":\"slow_down\"}"));
+    // A 429 may pass later, whatever it names.
+    try testing.expect(!refusesRefresh(429, "{\"error\":\"invalid_grant\"}"));
     try testing.expect(!refusesRefresh(503, "{\"error\":\"temporarily_unavailable\"}"));
     try testing.expect(!refusesRefresh(302, "{\"error\":\"invalid_grant\"}"));
     try testing.expect(!refusesRefresh(400, "not json"));

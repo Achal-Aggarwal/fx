@@ -1339,7 +1339,7 @@ describe("MCP login", () => {
 
   test("a refresh refused with HTTP 200 and ok:false, as Slack refuses, needs a new login at once and isn't tried again", async () => {
     upstream = startModernMcpHttpFixture("json");
-    auth = startAuthFixture(upstream.url, { refreshAnswer: { status: 200, body: { ok: false, error: "bad_client_secret" } } });
+    auth = startAuthFixture(upstream.url, { refreshAnswer: { status: 200, body: { ok: false, error: "invalid_refresh_token" } } });
     const root = createRoot(auth);
     seedV2Credential(root, auth, { expires_at_ms: 0 });
     const env = v2Env(root);
@@ -1366,6 +1366,24 @@ describe("MCP login", () => {
     expect(show.signal).toBeNull();
     expect(Date.now() - started).toBeLessThan(10_000);
     // A sign-in server that didn't answer says nothing about the login.
+    const status = JSON.parse(show.stdout);
+    expect(status.status).toBe("retrying");
+    expect(status.error).toContain("couldn't be renewed");
+    expect(auth.refreshes).toBe(1);
+    expect(readFileSync(store, "utf8")).toContain(REFRESH_INITIAL);
+  }, 60_000);
+
+  test("a refresh Slack answers with a temporary error at HTTP 200 keeps the login, and fx mcp show says it's retrying", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { refreshAnswer: { status: 200, body: { ok: false, error: "internal_error" } } });
+    const root = createRoot(auth);
+    const store = seedV2Credential(root, auth, { expires_at_ms: 0 });
+    const env = v2Env(root);
+    const started = Date.now();
+    const show = await runFx(["mcp", "show", "fixture", "--json"], { cwd: root.workspace, env, timeoutMs: 20_000 });
+    expect(show.signal).toBeNull();
+    expect(Date.now() - started).toBeLessThan(10_000);
+    // Only a refusal ends the login; a temporary error leaves it for the next try.
     const status = JSON.parse(show.stdout);
     expect(status.status).toBe("retrying");
     expect(status.error).toContain("couldn't be renewed");

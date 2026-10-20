@@ -735,7 +735,7 @@ pub const Auth = struct {
             if (a.options.refresh_via_host) try a.actions.append(a.gpa, .refresh_ended);
             return;
         } else |err| if (err == error.OutOfMemory) return error.OutOfMemory;
-        // An answer naming an error refuses the refresh token for good.
+        // An answer naming a refusal refuses the refresh token for good.
         try a.refreshEnded(if (oauth.refusesRefresh(status, body)) .refused else .failed);
     }
 
@@ -883,7 +883,7 @@ test "a refresh the host decides waits for it, and ends however it does: replace
         "\"revocation_endpoint\":null,\"resource\":\"http://127.0.0.1:9/mcp\",\"client_id\":\"c1\",\"client_secret\":null,\"method\":\"none\"}}";
     var buffer: [512]u8 = undefined;
     const actions = &a.actions.items;
-    for ([_]enum { replaced, signed_out, answered, refused, refused_200, failed_429 }{ .replaced, .signed_out, .answered, .refused, .refused_200, .failed_429 }) |case| {
+    for ([_]enum { replaced, signed_out, answered, refused, refused_200, failed_200, failed_429 }{ .replaced, .signed_out, .answered, .refused, .refused_200, .failed_200, .failed_429 }) |case| {
         try a.restore(try std.mem.print(&buffer, saved, .{"at1"}));
         try a.beforeSend(1);
         a.actions.clearRetainingCapacity();
@@ -934,11 +934,21 @@ test "a refresh the host decides waits for it, and ends however it does: replace
             .refused_200 => {
                 a.refresh_due = false;
                 a.refresh_key = a.newKey();
-                _ = try a.fetched(a.refresh_key, 200, "application/json", null, "{\"ok\":false,\"error\":\"bad_client_secret\"}");
+                _ = try a.fetched(a.refresh_key, 200, "application/json", null, "{\"ok\":false,\"error\":\"invalid_refresh_token\"}");
                 try testing.expect(actions.*[0] == .save);
                 try testing.expect(actions.*[actions.len - 1] == .refresh_ended);
                 try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
                 try testing.expectEqual(@as(?[]u8, null), a.refresh_token);
+            },
+            // Slack's temporary errors come with HTTP 200 too, and may pass
+            // later: the tokens stay, and nothing is saved.
+            .failed_200 => {
+                a.refresh_due = false;
+                a.refresh_key = a.newKey();
+                _ = try a.fetched(a.refresh_key, 200, "application/json", null, "{\"ok\":false,\"error\":\"internal_error\"}");
+                for (actions.*) |x| try testing.expect(x != .save);
+                try testing.expect(actions.*[actions.len - 1] == .refresh_ended);
+                try testing.expectEqualStrings("rt", a.refresh_token.?);
             },
             // A 429 may pass later: the tokens stay, and nothing is saved.
             .failed_429 => {
