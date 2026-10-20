@@ -1629,54 +1629,68 @@ fn formatModelSafeSnapshotRaw(
     );
 }
 
-// bash parses and runs a multi-line command one line at a time, so lines
-// before the parse error may already have run.
-const shell_parse_retry_guidance = "The shell could not parse this command (unmatched quote or syntax error). The line with the error did not run, but lines before it may have. Rewrite the command with corrected quoting or escaping and submit it instead of rerunning the same text, leaving out any lines that already ran.";
+// zsh parses a whole command before it runs any of it. bash, sh, and dash
+// parse and run a command one line at a time, so other lines may have run.
+const zsh_parse_retry_guidance = "The shell could not parse this command (unmatched quote or syntax error), so nothing executed. Rewrite the command with corrected quoting or escaping and submit the full corrected command instead of rerunning the same text.";
+const line_shell_parse_retry_guidance = "The shell could not parse this command (unmatched quote or syntax error). This shell runs a command line by line, so other lines may already have run. Check the output, then submit a corrected command instead of rerunning the same text, without repeating side effects that already happened.";
 const usage_error_retry_guidance = "The command exited with a usage error (missing or invalid arguments). Rebuild the command with the required arguments explicitly set, then submit the corrected command instead of rerunning it unchanged.";
 
 fn failureRetryGuidance(exit_code: ?i64, output: []const u8) ?[]const u8 {
     const code = exit_code orelse return null;
     if (code == 0) return null;
-    if (isShellParseErrorOutput(output)) return shell_parse_retry_guidance;
+    if (shellParseRetryGuidance(output)) |guidance| return guidance;
     if (hasUsageBannerOutput(output)) return usage_error_retry_guidance;
     return null;
 }
 
-fn isShellParseErrorOutput(output: []const u8) bool {
+const ShellFamily = enum { zsh, line_by_line };
+
+fn shellParseRetryGuidance(output: []const u8) ?[]const u8 {
     var lines = std.mem.splitScalar(u8, output, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (!hasShellErrorPrefix(trimmed)) continue;
+        const family = shellErrorFamily(trimmed) orelse continue;
+        // zsh's `[` and `test` builtins report a bad expression at run time as
+        // `parse error: condition expected`, and the command keeps running.
+        if (text_utils.containsIgnoreCase(trimmed, "condition expected")) continue;
         // bash 5.2 reports an unclosed quote with only this line; older
         // versions follow it with `syntax error: unexpected end of file`.
         if (text_utils.containsIgnoreCase(trimmed, "unmatched") or
             text_utils.containsIgnoreCase(trimmed, "unexpected EOF while looking for matching") or
             text_utils.containsIgnoreCase(trimmed, "syntax error") or
             text_utils.containsIgnoreCase(trimmed, "parse error") or
-            text_utils.containsIgnoreCase(trimmed, "unterminated quoted string")) return true;
+            text_utils.containsIgnoreCase(trimmed, "unterminated quoted string"))
+        {
+            return switch (family) {
+                .zsh => zsh_parse_retry_guidance,
+                .line_by_line => line_shell_parse_retry_guidance,
+            };
+        }
     }
-    return false;
+    return null;
 }
 
 // Shell error prefixes may carry an absolute argv[0] path (fx spawns the
 // resolved login shell as /bin/bash, /bin/zsh, ...), so match the basename
 // of the token before the first colon rather than a raw line prefix.
 // Snapshot and terminal runs pass the command to `eval`, so zsh names the
-// source `(eval)`. Under the snapshot, bash names the script it sources from
-// `/dev/fd/0` (`snapshotScript` in shell_resolver.zig), followed by `eval:`.
-// Anchoring bash to that path keeps a script's own `eval` errors out.
-fn hasShellErrorPrefix(line: []const u8) bool {
-    const colon = std.mem.findScalar(u8, line, ':') orelse return false;
+// source `(eval)`, as it does for an `eval` inside the command. Under the
+// snapshot, bash names the script it sources from `/dev/fd/0`
+// (`snapshotScript` in shell_resolver.zig), followed by `eval:`. Anchoring
+// bash to that path keeps the `eval` errors of a script the command runs out.
+fn shellErrorFamily(line: []const u8) ?ShellFamily {
+    const colon = std.mem.findScalar(u8, line, ':') orelse return null;
     const token = line[0..colon];
-    if (token.len == 0 or std.mem.findScalar(u8, token, ' ') != null) return false;
-    if (std.mem.eql(u8, token, "(eval)")) return true;
-    if (std.mem.eql(u8, token, "/dev/fd/0") and std.mem.startsWith(u8, line[colon + 1 ..], " eval:")) return true;
+    if (token.len == 0 or std.mem.findScalar(u8, token, ' ') != null) return null;
+    if (std.mem.eql(u8, token, "(eval)")) return .zsh;
+    if (std.mem.eql(u8, token, "/dev/fd/0") and std.mem.startsWith(u8, line[colon + 1 ..], " eval:")) return .line_by_line;
     const base = if (std.mem.findLast(u8, token, "/")) |slash| token[slash + 1 ..] else token;
-    const names = [_][]const u8{ "zsh", "bash", "sh", "dash" };
-    for (names) |name| {
-        if (std.mem.eql(u8, base, name)) return true;
+    if (std.mem.eql(u8, base, "zsh")) return .zsh;
+    const line_shells = [_][]const u8{ "bash", "sh", "dash" };
+    for (line_shells) |name| {
+        if (std.mem.eql(u8, base, name)) return .line_by_line;
     }
-    return false;
+    return null;
 }
 
 fn hasUsageBannerOutput(output: []const u8) bool {
@@ -2406,7 +2420,7 @@ test "completed shell snapshot with shell parse error carries rewrite guidance" 
     try std.testing.expectEqualStrings("completed", object.get("state").?.string);
     try std.testing.expectEqual(@as(i64, 1), object.get("exit_code").?.integer);
     try std.testing.expectEqualStrings(
-        shell_parse_retry_guidance,
+        zsh_parse_retry_guidance,
         object.get("retry_guidance").?.string,
     );
 }
@@ -2499,49 +2513,49 @@ test "incomplete output guidance takes precedence over failure guidance" {
 
 test "failure guidance detectors match only their signatures" {
     try std.testing.expectEqual(
-        shell_parse_retry_guidance,
+        zsh_parse_retry_guidance,
         failureRetryGuidance(1, "zsh:1: unmatched '\n"),
     );
     // fx spawns the resolved login shell with an absolute argv[0], so bash
     // errors carry a /bin/bash prefix; bare-basename forms also occur when a
     // command spawns a shell subprocess itself.
     try std.testing.expectEqual(
-        shell_parse_retry_guidance,
+        line_shell_parse_retry_guidance,
         failureRetryGuidance(2, "/bin/bash: -c: line 1: syntax error: unexpected end of file\n"),
     );
     try std.testing.expectEqual(
-        shell_parse_retry_guidance,
+        line_shell_parse_retry_guidance,
         failureRetryGuidance(2, "bash: -c: line 1: syntax error near unexpected token `)'\n"),
     );
     try std.testing.expectEqual(
-        shell_parse_retry_guidance,
+        line_shell_parse_retry_guidance,
         failureRetryGuidance(2, "/bin/dash: 1: Syntax error: Unterminated quoted string\n"),
     );
     try std.testing.expectEqual(
-        shell_parse_retry_guidance,
+        zsh_parse_retry_guidance,
         failureRetryGuidance(1, "zsh: parse error near '\\n'\n"),
     );
     // Snapshot and terminal runs evaluate the command, so zsh reports `(eval)`
     // and bash reports the sourced snapshot script followed by `eval:`.
     try std.testing.expectEqual(
-        shell_parse_retry_guidance,
+        zsh_parse_retry_guidance,
         failureRetryGuidance(1, "(eval):1: unmatched \"\n"),
     );
     try std.testing.expectEqual(
-        shell_parse_retry_guidance,
+        zsh_parse_retry_guidance,
         failureRetryGuidance(1, "(eval):1: parse error near `)'\r\n"),
     );
     try std.testing.expectEqual(
-        shell_parse_retry_guidance,
+        line_shell_parse_retry_guidance,
         failureRetryGuidance(1, "/dev/fd/0: eval: line 2: unexpected EOF while looking for matching `\"'\n/dev/fd/0: eval: line 3: syntax error: unexpected end of file\n"),
     );
     // bash 5.2 prints only the unexpected EOF line for an unclosed quote.
     try std.testing.expectEqual(
-        shell_parse_retry_guidance,
+        line_shell_parse_retry_guidance,
         failureRetryGuidance(1, "/dev/fd/0: eval: line 40: unexpected EOF while looking for matching `\"'\n"),
     );
     try std.testing.expectEqual(
-        shell_parse_retry_guidance,
+        line_shell_parse_retry_guidance,
         failureRetryGuidance(2, "/bin/bash: -c: line 1: unexpected EOF while looking for matching `\"'\n"),
     );
     try std.testing.expectEqual(
@@ -2566,8 +2580,11 @@ test "failure guidance detectors match only their signatures" {
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "error: bash: syntax error\n"));
     // An eval source alone is not enough; the line must still name a parse error.
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "(eval):1: no such file or directory: missing\n"));
-    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "notes.txt: evaluation: syntax error\n"));
-    // A script's own `eval` is not the snapshot's, even when its text fails to parse.
+    // A bash run-time error under the snapshot names `/dev/fd/0` without `eval:`.
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "/dev/fd/0: line 3: 1 +  : syntax error: operand expected (error token is \" \")\n"));
+    // zsh's `[` builtin reports a bad expression at run time, after the command parsed.
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "(eval):3: parse error: condition expected: =\n"));
+    // The `eval` of a bash script the command runs is not the snapshot's.
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(3, "./build.sh: eval: line 4: unexpected EOF while looking for matching `\"'\n"));
     // Ordinary failures keep null guidance.
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(2, "grep: /nonexistent: No such file or directory\n"));
