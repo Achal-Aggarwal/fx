@@ -414,8 +414,9 @@ const AcpContext = struct {
     }
 
     /// Sends a final failed update for every announced card that never got
-    /// one. A cancel can stop a step before some of its calls run, and the
-    /// turn's end is the last point where the client can still learn that.
+    /// one. A cancel can stop a step before some of its calls run, and a
+    /// failed or paused turn can end with a provider search still announced,
+    /// so the turn's end is the last point where the client can learn that.
     fn finishOpenToolCalls(self: *AcpContext, text: []const u8) void {
         var cards = self.published_tool_calls.iterator();
         while (cards.next()) |entry| {
@@ -1201,7 +1202,6 @@ pub fn handlePrompt(
     if (session.cancel_flag.load(.seq_cst)) {
         ctx.stop_reason = .cancelled;
     }
-    if (ctx.stop_reason == .cancelled) ctx.finishOpenToolCalls("Cancelled");
 
     return .{ .stop_reason = ctx.stop_reason };
 }
@@ -2243,6 +2243,31 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
     } else if (outcome == .failed or outcome == .paused) {
         ctx.stop_reason = .refused;
     }
+    // The core reports no more tool events once a turn finishes, so close
+    // what it left open, as the terminal transcript does at the same point.
+    const cancel_requested = if (ctx.state.active_session) |*session| session.cancel_flag.load(.seq_cst) else false;
+    ctx.finishOpenToolCalls(unfinishedToolCallText(outcome, cancel_requested));
+}
+
+/// The text of the final update for a tool call a finished turn left open.
+/// It matches the terminal transcript's wording for the same outcome. A
+/// requested cancel reads as one even when the turn ends as failed.
+fn unfinishedToolCallText(outcome: types.TurnPresentationOutcome, cancel_requested: bool) []const u8 {
+    if (cancel_requested) return "Cancelled";
+    return switch (outcome) {
+        .completed => "Tool completion was not reported",
+        .interrupted => "Cancelled",
+        .failed => "Tool failed",
+        .paused => "Tool state preserved for recovery",
+    };
+}
+
+test "a tool call a finished turn left open reads as the turn's outcome" {
+    try std.testing.expectEqualStrings("Tool completion was not reported", unfinishedToolCallText(.completed, false));
+    try std.testing.expectEqualStrings("Cancelled", unfinishedToolCallText(.interrupted, false));
+    try std.testing.expectEqualStrings("Tool failed", unfinishedToolCallText(.failed, false));
+    try std.testing.expectEqualStrings("Tool state preserved for recovery", unfinishedToolCallText(.paused, false));
+    try std.testing.expectEqualStrings("Cancelled", unfinishedToolCallText(.failed, true));
 }
 
 fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
