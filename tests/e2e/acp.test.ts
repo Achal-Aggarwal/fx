@@ -1374,13 +1374,16 @@ function sendSteeringPrompt(client: AcpClient, id: number, text: string): void {
 }
 
 // A withheld image's original: the session's blob, which the notice names
-// and its saved prompt lists (D79).
+// (D79) and its saved prompt names by hash, without the image's bytes (D89).
 function expectSavedOriginal(home: string, sessionId: string, body: string, original: Buffer): void {
   const named = /The original is saved at (\S+)\. Use/.exec(body)?.[1];
-  const blob = join(sessionDir(home, sessionId), "blobs", createHash("sha256").update(original).digest("hex"));
+  const hash = createHash("sha256").update(original).digest("hex");
+  const blob = join(sessionDir(home, sessionId), "blobs", hash);
   expect(named).toBe(blob);
   expect(readFileSync(blob)).toEqual(original);
-  expect(savedText(home, sessionId)).toContain(blob);
+  const saved = savedText(home, sessionId);
+  expect(saved).toContain(hash);
+  expect(saved).not.toContain(original.toString("base64"));
 }
 
 async function startAutoSession(client: AcpClient, hooks = false) {
@@ -7151,8 +7154,14 @@ describe("acp: model-independent", () => {
         { type: "image", data: imageData, mimeType: "image/png" },
       ], TIMEOUT);
       expect(JSON.stringify(failed)).toContain("RequiredVisionToolCallMissing");
-      // The failed turn keeps its image inside the saved prompt (D44).
-      expect(savedText(root.home, sessionId)).toContain(imageData);
+      // The failed turn keeps its image as the session's blob, which its
+      // saved prompt names by hash, without the image's bytes (D89).
+      const imageBytes = Buffer.from(imageData, "base64");
+      const hash = createHash("sha256").update(imageBytes).digest("hex");
+      expect(readFileSync(join(sessionDir(root.home, sessionId), "blobs", hash))).toEqual(imageBytes);
+      const saved = savedText(root.home, sessionId);
+      expect(saved).toContain(hash);
+      expect(saved).not.toContain(imageData);
       await client.close();
       client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
       await client.request("initialize", { protocolVersion: 1 }, 10);

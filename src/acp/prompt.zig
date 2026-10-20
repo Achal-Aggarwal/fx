@@ -1953,13 +1953,13 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .publish_deferred_tool_completion = publishDeferredToolCompletion,
         .propagate_history_turn = propagateHistoryTurn,
-        .image_blob_dir = if (session.v2) |v2| v2.blobsPath() else null,
         .append_turn_piece = if (session.v2 != null)
             appendTurnPiece
         else if (session.journal != null)
             appendJournalToolIntent
         else
             null,
+        .save_prompt_images = if (session.v2 != null) savePromptImages else null,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = if (session.journal != null)
             .{
@@ -2792,6 +2792,21 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     const v2 = session.v2 orelse return;
     v2.appendProgress(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }) catch |err| {
         debug_trace.logf("session", "event=sessions_v2_stream_failed session={s} err={s} deferred=commit", .{ v2.id(), @errorName(err) });
+    };
+}
+
+/// `AgentRuntimeDeps.save_prompt_images` on v2: the prompt's images become
+/// the session's blobs before its first request (D89). A failure leaves the
+/// rest inline, with no path, as the adapter does for one image the store
+/// refuses.
+fn savePromptImages(raw_ctx: *anyopaque, alloc: std.mem.Allocator, images: []types.ImageAttachment) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = session.v2 orelse return;
+    v2.savePromptImages(alloc, images) catch |err| {
+        debug_trace.logf("session", "event=sessions_v2_prompt_images_inline session={s} err={s}", .{ v2.id(), @errorName(err) });
     };
 }
 
