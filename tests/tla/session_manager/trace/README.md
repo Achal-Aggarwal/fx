@@ -12,8 +12,11 @@ we execute: unit tests, the standalone driver, and the `kill -9` and
 machine-crash matrix.
 
 In fx, the manager's trace hook is compiled out: `build.zig` sets the
-`hooks` option to false, and the standalone driver and crash matrix are not
-part of this repository. What runs here is `selftest.sh`, each checker's
+`hooks` option to false for every artifact it ships. `zig build test` also
+runs the manager's own tests with `hooks` on, and they write their traces to
+`zig-out/session-manager-traces/`, but nothing checks those traces against
+the specs yet. The standalone driver and crash matrix are not part of this
+repository. What runs here is `selftest.sh`, each checker's
 `--selftest` mode, `check_saved_logs.py` on logs fx saved, and
 `check_wiring_traces.py` on traces from a run with
 `FX_TRACE_SCOPES=wiring`.
