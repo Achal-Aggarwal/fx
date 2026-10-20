@@ -220,12 +220,12 @@ pub fn collect_image_catalog(
 
     for (canonical_history) |turn| {
         for (images_for_history_turn(turn)) |attachment| {
-            catalog[copied] = try dupeImageAttachment(alloc, attachment);
+            catalog[copied] = try core_types.dupeImageAttachment(alloc, attachment);
             copied += 1;
         }
     }
     for (current_images) |attachment| {
-        catalog[copied] = try dupeImageAttachment(alloc, attachment);
+        catalog[copied] = try core_types.dupeImageAttachment(alloc, attachment);
         copied += 1;
     }
 
@@ -278,12 +278,12 @@ pub fn merge_image_catalog_history_turn(
         core_types.freeImageAttachment(alloc, attachment);
     };
     for (catalog) |attachment| {
-        merged[copied] = try dupeImageAttachment(alloc, attachment);
+        merged[copied] = try core_types.dupeImageAttachment(alloc, attachment);
         copied += 1;
     }
     for (additions) |attachment| {
         if (image_attachment_for_id(catalog, attachment.id) != null) continue;
-        merged[copied] = try dupeImageAttachment(alloc, attachment);
+        merged[copied] = try core_types.dupeImageAttachment(alloc, attachment);
         copied += 1;
     }
     sort_utils.sort(ImageAttachment, merged, {}, image_id_less_than);
@@ -1814,57 +1814,7 @@ pub fn freeHistoryTurnSlice(alloc: Allocator, turns: []HistoryTurn) void {
     if (turns.len > 0) alloc.free(turns);
 }
 /// Deep-copies an image attachment slice; caller owns the returned slice and frees with freeImageAttachmentSlice.
-pub fn dupeImageAttachmentSlice(alloc: Allocator, attachments: []const ImageAttachment) ![]ImageAttachment {
-    if (attachments.len == 0) return &.{};
-    const copy = try alloc.alloc(ImageAttachment, attachments.len);
-    errdefer alloc.free(copy);
-    var copied: usize = 0;
-    errdefer {
-        var i: usize = 0;
-        while (i < copied) : (i += 1) {
-            core_types.freeImageAttachment(alloc, copy[i]);
-        }
-    }
-    for (attachments, 0..) |attachment, i| {
-        copy[i] = try dupeImageAttachment(alloc, attachment);
-        copied += 1;
-    }
-    return copy;
-}
-/// A full copy of `src`: a saved image is only its blob's handle (D89), and
-/// an unsaved one keeps its bytes inline, so readers such as Vision find the
-/// image either way.
-fn dupeImageAttachment(alloc: Allocator, src: ImageAttachment) !ImageAttachment {
-    const path = try alloc.dupe(u8, src.path);
-    errdefer alloc.free(path);
-    const media_type = try alloc.dupe(u8, src.media_type);
-    errdefer alloc.free(media_type);
-    const snapshot_path = if (src.snapshot_path) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    errdefer if (snapshot_path) |value| alloc.free(value);
-    const snapshot_sha256 = if (src.snapshot_sha256) |value|
-        try alloc.dupe(u8, value)
-    else
-        null;
-    errdefer if (snapshot_sha256) |value| alloc.free(value);
-    const inline_data = if (src.inline_data) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (inline_data) |value| alloc.free(value);
-    const source_ref = if (src.source_ref) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (source_ref) |value| alloc.free(value);
-    const blob_path = if (src.blob_path) |value| try alloc.dupe(u8, value) else null;
-    return .{
-        .id = src.id,
-        .path = path,
-        .media_type = media_type,
-        .snapshot_path = snapshot_path,
-        .snapshot_sha256 = snapshot_sha256,
-        .inline_data = inline_data,
-        .source_ref = source_ref,
-        .blob_path = blob_path,
-    };
-}
+pub const dupeImageAttachmentSlice = core_types.dupeImageAttachmentSlice;
 /// Deep-copies one history turn; caller owns the returned turn and frees with freeHistoryTurn.
 pub const dupeHistoryTurn = core_types.dupeHistoryTurn;
 pub fn appendAssistantTurnWithExecution(
@@ -2606,27 +2556,6 @@ test "appendHistoryMessages frees owned projection text when append fails" {
     var compact_failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 1 });
     var compact_messages: std.ArrayList(message.Message) = .empty;
     try std.testing.expectError(error.OutOfMemory, appendHistoryMessages(compact_failing.allocator(), &compact_messages, &compact));
-}
-test "dupeImageAttachment frees path when media_type allocation fails" {
-    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 1 });
-    try std.testing.expectError(error.OutOfMemory, dupeImageAttachment(failing.allocator(), .{
-        .path = @constCast("/tmp/a.png"),
-        .media_type = @constCast("image/png"),
-    }));
-}
-test "dupeImageAttachment preserves stable image id" {
-    const alloc = std.testing.allocator;
-    const copy = try dupeImageAttachment(alloc, .{
-        .id = 41,
-        .path = @constCast("/tmp/a.png"),
-        .media_type = @constCast("image/png"),
-    });
-    defer {
-        alloc.free(copy.path);
-        alloc.free(copy.media_type);
-    }
-
-    try std.testing.expectEqual(@as(usize, 41), copy.id);
 }
 test "conversation-language inference matches script signals" {
     try std.testing.expectEqual(ConversationLanguage.literal("und-Latn"), inferConversationLanguage("puoi aprire la landing page", ConversationLanguage.default()));

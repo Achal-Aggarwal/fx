@@ -3309,51 +3309,57 @@ pub fn dupeImageAttachmentSlice(alloc: std.mem.Allocator, attachments: []const I
     }
 
     for (attachments, 0..) |attachment, i| {
-        const path = try alloc.dupe(u8, attachment.path);
-        errdefer alloc.free(path);
-
-        const media_type = try alloc.dupe(u8, attachment.media_type);
-        errdefer alloc.free(media_type);
-
-        const snapshot_path = if (attachment.snapshot_path) |value|
-            try alloc.dupe(u8, value)
-        else
-            null;
-        errdefer if (snapshot_path) |value| alloc.free(value);
-
-        const snapshot_sha256 = if (attachment.snapshot_sha256) |value|
-            try alloc.dupe(u8, value)
-        else
-            null;
-        errdefer if (snapshot_sha256) |value| alloc.free(value);
-
-        const inline_data = if (attachment.inline_data) |value|
-            try alloc.dupe(u8, value)
-        else
-            null;
-        errdefer if (inline_data) |value| alloc.free(value);
-        const source_ref = if (attachment.source_ref) |value|
-            try alloc.dupe(u8, value)
-        else
-            null;
-        errdefer if (source_ref) |value| alloc.free(value);
-        const blob_path = if (attachment.blob_path) |value|
-            try alloc.dupe(u8, value)
-        else
-            null;
-        copy[i] = .{
-            .id = attachment.id,
-            .path = path,
-            .media_type = media_type,
-            .snapshot_path = snapshot_path,
-            .snapshot_sha256 = snapshot_sha256,
-            .inline_data = inline_data,
-            .source_ref = source_ref,
-            .blob_path = blob_path,
-        };
+        copy[i] = try dupeImageAttachment(alloc, attachment);
         copied += 1;
     }
     return copy;
+}
+
+/// A copy of `attachment` that owns every field it has; free it with
+/// `freeImageAttachment`.
+pub fn dupeImageAttachment(alloc: std.mem.Allocator, attachment: ImageAttachment) !ImageAttachment {
+    const path = try alloc.dupe(u8, attachment.path);
+    errdefer alloc.free(path);
+
+    const media_type = try alloc.dupe(u8, attachment.media_type);
+    errdefer alloc.free(media_type);
+
+    const snapshot_path = if (attachment.snapshot_path) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (snapshot_path) |value| alloc.free(value);
+
+    const snapshot_sha256 = if (attachment.snapshot_sha256) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (snapshot_sha256) |value| alloc.free(value);
+
+    const inline_data = if (attachment.inline_data) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (inline_data) |value| alloc.free(value);
+    const source_ref = if (attachment.source_ref) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    errdefer if (source_ref) |value| alloc.free(value);
+    const blob_path = if (attachment.blob_path) |value|
+        try alloc.dupe(u8, value)
+    else
+        null;
+    return .{
+        .id = attachment.id,
+        .path = path,
+        .media_type = media_type,
+        .snapshot_path = snapshot_path,
+        .snapshot_sha256 = snapshot_sha256,
+        .inline_data = inline_data,
+        .source_ref = source_ref,
+        .blob_path = blob_path,
+    };
 }
 
 /// Frees the owned fields in one attachment; caller owns any containing storage.
@@ -3656,6 +3662,29 @@ test "ImageAttachment helpers duplicate empty and populated slices" {
 
     freeImageAttachmentSlice(alloc, copy);
     freeImageAttachmentSlice(alloc, originals);
+}
+
+test "dupeImageAttachment frees path when media_type allocation fails" {
+    var failing = std.testing.FailingAllocator.init(testing_allocator.no_resize, .{ .fail_index = 1 });
+    try std.testing.expectError(error.OutOfMemory, dupeImageAttachment(failing.allocator(), .{
+        .path = @constCast("/tmp/a.png"),
+        .media_type = @constCast("image/png"),
+    }));
+}
+
+test "dupeImageAttachment preserves stable image id" {
+    const alloc = std.testing.allocator;
+    const copy = try dupeImageAttachment(alloc, .{
+        .id = 41,
+        .path = @constCast("/tmp/a.png"),
+        .media_type = @constCast("image/png"),
+    });
+    defer {
+        alloc.free(copy.path);
+        alloc.free(copy.media_type);
+    }
+
+    try std.testing.expectEqual(@as(usize, 41), copy.id);
 }
 
 test "ImageAttachment source references clone independently and clean up allocation failures" {

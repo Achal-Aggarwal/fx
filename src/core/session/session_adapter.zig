@@ -1755,8 +1755,6 @@ pub const Session = struct {
             image.blob_path = null;
             const bytes = image.inline_data.?;
             const digest = image.snapshot_sha256 orelse continue;
-            // A blob needs the turn on disk (D44).
-            try self.openTurnLocked();
             const path = self.savePromptImageLocked(bytes, digest) catch |err| switch (err) {
                 error.OutOfMemory => return err,
                 else => {
@@ -1770,8 +1768,12 @@ pub const Session = struct {
         }
     }
 
-    /// The path of the blob holding `bytes`, owned by `prompt_blobs`.
+    /// The path of the blob holding `bytes`, owned by `prompt_blobs`. A turn
+    /// the store cannot start fails the save, as a refused blob does, so the
+    /// image stays inline and the prompt goes on.
     fn savePromptImageLocked(self: *Session, bytes: []const u8, digest: []const u8) ![]const u8 {
+        // A blob needs the turn on disk (D44).
+        try self.openTurnLocked();
         const hash = try BlobHost.put(self.host, bytes);
         // The digest names the blob: bytes that do not match it are not
         // saved under it.
@@ -1980,8 +1982,6 @@ pub const Session = struct {
             .user => |user| for (user.images) |image| {
                 const bytes = image.inline_data orelse continue;
                 const digest = image.snapshot_sha256 orelse continue;
-                // A blob needs the turn on disk (D44).
-                try self.openTurnLocked();
                 _ = self.savePromptImageLocked(bytes, digest) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
                     debug_trace.logf("session", "event=sessions_v2_prompt_image_inline session={s} image={d} reason={s}", .{ self.id(), image.id, @errorName(err) });
@@ -6939,6 +6939,33 @@ test "a prompt image the store does not save keeps its bytes inline and gets no 
     try testing.expectEqual(@as(?[]u8, null), kept[0].blob_path);
     try testing.expectEqual(@as(?[]u8, null), kept[1].blob_path);
     try testing.expectEqualStrings(images[1].snapshot_path.?, kept[1].snapshot_path.?);
+}
+
+test "a turn the store cannot start keeps its prompt images inline and does not fail the prompt (D89)" {
+    var t: TestHome = undefined;
+    try t.init();
+    defer t.deinit();
+    var model = "m".*;
+    const bytes = OldSideFolder.png;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&bytes, &digest, .{});
+    var digest_hex = std.fmt.bytesToHex(digest, .lower);
+    var images = [_]types.ImageAttachment{.{ .id = 1, .path = @constCast("/Users/example/a.png"), .media_type = @constCast("image/png"), .snapshot_sha256 = &digest_hex, .inline_data = @constCast(&bytes) }};
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const s = try Session.create(testing.allocator, &t.store, "/w", .app, testSeed(&model));
+    defer s.close();
+    // A new session reaches the disk with its first line, the turn's start,
+    // which a read-only store refuses.
+    const io = io_mod.getIo();
+    try std.Io.Dir.cwd().createDirPath(io, t.store.manager.root_path);
+    var root = try std.Io.Dir.openDirAbsolute(io, t.store.manager.root_path, .{});
+    defer root.close(io);
+    root.setPermissions(io, .fromMode(0o500)) catch return error.SkipZigTest;
+    defer root.setPermissions(io, .fromMode(0o700)) catch {};
+    try s.savePromptImages(arena.allocator(), &images);
+    try testing.expectEqual(@as(?[]u8, null), images[0].blob_path);
+    try testing.expectEqualSlices(u8, &bytes, images[0].inline_data.?);
 }
 
 test "an image that arrives with another session's blob path is saved here or written without a blob (D89)" {
