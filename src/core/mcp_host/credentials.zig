@@ -213,8 +213,11 @@ pub const Store = struct {
             std.crypto.secureZero(u8, out.writer.buffer);
             out.deinit();
         }
-        // A profile server's entry has no workspace field, as before.
-        try std.json.Stringify.value(.{ .version = 1, .servers = doc.entries.items }, .{ .emit_null_optional_fields = false }, &out.writer);
+        // Version 2: an fx that reads only version 1 treats the store as
+        // newer and never writes over it, so it can't take over v1's logins
+        // or drop a login's workspace. A profile server's entry has no
+        // workspace field.
+        try std.json.Stringify.value(.{ .version = 2, .servers = doc.entries.items }, .{ .emit_null_optional_fields = false }, &out.writer);
         switch (s.backend) {
             .keychain => try native_keychain.storeMcpHostCredentials(out.written()),
             .file => try io_mod.durableReplaceVerified(alloc, dir, file_name, out.written()),
@@ -325,7 +328,7 @@ const Doc = struct {
         var arena: std.heap.ArenaAllocator = .init(alloc);
         defer arena.deinit();
         const saved = try std.json.parseFromSliceLeaky(Saved, arena.allocator(), bytes, .{ .ignore_unknown_fields = true });
-        if (saved.version != 1) return error.UnsupportedVersion;
+        if (saved.version != 1 and saved.version != 2) return error.UnsupportedVersion;
         var doc: Doc = .{};
         errdefer doc.deinit(alloc);
         try doc.entries.ensureTotalCapacity(alloc, saved.servers.len);
@@ -504,7 +507,7 @@ test "the credential file is private, and one this fx can't read is never writte
     // sign-in or sign-out fails, and the file stays as it was.
     for ([_][]const u8{
         "not json",
-        "{\"version\":2,\"imported_v1\":true,\"servers\":[{\"name\":\"plain\",\"url\":\"https://mcp.plain.com/mcp\",\"credential\":\"{}\"}]}",
+        "{\"version\":3,\"imported_v1\":true,\"servers\":[{\"name\":\"plain\",\"url\":\"https://mcp.plain.com/mcp\",\"credential\":\"{}\"}]}",
     }) |bytes| {
         try tmp.dir.writeFile(testing.io, .{ .sub_path = test_path, .data = bytes });
         try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, .{ .name = "plain", .url = url }));

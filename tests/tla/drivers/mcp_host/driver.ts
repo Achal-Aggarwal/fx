@@ -126,7 +126,7 @@ export function observeStores(f: Fixture) {
     try {
       const doc = JSON.parse(text);
       entries = (doc.servers ?? []).map((s: { name: string }) => s.name).sort();
-      kind = doc.version === 1 && Array.isArray(doc.servers) ? "ok" : "unreadable";
+      kind = (doc.version === 1 || doc.version === 2) && Array.isArray(doc.servers) ? "ok" : "unreadable";
     } catch { kind = "unreadable"; }
   }
   const v1 = existsSync(v1Path(f)) ? (JSON.parse(readFileSync(v1Path(f), "utf8")).credentials ?? []).map((c: { server_identity: string }) => c.server_identity).sort() : [];

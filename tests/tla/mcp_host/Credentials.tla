@@ -4,10 +4,10 @@
 \* same document through native_keychain).
 \*
 \* One document, `~/.fx/mcp-credentials/credentials-v2.json`:
-\*   {"version":1, "servers":[{name,url,credential}]}
+\*   {"version":2, "servers":[{name,url,credential}]}, version 1 still read
 \* Every operation holds the directory's advisory lock (Store.lock), so each
 \* is atomic here, and reads the document first (Store.read): a missing file
-\* is empty; one that doesn't parse, or whose version isn't 1, is unreadable,
+\* is empty; one that doesn't parse, or whose version is neither 1 nor 2, is unreadable,
 \* and nothing writes over it: get finds no login, and put and remove
 \* fail. A read writes nothing. v1's logins (`credentials.json`) are never
 \* taken over: an older fx and this one refreshing one login apart, neither
@@ -103,7 +103,7 @@ Unreadable ==
     /\ UNCHANGED <<entries, v1, loggedOut, kept, taken, overwritten>>
 
 \* Environment: it is readable again (fixed by hand, or saved as version 1
-\* again), holding what it held.
+\* or 2 again), holding what it held.
 Repair ==
     /\ "repair" \in Faults /\ kind = "unreadable"
     /\ kind' = "ok"

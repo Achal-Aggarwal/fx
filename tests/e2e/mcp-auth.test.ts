@@ -1542,7 +1542,7 @@ describe("MCP login", () => {
     expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env, timeoutMs: 20_000 }));
     // A newer fx saves the same store as version 2.
     const storePath = join(root.home, ".fx", "mcp-credentials", "credentials-v2.json");
-    writeFileSync(storePath, JSON.stringify({ ...JSON.parse(readFileSync(storePath, "utf8")), version: 2 }));
+    writeFileSync(storePath, JSON.stringify({ ...JSON.parse(readFileSync(storePath, "utf8")), version: 3 }));
     const before = readFileSync(storePath, "utf8");
     const unreadable = "fx can't read the saved MCP sign-ins in ~/.fx/mcp-credentials/credentials-v2.json. A newer fx saved them, or they're damaged; fix or delete them, then try again.\n";
 
