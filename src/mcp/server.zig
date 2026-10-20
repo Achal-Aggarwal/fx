@@ -460,6 +460,8 @@ pub const Server = struct {
         r.listen_key = null;
         r.timers.clearRetainingCapacity();
         r.held_sends.clearRetainingCapacity();
+        // An initialized notification still unanswered: its POST goes too.
+        if (r.initialized_key) |key| try r.closeKey(key, .forgotten);
         r.initialized_key = null;
         r.listen_pending = false;
         r.legacy = null;
@@ -1591,9 +1593,10 @@ pub const Server = struct {
 
     /// A 2025 initialized notification went unanswered for the request
     /// timeout. Every later send waits for it, so the session can't go on:
-    /// it fails with the reason. The host's teardown closes the
-    /// POST with the session.
-    fn onInitializedTimedOut(r: *Server) void {
+    /// it fails with the reason. Nothing reads its answer now, so its POST
+    /// is closed here; the teardown doesn't know of it.
+    fn onInitializedTimedOut(r: *Server) Error!void {
+        if (r.initialized_key) |key| try r.closeKey(key, .forgotten);
         r.initialized_key = null;
         r.emit(.{ .failed = .initialized_timed_out });
     }
@@ -2136,7 +2139,7 @@ pub const Server = struct {
                 .listen_wait => try r.listenSettled(),
                 .backoff => |handle| if (r.logicalByHandle(handle)) |l| try r.stepChain(l, .backoff_elapsed),
                 .relisten => |x| try r.stepSubs(.{ .retry_due = .{ .sub = x.sub, .generation = x.generation } }),
-                .initialized => |key| if (r.initialized_key == key) r.onInitializedTimedOut(),
+                .initialized => |key| if (r.initialized_key == key) try r.onInitializedTimedOut(),
                 // No answer in time is no answer: the refresh fails, the
                 // tokens stay, and what waits for it fails.
                 .refresh => |key| if (r.auth.refresh_key == key) {
