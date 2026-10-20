@@ -1629,7 +1629,9 @@ fn formatModelSafeSnapshotRaw(
     );
 }
 
-const shell_parse_retry_guidance = "The shell could not parse this command (unmatched quote or syntax error), so nothing executed. Rewrite the command with corrected quoting or escaping and submit the full corrected command instead of rerunning the same text.";
+// bash parses and runs a multi-line command one line at a time, so lines
+// before the parse error may already have run.
+const shell_parse_retry_guidance = "The shell could not parse this command (unmatched quote or syntax error). The line with the error did not run, but lines before it may have. Rewrite the command with corrected quoting or escaping and submit it instead of rerunning the same text, leaving out any lines that already ran.";
 const usage_error_retry_guidance = "The command exited with a usage error (missing or invalid arguments). Rebuild the command with the required arguments explicitly set, then submit the corrected command instead of rerunning it unchanged.";
 
 fn failureRetryGuidance(exit_code: ?i64, output: []const u8) ?[]const u8 {
@@ -1660,12 +1662,15 @@ fn isShellParseErrorOutput(output: []const u8) bool {
 // resolved login shell as /bin/bash, /bin/zsh, ...), so match the basename
 // of the token before the first colon rather than a raw line prefix.
 // Snapshot and terminal runs pass the command to `eval`, so zsh names the
-// source `(eval)` and bash names the file it sourced, followed by `eval:`.
+// source `(eval)`. Under the snapshot, bash names the script it sources from
+// `/dev/fd/0` (`snapshotScript` in shell_resolver.zig), followed by `eval:`.
+// Anchoring bash to that path keeps a script's own `eval` errors out.
 fn hasShellErrorPrefix(line: []const u8) bool {
     const colon = std.mem.findScalar(u8, line, ':') orelse return false;
     const token = line[0..colon];
     if (token.len == 0 or std.mem.findScalar(u8, token, ' ') != null) return false;
-    if (std.mem.eql(u8, token, "(eval)") or std.mem.startsWith(u8, line[colon + 1 ..], " eval:")) return true;
+    if (std.mem.eql(u8, token, "(eval)")) return true;
+    if (std.mem.eql(u8, token, "/dev/fd/0") and std.mem.startsWith(u8, line[colon + 1 ..], " eval:")) return true;
     const base = if (std.mem.findLast(u8, token, "/")) |slash| token[slash + 1 ..] else token;
     const names = [_][]const u8{ "zsh", "bash", "sh", "dash" };
     for (names) |name| {
@@ -2562,6 +2567,8 @@ test "failure guidance detectors match only their signatures" {
     // An eval source alone is not enough; the line must still name a parse error.
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "(eval):1: no such file or directory: missing\n"));
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "notes.txt: evaluation: syntax error\n"));
+    // A script's own `eval` is not the snapshot's, even when its text fails to parse.
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(3, "./build.sh: eval: line 4: unexpected EOF while looking for matching `\"'\n"));
     // Ordinary failures keep null guidance.
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(2, "grep: /nonexistent: No such file or directory\n"));
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, ""));

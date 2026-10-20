@@ -1033,6 +1033,7 @@ describe("fx ask shell startup files", () => {
     expect(result.code).toBe(0);
     // The snapshot runs the command through eval, so zsh reports the error as
     // `(eval):1:` and bash as `/dev/fd/0: eval:` instead of under the shell's name.
+    expect(result.stderr).not.toContain("shell snapshot unavailable");
     expect(gateway.requests[1]!.body).toContain("The shell could not parse this command");
   }, TIMEOUT);
 
