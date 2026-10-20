@@ -1656,10 +1656,13 @@ fn isShellParseErrorOutput(output: []const u8) bool {
 // Shell error prefixes may carry an absolute argv[0] path (fx spawns the
 // resolved login shell as /bin/bash, /bin/zsh, ...), so match the basename
 // of the token before the first colon rather than a raw line prefix.
+// Snapshot and terminal runs pass the command to `eval`, so zsh names the
+// source `(eval)` and bash names the file it sourced, followed by `eval:`.
 fn hasShellErrorPrefix(line: []const u8) bool {
     const colon = std.mem.findScalar(u8, line, ':') orelse return false;
     const token = line[0..colon];
     if (token.len == 0 or std.mem.findScalar(u8, token, ' ') != null) return false;
+    if (std.mem.eql(u8, token, "(eval)") or std.mem.startsWith(u8, line[colon + 1 ..], " eval:")) return true;
     const base = if (std.mem.findLast(u8, token, "/")) |slash| token[slash + 1 ..] else token;
     const names = [_][]const u8{ "zsh", "bash", "sh", "dash" };
     for (names) |name| {
@@ -2510,6 +2513,20 @@ test "failure guidance detectors match only their signatures" {
         shell_parse_retry_guidance,
         failureRetryGuidance(1, "zsh: parse error near '\\n'\n"),
     );
+    // Snapshot and terminal runs evaluate the command, so zsh reports `(eval)`
+    // and bash reports the sourced snapshot script followed by `eval:`.
+    try std.testing.expectEqual(
+        shell_parse_retry_guidance,
+        failureRetryGuidance(1, "(eval):1: unmatched \"\n"),
+    );
+    try std.testing.expectEqual(
+        shell_parse_retry_guidance,
+        failureRetryGuidance(1, "(eval):1: parse error near `)'\r\n"),
+    );
+    try std.testing.expectEqual(
+        shell_parse_retry_guidance,
+        failureRetryGuidance(1, "/dev/fd/0: eval: line 2: unexpected EOF while looking for matching `\"'\n/dev/fd/0: eval: line 3: syntax error: unexpected end of file\n"),
+    );
     try std.testing.expectEqual(
         usage_error_retry_guidance,
         failureRetryGuidance(2, "usage: grep [-abcdDEFGHhIiJLlMmnOopqRSsUVvwXxZz]\n"),
@@ -2530,6 +2547,9 @@ test "failure guidance detectors match only their signatures" {
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "main.c:4:5: error: expected ';' after expression (syntax error)\n"));
     // A non-shell token before the colon is not a shell prefix even when a shell name appears later.
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "error: bash: syntax error\n"));
+    // An eval source alone is not enough; the line must still name a parse error.
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "(eval):1: no such file or directory: missing\n"));
+    try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, "notes.txt: evaluation: syntax error\n"));
     // Ordinary failures keep null guidance.
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(2, "grep: /nonexistent: No such file or directory\n"));
     try std.testing.expectEqual(@as(?[]const u8, null), failureRetryGuidance(1, ""));
