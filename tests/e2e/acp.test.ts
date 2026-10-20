@@ -1154,6 +1154,39 @@ test("ACP finishes tool calls that a cancel stopped before they ran", async () =
   }
 }, 45000);
 
+test("ACP finishes a provider search the turn ended before it finished", async () => {
+  const root = createIsolatedRoot("fx-acp-open-search-");
+  // Every attempt starts a provider search, then the stream breaks off, so
+  // recovery gives up with the search announced and never finished.
+  const brokenSearch = () => new Response(
+    `data: ${JSON.stringify({ type: "tool-input-start", id: "search_open", toolName: "exa_search" })}\n\n`
+      + `data: ${JSON.stringify({ type: "tool-input-delta", id: "search_open", delta: "{\"query\":" })}\n\n`,
+    { headers: { "content-type": "text/event-stream" } },
+  );
+  const gateway = startFakeGateway(Array.from({ length: 12 }, brokenSearch));
+  let client: AcpClient | undefined;
+  try {
+    client = await AcpClient.create({ cwd: root.workspace, env: fakeGatewayEnv(root, gateway) });
+    await client.request("initialize", { protocolVersion: 1 }, 1);
+    const created = await client.request("session/new", { cwd: root.workspace, mcpServers: [] }, 2) as any;
+    if (created.error) throw new Error(JSON.stringify(created));
+    sendPrompt(client, 3, "Search the web.");
+    const { responses } = await readUntilResponses(client, [3]);
+    expect(responses.get(3)!.result.stopReason).toBe("refused");
+    const search = client.rawLines
+      .map(line => JSON.parse(line))
+      .filter((message: any) => message.method === "session/update" && message.params?.update?.toolCallId === "search_open")
+      .map((message: any) => message.params.update);
+    expect(search.map((update: any) => update.status)).toEqual(["pending", "failed"]);
+    expect(acpContentText(search[1].content)).toBe("Tool state preserved for recovery");
+    expect(client.stderr).toBe("");
+  } finally {
+    await client?.close();
+    gateway.stop();
+    rmSync(root.root, { recursive: true, force: true });
+  }
+}, 45000);
+
 function createIsolatedRoot(prefix: string) {
   const root = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
   const home = join(root, "home");
