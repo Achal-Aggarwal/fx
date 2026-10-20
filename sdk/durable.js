@@ -775,6 +775,10 @@ const gapless = (read) => read.listed === 0 || read.newest - read.lowest + 1 ===
 // from 1.
 const firstEventSlot = 1;
 
+// Whether a newest-first listing reached slot `floor`, or the checkpoint it
+// stopped at, which stands for every slot through its `through`. Pure.
+const listedDownTo = (read, floor) => read.lowest === floor || (read.through !== null && read.lowest <= read.through);
+
 /**
  * A run's log view extended by the entries listed after it, as a full read
  * returns the log: every entry after the newest checkpoint's `through`.
@@ -1180,10 +1184,9 @@ function createWorldBackend(world, durability) {
         // A listing that skipped a slot may show a later write before an
         // earlier one lands. The entries go back as they are, as every read
         // returned them before, but no view keeps the gap for later reads.
-        // The listing must also reach the checkpoint it stopped at or the
-        // run's first event, so no slot below what it listed is missing.
-        const reached = read.lowest === firstEventSlot || (read.through !== null && read.lowest <= read.through);
-        if (!read.missing && reached && gapless(read)) {
+        // The listing must also reach the run's first event or the checkpoint
+        // it stopped at, so no slot below what it listed is missing.
+        if (!read.missing && listedDownTo(read, firstEventSlot) && gapless(read)) {
           rememberView(runId, entries, read.newest, read.through ?? 0);
           covered = read.newest;
         } else {
@@ -1208,7 +1211,7 @@ function createWorldBackend(world, durability) {
           // view or a checkpoint that stands for what lies between; and a
           // checkpoint covering less than the view starts after is not one
           // the view can stand for. Otherwise read the log whole.
-          const reaches = since.listed === 0 || since.lowest === view.known + 1 || (since.through !== null && since.lowest <= since.through);
+          const reaches = since.listed === 0 || listedDownTo(since, view.known + 1);
           const next = reaches && gapless(since) ? extendLogView(view, since.events.reverse()) : null;
           if (!next) return fullRead();
           // The in-band count at the chain's head, as a full read notes it.

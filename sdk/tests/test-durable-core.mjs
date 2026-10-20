@@ -2341,7 +2341,32 @@ if (durabilityKind !== "memory") {
       assert.deepEqual(await log.read(), whole, "the entry is read once the World lists it");
       assert.ok(Number.isSafeInteger(log.newest()));
     }
-    for (const closing of [agent, other, late, bottom, fresh]) await closing.close();
+    // The lowest of the newer writes lists late: the newer listing does not
+    // reach the view, so the read is whole and keeps no view.
+    hidden.add(Number(await theirs.append({ k: "input", key: "cancel:cnl_low", type: "cancel", messageId: "cnl_low" })));
+    await theirs.append({ k: "input", key: "cancel:cnl_high", type: "cancel", messageId: "cnl_high" });
+    assert.ok(!ids(await ours.read()).includes("cnl_low"));
+    assert.equal(ours.newest(), null, "a newer listing that does not reach the view hands no worker its view");
+    hidden.clear();
+    assert.ok(ids(await ours.read()).includes("cnl_low"));
+    // A whole read that stops at a checkpoint keeps a view, but only when its
+    // listing reached that checkpoint's through.
+    const through = await theirs.append({ k: "input", key: "cancel:cnl_covered", type: "cancel", messageId: "cnl_covered" });
+    await theirs.append({ k: "input", key: "cancel:cnl_after", type: "cancel", messageId: "cnl_after" });
+    await theirs.append({ k: "checkpoint", through, data: "", pending: [], recent: [] });
+    for (let slot = 1; slot <= Number(through) + 1; slot += 1) hidden.add(slot);
+    const short = createAgent({ durability: await hiding() });
+    const shortLog = await internals(short).openLog(session.id);
+    assert.ok(!ids(await shortLog.read()).includes("cnl_after"));
+    assert.equal(shortLog.newest(), null, "a listing that ended above the checkpoint's through keeps no view");
+    hidden.clear();
+    const cold = createAgent({ durability: await hiding() });
+    const coldLog = await internals(cold).openLog(session.id);
+    const coldRead = await coldLog.read();
+    assert.deepEqual(coldRead.map(({ entry }) => entry.k), ["input", "checkpoint"]);
+    assert.ok(Number.isSafeInteger(coldLog.newest()), "a whole read that stopped at a checkpoint keeps a view");
+    assert.deepEqual(await shortLog.read(), coldRead);
+    for (const closing of [agent, other, late, bottom, fresh, short, cold]) await closing.close();
   });
 
   test("a write a log makes while its own read lists shows in its next read", async () => {
