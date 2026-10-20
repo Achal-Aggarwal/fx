@@ -264,6 +264,26 @@ fn append_immediate_steering_after_cancel(
     return true;
 }
 
+/// Continues the turn with steering that waited out a Stop hook which allowed
+/// the reply, such as steering submitted while a provider-executed tool's
+/// step still counted as running. The reply stays in the turn, and the next
+/// one runs the hook again, as after steering that cancelled the hook.
+fn continue_steering_after_stop(
+    deps: *const AgentRuntimeDeps,
+    arena: Allocator,
+    within_turn_suffix: *std.ArrayList(ChatMessage),
+    turn_id: u64,
+    origin: runtime_config.TurnOrigin,
+    stop_state: *CommonStopState,
+) !bool {
+    const action = try observe_steering_boundary(deps, arena, arena, within_turn_suffix, turn_id, origin, .finalizing);
+    if (action != .continued) return false;
+    stop_state.retained_candidate = null;
+    stop_state.latest_partial = null;
+    stop_state.dispatched = false;
+    return true;
+}
+
 fn reset_recovery_after_immediate_steering(
     latest_diagnostic: *?types.ModelFailureDiagnostic,
     strategy: *?model_response_recovery.Strategy,
@@ -9745,6 +9765,9 @@ fn processQueuedPromptLoop(
             stop_state.dispatched = true;
             switch (stop_outcome) {
                 .allow => {
+                    if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                        try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, config.origin, stop_state))
+                        continue :agent_steps_loop;
                     stop_state.terminal_materializing = true;
                     try finishCommonAssistantTerminal(
                         deps,
@@ -12546,6 +12569,17 @@ fn processQueuedPromptLoop(
                 },
             ) catch |err| switch (err) {
                 error.Cancelled => {
+                    if (try append_immediate_steering_after_cancel(
+                        deps,
+                        arena,
+                        &within_turn_suffix,
+                        turn_id,
+                        "",
+                    )) {
+                        stop_state.retained_candidate = null;
+                        stop_state.latest_partial = null;
+                        continue :agent_steps_loop;
+                    }
                     runtime_telemetry.traceCancelObserved(step_ctx, false);
                     try runtime_interruption.persistInterruptedTurnOnce(
                         deps,
@@ -12569,6 +12603,9 @@ fn processQueuedPromptLoop(
             stop_state.dispatched = true;
             switch (stop_outcome) {
                 .allow => {
+                    if (agent_steps.allowsStep(config.agent_step_limit, step + 1) and
+                        try continue_steering_after_stop(deps, arena, &within_turn_suffix, turn_id, config.origin, stop_state))
+                        continue :agent_steps_loop;
                     stop_state.terminal_materializing = true;
                     try finishCommonAssistantTerminal(
                         deps,
