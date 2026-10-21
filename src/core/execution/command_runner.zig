@@ -854,14 +854,20 @@ fn executeWithSnapshot(
         &snapshot_cfg.accepted_output_chunk_ctx,
         &snapshot_cfg.on_accepted_output_chunk,
     );
-    const result = try executeProcessWithScript(
+    const result = executeProcessWithScript(
         scratch,
         snapshot_cfg,
         invocation.argv(),
         cwd,
         script,
         &generation.environ,
-    );
+    ) catch |err| {
+        // A run that timed out or was cancelled still reports the output it
+        // produced, including any bytes held as a possible marker.
+        if (presented) |*filter| filter.finishOrLog();
+        if (accepted) |*filter| filter.finishOrLog();
+        return err;
+    };
     if (snapshotReplayFailed(result, failure_marker)) {
         // The replay stopped before the command started, so the command has
         // not run. Fail this snapshot and let the caller run it once with
@@ -874,11 +880,7 @@ fn executeWithSnapshot(
         owner.markReplayFailed(generation);
         return null;
     }
-    if (presented) |*filter| filter.finish() catch |err| debug_trace.logf(
-        "core",
-        "command output presentation suppressed err={s}",
-        .{@errorName(err)},
-    );
+    if (presented) |*filter| filter.finishOrLog();
     if (accepted) |*filter| try filter.finish();
     return try formatCollectedOutput(arena, command, cwd, result);
 }
@@ -941,6 +943,16 @@ const ReplayMarkerFilter = struct {
         const held_len = self.held_len;
         self.held_len = 0;
         try self.forward(self.held[0..held_len]);
+    }
+
+    /// `finish` for a path that cannot return the callback's error.
+    fn finishOrLog(self: *ReplayMarkerFilter) void {
+        const held_len = self.held_len;
+        self.finish() catch |err| debug_trace.logf(
+            "core",
+            "command output dropped {d} held stderr bytes err={s}",
+            .{ held_len, @errorName(err) },
+        );
     }
 
     /// Decides the held bytes against the start of `chunk`: forwards the ones
@@ -2517,6 +2529,45 @@ test "bash user profile command hides a failed replay from its output" {
     defer tmp.cleanup();
     const paths = try writeSnapshotTestShellFor(arena, &tmp, "bash", ".bash_profile", "");
     try expectFailedReplayHidden(arena, "echo done", paths);
+}
+
+test "timed-out user profile command keeps stderr that could begin the replay marker" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const paths = try writeSnapshotTestShell(arena, &tmp, "");
+    // Capture the snapshot first so the timeout covers only the command.
+    _ = try executeCommandInEnvironment(
+        .{ .max_command_output_bytes = 1024 },
+        arena,
+        "true",
+        paths.workspace,
+        .{ .user = paths.shell },
+    );
+
+    // The trailing `f` could begin the marker, so the filter holds it until
+    // the run ends, which here is a timeout.
+    var accepted: StreamCapture = .{ .alloc = arena };
+    try std.testing.expectError(error.TimeoutExpired, executeCommandInEnvironment(.{
+        .max_command_output_bytes = 1024,
+        .accepted_output_chunk_ctx = &accepted,
+        .on_accepted_output_chunk = StreamCapture.onChunk,
+        .timeout_ms = 1000,
+    }, arena, "printf 'waiting f' >&2; sleep 30", paths.workspace, .{ .user = paths.shell }));
+    var streamed: std.ArrayList(u8) = .empty;
+    for (accepted.streams.items, accepted.chunks.items) |stream, chunk| {
+        try std.testing.expectEqual(CommandOutputStream.stderr, stream);
+        try streamed.appendSlice(arena, chunk);
+    }
+    try std.testing.expectEqualStrings("waiting f", streamed.items);
 }
 
 test "replay marker filter drops the marker however chunks split it" {
