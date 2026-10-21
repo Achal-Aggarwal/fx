@@ -95,12 +95,19 @@ pub fn build(b: *std.Build) void {
     const session_manager_tests = b.addTest(.{ .root_module = session_manager });
 
     const run_session_manager_tests = b.addRunArtifact(session_manager_tests);
+    // And with its fault and trace hooks, whose tests fx's build leaves out.
+    const session_manager_hook_tests = b.addTest(.{
+        .root_module = sessionManagerModule(b, target, optimize, null, true),
+    });
+    const run_session_manager_hook_tests = b.addRunArtifact(session_manager_hook_tests);
     const session_manager_test_step = b.step("test-session-manager", "Run the session manager's tests");
     session_manager_test_step.dependOn(&run_session_manager_tests.step);
+    session_manager_test_step.dependOn(&run_session_manager_hook_tests.step);
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_session_manager_tests.step);
+    test_step.dependOn(&run_session_manager_hook_tests.step);
 
     if (wasm_surface != .none) {
         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
@@ -266,6 +273,7 @@ pub fn build(b: *std.Build) void {
     const run_approval_review_bench_tests = b.addRunArtifact(
         approval_review_bench_tests,
     );
+    test_step.dependOn(&run_approval_review_bench_tests.step);
     const test_approval_review_bench_step = b.step(
         "test-approval-review-benchmark",
         "Run file-diff approval review benchmark qualification tests",
@@ -453,8 +461,21 @@ fn addSessionManager(
     optimize: std.lang.Optimize,
     single_threaded: ?bool,
 ) *std.Build.Module {
+    const module = sessionManagerModule(b, target, optimize, single_threaded, false);
+    importer.addImport("session_manager", module);
+    return module;
+}
+
+/// `hooks` compiles in the fault and trace hooks, which only tests use.
+fn sessionManagerModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.lang.Optimize,
+    single_threaded: ?bool,
+    hooks: bool,
+) *std.Build.Module {
     const options = b.addOptions();
-    options.addOption(bool, "hooks", false);
+    options.addOption(bool, "hooks", hooks);
     options.addOptionPathUntracked("trace_dir", b.graph.path(.install_prefix, "session-manager-traces"));
     options.addOptionPathUntracked("src_dir", b.path("src/core/session_manager"));
     const module = b.createModule(.{
@@ -465,7 +486,6 @@ fn addSessionManager(
         .single_threaded = single_threaded,
     });
     module.addImport("build_options", options.createModule());
-    importer.addImport("session_manager", module);
     return module;
 }
 

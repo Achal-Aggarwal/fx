@@ -1139,6 +1139,15 @@ const LiveTerminalFixture = struct {
 
     /// Starts `command` in a clean bash and returns its owned session id.
     fn start(fixture: *LiveTerminalFixture, command: []const u8) ![]u8 {
+        return fixture.startInShell("/bin/bash", command);
+    }
+
+    /// Starts `command` in a clean `shell_path` and returns its owned session id.
+    fn startInShell(
+        fixture: *LiveTerminalFixture,
+        shell_path: []const u8,
+        command: []const u8,
+    ) ![]u8 {
         const alloc = std.testing.allocator;
         if (fixture.persistence) |*previous| previous.deinit();
         fixture.persistence = try operation.prepareStartPersistence(alloc, .{
@@ -1155,7 +1164,7 @@ const LiveTerminalFixture = struct {
         var started = try fixture.run(.{ .start = .{
             .cwd = fixture.home,
             .command = command,
-            .shell = .{ .executable = .{ .path = "/bin/bash", .clean_start = true } },
+            .shell = .{ .executable = .{ .path = shell_path, .clean_start = true } },
             .backend = .native,
             .return_when = .started,
             .wait_ceiling_ms = 15_000,
@@ -1373,6 +1382,42 @@ test "in-process registry starts writes to and stops a real terminal" {
         contracts.Lifecycle.closed,
         try fixture.recordedLifecycle(sleeper),
     );
+}
+
+test "zsh terminal commands keep words that start with = literal" {
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    var fixture: LiveTerminalFixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    const alloc = std.testing.allocator;
+
+    const session_id = try fixture.startInShell(
+        "/bin/zsh",
+        "echo before; echo ======; [ x == x ] && echo same; echo after",
+    );
+    defer alloc.free(session_id);
+    try std.testing.expectEqual(
+        contracts.ReturnOutcome{ .exited = 0 },
+        try fixture.waitForExit(session_id),
+    );
+
+    var read = try fixture.run(.{ .read = .{
+        .session_id = session_id,
+        .cursor = .{ .segment = 1, .offset = 0 },
+        .authority = fixture.claim(),
+    } });
+    defer read.deinit(alloc);
+    const output = switch (read.view()) {
+        .success => |success| switch (success) {
+            .read => |value| value.output,
+            else => return error.TestUnexpectedResult,
+        },
+        .failure => return error.TestUnexpectedResult,
+    };
+    try std.testing.expect(std.mem.find(u8, output, "======") != null);
+    try std.testing.expect(std.mem.find(u8, output, "same") != null);
+    try std.testing.expect(std.mem.find(u8, output, "after") != null);
 }
 
 test "closing owned terminals for exit leaves no orphan and records them ended" {

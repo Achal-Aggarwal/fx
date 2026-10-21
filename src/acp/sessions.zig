@@ -1859,7 +1859,8 @@ fn planToolCallFrame(
         // contract as the live path; only arguments are masked for display
         // (redactToolArgumentsJson).
         .content_text = if (result) |r| if (r.output.len > 0)
-            tool_call_presentation.toolUpdateContentText(r.status == .failure, r.output)
+            try tool_call_presentation.shellUpdateContentText(arena, call.name, r.output) orelse
+                tool_call_presentation.toolUpdateContentText(r.status == .failure, r.output)
         else
             null else null,
     };
