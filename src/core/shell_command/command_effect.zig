@@ -156,10 +156,11 @@ const reversible_git_fetch_flags = [_][]const u8{
     "-6",                       "--recurse-submodules", "--no-recurse-submodules",
 };
 
-/// Options that take a value, accepted only as `--name=value`.
+/// Options that take a value, accepted only as `--name=value`. `--filter`
+/// is left out: it turns a full clone into a partial clone for good.
 const reversible_git_fetch_value_options = [_][]const u8{
-    "--depth=", "--deepen=", "--shallow-since=",      "--shallow-exclude=",
-    "--jobs=",  "--filter=", "--recurse-submodules=",
+    "--depth=", "--deepen=",             "--shallow-since=", "--shallow-exclude=",
+    "--jobs=",  "--recurse-submodules=",
 };
 
 fn reversibleGitFetch(words: []const command_lex.ArgvToken) bool {
@@ -272,6 +273,8 @@ test "known reversible auto commands exclude destructive and hidden effects" {
         "git fetch --upl=x .",
         "git fetch origin --upload-pack=x",
         "git fetch '--upload-pack=x' .",
+        // A filter turns a full clone into a partial clone.
+        "git fetch --filter=blob:none origin",
     }) |command| {
         try std.testing.expect(!try knownReversibleAutoCommand(
             std.testing.allocator,
