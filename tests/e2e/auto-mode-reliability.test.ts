@@ -477,6 +477,49 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "routine commands with zsh extended glob words remain reviewer owned",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "npm-must-not-run");
+      const bin = installRecorder(root, "npm", marker);
+      const gateway = startGateway(
+        [
+          // With zsh's `extendedglob`, `^x` matches every file not named `x`
+          // and `x#` matches any run of `x`.
+          cleanCommandCall("npm test ^nomatch", "caret_glob"),
+          cleanCommandCall("npm install react@^18", "caret_in_word"),
+          cleanCommandCall("npm test x#", "hash_glob"),
+          (body) => {
+            expect(body).toContain("review_caution");
+            return fakeGatewayFinalText("glob words stayed reviewed");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "caret_glob_review"),
+          fakeGatewayPermissionDecision("caution", "caret_in_word_review"),
+          fakeGatewayPermissionDecision("caution", "hash_glob_review"),
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Run the tests."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(3);
+      expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "an exact read-only git status bypasses automatic review",
     async () => {
       const root = createIsolatedRoot();
