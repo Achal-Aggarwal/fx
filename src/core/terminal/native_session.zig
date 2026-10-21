@@ -1682,6 +1682,7 @@ const Session = struct {
         defer self.alloc.free(executable);
         const bootstrap = try shell_resolver.buildBootstrap(
             self.alloc,
+            shell_resolver.shellKind(invocation.path) orelse return error.UnsupportedShell,
             executable,
             control_path,
             &nonce,

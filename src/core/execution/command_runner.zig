@@ -832,7 +832,8 @@ fn executeWithSnapshot(
         &nonce,
     });
     const invocation = try shell_resolver.snapshotInvocation(scratch, generation.shell_path, failure_marker);
-    const script = try shell_resolver.snapshotScript(scratch, generation.replay, command);
+    const kind = shell_resolver.shellKind(generation.shell_path) orelse return error.UnsupportedShell;
+    const script = try shell_resolver.snapshotScript(scratch, kind, generation.replay, command);
     debug_trace.logf(
         "core",
         "command runner snapshot generation={d} shell={s} replay_bytes={d}",
@@ -2343,6 +2344,42 @@ test "user profile command reruns once with full startup after a failed replay" 
     var notice_buffer: [256]u8 = undefined;
     const notice = shell_snapshot.processOwner().takeUiNotice(&notice_buffer).?;
     try std.testing.expect(std.mem.find(u8, notice, "could not be restored") != null);
+}
+
+test "zsh commands keep words that start with = literal in every captured profile" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Startup files that turn the option on explicitly do not reach the command.
+    const paths = try writeSnapshotTestShell(
+        arena,
+        &tmp,
+        "print -r -- loaded >> \"$HOME/rc-loads.log\"\nsetopt equals\n",
+    );
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    const command = "echo before; echo ======; [ x == x ] && echo same; echo after";
+    const expected = "exit_code=0\n<stdout>\nbefore\n======\nsame\nafter\n</stdout>\n";
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+
+    const clean = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .clean = "/bin/zsh" });
+    try std.testing.expectEqualStrings(expected, clean.output);
+
+    const snapshot = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
+    try std.testing.expectEqualStrings(expected, snapshot.output);
+    try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
+
+    shell_snapshot.resetProcessOwnerForTest(brokenReplayCapture);
+    const full_startup = try executeCommandInEnvironment(config, arena, command, paths.workspace, .{ .user = paths.shell });
+    try std.testing.expectEqualStrings(expected, full_startup.output);
+    try std.testing.expectEqualStrings("loaded\nloaded\n", try readAbsoluteFile(arena, loads_path, 4096));
 }
 
 fn formatOutput(alloc: Allocator, command: []const u8, cwd: []const u8, term: std.process.Child.Term, stdout_raw: []const u8, stderr_raw: []const u8, duration_ms: ?u64) !command_contract.RunCommandResult {

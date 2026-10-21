@@ -189,10 +189,13 @@ fn promptExecutionFailure(err: anyerror) anyerror!TerminalOutcome {
     };
 }
 
-const ProviderTerminalPublication = enum {
-    not_applicable,
-    pending,
-    published,
+/// Where an announced tool-call card stands. A card is open until ACP sends
+/// its final update; a provider-executed search waits for its terminal
+/// lifecycle event instead of a tool result.
+const ToolCallCard = enum {
+    open,
+    awaiting_provider_terminal,
+    finished,
 };
 
 /// Pure final admission for every ACP model request. A persisted or
@@ -240,10 +243,10 @@ const AcpContext = struct {
     alloc: Allocator,
     state: *server.ServerState,
     session_id: []const u8,
-    /// Tool-call IDs already announced with a pending update. Keys are owned
-    /// copies of provider call ids so the ID stays stable from permission
-    /// review through execution.
-    published_tool_calls: std.StringHashMapUnmanaged(ProviderTerminalPublication) = .empty,
+    /// Tool-call IDs already announced with a pending update, and where each
+    /// card stands. Keys are owned copies of provider call ids so the ID
+    /// stays stable from permission review through execution.
+    published_tool_calls: std.StringHashMapUnmanaged(ToolCallCard) = .empty,
     message_id: acp_types.MessageIdBuffer = undefined,
     message_kind: ?AgentMessageKind = null,
     stop_reason: acp_types.StopReason = .end_turn,
@@ -378,7 +381,7 @@ const AcpContext = struct {
         try self.sendUpdate(out.writer.buffered());
         self.published_tool_calls.putAssumeCapacity(
             owned_id,
-            if (tool_presentation.isProviderSearchAlias(call.name)) .pending else .not_applicable,
+            if (tool_presentation.isProviderSearchAlias(call.name)) .awaiting_provider_terminal else .open,
         );
         return owned_id;
     }
@@ -389,8 +392,8 @@ const AcpContext = struct {
         outcome: types.ToolOutcome,
         result: ?[]const u8,
     ) !void {
-        const publication = self.published_tool_calls.getPtr(tool_call_id) orelse return;
-        if (publication.* != .pending) return;
+        const card = self.published_tool_calls.get(tool_call_id) orelse return;
+        if (card != .awaiting_provider_terminal) return;
         const status = providerTerminalStatus(outcome.kind) orelse return;
 
         const detail = if (self.state.cfg.minimal_kernel) result else null;
@@ -399,14 +402,29 @@ const AcpContext = struct {
             .failed => try self.sendToolCallErrorWithCommandResult(tool_call_id, detail orelse "Web search failed", null),
             .pending, .in_progress => unreachable,
         }
-        const updated = self.published_tool_calls.getPtr(tool_call_id) orelse
-            return error.ToolCallPublicationStateLost;
-        updated.* = .published;
     }
 
-    fn providerTerminalPublished(self: *const AcpContext, tool_call_id: []const u8) bool {
-        const publication = self.published_tool_calls.get(tool_call_id) orelse return false;
-        return publication == .published;
+    fn finalUpdateSent(self: *const AcpContext, tool_call_id: []const u8) bool {
+        const card = self.published_tool_calls.get(tool_call_id) orelse return false;
+        return card == .finished;
+    }
+
+    fn markCardFinished(self: *AcpContext, tool_call_id: []const u8) void {
+        if (self.published_tool_calls.getPtr(tool_call_id)) |card| card.* = .finished;
+    }
+
+    /// Sends a final failed update for every announced card that never got
+    /// one. A cancel can stop a step before some of its calls run, and a
+    /// failed or paused turn can end with a provider search still announced,
+    /// so the turn's end is the last point where the client can learn that.
+    fn finishOpenToolCalls(self: *AcpContext, text: []const u8) void {
+        var cards = self.published_tool_calls.iterator();
+        while (cards.next()) |entry| {
+            if (entry.value_ptr.* == .finished) continue;
+            self.sendToolCallError(entry.key_ptr.*, text) catch |err| {
+                debug_trace.logf("acp", "tool call card left open call_id={s} err={s}", .{ entry.key_ptr.*, @errorName(err) });
+            };
+        }
     }
 
     fn sendToolCallProgressText(self: *AcpContext, tool_call_id: []const u8, text: ?[]const u8) !void {
@@ -439,6 +457,7 @@ const AcpContext = struct {
         defer out.deinit();
         try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .completed, result_text, command_result_json);
         try self.sendUpdate(out.writer.buffered());
+        self.markCardFinished(tool_call_id);
     }
 
     fn sendToolCallError(self: *AcpContext, tool_call_id: []const u8, err_text: []const u8) !void {
@@ -450,6 +469,7 @@ const AcpContext = struct {
         defer out.deinit();
         try acp_types.writeToolCallUpdateWithCommandResult(&out.writer, tool_call_id, .failed, err_text, command_result_json);
         try self.sendUpdate(out.writer.buffered());
+        self.markCardFinished(tool_call_id);
     }
 
     fn toolContext(self: *AcpContext) tool_runtime.Context {
@@ -1933,13 +1953,13 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
         .publish_committed_file_handoff = publishCommittedFileHandoff,
         .publish_deferred_tool_completion = publishDeferredToolCompletion,
         .propagate_history_turn = propagateHistoryTurn,
-        .image_blob_dir = if (session.v2) |v2| v2.blobsPath() else null,
         .append_turn_piece = if (session.v2 != null)
             appendTurnPiece
         else if (session.journal != null)
             appendJournalToolIntent
         else
             null,
+        .save_prompt_images = if (session.v2 != null) savePromptImages else null,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = if (session.journal != null)
             .{
@@ -2223,6 +2243,31 @@ fn finalizeTurn(raw_ctx: *anyopaque, turn_id: u64, outcome: types.TurnPresentati
     } else if (outcome == .failed or outcome == .paused) {
         ctx.stop_reason = .refused;
     }
+    // The core reports no more tool events once a turn finishes, so close
+    // what it left open, as the terminal transcript does at the same point.
+    const cancel_requested = if (ctx.state.active_session) |*session| session.cancel_flag.load(.seq_cst) else false;
+    ctx.finishOpenToolCalls(unfinishedToolCallText(outcome, cancel_requested));
+}
+
+/// The text of the final update for a tool call a finished turn left open.
+/// It matches the terminal transcript's wording for the same outcome. A
+/// requested cancel reads as one even when the turn ends as failed.
+fn unfinishedToolCallText(outcome: types.TurnPresentationOutcome, cancel_requested: bool) []const u8 {
+    if (cancel_requested) return "Cancelled";
+    return switch (outcome) {
+        .completed => "Tool completion was not reported",
+        .interrupted => "Cancelled",
+        .failed => "Tool failed",
+        .paused => "Tool state preserved for recovery",
+    };
+}
+
+test "a tool call a finished turn left open reads as the turn's outcome" {
+    try std.testing.expectEqualStrings("Tool completion was not reported", unfinishedToolCallText(.completed, false));
+    try std.testing.expectEqualStrings("Cancelled", unfinishedToolCallText(.interrupted, false));
+    try std.testing.expectEqualStrings("Tool failed", unfinishedToolCallText(.failed, false));
+    try std.testing.expectEqualStrings("Tool state preserved for recovery", unfinishedToolCallText(.paused, false));
+    try std.testing.expectEqualStrings("Cancelled", unfinishedToolCallText(.failed, true));
 }
 
 fn appendRuntimeContext(raw_ctx: *anyopaque, arena: Allocator, messages: *std.ArrayList(ChatMessage)) !void {
@@ -2606,20 +2651,13 @@ fn completeToolCallTransport(
     result: ToolExecutionResult,
 ) ToolExecutionResult {
     recordJournalToolResult(ctx, call, result);
-    var notice_text: ?[]u8 = null;
-    defer if (notice_text) |text| ctx.alloc.free(text);
-    const output_text = blk: {
-        const preview = toolUpdateContentText(result);
-        if (!std.mem.eql(u8, call.name, "shell")) break :blk preview;
-        // The preview is clipped, so a snapshot fallback notice is shown on
-        // its own line beside the command it affected.
-        var buffer: [512]u8 = undefined;
-        const notice = tool_call_presentation.shellResultNotice(result.model_output, &buffer) orelse
-            break :blk preview;
-        notice_text = ctx.alloc.print("{s}\n{s}", .{ notice, preview }) catch
-            break :blk preview;
-        break :blk notice_text.?;
-    };
+    const shell_text = tool_call_presentation.shellUpdateContentText(
+        ctx.alloc,
+        call.name,
+        result.model_output,
+    ) catch null;
+    defer if (shell_text) |text| ctx.alloc.free(text);
+    const output_text = shell_text orelse toolUpdateContentText(result);
     if (result.status == .failure) {
         ctx.sendToolCallErrorWithCommandResult(
             acp_id,
@@ -2714,11 +2752,12 @@ fn recordToolCallRejected(
     command_result_json: ?[]const u8,
 ) !void {
     const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
-    // A call named like a provider search gets its final update from the
-    // terminal lifecycle event, under the id it streamed with.
-    if (ctx.providerTerminalPublished(call.id)) return;
+    // A card gets one final update. A call named like a provider search is
+    // finished from the terminal lifecycle event, under the id it streamed
+    // with, before this hook runs.
+    if (ctx.finalUpdateSent(call.id)) return;
     if (call.provisional_id) |provisional_id| {
-        if (ctx.providerTerminalPublished(provisional_id)) return;
+        if (ctx.finalUpdateSent(provisional_id)) return;
     }
     const acp_id = ctx.sendToolCallPending(arena, call) catch "call_unknown";
     ctx.sendToolCallErrorWithCommandResult(
@@ -2778,6 +2817,21 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     const v2 = session.v2 orelse return;
     v2.appendProgress(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }) catch |err| {
         debug_trace.logf("session", "event=sessions_v2_stream_failed session={s} err={s} deferred=commit", .{ v2.id(), @errorName(err) });
+    };
+}
+
+/// `AgentRuntimeDeps.save_prompt_images` on v2: the prompt's images become
+/// the session's blobs before its first request (D89). A failure leaves the
+/// rest inline, with no path, as the adapter does for one image the store
+/// refuses.
+fn savePromptImages(raw_ctx: *anyopaque, alloc: std.mem.Allocator, images: []types.ImageAttachment) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = session.v2 orelse return;
+    v2.savePromptImages(alloc, images) catch |err| {
+        debug_trace.logf("session", "event=sessions_v2_prompt_images_inline session={s} err={s}", .{ v2.id(), @errorName(err) });
     };
 }
 
@@ -5029,6 +5083,65 @@ test "ACP rejection of a finished provider search sends no second card or update
         try std.testing.expect(std.mem.find(u8, line, "exa_search") == null);
     }
     try std.testing.expectEqual(@as(usize, 2), updates);
+}
+
+test "ACP finishes each open tool-call card once when a turn is cancelled" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var capture = try tmp.dir.createFile(io_mod.getIo(), "acp-cancelled-cards.jsonl", .{ .read = true });
+    defer capture.close(io_mod.getIo());
+    var state = try initTestAcpState(alloc, "/tmp/workspace", .ask);
+    defer state.deinit();
+    state.writer = .{ .stdout = capture };
+    var ctx = AcpContext{
+        .alloc = alloc,
+        .state = &state,
+        .session_id = "session_1",
+    };
+    defer ctx.deinitPublishedToolCalls();
+
+    for ([_][]const u8{ "ran", "skipped" }) |call_id| {
+        try pushToolLifecycle(&ctx, .{ .authoritative_started = .{
+            .id = .{ .turn_id = 1, .call_id = call_id },
+            .reconciles_provisional_call_id = null,
+            .tool_name = "read_file",
+            .activity_kind = .read,
+            .arguments_json = "{\"path\":\"README.md\"}",
+        } });
+    }
+    try ctx.sendToolCallCompletedWithCommandResult("ran", "read", null);
+    ctx.finishOpenToolCalls("Cancelled");
+    ctx.finishOpenToolCalls("Cancelled");
+    try capture.sync(io_mod.getIo());
+
+    var captured_file = try tmp.dir.openFile(io_mod.getIo(), "acp-cancelled-cards.jsonl", .{});
+    defer captured_file.close(io_mod.getIo());
+    const captured = try io_mod.readFileToEnd(alloc, &captured_file, 64 * 1024);
+    var lines = std.mem.splitScalar(u8, captured, '\n');
+    var finals: [2]usize = .{ 0, 0 };
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
+        const update = parsed.value.object.get("params").?.object.get("update").?.object;
+        if (!std.mem.eql(u8, update.get("sessionUpdate").?.string, "tool_call_update")) continue;
+        const status = update.get("status").?.string;
+        if (std.mem.eql(u8, update.get("toolCallId").?.string, "ran")) {
+            try std.testing.expectEqualStrings("completed", status);
+            finals[0] += 1;
+        } else {
+            try std.testing.expectEqualStrings("failed", status);
+            try std.testing.expectEqualStrings(
+                "Cancelled",
+                update.get("content").?.array.items[0].object.get("content").?.object.get("text").?.string,
+            );
+            finals[1] += 1;
+        }
+    }
+    try std.testing.expectEqual([2]usize{ 1, 1 }, finals);
 }
 
 test "ACP propagateGrant stores deduped runtime session grants" {

@@ -5113,6 +5113,9 @@ test {
     _ = @import("core/tooling/tool_dispatch.zig");
     _ = @import("core/tooling/tool_set.zig");
     _ = @import("core/hosts/js_host_workspace.zig");
+    _ = @import("core/hosts/js_host_clipboard.zig");
+    _ = @import("core/hosts/js_host_url_opener.zig");
+    _ = @import("core/hosts/browser_capabilities.zig");
     _ = @import("core/tooling/tool_args.zig");
     _ = @import("core/tooling/tool_result_errors.zig");
     _ = @import("core/tooling/tool_runtime.zig");

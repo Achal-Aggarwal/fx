@@ -60,7 +60,7 @@ export type FxModelChoice =
     ultrafast?: never;
   }
   | {
-    /** The model ID. Defaults to fx's built-in model. */
+    /** The model ID. On AI Gateway it defaults to fx's built-in model; Codex, Grok, and custom providers need one. */
     model?: string | undefined;
     /** @deprecated Use `model: { id, effort }`. */
     effort?: FxEffort;
@@ -704,6 +704,8 @@ export type FxEngineOptions = FxSharedOptions<FxEngineEvent> & FxModelChoice & F
   | ((FxCodexProvider | FxGrokProvider | FxCustomProvider) & {
     /** The AI Gateway credential, unused by this provider's turns. */
     apiKey?: string | undefined;
+    /** The provider's own model. Required: fx's built-in model is an AI Gateway id. */
+    model: string | FxModelOptions;
   })
 ) & {
   /** The id for AI Gateway session affinity: 1 to 255 letters, digits, `.`, `_`, or `-`. Give a restored session the id it had before. */
