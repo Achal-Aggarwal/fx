@@ -9973,6 +9973,100 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   });
 
+  test("a restarted reply refused as too long compacts and finishes the turn", async () => {
+    const root = createFixtureRoot("restarted-reply-overflow");
+    const tracePath = join(root.root, "trace.log");
+    writeFileSync(join(root.workspace, "seed-notes.txt"), "RESTARTED_OVERFLOW_SEED_NOTES\n");
+    let phase: "seed" | "attempt" = "seed";
+    let attempt = 0;
+    const gateway = startDynamicFakeGateway((raw) => {
+      const body = JSON.parse(raw);
+      if (body.toolChoice?.type === "none" && body.tools?.length === 0) {
+        return fakeGatewayFinalText("Facts:\nF1: RESTARTED_OVERFLOW_SUMMARY: the earlier turn read seed-notes.txt.");
+      }
+      if (phase === "seed") {
+        // The earlier turn reads a file, which leaves work to compact.
+        return raw.includes('"seed-read"')
+          ? fakeGatewayFinalText("SEED_DONE")
+          : fakeGatewayToolCall("seed-read", "read_file", { path: "seed-notes.txt" });
+      }
+      attempt += 1;
+      // The reply is cut off before its finish, so fx restarts it.
+      if (attempt === 1) return sse('data: {"type":"text-delta","id":"answer","delta":"visible partial text"}\n\n');
+      // The provider refuses the restart for its size, before any output.
+      if (attempt === 2) {
+        return Response.json({ error: {
+          type: "invalid_request_error",
+          code: "context_length_exceeded",
+          message: "This model's maximum context length is 128000 tokens. The request exceeds the context window.",
+        } }, { status: 400 });
+      }
+      return fakeGatewayFinalText("RESTARTED_OVERFLOW_RECOVERED");
+    }, {
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"], context_window: 128_000, max_tokens: 8192 }],
+    });
+    try {
+      const seed = await runFx(["ask", "--json", "--auto", "Read seed-notes.txt and reply."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, tracePath),
+        timeoutMs: 15_000,
+      });
+      expect(seed.code).toBe(0);
+      const sessionId = parseAskJson(seed.stdout).session_id;
+      const seedRequests = gateway.requests.length;
+      phase = "attempt";
+
+      const result = await runFx(["ask", "--json", "--auto", "--resume-id", sessionId, "Continue."], {
+        cwd: root.workspace,
+        env: { ...fixtureEnv(root, gateway, tracePath), FX_TRACE_SCOPES: "agent,core,gateway,stream,context_compaction" },
+        timeoutMs: 15_000,
+      });
+      const json = parseAskJson(result.stdout);
+
+      expect(result.stderr).toContain("Response interrupted. Restarting.");
+      expect(result.stderr).not.toContain("HTTP 400");
+      expect(result.code).toBe(0);
+      expect(json.exit_code).toBe(0);
+      expect(json.error).toBeUndefined();
+      expect(json.output).toBe("RESTARTED_OVERFLOW_RECOVERED");
+
+      // The cut-off reply, its refused restart, the compaction's summary
+      // requests, and the restart sent again over the compacted conversation.
+      const requests = gateway.requests.slice(seedRequests).map((request) => request.body);
+      const restart = "Restart that response from the beginning";
+      const isSummary = (raw: string) => {
+        const body = JSON.parse(raw);
+        return body.toolChoice?.type === "none" && body.tools?.length === 0;
+      };
+      expect(requests.length).toBeGreaterThanOrEqual(4);
+      expect(promptText(requests[0]!)).not.toContain(restart);
+      expect(promptText(requests[1]!)).toContain(restart);
+      expect(requests[1]).not.toContain("compacted_conversation");
+      const summaries = requests.slice(2, -1);
+      expect(summaries.every(isSummary)).toBe(true);
+      expect(summaries[0]).toContain("seed-notes.txt");
+      const retry = requests.at(-1)!;
+      expect(isSummary(retry)).toBe(false);
+      expect(promptText(retry)).toContain(restart);
+      expect(retry).toContain("compacted_conversation");
+      expect(retry).toContain("RESTARTED_OVERFLOW_SUMMARY");
+      expect(retry).not.toContain("RESTARTED_OVERFLOW_SEED_NOTES");
+
+      // The session keeps the compaction and the finished reply.
+      const saved = await savedSession(root.home, sessionId);
+      expect(saved.history.some((turn) => turn.kind === "compacted_summary")).toBe(true);
+      expect(saved.history.at(-1)).toEqual(expect.objectContaining({
+        kind: "assistant",
+        user: expect.objectContaining({ text: "Continue." }),
+        assistant: "RESTARTED_OVERFLOW_RECOVERED",
+      }));
+      expect(readFileSync(tracePath, "utf8")).toContain("provider_overflow_recovery");
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  });
+
   test("post-tool provider retry keeps instructions leading", async () => {
     const root = createFixtureRoot("post-tool-retry-order");
     const tracePath = join(root.root, "trace.log");

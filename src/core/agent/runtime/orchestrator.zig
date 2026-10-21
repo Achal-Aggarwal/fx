@@ -3466,9 +3466,10 @@ fn streamReplaySafe(
 }
 
 /// Whether the current attempt has shown no output. A provider refuses a
-/// request for its size before any output, so a reply an earlier attempt
-/// streamed, such as one restored when a turn resumes, does not make sending
-/// it again with fewer images unsafe.
+/// request for its size or its context before any output, so a reply an
+/// earlier attempt streamed, such as one restarted or restored when a turn
+/// resumes, does not make sending it again with fewer images or a compacted
+/// conversation unsafe.
 fn attemptReplaySafe(
     stream_ctx: *const runtime_assistant_stream.StreamChunkContext,
 ) bool {
@@ -8414,7 +8415,7 @@ fn processQueuedPromptLoop(
                 if (shouldRecoverContextOverflow(
                     failure,
                     has_compactable_context,
-                    streamReplaySafe(&stream_ctx),
+                    attemptReplaySafe(&stream_ctx),
                     context_overflow_recovery == .ready,
                     config.cancel_flag.load(.seq_cst),
                 )) {
