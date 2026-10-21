@@ -206,8 +206,8 @@ pub const Catalog = struct {
         return result;
     }
 
-    /// `page` saying why each searched server whose list failed or needs a
-    /// login was skipped, in the words `whyUnavailableLocked` uses.
+    /// `page` saying why each searched server whose list failed, needs a
+    /// login, or is held was skipped.
     fn withUnavailableLocked(c: *Catalog, alloc: Allocator, page: []u8) ![]u8 {
         var reasons: std.ArrayList([]const u8) = .empty;
         defer {
@@ -215,13 +215,8 @@ pub const Catalog = struct {
             reasons.deinit(alloc);
         }
         for (c.runtime.servers(), c.lists) |s, l| {
-            if (s.held != null) continue;
             try reasons.ensureUnusedCapacity(alloc, 1);
-            reasons.appendAssumeCapacity(switch (l.state) {
-                .needs_login => try needsLoginText(alloc, s.name, signIn(c.runtime.options.slash_commands, s.source)),
-                .failed => try alloc.print("MCP server '{s}' is unavailable: {s}", .{ s.name, l.failure orelse "it did not start" }),
-                .unknown, .loaded => continue,
-            });
+            reasons.appendAssumeCapacity(try c.unavailableText(alloc, s, l) orelse continue);
         }
         if (reasons.items.len == 0) return page;
         return tool_search.withUnavailable(alloc, page, reasons.items);
@@ -623,21 +618,28 @@ pub const Catalog = struct {
         return out.items;
     }
 
+    /// Why server `s` offers the model no tools now, in the words both a
+    /// search that finds nothing and a tool that can't be selected use;
+    /// null when nothing keeps its tools from the model.
+    fn unavailableText(c: *Catalog, alloc: Allocator, s: config.Server, l: List) !?[]u8 {
+        return switch (l.state) {
+            .needs_login => try needsLoginText(alloc, s.name, signIn(c.runtime.options.slash_commands, s.source)),
+            .failed => try alloc.print("MCP server '{s}' is unavailable: {s}", .{ s.name, l.failure orelse "it did not start" }),
+            else => if (s.held == .missing_env)
+                try alloc.print("MCP server '{s}' needs {s} set before fx starts.", .{ s.name, s.missing orelse "a variable" })
+            else if (s.held == .invalid_env)
+                try alloc.print("MCP server '{s}' can't use {s}: its value holds a line break or another character a header can't carry. Fix it, then restart fx.", .{ s.name, s.missing orelse "a variable" })
+            else
+                null,
+        };
+    }
+
     /// Why `name` can't be selected when its server's list didn't load, so
     /// the model hears more than "not found".
     fn whyUnavailableLocked(c: *Catalog, alloc: Allocator, name: []const u8) !?tool_mcp_runtime.ToolSchemaResult {
         for (c.runtime.servers(), c.lists) |s, l| {
             if (!tool_names.matchesServer(name, s.name)) continue;
-            const text = switch (l.state) {
-                .needs_login => try needsLoginText(alloc, s.name, signIn(c.runtime.options.slash_commands, s.source)),
-                .failed => try alloc.print("MCP server '{s}' is unavailable: {s}", .{ s.name, l.failure orelse "it did not start" }),
-                else => if (s.held == .missing_env)
-                    try alloc.print("MCP server '{s}' needs {s} set before fx starts.", .{ s.name, s.missing orelse "a variable" })
-                else if (s.held == .invalid_env)
-                    try alloc.print("MCP server '{s}' can't use {s}: its value holds a line break or another character a header can't carry. Fix it, then restart fx.", .{ s.name, s.missing orelse "a variable" })
-                else
-                    continue,
-            };
+            const text = try c.unavailableText(alloc, s, l) orelse continue;
             return .{ .rejected = .{ .model_output = text } };
         }
         return null;
@@ -973,6 +975,10 @@ test "a search says why a server it names has no tools, and calls that end say h
         "{\"tools\":[],\"count\":0,\"authentication_required\":{\"server\":\"keyed\",\"interactive\":false,\"environment\":\"FX_MCP_HOST_TEST_UNSET\",\"message\":\"Set this environment variable before starting fx.\"}}",
         keyed.model_output,
     );
+    // A search that names no server and finds nothing says why each server
+    // has no tools, one held on a missing variable too.
+    const open = try c.searchTools(a, .{ .query = &query, .kind = .mcp }, .{}, .{}, .unrestricted, null);
+    try testing.expect(std.mem.find(u8, open.model_output, "MCP server 'keyed' needs FX_MCP_HOST_TEST_UNSET set before fx starts.") != null);
     const missing = try c.searchTools(a, .{ .query = &query, .kind = .mcp, .server = "nope" }, .{}, .{}, .unrestricted, null);
     try testing.expect(std.mem.find(u8, missing.model_output, "\"state\":\"server_not_found\"") != null);
 
