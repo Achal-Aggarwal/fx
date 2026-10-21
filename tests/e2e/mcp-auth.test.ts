@@ -1579,6 +1579,24 @@ describe("MCP login", () => {
     expect(auth.tokenExchanges).toBe(1);
   }, 60_000);
 
+  test.skipIf(!tmuxAvailable())("a login another fx process saved that the server can't use isn't announced, and the server still needs one", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    const env = v2Env(root);
+    tui = await TmuxSession.create({ isolated: true, cwd: root.workspace, width: 120, height: 40, env });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp show fixture");
+    await tui.waitForText(/status +needs login/, 15_000);
+    // Another fx saves a login whose token would break its header.
+    seedV2Credential(root, auth, { access: "at\r\n1" });
+    await tui.waitForComposer(5_000);
+    await tui.sendText("/mcp show fixture");
+    const pane = await tui.waitForText(/status +needs login[\s\S]*status +needs login/, 15_000);
+    expect(pane).not.toContain("Signed in to fixture.");
+    expect(auth.tokenExchanges).toBe(0);
+  }, 60_000);
+
   test.skipIf(!tmuxAvailable())("a login another fx process made before the shell first used the server is used at once", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);

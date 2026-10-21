@@ -350,7 +350,7 @@ pub const Server = struct {
             .http => |h| {
                 try r.client.init(io, gpa, h);
                 r.auth = .init(io, gpa, &r.client, h.url, options.auth, trace.on(options.trace));
-                if (options.auth.saved) |saved| try r.auth.restore(saved);
+                if (options.auth.saved) |saved| _ = try r.auth.restore(saved);
             },
             .stdio => |o| {
                 var po = o;
@@ -601,10 +601,13 @@ pub const Server = struct {
 
     /// Takes a credential `saveCredential` wrote, as a sign-in would: what
     /// waits for one goes out with it (another host process signed in).
-    pub fn useCredential(r: *Server, saved: []const u8) Error!void {
+    /// False when it can't be used, as `Auth.restore` says, and nothing
+    /// changes.
+    pub fn useCredential(r: *Server, saved: []const u8) Error!bool {
         if (r.stdio) return error.NotReady;
-        try r.auth.restore(saved);
+        if (!try r.auth.restore(saved)) return false;
         try r.runAuth(null);
+        return true;
     }
 
     /// Sends the refresh `refresh_due` announced.

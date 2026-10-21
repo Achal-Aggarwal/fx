@@ -445,25 +445,26 @@ pub const Auth = struct {
     /// Takes back a credential `save` wrote: its tokens are held again, so
     /// requests carry them and a refresh can renew them. One that can't be
     /// read, whose access token isn't valid, or whose endpoints
-    /// discovery may not reach for this server, is ignored.
-    pub fn restore(a: *Auth, saved: []const u8) Error!void {
+    /// discovery may not reach for this server, is ignored: false, and the
+    /// credential in use stays.
+    pub fn restore(a: *Auth, saved: []const u8) Error!bool {
         const names = [_][]const u8{ "access", "refresh", "expires_at_ms", "skew_ms", "token_endpoint", "revocation_endpoint", "resource", "client_id", "client_secret", "method", "scope", "step_up" };
         var raw: [names.len]?[]const u8 = undefined;
-        wire.objectFields(saved, &names, &raw) catch return;
+        wire.objectFields(saved, &names, &raw) catch return false;
         // Checked before the credential in use is replaced, so an ignored one
         // leaves it whole.
         var scratch: std.heap.ArenaAllocator = .init(a.gpa);
         defer scratch.deinit();
         var text: [names.len]?[]const u8 = undefined;
         for (raw, &text) |r, *t| t.* = if (r) |v| try wire.decodeString(scratch.allocator(), v) else null;
-        const access = text[0] orelse return;
-        if (!oauth.validToken(access)) return;
-        const method = std.meta.stringToEnum(oauth.Method, text[9] orelse return) orelse return;
-        const token_endpoint = text[4] orelse return;
-        if (!discovery.fetchable(token_endpoint, a.server_url)) return;
-        if (text[5]) |revocation| if (!discovery.fetchable(revocation, a.server_url)) return;
-        const resource = text[6] orelse return;
-        const client_id = text[7] orelse return;
+        const access = text[0] orelse return false;
+        if (!oauth.validToken(access)) return false;
+        const method = std.meta.stringToEnum(oauth.Method, text[9] orelse return false) orelse return false;
+        const token_endpoint = text[4] orelse return false;
+        if (!discovery.fetchable(token_endpoint, a.server_url)) return false;
+        if (text[5]) |revocation| if (!discovery.fetchable(revocation, a.server_url)) return false;
+        const resource = text[6] orelse return false;
+        const client_id = text[7] orelse return false;
         _ = a.cred_arena.reset(.retain_capacity);
         const ca = a.cred_arena.allocator();
         a.cred = .{
@@ -480,6 +481,7 @@ pub const Auth = struct {
         a.flow.granted = if (raw[10]) |v| try a.scopes.ofArray(a.keep.allocator(), v) else 0;
         a.flow.challenge = if (raw[11]) |v| try a.scopes.ofArray(a.keep.allocator(), v) else 0;
         try a.stepGate(.{ .signed_in = .{ .refreshable = a.refresh_token != null } });
+        return true;
     }
 
     fn stepFlow(a: *Auth, event: core.FlowEvent) Error!void {
@@ -845,17 +847,17 @@ test "a saved credential comes back whole: requests carry its token, and it save
     defer out.deinit();
     try testing.expect(!try a.save(&out.writer));
     // Unreadable or incomplete: ignored.
-    try a.restore("not json");
-    try a.restore("{\"access\":\"at\"}");
+    try std.testing.expect(!try a.restore("not json"));
+    try std.testing.expect(!try a.restore("{\"access\":\"at\"}"));
     try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
     const fields = ",\"expires_at_ms\":4102444800000,\"skew_ms\":30000,\"token_endpoint\":\"https://as/token\",\"revocation_endpoint\":\"https://as/revoke\"," ++
         "\"resource\":\"http://127.0.0.1:9/mcp\",\"client_id\":\"c1\",\"client_secret\":null,\"method\":\"none\"}";
     // Whole, but with a token that would break its header: ignored too.
-    try a.restore("{\"access\":\"at\\r\\n1\",\"refresh\":\"rt\"" ++ fields);
+    try std.testing.expect(!try a.restore("{\"access\":\"at\\r\\n1\",\"refresh\":\"rt\"" ++ fields));
     try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
     try testing.expect(!try a.save(&out.writer));
     // A JSON escape in the token is read as what it stands for.
-    try a.restore("{\"access\":\"at\\/1\",\"refresh\":\"rt\"" ++ fields);
+    try std.testing.expect(try a.restore("{\"access\":\"at\\/1\",\"refresh\":\"rt\"" ++ fields));
     try testing.expectEqualStrings("Bearer at/1", a.authorization(a.gate.gen).?);
     try testing.expect(a.gate.refreshable);
     try testing.expect(try a.save(&out.writer));
@@ -864,7 +866,7 @@ test "a saved credential comes back whole: requests carry its token, and it save
     // The scopes granted and those a step-up owes come back in the flow,
     // for the next sign-in, and are saved again.
     const scoped = "{\"access\":\"at2\",\"refresh\":\"rt\"" ++ fields[0 .. fields.len - 1] ++ ",\"scope\":[\"a\",\"b\"],\"step_up\":[\"c\"]}";
-    try a.restore(scoped);
+    try std.testing.expect(try a.restore(scoped));
     try testing.expectEqual(try a.scopeBits("a b"), a.flow.granted);
     try testing.expectEqual(try a.scopeBits("c"), a.flow.challenge);
     out.clearRetainingCapacity();
@@ -884,7 +886,7 @@ test "a refresh the host decides waits for it, and ends however it does: replace
     var buffer: [512]u8 = undefined;
     const actions = &a.actions.items;
     for ([_]enum { replaced, signed_out, answered, refused, refused_200, failed_200, failed_429 }{ .replaced, .signed_out, .answered, .refused, .refused_200, .failed_200, .failed_429 }) |case| {
-        try a.restore(try std.mem.print(&buffer, saved, .{"at1"}));
+        try std.testing.expect(try a.restore(try std.mem.print(&buffer, saved, .{"at1"})));
         try a.beforeSend(1);
         a.actions.clearRetainingCapacity();
         // The server rejects the token: the refresh waits, and nothing goes out.
@@ -897,7 +899,7 @@ test "a refresh the host decides waits for it, and ends however it does: replace
             // Another process saved a newer one: the request goes again
             // with it, and the refresh is over.
             .replaced => {
-                try a.restore(try std.mem.print(&buffer, saved, .{"at2"}));
+                try std.testing.expect(try a.restore(try std.mem.print(&buffer, saved, .{"at2"})));
                 try testing.expectEqual(@as(usize, 2), actions.len);
                 try testing.expect(actions.*[0] == .post and actions.*[0].post.key == 1);
                 try testing.expect(actions.*[1] == .refresh_ended);
@@ -1002,7 +1004,7 @@ test "a step-up is saved with the login, so a sign-in in a new process asks for 
     defer a.deinit();
     const login = "{\"access\":\"at\",\"refresh\":\"rt\",\"expires_at_ms\":4102444800000,\"skew_ms\":30000,\"token_endpoint\":\"https://as/token\"," ++
         "\"revocation_endpoint\":null,\"resource\":\"http://127.0.0.1:9/mcp\",\"client_id\":\"c1\",\"client_secret\":null,\"method\":\"none\",\"scope\":[\"a\"],\"step_up\":[]}";
-    try a.restore(login);
+    try std.testing.expect(try a.restore(login));
     try a.beforeSend(1);
     a.actions.clearRetainingCapacity();
     _ = try a.ended(1, .{ .rejected = .{ .status = 403, .challenge = "Bearer error=\"insufficient_scope\", scope=\"b\"" } });
@@ -1015,7 +1017,7 @@ test "a step-up is saved with the login, so a sign-in in a new process asks for 
 
     var b: Auth = .init(testing.io, testing.allocator, &client, "http://127.0.0.1:9/mcp", .{}, null);
     defer b.deinit();
-    try b.restore(out.written());
+    try std.testing.expect(try b.restore(out.written()));
     try testing.expectEqual(try b.scopeBits("a"), b.flow.granted);
     try testing.expectEqual(try b.scopeBits("b"), b.flow.challenge);
     var step: core.FlowOutput = .{};
@@ -1039,13 +1041,13 @@ test "a saved credential whose endpoints discovery may not reach is ignored" {
         .{ "http://auth.example.com/token", "null" },
         .{ "https://auth.example.com/token", "\"https://169.254.169.254/revoke\"" },
     }) |case| {
-        try a.restore(try std.mem.print(&buffer, saved, .{ case[0], case[1] }));
+        try std.testing.expect(!try a.restore(try std.mem.print(&buffer, saved, .{ case[0], case[1] })));
         try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
     }
-    try a.restore(try std.mem.print(&buffer, saved, .{ "https://auth.example.com/token", "\"https://auth.example.com/revoke\"" }));
+    try std.testing.expect(try a.restore(try std.mem.print(&buffer, saved, .{ "https://auth.example.com/token", "\"https://auth.example.com/revoke\"" })));
     try testing.expectEqualStrings("Bearer at", a.authorization(a.gate.gen).?);
     // An ignored one after it leaves it whole, its endpoints included.
-    try a.restore(try std.mem.print(&buffer, saved, .{ "https://0.0.0.0:1/tokenxxxxxx", "null" }));
+    try std.testing.expect(!try a.restore(try std.mem.print(&buffer, saved, .{ "https://0.0.0.0:1/tokenxxxxxx", "null" })));
     try testing.expectEqualStrings("Bearer at", a.authorization(a.gate.gen).?);
     try testing.expectEqualStrings("https://auth.example.com/token", a.cred.?.token_endpoint);
     try testing.expectEqualStrings("https://auth.example.com/revoke", a.cred.?.revocation_endpoint.?);

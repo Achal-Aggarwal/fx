@@ -292,11 +292,13 @@ pub const Engine = struct {
     }
 
     /// Hands server `name` a credential its host found saved since, as after
-    /// a sign-in, and starts the server.
-    pub fn useCredential(e: *Engine, name: []const u8, saved: []const u8) Error!void {
+    /// a sign-in, and starts the server; false when the server can't
+    /// use it, so it is still signed out and nothing starts.
+    pub fn useCredential(e: *Engine, name: []const u8, saved: []const u8) Error!bool {
         const slot = try e.find(name);
-        try (try e.ensureServer(slot)).useCredential(saved);
+        if (!try (try e.ensureServer(slot)).useCredential(saved)) return false;
         try e.step(slot, .need);
+        return true;
     }
 
     /// Sends the refresh server `name` said was due.
@@ -723,6 +725,26 @@ test "a credential restored after init is the one the server starts with" {
     @memset(&saved, 0);
     try std.testing.expectEqualStrings("{\"access\":\"w1\"}", e.slots.items[0].config.auth.saved.?);
     try std.testing.expectError(error.UnknownServer, e.restoreCredential("nope", "{}"));
+}
+
+test "a saved credential the server can't use starts nothing, and the host hears so" {
+    const Fake = struct {
+        fn allow(_: *anyopaque, _: []const u8, _: []const u8, _: ?[]const u8) bool {
+            return true;
+        }
+        fn log(_: *anyopaque, _: []const u8, _: []const u8) void {}
+    };
+    var context: u8 = 0;
+    var e: Engine = undefined;
+    const servers = [_]Config{.{ .name = "web", .transport = .{ .http = .{ .url = "https://web.example.invalid/mcp" } } }};
+    try e.init(std.testing.io, std.testing.allocator, .{ .context = &context, .allow = Fake.allow, .log = Fake.log }, .{
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+    }, &servers);
+    defer e.deinit();
+    const before = e.status(0).phase;
+    try std.testing.expect(!try e.useCredential("web", "not json"));
+    try std.testing.expect(!try e.useCredential("web", "{\"access\":\"w1\"}"));
+    try std.testing.expectEqual(before, e.status(0).phase);
 }
 
 test "a stdio server's directory is part of its config, so a new one restarts it" {

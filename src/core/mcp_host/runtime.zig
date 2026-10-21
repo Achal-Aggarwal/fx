@@ -1735,7 +1735,8 @@ pub const Runtime = struct {
     }
 
     /// The login another fx saved under server `i`'s key, given to it; false
-    /// when there is none, or it's one `i` had or tried already.
+    /// when there is none, it's one `i` had or tried already, or the server
+    /// can't use it.
     fn takeSaved(r: *Runtime, i: usize) !bool {
         const s = r.resolved.servers[i];
         const saved = r.options.credentials.store.get(r.gpa, s.credentialKey()) catch |err| switch (err) {
@@ -1749,7 +1750,11 @@ pub const Runtime = struct {
         const digest = credentials.digest(saved);
         if (r.flags[i].tried) |tried| if (std.mem.eql(u8, &tried, &digest)) return false;
         r.flags[i].tried = digest;
-        try r.engine.useCredential(s.name, saved);
+        // One the server can't use isn't a login: the server still needs one.
+        if (!try r.engine.useCredential(s.name, saved)) {
+            debug_trace.logf("mcp", "MCP saved login not usable, ignored server={s}", .{s.name});
+            return false;
+        }
         return true;
     }
 
