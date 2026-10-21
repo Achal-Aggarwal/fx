@@ -22,8 +22,6 @@ const Spec = struct {
     mutation_lock_file_name: []const u8,
     /// Provider name that starts each debug trace line.
     trace_label: []const u8,
-    /// Whether `stringify` refuses an account ID that `parse` would reject.
-    validate_account_id_on_save: bool,
 };
 
 pub const DeleteOutcome = enum {
@@ -227,10 +225,10 @@ pub fn Store(comptime spec: Spec, comptime invalid_session: anytype, comptime un
             };
         }
 
+        /// Refuses an account ID that `parse` would reject, so a saved session
+        /// can always be loaded again.
         pub fn stringify(alloc: Allocator, session: Session) ![]u8 {
-            if (spec.validate_account_id_on_save and !types.validCredentialAccountId(session.account_id)) {
-                return invalid_session;
-            }
+            if (!types.validCredentialAccountId(session.account_id)) return invalid_session;
             var out: std.Io.Writer.Allocating = .init(alloc);
             errdefer out.deinit();
             try out.writer.writeAll("{\"version\":1,\"access_token\":");
@@ -277,19 +275,15 @@ fn openExistingPrivateFxDir(home_dir: *io_mod.VerifiedDir) !io_mod.VerifiedDir {
     return .{ .dir = dir };
 }
 
-fn TestStore(comptime validate_account_id_on_save: bool) type {
-    return Store(.{
-        .auth_file_name = "test-auth.json",
-        .mutation_lock_file_name = "test-auth.lock",
-        .trace_label = "Test",
-        .validate_account_id_on_save = validate_account_id_on_save,
-    }, error.InvalidTestAuthSession, error.TestOAuthUnavailable);
-}
+const TestStore = Store(.{
+    .auth_file_name = "test-auth.json",
+    .mutation_lock_file_name = "test-auth.lock",
+    .trace_label = "Test",
+}, error.InvalidTestAuthSession, error.TestOAuthUnavailable);
 
 test "subscription auth session round trips without exposing token fields to structure" {
-    const store = TestStore(true);
     const alloc = std.testing.allocator;
-    var session = store.Session{
+    var session = TestStore.Session{
         .access_token = try alloc.dupe(u8, "header.payload.signature"),
         .refresh_token = try alloc.dupe(u8, "refresh"),
         .expires_at_ms = 1234,
@@ -297,9 +291,9 @@ test "subscription auth session round trips without exposing token fields to str
     };
     defer session.deinit(alloc);
 
-    const encoded = try store.stringify(alloc, session);
+    const encoded = try TestStore.stringify(alloc, session);
     defer secret.zeroAndFree(alloc, encoded);
-    var decoded = try store.parse(alloc, encoded);
+    var decoded = try TestStore.parse(alloc, encoded);
     defer decoded.deinit(alloc);
 
     try std.testing.expectEqualStrings(session.access_token, decoded.access_token);
@@ -313,24 +307,14 @@ test "subscription session refresh deadline keeps a one minute safety margin" {
     try std.testing.expectEqual(@as(i64, 0), refreshDeadlineMs(10_000));
 }
 
-test "subscription session saves an unsafe account ID only when save-time validation is off" {
+test "subscription session refuses to save an account ID it could not load" {
     const alloc = std.testing.allocator;
-    var session = TestStore(true).Session{
+    var session = TestStore.Session{
         .access_token = try alloc.dupe(u8, "access"),
         .refresh_token = try alloc.dupe(u8, "refresh"),
         .expires_at_ms = 1000,
         .account_id = try alloc.dupe(u8, "acct\r\ninjected"),
     };
     defer session.deinit(alloc);
-    try std.testing.expectError(error.InvalidTestAuthSession, TestStore(true).stringify(alloc, session));
-
-    const unchecked = TestStore(false).Session{
-        .access_token = session.access_token,
-        .refresh_token = session.refresh_token,
-        .expires_at_ms = session.expires_at_ms,
-        .account_id = session.account_id,
-    };
-    const encoded = try TestStore(false).stringify(alloc, unchecked);
-    defer secret.zeroAndFree(alloc, encoded);
-    try std.testing.expectError(error.InvalidTestAuthSession, TestStore(false).parse(alloc, encoded));
+    try std.testing.expectError(error.InvalidTestAuthSession, TestStore.stringify(alloc, session));
 }

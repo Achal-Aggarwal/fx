@@ -6,7 +6,6 @@ const store = subscription_session.Store(.{
     .auth_file_name = profile_paths.chatgpt_auth_file_name,
     .mutation_lock_file_name = "chatgpt-auth.lock",
     .trace_label = "ChatGPT",
-    .validate_account_id_on_save = false,
 }, error.InvalidChatGptAuthSession, error.ChatGptOAuthUnavailable);
 
 pub const Session = store.Session;
@@ -29,4 +28,16 @@ test "ChatGPT auth session rejects account identifiers unsafe for HTTP headers" 
     };
     defer session.deinit(std.testing.allocator);
     return error.TestExpectedInvalidChatGptAuthSession;
+}
+
+test "ChatGPT auth session refuses to save an account identifier unsafe for HTTP headers" {
+    const alloc = std.testing.allocator;
+    var session = Session{
+        .access_token = try alloc.dupe(u8, "access"),
+        .refresh_token = try alloc.dupe(u8, "refresh"),
+        .expires_at_ms = 1000,
+        .account_id = try alloc.dupe(u8, "acct\r\ninjected"),
+    };
+    defer session.deinit(alloc);
+    try std.testing.expectError(error.InvalidChatGptAuthSession, store.stringify(alloc, session));
 }

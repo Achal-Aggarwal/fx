@@ -8,7 +8,6 @@ const store = subscription_session.Store(.{
     .auth_file_name = profile_paths.grok_auth_file_name,
     .mutation_lock_file_name = "grok-auth.lock",
     .trace_label = "Grok",
-    .validate_account_id_on_save = true,
 }, error.InvalidGrokAuthSession, error.GrokOAuthUnavailable);
 
 pub const Session = store.Session;
