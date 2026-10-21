@@ -1984,7 +1984,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .propagate_history_turn = propagateHistoryTurn,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .append_turn_piece = if (ctx.v2 != null) appendTurnPiece else null,
-        .image_blob_dir = if (ctx.v2) |v2| v2.blobsPath() else null,
+        .save_prompt_images = if (ctx.v2 != null) savePromptImages else null,
         .propagate_grant = propagateGrant,
         .push_event = pushEvent,
         .push_text = pushText,
@@ -2915,6 +2915,19 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     };
     // The log now refers to this prompt's images.
     ctx.prompt_snapshot_committed = true;
+}
+
+/// The prompt's images become the session's blobs before its first request
+/// (D89). A failure leaves the rest inline, with no path, as the adapter
+/// does for one image the store refuses.
+fn savePromptImages(raw_ctx: *anyopaque, alloc: std.mem.Allocator, images: []types.ImageAttachment) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = ctx.v2 orelse return;
+    v2.savePromptImages(alloc, images) catch |err| {
+        debug_trace.logf("session", "event=sessions_v2_prompt_images_inline session={s} err={s}", .{ v2.id(), @errorName(err) });
+    };
 }
 
 fn propagateGrant(_: *anyopaque, _: []const u8, _: []const u8) !void {}

@@ -3040,7 +3040,6 @@ const RoutingSubagents = struct {
         switch (self.manager_paste.paste.settleDeliveryEpoch()) {
             .none => return false,
             .finish => self.manager_paste.paste.resetWithTrace(.decision_prompt_active),
-            .reject => self.manager_paste.paste.resetWithTrace(.unsafe_suffix),
         }
         return true;
     }
@@ -9314,7 +9313,7 @@ test "app_input_runtime rejects same-epoch paste suffix without submitting it" {
     try std.testing.expectEqualStrings("keep", app.submitted_prompt[0..app.submitted_prompt_len]);
 }
 
-test "app_input_runtime rejects a same-epoch enter after an otherwise valid paste" {
+test "app_input_runtime keeps a paste but not a same-epoch enter after it" {
     const alloc = std.testing.allocator;
     var app = try RoutingFakeApp.init(alloc);
     defer app.deinit();
@@ -9322,7 +9321,7 @@ test "app_input_runtime rejects a same-epoch enter after an otherwise valid past
 
     try feedRoutingBytes(&app, "\x1b[200~new\x1b[201~\r");
 
-    try std.testing.expectEqualStrings("prior", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("priornew", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(@as(usize, 0), app.submitted_prompt_count);
     try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
 }
@@ -9580,7 +9579,7 @@ test "app_input_runtime question freeform accepts bracketed paste atomically" {
     try std.testing.expect(app.shell.render_requests.hasReason(.modal));
 }
 
-test "app_input_runtime rejects unsafe suffixes for every root modal paste owner" {
+test "app_input_runtime keeps a modal paste but never runs its same-epoch suffix" {
     const alloc = std.testing.allocator;
 
     {
@@ -9607,7 +9606,7 @@ test "app_input_runtime rejects unsafe suffixes for every root modal paste owner
 
         try feedRoutingBytes(&app, "\x1b[200~new\x1b[201~\r");
 
-        try std.testing.expectEqualStrings("keep", app.approval_prompt.decision.selectedDraft());
+        try std.testing.expectEqualStrings("keepnew", app.approval_prompt.decision.selectedDraft());
         try std.testing.expect(app.worker.submitted_permission == null);
         try std.testing.expectEqual(@as(usize, 1), app.notice_write_count);
     }
@@ -9629,7 +9628,7 @@ test "app_input_runtime rejects unsafe suffixes for every root modal paste owner
         try feedRoutingBytes(&app, "\x1b[200~new\x1b[201~\r");
 
         try std.testing.expectEqualStrings(
-            "keep",
+            "keepnew",
             app.question_prompt.entries.items[0].freeform_buffer.items,
         );
         try std.testing.expect(app.question_prompt.isActive());
