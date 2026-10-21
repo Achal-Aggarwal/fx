@@ -2210,7 +2210,6 @@ function normalizeHostTools(value) {
   } else {
     throw new TypeError("tools must be an array or an object");
   }
-  if (entries.length > 64) throw new RangeError("tools cannot contain more than 64 entries");
   const descriptors = [];
   const executors = new Map();
   const names = new Set();

@@ -224,7 +224,7 @@ export type FxKeyedTool =
   | (Omit<FxHostTool, "name"> & { name?: string })
   | (Omit<FxProviderTool, "name"> & { name?: "web_search" });
 
-/** At most 64 tools: an array of descriptors, or an object keyed by tool name. */
+/** Tools: an array of descriptors, or an object keyed by tool name. */
 export type FxTools = readonly FxTool[] | { readonly [name: string]: FxKeyedTool };
 
 /** A tool descriptor for `createFxAgent()`. */
@@ -235,7 +235,7 @@ export type FxAgentKeyedTool =
   | (Omit<FxAgentHostTool, "name"> & { name?: string })
   | (Omit<FxProviderTool, "name"> & { name?: "web_search" });
 
-/** At most 64 `createFxAgent()` tools: an array of descriptors, or an object keyed by tool name. */
+/** `createFxAgent()` tools: an array of descriptors, or an object keyed by tool name. */
 export type FxAgentTools = readonly FxAgentTool[] | { readonly [name: string]: FxAgentKeyedTool };
 
 // ---------------------------------------------------------------------------
