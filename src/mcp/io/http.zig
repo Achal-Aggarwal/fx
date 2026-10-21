@@ -847,7 +847,6 @@ fn manyLargeAnswers(events: bool) !void {
         else => {},
     };
     try testing.expectEqual(@as(usize, count), answers);
-    std.debug.print("peak live bytes: {d} ({s} {d} x {d})\n", .{ peak.peak.load(.monotonic), if (events) "events" else "bodies", count, size });
     // What the budget counts, the spare, each reader's allowance, growth
     // slack, and the client's own buffers: set by `max`, not by how many
     // answers come at once.
