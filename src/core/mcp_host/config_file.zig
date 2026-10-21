@@ -346,18 +346,32 @@ test "a linked config file is never edited, whether a symlink or a hard link" {
     try tmp.dir.writeFile(io, .{ .sub_path = "plain.json", .data = "{}" });
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    const Case = struct { name: []const u8, linked: bool };
+    const Case = struct { name: []const u8, want: enum { linked, written, no_dir } };
     for ([_]Case{
-        .{ .name = "soft.json", .linked = true },
-        .{ .name = "hard.json", .linked = true },
-        .{ .name = "plain.json", .linked = false },
-        .{ .name = "missing.json", .linked = false },
-        .{ .name = "no-dir/mcp.json", .linked = false },
+        .{ .name = "soft.json", .want = .linked },
+        .{ .name = "hard.json", .want = .linked },
+        .{ .name = "plain.json", .want = .written },
+        .{ .name = "missing.json", .want = .written },
+        .{ .name = "no-dir/mcp.json", .want = .no_dir },
     }) |case| {
         const path = try std.Io.Dir.path.join(alloc, &.{ root, case.name });
         defer alloc.free(path);
-        if (case.linked) try testing.expectError(error.Linked, write(alloc, .project, path, "{}")) else write(alloc, .project, path, "{}") catch |err| try testing.expect(case.name.len > 0 and err == error.FileNotFound);
+        const text = "{\"mcpServers\":{}}";
+        switch (case.want) {
+            .linked => try testing.expectError(error.Linked, write(alloc, .project, path, text)),
+            .written => {
+                try write(alloc, .project, path, text);
+                const got = try tmp.dir.readFileAlloc(io, case.name, alloc, .limited(64));
+                defer alloc.free(got);
+                try testing.expectEqualStrings(text, got);
+            },
+            .no_dir => try testing.expectError(error.FileNotFound, write(alloc, .project, path, text)),
+        }
     }
+    // The file the links point to is as it was.
+    const shared = try tmp.dir.readFileAlloc(io, "shared.json", alloc, .limited(64));
+    defer alloc.free(shared);
+    try testing.expectEqualStrings("{}", shared);
 }
 
 test "the profile's first write creates ~/.fx readable only by its owner" {
