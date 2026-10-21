@@ -1093,6 +1093,50 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "routine commands with words the shell reads differently remain reviewer owned",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "npm-must-not-run");
+      const bin = installRecorder(root, "npm", marker);
+      const gateway = startGateway(
+        [
+          // The shell passes a quoted `&&` to `npm test`, with `--global`.
+          cleanCommandCall("npm test '&&' npm run build --global", "quoted_separator"),
+          // zsh expands `=ls` to the path of `ls`.
+          cleanCommandCall("npm run =ls", "equals_word"),
+          // Every shell drops `#note` as a comment.
+          cleanCommandCall("npm test #note", "comment_word"),
+          (body) => {
+            expect(body).toContain("review_caution");
+            return fakeGatewayFinalText("shell syntax stayed reviewed");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "quoted_separator_review"),
+          fakeGatewayPermissionDecision("caution", "equals_word_review"),
+          fakeGatewayPermissionDecision("caution", "comment_word_review"),
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Run the tests."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(3);
+      expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "existing startup targets remain reviewer owned",
     async () => {
       const root = createIsolatedRoot();

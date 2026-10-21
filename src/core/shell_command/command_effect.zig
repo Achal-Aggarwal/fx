@@ -38,7 +38,7 @@ pub fn knownReversibleAutoCommand(
     var index: usize = 0;
     while (index <= argv.tokens.len) : (index += 1) {
         const at_end = index == argv.tokens.len;
-        if (!at_end and !std.mem.eql(u8, argv.tokens[index].value, "&&")) {
+        if (!at_end and !isStageSeparator(argv.tokens[index])) {
             if (isUnsupportedAutoControlOperator(argv.tokens[index])) return false;
             continue;
         }
@@ -46,6 +46,19 @@ pub fn knownReversibleAutoCommand(
         stage_start = index + 1;
     }
     return true;
+}
+
+/// The `&&` between two stages. A quoted `&&` is an ordinary argument to the
+/// shell, so it is one here too.
+fn isStageSeparator(token: command_lex.ArgvToken) bool {
+    return !token.quoted and std.mem.eql(u8, token.value, "&&");
+}
+
+/// Whether a word does not mean what it says: every shell reads a word that
+/// starts with an unquoted `#` as a comment, and zsh expands one that starts
+/// with an unquoted `=` to a program's path.
+fn startsWithShellWordSyntax(raw: []const u8) bool {
+    return raw.len > 0 and (raw[0] == '#' or raw[0] == '=');
 }
 
 fn isUnsupportedAutoOperator(token: command_lex.ArgvToken) bool {
@@ -80,7 +93,10 @@ fn reversibleAutoStage(raw_tokens: []const command_lex.ArgvToken) bool {
     }
     if (tokens.len == 0) return false;
     for (tokens) |token| {
-        if (isUnsupportedAutoOperator(token) or tokenHasDynamicShellSyntax(token.raw)) {
+        if (isUnsupportedAutoOperator(token) or
+            tokenHasDynamicShellSyntax(token.raw) or
+            startsWithShellWordSyntax(token.raw))
+        {
             return false;
         }
     }
@@ -222,6 +238,12 @@ test "known reversible auto commands exclude destructive and hidden effects" {
         "npm install --prefix=/tmp/global",
         "npm install --location global",
         "git fetch --prune origin",
+        // A quoted `&&` is an argument, so `--prune` here reaches `git fetch`.
+        "git fetch '&&' git status --prune",
+        // Every shell drops a comment, and zsh expands `=ls` to a path.
+        "git status #note",
+        "npm run =ls",
+        "which =node",
     }) |command| {
         try std.testing.expect(!try knownReversibleAutoCommand(
             std.testing.allocator,
@@ -471,6 +493,7 @@ fn parseStage(
             return .{ .approval_required = .unsupported_input_redirect };
         }
         if (isOperatorToken(token)) return .{ .approval_required = .unsupported_shell };
+        if (startsWithShellWordSyntax(token.raw)) return .{ .approval_required = .dynamic_shell };
         try words.append(alloc, token.value);
         index += 1;
     }
@@ -1815,6 +1838,13 @@ test "planner native ls policy preserves reviewed target behavior" {
     const group = fields.next() orelse return error.TestExpectedEqual;
     _ = try std.fmt.parseInt(u64, owner, 10);
     _ = try std.fmt.parseInt(u64, group, 10);
+}
+
+test "planner sends words that zsh expands to review" {
+    try expectApproval("ls =x", false, .linux, .dynamic_shell);
+    try expectApproval("grep =x", false, .macos, .dynamic_shell);
+    var quoted = try expectDirect("ls '=x'", .linux);
+    quoted.deinit(std.testing.allocator);
 }
 
 test "planner bounds ls operands at sixty four" {
