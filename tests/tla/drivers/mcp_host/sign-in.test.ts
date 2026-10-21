@@ -211,7 +211,8 @@ test("contract: a reload during a sign-in closes its listener, and the shell sto
     await shell.tui.sendText(`/mcp add other -- ${BUN} ${stdioServer(f, "other").args[0]}`);
     await shell.tui.waitForText("Added other", 10_000);
     let after = await probe(port);
-    for (let k = 0; k < 30 && after.result === "open"; k++) { await Bun.sleep(100); after = await probe(port); }
+    // A probe the closing listener drops is no answer either way: probe again.
+    for (let k = 0; k < 30 && (after.result === "open" || after.result === "reset"); k++) { await Bun.sleep(100); after = await probe(port); }
     records.push({ event: "probe", data: { login: 1, result: after.result }, at: Date.now() });
     await Bun.sleep(3_000);
     const still = await shell.status(null, 5_000);

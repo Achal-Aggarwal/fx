@@ -83,8 +83,10 @@ export async function waitFor<T>(what: string, probe: () => T | undefined | null
   }
 }
 
-/** A GET to a loopback port: "open" when something answered, "closed" when the connection was refused. */
-export async function probe(port: number, path = "/favicon.ico"): Promise<{ result: "open" | "closed" | "hang"; status?: number }> {
+/** A GET to a loopback port: "open" when something answered, "closed" when
+ * the connection was refused, and "reset" when a listener that was closing
+ * dropped it while it waited to be accepted, so a caller probes again. */
+export async function probe(port: number, path = "/favicon.ico"): Promise<{ result: "open" | "closed" | "hang" | "reset"; status?: number }> {
   try {
     const response = await fetch(`http://127.0.0.1:${port}${path}`, { signal: AbortSignal.timeout(2000) });
     await response.text();
@@ -93,6 +95,7 @@ export async function probe(port: number, path = "/favicon.ico"): Promise<{ resu
     const text = String((error as { code?: string }).code ?? error);
     if (/ECONNREFUSED|ConnectionRefused|Unable to connect/i.test(text)) return { result: "closed" };
     if (/Timeout|abort/i.test(text)) return { result: "hang" };
+    if (/ECONNRESET/i.test(text)) return { result: "reset" };
     throw error;
   }
 }
