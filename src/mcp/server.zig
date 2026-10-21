@@ -2161,3 +2161,24 @@ test {
     // run cli/conformance.zig on this; this makes sure everything compiles.
     std.testing.refAllDecls(Server);
 }
+
+test "a send that fails after the outbox took its copy frees the copy once" {
+    var r: Server = undefined;
+    // No request may start, so each waits for a slot and nothing reaches the network.
+    try r.init(std.testing.io, std.testing.allocator, .{
+        .link = .{ .http = .{ .url = "http://127.0.0.1:1/mcp", .max_in_flight = 0 } },
+        .client = .{ .info = .{ .name = "test", .version = "0" } },
+    });
+    defer r.deinit();
+    const headers = [_]std.http.Header{.{ .name = "accept", .value = "application/json" }};
+    // Requests wait until every place is taken; the next fails once kept.
+    var key: u64 = 1;
+    const failed = while (key < 100) : (key += 1) {
+        r.send(key, .post, "{}", &headers) catch |err| break err;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(error.TooManyInFlight, failed);
+    try std.testing.expectEqual(@as(u64, 33), key);
+    // The one that failed keeps nothing; the others stay kept.
+    try std.testing.expect(r.kept(key) == null);
+    try std.testing.expect(r.kept(key - 1) != null);
+}
