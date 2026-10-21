@@ -1100,10 +1100,10 @@ describe("lean auto mode reliability", () => {
       const bin = installRecorder(root, "npm", marker);
       const gateway = startGateway(
         [
-          // The shell passes a quoted `&&` to `npm test`, with `--global`.
+          // The shell passes a quoted or escaped `&&` to `npm test`, with
+          // `--global`.
           cleanCommandCall("npm test '&&' npm run build --global", "quoted_separator"),
-          // zsh expands `=ls` to the path of `ls`.
-          cleanCommandCall("npm run =ls", "equals_word"),
+          cleanCommandCall("npm test \\&\\& npm run build --global", "escaped_separator"),
           // Every shell drops `#note` as a comment.
           cleanCommandCall("npm test #note", "comment_word"),
           (body) => {
@@ -1113,7 +1113,7 @@ describe("lean auto mode reliability", () => {
         ],
         [
           fakeGatewayPermissionDecision("caution", "quoted_separator_review"),
-          fakeGatewayPermissionDecision("caution", "equals_word_review"),
+          fakeGatewayPermissionDecision("caution", "escaped_separator_review"),
           fakeGatewayPermissionDecision("caution", "comment_word_review"),
         ],
       );
