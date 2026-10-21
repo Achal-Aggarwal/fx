@@ -1,0 +1,23 @@
+//! Root of the `zig build fuzz` test binary. Each import below brings in a
+//! file that holds an fx fuzz target listed in `tests/fuzz/targets.json`.
+//! The build filters this binary to the registered fuzz tests, so ordinary
+//! unit tests in these files never run here. A new fx fuzz target needs its
+//! file imported here and an entry in the registry.
+
+test {
+    _ = @import("acp/mcp_servers.zig");
+    _ = @import("core/agent/runtime/vision_contracts.zig");
+    _ = @import("core/images/image_data.zig");
+    _ = @import("core/mcp/elicitation.zig");
+    _ = @import("core/session/session_codec.zig");
+    _ = @import("core/session/session_event.zig");
+    _ = @import("core/shared/display_width.zig");
+    _ = @import("core/shared/types.zig");
+    _ = @import("core/shell_command/command_effect.zig");
+    _ = @import("core/skills/skill_contract.zig");
+    _ = @import("core/skills/skill_invocation.zig");
+    _ = @import("core/tooling/command_output_content.zig");
+    _ = @import("core/workspace/file_index.zig");
+    _ = @import("gateway/responses_protocol.zig");
+    _ = @import("gateway/sse.zig");
+}
