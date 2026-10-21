@@ -52,7 +52,11 @@ pub fn signalAllForExit(io: std.Io) void {
 /// gone, by exit or by crash. It hears
 /// each group that starts ("+") and each one that is reaped ("-"). When its
 /// stdin closes it sends the groups still listed SIGTERM, then SIGKILL 2 s
-/// later, so the program's exit waits for nothing.
+/// later, so the program's exit waits for nothing. A group that ends in those
+/// 2 s frees its id, and the SIGKILL would reach a group given that id since;
+/// on Linux and macOS a freed process id comes back only after the others
+/// have been handed out, so that would take the system starting a process
+/// for every other id within those 2 s.
 const helper = struct {
     /// A leaf lock: taken under `pid_lock`, and nothing is taken under it.
     var mutex: std.Io.Mutex = .init;
