@@ -4875,7 +4875,6 @@ pub fn Runtime(comptime App: type) type {
                     root_id,
                     root_id,
                     app.permission_engine.rules,
-                    !permissions.rulesDenyAllTargetsForTool(app.permission_engine.rules, "mcp_features"),
                 )
             else
                 null;

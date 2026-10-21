@@ -6,7 +6,7 @@ import { join } from "node:path";
 import type { TraceRecord } from "./trace";
 
 export const FIXTURE = join(import.meta.dirname, "fixtures", "stdio-server.ts");
-/** MCP-v2's fake Streamable HTTP server with fake OAuth, used read-only. */
+/** The engine models' fake Streamable HTTP server with fake OAuth, used read-only. */
 export const HTTP_FAKE = join(import.meta.dirname, "../mcp/fakes/http.ts");
 export const BUN = process.execPath;
 
@@ -22,13 +22,12 @@ export function fixture(root: string, name: string): Fixture {
   return { base, home, workspace, control, serverLog: join(base, "servers.jsonl"), traceLog: join(base, "fx-trace.log") };
 }
 
-/** fx's environment: scratch HOME, MCP-v2, no Keychain, no browser, no sound, a fake gateway key. */
+/** fx's environment: scratch HOME, no Keychain, no browser, no sound, a fake gateway key. */
 export function fxEnv(f: Fixture, extra: Record<string, string> = {}): Record<string, string> {
   return {
     PATH: process.env.PATH ?? "/usr/bin:/bin",
     HOME: f.home,
     TMPDIR: process.env.TMPDIR ?? "/tmp",
-    FX_MCP_ENGINE: "v2",
     FX_DISABLE_KEYCHAIN: "1",
     FX_NO_OPEN_BROWSER: "1",
     FX_AUTO_UPGRADE: "0",
@@ -84,8 +83,10 @@ export async function waitFor<T>(what: string, probe: () => T | undefined | null
   }
 }
 
-/** A GET to a loopback port: "open" when something answered, "closed" when the connection was refused. */
-export async function probe(port: number, path = "/favicon.ico"): Promise<{ result: "open" | "closed" | "hang"; status?: number }> {
+/** A GET to a loopback port: "open" when something answered, "closed" when
+ * the connection was refused, and "reset" when a listener that was closing
+ * dropped it while it waited to be accepted, so a caller probes again. */
+export async function probe(port: number, path = "/favicon.ico"): Promise<{ result: "open" | "closed" | "hang" | "reset"; status?: number }> {
   try {
     const response = await fetch(`http://127.0.0.1:${port}${path}`, { signal: AbortSignal.timeout(2000) });
     await response.text();
@@ -94,6 +95,7 @@ export async function probe(port: number, path = "/favicon.ico"): Promise<{ resu
     const text = String((error as { code?: string }).code ?? error);
     if (/ECONNREFUSED|ConnectionRefused|Unable to connect/i.test(text)) return { result: "closed" };
     if (/Timeout|abort/i.test(text)) return { result: "hang" };
+    if (/ECONNRESET/i.test(text)) return { result: "reset" };
     throw error;
   }
 }
@@ -127,7 +129,7 @@ export function observeStores(f: Fixture) {
     try {
       const doc = JSON.parse(text);
       entries = (doc.servers ?? []).map((s: { name: string }) => s.name).sort();
-      kind = doc.version === 1 && Array.isArray(doc.servers) ? "ok" : "unreadable";
+      kind = (doc.version === 1 || doc.version === 2) && Array.isArray(doc.servers) ? "ok" : "unreadable";
     } catch { kind = "unreadable"; }
   }
   const v1 = existsSync(v1Path(f)) ? (JSON.parse(readFileSync(v1Path(f), "utf8")).credentials ?? []).map((c: { server_identity: string }) => c.server_identity).sort() : [];

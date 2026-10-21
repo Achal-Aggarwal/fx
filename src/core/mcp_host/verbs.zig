@@ -10,9 +10,9 @@ const text_utils = @import("../shared/text_utils.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
 const config_runtime = @import("../config/config_runtime.zig");
 const project_config = @import("../mcp/project_config.zig");
-const command_provider = @import("../mcp/command_provider.zig");
 const config_file = @import("config_file.zig");
 const credentials = @import("credentials.zig");
+const secret = @import("../auth/secret.zig");
 const slack = @import("slack.zig");
 const runtime_mod = @import("runtime.zig");
 const Host = @import("host.zig").Host;
@@ -131,7 +131,7 @@ pub fn parse(arena: Allocator, surface: Surface, args: []const []const u8) Alloc
         .add => {
             if (n.len == 0) return usage(arena, verb, "{s} add needs a NAME.", .{p});
             const name = n[0];
-            if (!command_provider.isValidServerName(name))
+            if (!isValidServerName(name))
                 return usage(arena, verb, "'{s}' can't be a server name: use letters, digits, '-' and '_'.", .{name});
             const file: config_file.File = if (project) .project else .profile;
             if (dash < rest.len) {
@@ -691,6 +691,10 @@ fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
         return 1;
     }
     const was = findStatus(try host.runtime.statuses(arena), name).?;
+    // There's a login to sign out of when one is saved, by this fx or
+    // another, or this session holds one. A running server needn't have one.
+    const saved = try credentials.Store.detect(arena, c.home).get(arena, server.credentialKey());
+    defer if (saved) |v| secret.zeroAndFree(arena, v);
     host.runtime.logout(name) catch |err| switch (err) {
         // A held server isn't in the engine; its saved login still goes.
         error.UnknownServer => _ = credentials.Store.detect(arena, c.home).remove(arena, server.credentialKey()) catch |e| switch (e) {
@@ -700,7 +704,7 @@ fn logout(c: Context, arena: Allocator, name: []const u8) !u8 {
         error.CredentialStoreUnreadable => return unreadableLogins(c, arena, "sign out of", name),
         else => return err,
     };
-    if (was.signed_in or was.needs_login or was.state == .ready) {
+    if (saved != null or was.signed_in) {
         try c.out.print("Signed out of {s}.\n", .{try safe(arena, name)});
     } else {
         try c.out.print("{s} wasn't signed in.\n", .{try safe(arena, name)});
@@ -862,6 +866,22 @@ const testing = std.testing;
 
 fn parseCli(arena: Allocator, args: []const []const u8) !Parsed {
     return parse(arena, .cli, args);
+}
+
+/// A server name is letters, digits, `_`, and `-`, as `mcp_SERVER_TOOL`
+/// names need.
+pub fn isValidServerName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |byte| {
+        if (std.ascii.isAlphanumeric(byte) or byte == '_' or byte == '-') continue;
+        return false;
+    }
+    return true;
+}
+
+test "a server name is letters, digits, underscores, and hyphens" {
+    try testing.expect(isValidServerName("my-server_2"));
+    for ([_][]const u8{ "", "bad/name", "bad name", "bad.name" }) |name| try testing.expect(!isValidServerName(name));
 }
 
 test "parse reads every verb, with flags before --" {

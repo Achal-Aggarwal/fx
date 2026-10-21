@@ -15,6 +15,7 @@ const sse = @import("../protocol/sse.zig");
 const http_headers = @import("../protocol/http_headers.zig");
 const wire = @import("../protocol/wire.zig");
 const Budget = @import("budget.zig").Budget;
+const Read = @import("budget.zig").Read;
 
 pub const Options = struct {
     url: []const u8,
@@ -59,8 +60,10 @@ pub const Incoming = union(enum) {
     /// Request `key` ended. Nothing more comes for it. A rejected one carries
     /// its `WWW-Authenticate` values, joined.
     ended: struct { key: u64, status: u16, how: Ending, challenge: ?[]const u8 },
-    /// The answer to `fetch` request `key`: status 0 when none came.
-    fetched: struct { key: u64, status: u16, body: []const u8, location: ?[]const u8 },
+    /// The answer to `fetch` request `key`: status 0 when none came. `media`
+    /// is its Content-Type, "" for none; `challenge` its `WWW-Authenticate`
+    /// values, joined.
+    fetched: struct { key: u64, status: u16, body: []const u8, location: ?[]const u8, media: []const u8, challenge: ?[]const u8 },
     timeout,
 };
 
@@ -71,7 +74,7 @@ const Posted = union(enum) {
     session: struct { key: u64, id: []u8 },
     opened: u64,
     ended: struct { key: u64, status: u16, how: Ending, challenge: ?[]u8 = null },
-    fetched: struct { key: u64, status: u16 = 0, body: ?[]u8 = null, location: ?[]u8 = null },
+    fetched: struct { key: u64, status: u16 = 0, body: ?[]u8 = null, location: ?[]u8 = null, media: ?[]u8 = null, challenge: ?[]u8 = null },
 
     fn free(p: Posted, gpa: std.mem.Allocator) void {
         switch (p) {
@@ -84,6 +87,8 @@ const Posted = union(enum) {
             .fetched => |f| {
                 if (f.body) |b| gpa.free(b);
                 if (f.location) |l| gpa.free(l);
+                if (f.media) |m| gpa.free(m);
+                if (f.challenge) |c| gpa.free(c);
             },
             .opened => {},
         }
@@ -320,7 +325,7 @@ pub const Client = struct {
                 }
                 c.settle(f.key);
                 c.held = posted;
-                return .{ .fetched = .{ .key = f.key, .status = f.status, .body = f.body orelse "", .location = f.location } };
+                return .{ .fetched = .{ .key = f.key, .status = f.status, .body = f.body orelse "", .location = f.location, .media = f.media orelse "", .challenge = f.challenge } };
             },
         }
     }
@@ -442,18 +447,61 @@ pub const Client = struct {
             if (status / 100 == 2) try c.put(.{ .opened = key });
             return c.readEvents(key, status, reader);
         }
-        // A JSON body: a JSON-RPC answer, or, with no such body, an HTTP failure.
-        const bytes = reader.allocRemaining(c.gpa, .limited(c.options.max_message)) catch return .{ .status = status, .how = .broken };
-        if (wire.decode(bytes)) |_| {
-            c.budget.take(c.io, bytes.len) catch |err| {
-                c.gpa.free(bytes);
-                return err;
+        // A JSON-RPC answer comes as application/json; any other body is an
+        // HTTP failure, whatever it holds.
+        if (!isJson(content_type)) return .{ .status = status, .how = .http_failure };
+        // The body is counted as it is read and posted as it is.
+        var read: Read = .{};
+        var answer: std.ArrayList(u8) = .empty;
+        defer {
+            c.budget.drop(c.io, &read);
+            answer.deinit(c.gpa);
+        }
+        c.readBody(reader, &read, &answer) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            error.TooLong, error.ReadFailed, error.OutOfMemory => return .{ .status = status, .how = .broken },
+        };
+        if (wire.decode(answer.items)) |message| {
+            // A result says it worked, so one under an error status
+            // contradicts itself. An error under one is read: a 400
+            // carries a version mismatch (VER-04).
+            if (status / 100 != 2 and message == .response and message.response.body == .result)
+                return .{ .status = status, .how = .http_failure };
+            const len = answer.items.len;
+            try c.budget.post(c.io, &read, len);
+            const bytes = answer.toOwnedSlice(c.gpa) catch {
+                c.budget.give(c.io, len);
+                return .{ .status = status, .how = .broken };
             };
             try c.put(.{ .event = .{ .key = key, .status = status, .data = bytes, .event_id = null, .retry_ms = null } });
             return .{ .status = status, .how = .complete };
         } else |_| {
-            c.gpa.free(bytes);
             return .{ .status = status, .how = .http_failure };
+        }
+    }
+
+    /// Reads a JSON body into `body` a step at a time, counting each step
+    /// before it is read. One past `max_message` is `TooLong`.
+    fn readBody(c: *Client, reader: *Io.Reader, read: *Read, body: *std.ArrayList(u8)) (Io.Cancelable || error{ TooLong, ReadFailed, OutOfMemory })!void {
+        var adopted = false;
+        while (true) {
+            if (body.items.len == c.options.max_message) {
+                _ = reader.peekByte() catch |err| switch (err) {
+                    error.EndOfStream => return,
+                    error.ReadFailed => return error.ReadFailed,
+                };
+                return error.TooLong;
+            }
+            const step = @min(c.budget.allowance, c.options.max_message - body.items.len);
+            try c.budget.grow(c.io, read, body.items.len + step);
+            if (read.large and !adopted) {
+                c.budget.adopt(c.io, c.gpa, body);
+                adopted = true;
+            }
+            try body.ensureUnusedCapacity(c.gpa, step);
+            const n = reader.readSliceShort(body.unusedCapacitySlice()[0..step]) catch return error.ReadFailed;
+            body.items.len += n;
+            if (n < step) return;
         }
     }
 
@@ -484,37 +532,90 @@ pub const Client = struct {
         } else req.sendBodiless() catch return none;
         var response = req.receiveHead(&.{}) catch return none;
         var got: @FieldType(Posted, "fetched") = .{ .key = key, .status = @backingInt(response.head.status) };
+        var challenge: std.ArrayList(u8) = .empty;
+        defer challenge.deinit(c.gpa);
         var it = response.head.iterateHeaders();
-        while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "location")) {
-            got.location = c.gpa.dupe(u8, h.value) catch null;
-            break;
-        };
+        while (it.next()) |h| {
+            if (got.location == null and std.ascii.eqlIgnoreCase(h.name, "location")) {
+                got.location = c.gpa.dupe(u8, h.value) catch null;
+            } else if (std.ascii.eqlIgnoreCase(h.name, "www-authenticate")) {
+                if (challenge.items.len > 0) challenge.appendSlice(c.gpa, ", ") catch {};
+                challenge.appendSlice(c.gpa, h.value) catch {};
+            }
+        }
+        if (challenge.items.len > 0) got.challenge = challenge.toOwnedSlice(c.gpa) catch null;
+        // The head's bytes don't outlive reading the body.
+        if (response.head.content_type) |media| got.media = c.gpa.dupe(u8, media) catch null;
         var transfer: [64]u8 = undefined;
         got.body = response.reader(&transfer).allocRemaining(c.gpa, .limited(1 << 20)) catch null;
         return got;
     }
 
+    /// Counts an event's buffer as it grows, a step of the allowance at a
+    /// time, and gives a large one the spare.
+    const Counter = struct {
+        c: *Client,
+        read: *Read,
+        data: *std.ArrayList(u8),
+        adopted: bool = false,
+
+        pub fn grow(n: *Counter, held: usize) Io.Cancelable!void {
+            if (held <= n.read.held) return;
+            const step = n.c.budget.allowance;
+            try n.c.budget.grow(n.c.io, n.read, @min(@divCeil(held, step) * step, n.c.options.max_message));
+            if (n.read.large and !n.adopted) {
+                n.c.budget.adopt(n.c.io, n.c.gpa, n.data);
+                n.adopted = true;
+            }
+        }
+    };
+
     fn readEvents(c: *Client, key: u64, status: u16, reader: *Io.Reader) Io.Cancelable!Result {
-        var line: Io.Writer.Allocating = .init(c.gpa);
-        defer line.deinit();
-        var parser: sse.Parser = .init(c.options.max_message);
+        var parser: sse.Parser = .{};
         defer parser.deinit(c.gpa);
+        // Each line is read onto the end of the event's buffer, which is
+        // counted as it grows and posted as it is.
+        var data: std.ArrayList(u8) = .empty;
+        var read: Read = .{};
+        var counter: Counter = .{ .c = c, .read = &read, .data = &data };
+        defer {
+            c.budget.drop(c.io, &read);
+            data.deinit(c.gpa);
+        }
+        var stream: lines.SseLines = .{};
         while (true) {
-            const got = lines.read(reader, &line, c.options.max_message) catch return .{ .status = status, .how = .broken };
+            const mark = data.items.len;
+            const got = stream.read(reader, c.gpa, &data, c.options.max_message, &counter) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                error.ReadFailed, error.OutOfMemory => return .{ .status = status, .how = .broken },
+            };
             if (got.too_long) return .{ .status = status, .how = .broken };
-            const event = parser.line(c.gpa, got.bytes) catch return .{ .status = status, .how = .broken };
+            const event = parser.line(c.gpa, &data, mark) catch return .{ .status = status, .how = .broken };
             if (event) |e| {
-                // An event's data waits for room before it is copied.
-                const data: ?[]u8 = if (e.data) |d| if (d.len > 0) (try c.budget.copy(c.io, c.gpa, d)) orelse return .{ .status = status, .how = .broken } else null else null;
-                const event_id: ?[]u8 = if (e.id) |i| c.gpa.dupe(u8, i) catch {
-                    if (data) |d| {
-                        c.budget.give(c.io, d.len);
-                        c.gpa.free(d);
-                    }
-                    return .{ .status = status, .how = .broken };
-                } else null;
-                if (data != null or event_id != null or e.retry_ms != null)
-                    try c.put(.{ .event = .{ .key = key, .status = status, .data = data, .event_id = event_id, .retry_ms = e.retry_ms } });
+                const event_id: ?[]u8 = if (e.id) |i| c.gpa.dupe(u8, i) catch return .{ .status = status, .how = .broken } else null;
+                var posted: ?[]u8 = null;
+                if (e.data != null and data.items.len > 0) {
+                    const len = data.items.len;
+                    c.budget.post(c.io, &read, len) catch |err| {
+                        if (event_id) |i| c.gpa.free(i);
+                        return err;
+                    };
+                    counter.adopted = false;
+                    posted = data.toOwnedSlice(c.gpa) catch {
+                        c.budget.give(c.io, len);
+                        if (event_id) |i| c.gpa.free(i);
+                        return .{ .status = status, .how = .broken };
+                    };
+                } else data.clearRetainingCapacity();
+                if (posted != null or event_id != null or e.retry_ms != null)
+                    try c.put(.{ .event = .{ .key = key, .status = status, .data = posted, .event_id = event_id, .retry_ms = e.retry_ms } });
+            }
+            // A buffer that holds no data doesn't keep the large read, or
+            // the memory it counted.
+            if (read.large and data.items.len == 0) {
+                c.budget.drop(c.io, &read);
+                data.clearAndFree(c.gpa);
+                counter.adopted = false;
             }
             if (got.at_end) return .{ .status = status, .how = .complete };
         }
@@ -531,7 +632,18 @@ fn now(io: Io) i64 {
     return Io.Clock.awake.now(io).toMilliseconds();
 }
 
+/// A Content-Type naming JSON, with any parameters such as `charset`.
+pub fn isJson(media: []const u8) bool {
+    const end = std.mem.findScalar(u8, media, ';') orelse media.len;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, media[0..end], " \t"), "application/json");
+}
+
 const testing = std.testing;
+
+test "only application/json, with or without parameters, is JSON" {
+    for ([_][]const u8{ "application/json", "Application/JSON", "application/json; charset=utf-8", "application/json;charset=UTF-8" }) |m| try testing.expect(isJson(m));
+    for ([_][]const u8{ "", "text/plain", "text/json", "application/json-rpc", "application/jsonx", "text/event-stream" }) |m| try testing.expect(!isJson(m));
+}
 
 test "a header that can't go out as it is never does, and the request ends refused" {
     // Nothing listens on port 1, so a request that does go out breaks.
@@ -623,6 +735,176 @@ test "events past the budget all arrive, each once the one before it is taken" {
     };
     try testing.expectEqual(@as(usize, 6), notes);
     try testing.expect(c.budget.used <= 64);
+}
+
+/// Counts the bytes an allocator has live, and the most it had at once.
+const Peak = struct {
+    child: std.mem.Allocator,
+    live: std.atomic.Value(usize) = .init(0),
+    peak: std.atomic.Value(usize) = .init(0),
+
+    fn allocator(p: *Peak) std.mem.Allocator {
+        return .{ .ptr = p, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn grew(p: *Peak, old: usize, new: usize) void {
+        if (new >= old) {
+            const total = p.live.fetchAdd(new - old, .monotonic) + new - old;
+            _ = p.peak.fetchMax(total, .monotonic);
+        } else _ = p.live.fetchSub(old - new, .monotonic);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const p: *Peak = @ptrCast(@alignCast(ctx));
+        const out = p.child.rawAlloc(len, a, ra) orelse return null;
+        p.grew(0, len);
+        return out;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) bool {
+        const p: *Peak = @ptrCast(@alignCast(ctx));
+        if (!p.child.rawResize(memory, a, new_len, ra)) return false;
+        p.grew(memory.len, new_len);
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+        const p: *Peak = @ptrCast(@alignCast(ctx));
+        const out = p.child.rawRemap(memory, a, new_len, ra) orelse return null;
+        p.grew(memory.len, new_len);
+        return out;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, a: std.mem.Alignment, ra: usize) void {
+        const p: *Peak = @ptrCast(@alignCast(ctx));
+        p.child.rawFree(memory, a, ra);
+        p.grew(memory.len, 0);
+    }
+};
+
+fn answerOne(stream: Io.net.Stream, size: usize, events: bool) !void {
+    defer stream.close(testing.io);
+    var in: [4096]u8 = undefined;
+    var r = stream.reader(testing.io, &in);
+    while ((try r.interface.takeDelimiterInclusive('\n')).len > 2) {}
+    var out: [4096]u8 = undefined;
+    var w = stream.writer(testing.io, &out);
+    const head = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"x\":\"";
+    const tail = "\"}}";
+    if (events) {
+        try w.interface.writeAll("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n: one large event\ndata: ");
+    } else {
+        try w.interface.print("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n", .{size});
+    }
+    try w.interface.writeAll(head);
+    try w.interface.splatByteAll('a', size - head.len - tail.len);
+    try w.interface.writeAll(tail);
+    if (events) try w.interface.writeAll("\n\n");
+    try w.interface.flush();
+}
+
+/// Answers `count` requests at once, each with a JSON body of `size` bytes,
+/// or one event that carries it.
+fn serveAnswers(server: *Io.net.Server, count: usize, size: usize, events: bool) !void {
+    var answering: [16]?Io.Future(@typeInfo(@TypeOf(answerOne)).@"fn".return_type.?) = @splat(null);
+    defer for (&answering) |*a| if (a.*) |*f| f.cancel(testing.io) catch {};
+    for (answering[0..count]) |*a| a.* = try testing.io.concurrent(answerOne, .{ try server.accept(testing.io), size, events });
+    for (answering[0..count]) |*a| {
+        try a.*.?.await(testing.io);
+        a.* = null;
+    }
+}
+
+fn manyLargeAnswers(events: bool) !void {
+    const count = 16;
+    const size = 200 * 1024;
+    const max = 256 * 1024;
+    var address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(testing.io, .{ .reuse_address = true });
+    defer server.deinit(testing.io);
+    var serving = try testing.io.concurrent(serveAnswers, .{ &server, count, size, events });
+    defer serving.cancel(testing.io) catch {};
+    var peak: Peak = .{ .child = testing.allocator };
+    var url: [64]u8 = undefined;
+    var c: Client = undefined;
+    try c.init(testing.io, peak.allocator(), .{ .url = try std.mem.print(&url, "http://127.0.0.1:{d}/mcp", .{server.socket.address.getPort()}), .max_message = max });
+    defer c.deinit();
+    c.budget.allowance = 4 * 1024;
+    for (1..count + 1) |key| try c.send(key, .post, "{}", &.{});
+    // Nothing is taken for a while: every reader reads what it may.
+    try Io.sleep(testing.io, .fromMilliseconds(500), .awake);
+    var answers: usize = 0;
+    var ended: usize = 0;
+    while (ended < count) switch (try c.next(10_000)) {
+        .message => |m| if (m.message == .response) {
+            answers += 1;
+        },
+        .ended => |e| {
+            try testing.expectEqual(Ending.complete, e.how);
+            ended += 1;
+        },
+        .timeout => return error.TestTimeout,
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, count), answers);
+    // What the budget counts, the spare, each reader's allowance, growth
+    // slack, and the client's own buffers: set by `max`, not by how many
+    // answers come at once.
+    try testing.expect(peak.peak.load(.monotonic) < count * size / 2);
+}
+
+test "many large answers at once are read within the budget, one large read at a time" {
+    // About 0.9 MiB here, and 3.5 MiB before D178.
+    try manyLargeAnswers(false);
+}
+
+test "many large events at once are read into one buffer each, within the budget" {
+    try manyLargeAnswers(true);
+}
+
+fn hangAfterComment(stream: Io.net.Stream) !void {
+    defer stream.close(testing.io);
+    var in: [4096]u8 = undefined;
+    var r = stream.reader(testing.io, &in);
+    while ((try r.interface.takeDelimiterInclusive('\n')).len > 2) {}
+    var out: [4096]u8 = undefined;
+    var w = stream.writer(testing.io, &out);
+    try w.interface.writeAll("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\r\n: ");
+    try w.interface.splatByteAll('c', 20 * 1024);
+    try w.interface.writeAll("\n");
+    try w.interface.flush();
+    try Io.sleep(testing.io, .fromSeconds(30), .awake);
+}
+
+/// One stream sends a large comment and stays open; the next, one large event.
+fn serveCommentThenEvent(server: *Io.net.Server) !void {
+    var hanging = try testing.io.concurrent(hangAfterComment, .{try server.accept(testing.io)});
+    defer hanging.cancel(testing.io) catch {};
+    try answerOne(try server.accept(testing.io), 200 * 1024, true);
+    // The comment's stream stays open until the test ends.
+    try Io.sleep(testing.io, .fromSeconds(30), .awake);
+}
+
+test "a large comment doesn't keep the large read from the next large event" {
+    var address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try address.listen(testing.io, .{ .reuse_address = true });
+    defer server.deinit(testing.io);
+    var serving = try testing.io.concurrent(serveCommentThenEvent, .{&server});
+    defer serving.cancel(testing.io) catch {};
+    var url: [64]u8 = undefined;
+    var c: Client = undefined;
+    try c.init(testing.io, testing.allocator, .{ .url = try std.mem.print(&url, "http://127.0.0.1:{d}/mcp", .{server.socket.address.getPort()}), .max_message = 256 * 1024 });
+    defer c.deinit();
+    c.budget.allowance = 4 * 1024;
+    try c.send(1, .post, "{}", &.{});
+    // The comment is read, past the allowance, and cut.
+    try Io.sleep(testing.io, .fromMilliseconds(200), .awake);
+    try c.send(2, .post, "{}", &.{});
+    while (true) switch (try c.next(5_000)) {
+        .message => |m| if (m.message == .response) break,
+        .timeout => return error.TestTimeout,
+        else => {},
+    };
 }
 
 test "a timed wait starts no task, so it works where none can run" {

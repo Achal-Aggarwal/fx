@@ -1,5 +1,5 @@
 ---- MODULE SignIn ----
-\* fx's MCP-v2 sign-in for one HTTP server (vercel-labs/fx at 53a561bea).
+\* fx's MCP sign-in for one HTTP server (vercel-labs/fx at 53a561bea).
 \*
 \* Code:
 \*   - src/core/mcp_host/runtime.zig: startLogin (endLogin of this server's
@@ -9,7 +9,7 @@
 \*     the bridge's origin, carrying the state `.authorize` gave the
 \*     listener, is posted as finish_login; the task then ends),
 \*     finishLogin (`fx mcp login NAME --no-browser`: a pasted address,
-\*     past the listener), `.finish_login` (engine.finishSignIn: MCP-v2's
+\*     past the listener), `.finish_login` (engine.finishSignIn: the engine's
 \*     flow checks the state),
 \*     onServer `.authorize` / `.signed_in` / `.sign_in_failed`, expireLogins
 \*     (5 minutes), shutdown (endLogin for every login, each with a
@@ -130,7 +130,7 @@ Arrive(k, s, kind) ==
        ELSE UNCHANGED <<phase, got, foreignTaken>>
     /\ UNCHANGED <<cur, alive, retired, leases, hostOf, live, flow, shownUrl, indicator, saved, next, badRedeem>>
 
-\* finishLogin: the address the browser ended on, pasted. It goes to MCP-v2
+\* finishLogin: the address the browser ended on, pasted. It goes to the engine
 \* as it is, past the listener, so a wrong one fails the sign-in there.
 Paste(k, s) ==
     /\ phase[k] = "open"
@@ -138,7 +138,7 @@ Paste(k, s) ==
     /\ got' = [got EXCEPT ![k] = s]
     /\ UNCHANGED <<cur, alive, retired, leases, hostOf, live, flow, shownUrl, indicator, saved, next, badRedeem, foreignTaken>>
 
-\* `.finish_login`: MCP-v2 checks the state against the live flow.
+\* `.finish_login`: the engine checks the state against the live flow.
 Handle(k) ==
     /\ phase[k] = "consumed" /\ alive[hostOf[k]] /\ live[hostOf[k]] = k
     /\ LET h == hostOf[k]

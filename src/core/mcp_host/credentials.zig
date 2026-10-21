@@ -1,11 +1,11 @@
-//! Sign-in credentials MCP-v2 hands fx to keep (AUTH-21): one opaque blob per
+//! Sign-in credentials the engine hands fx to keep (AUTH-21): one opaque blob per
 //! server name and URL, so a changed URL never gets an old token. They live in
 //! the macOS Keychain, or in a private file under `~/.fx/mcp-credentials/`.
 //! Either way the directory's advisory lock is held while the store is read
 //! and rewritten, so two fx processes don't overwrite each other's entries.
 //! A store this fx can't read, damaged or saved by a newer fx, is never
-//! written over. v1's logins are never taken over: v1 and
-//! MCP-v2 refreshing one login apart, neither seeing the other's saves, would
+//! written over. v1's logins are never taken over: an older fx and this
+//! one refreshing one login apart, neither seeing the other's saves, would
 //! sign it out. One fx refreshes a login at a time, under that login's
 //! refresh lock.
 //!
@@ -213,8 +213,11 @@ pub const Store = struct {
             std.crypto.secureZero(u8, out.writer.buffer);
             out.deinit();
         }
-        // A profile server's entry has no workspace field, as before.
-        try std.json.Stringify.value(.{ .version = 1, .servers = doc.entries.items }, .{ .emit_null_optional_fields = false }, &out.writer);
+        // Version 2: an fx that reads only version 1 treats the store as
+        // newer and never writes over it, so it can't take over v1's logins
+        // or drop a login's workspace. A profile server's entry has no
+        // workspace field.
+        try std.json.Stringify.value(.{ .version = 2, .servers = doc.entries.items }, .{ .emit_null_optional_fields = false }, &out.writer);
         switch (s.backend) {
             .keychain => try native_keychain.storeMcpHostCredentials(out.written()),
             .file => try io_mod.durableReplaceVerified(alloc, dir, file_name, out.written()),
@@ -325,7 +328,7 @@ const Doc = struct {
         var arena: std.heap.ArenaAllocator = .init(alloc);
         defer arena.deinit();
         const saved = try std.json.parseFromSliceLeaky(Saved, arena.allocator(), bytes, .{ .ignore_unknown_fields = true });
-        if (saved.version != 1) return error.UnsupportedVersion;
+        if (saved.version != 1 and saved.version != 2) return error.UnsupportedVersion;
         var doc: Doc = .{};
         errdefer doc.deinit(alloc);
         try doc.entries.ensureTotalCapacity(alloc, saved.servers.len);
@@ -428,7 +431,7 @@ test "a workspace server's credential is its workspace's own, apart from the pro
     try testing.expectEqualStrings("{\"access\":\"mine\"}", still);
 }
 
-/// v1's store with a login for linear, and one MCP-v2 can't use.
+/// v1's store with a login for linear, and one the engine can't use.
 fn writeV1(home: []const u8) !void {
     var home_dir = io_mod.VerifiedDir{ .dir = try std.Io.Dir.openDirAbsolute(io_mod.getIo(), home, .{ .iterate = true }) };
     defer home_dir.close();
@@ -504,7 +507,7 @@ test "the credential file is private, and one this fx can't read is never writte
     // sign-in or sign-out fails, and the file stays as it was.
     for ([_][]const u8{
         "not json",
-        "{\"version\":2,\"imported_v1\":true,\"servers\":[{\"name\":\"plain\",\"url\":\"https://mcp.plain.com/mcp\",\"credential\":\"{}\"}]}",
+        "{\"version\":3,\"imported_v1\":true,\"servers\":[{\"name\":\"plain\",\"url\":\"https://mcp.plain.com/mcp\",\"credential\":\"{}\"}]}",
     }) |bytes| {
         try tmp.dir.writeFile(testing.io, .{ .sub_path = test_path, .data = bytes });
         try testing.expectEqual(@as(?[]u8, null), try store.get(testing.allocator, .{ .name = "plain", .url = url }));

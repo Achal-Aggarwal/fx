@@ -51,6 +51,20 @@ const auth_core = @import("core/auth.zig");
 const subscription = @import("core/subscription.zig");
 const subscriptions = @import("protocol/subscriptions.zig");
 
+/// Bytes of a line an excerpt keeps, before "...".
+const excerpt_max = 80;
+/// Bytes of a progress note the host is shown, before "...".
+const note_max = 160;
+
+/// The start of `line`, at most `max` bytes, terminal-safe, in `buf`: never
+/// a cut UTF-8 sequence, control bytes as '?', and "..." when cut.
+fn excerptOf(comptime max: usize, buf: *[max + 3]u8, line: []const u8) []const u8 {
+    const n = process.maskedPrefix(buf[0..max], line).len;
+    if (n == line.len) return buf[0..n];
+    @memcpy(buf[n..][0..3], "...");
+    return buf[0 .. n + 3];
+}
+
 pub const Link = union(enum) {
     http: http.Options,
     /// Its `config` is replaced: the process never backs off or gives up on
@@ -105,8 +119,16 @@ pub const Event = union(enum) {
     /// A listing ended (or a need was served from the cache). Read the list
     /// with `toolList`.
     tools: struct { ok: bool, fresh: bool, dropped: tools.Added = .{}, needs_auth: bool = false },
+    /// The tool list may have changed: `list_changed`, a call answer that
+    /// suggests so, a new process, or a fresh list's TTL ran out. A host
+    /// that keeps its own copy lists again before its next call (CAT-05).
+    tools_stale,
     /// A call ended. `answer` is set when the server answered, valid until the next `next`.
     called: struct { handle: Handle, outcome: CallOutcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call },
+    /// A call's server reported progress that the request core accepted.
+    /// `message` is terminal-safe and cut to 160 bytes, valid until the
+    /// next `next`.
+    progress: struct { handle: Handle, progress: f64, total: ?f64, message: ?[]const u8 },
     /// A call needs the host's answers to its input requests: `respond` with
     /// one value per request, in order, or `cancel`. The requests stay
     /// valid until then.
@@ -201,7 +223,7 @@ const Kept = struct {
 };
 
 const Timer = struct {
-    kind: union(enum) { request: request.Timer, probe: u32, expiry: catalog.Generation, resume_stream: request.Id, listen, listen_wait, backoff: Handle, relisten: struct { sub: u8, generation: u32 }, initialized: u64 },
+    kind: union(enum) { request: request.Timer, probe: u32, expiry: catalog.Generation, resume_stream: request.Id, listen, listen_wait, backoff: Handle, relisten: struct { sub: u8, generation: u32 }, initialized: u64, refresh: u64 },
     due_ms: i64,
 };
 
@@ -229,13 +251,18 @@ pub const Server = struct {
     /// Stdio: the process the era was last detected for, and a start asked
     /// for while the last process was still stopping.
     era_generation: stdio_conn.Generation = 0,
+    /// When the current start's time runs out.
+    start_due_ms: i64 = 0,
+    /// The refresh whose deadline is armed.
+    refresh_timed: u64 = 0,
     catalog_generation: stdio_conn.Generation = 0,
     start_pending: bool = false,
     table: request.Table,
     table_slots: [64]request.Slot = undefined,
     detector: era.Detector,
     catalog: catalog.Catalog,
-    store: tools.Store = .{ .check_headers = true },
+    /// Its `check_headers` is set for each page from the session's era.
+    store: tools.Store = .{},
     logicals: [32]Logical = undefined,
     next_handle: Handle = 1,
     timers: std.ArrayList(Timer) = .empty,
@@ -244,6 +271,15 @@ pub const Server = struct {
     event_count: usize = 0,
     /// The answer an event points into, kept until the next `next`.
     held_answer: ?tools.Call = null,
+    /// The message of an invalid reply's answer, kept as long as the line it
+    /// came from: until the process is read again.
+    refused_reply: [512]u8 = undefined,
+    /// An excerpt of the last stdout line that answered nothing, since the
+    /// server was last ready: what a failed start wrote instead.
+    stray: [excerpt_max + 3]u8 = undefined,
+    stray_len: u8 = 0,
+    /// The message of the last progress event, until the next `next`.
+    note: [note_max + 3]u8 = undefined,
     /// What the last page added, for the warning about dropped tools.
     last_added: tools.Added = .{},
 
@@ -314,7 +350,7 @@ pub const Server = struct {
             .http => |h| {
                 try r.client.init(io, gpa, h);
                 r.auth = .init(io, gpa, &r.client, h.url, options.auth, trace.on(options.trace));
-                if (options.auth.saved) |saved| try r.auth.restore(saved);
+                if (options.auth.saved) |saved| _ = try r.auth.restore(saved);
             },
             .stdio => |o| {
                 var po = o;
@@ -376,6 +412,28 @@ pub const Server = struct {
         try r.started();
     }
 
+    /// How the server's last process ended, once it has.
+    pub fn exitStatus(r: *const Server) ?process.Exit {
+        return if (r.stdio) r.proc.exit else null;
+    }
+
+    /// An excerpt of the last stdout line that answered nothing since the
+    /// server was last ready.
+    pub fn strayLine(r: *const Server) ?[]const u8 {
+        return if (r.stray_len == 0) null else r.stray[0..r.stray_len];
+    }
+
+    /// The server's last stderr lines, in `out`, while it runs over stdio.
+    pub fn stderrTail(r: *Server, out: *[process.tail_max]u8) ?[]const u8 {
+        if (!r.stdio) return null;
+        const tail = r.proc.stderrTail(out);
+        return if (tail.len == 0) null else tail;
+    }
+
+    fn keepStray(r: *Server, line: []const u8) void {
+        r.stray_len = @intCast(excerptOf(excerpt_max, &r.stray, line).len);
+    }
+
     /// Why the last start of the process failed, if it did. The engine shows
     /// it in the server's status.
     pub fn spawnError(r: *const Server) ?anyerror {
@@ -402,6 +460,8 @@ pub const Server = struct {
         r.listen_key = null;
         r.timers.clearRetainingCapacity();
         r.held_sends.clearRetainingCapacity();
+        // An initialized notification still unanswered: its POST goes too.
+        if (r.initialized_key) |key| try r.closeKey(key, .forgotten);
         r.initialized_key = null;
         r.listen_pending = false;
         r.legacy = null;
@@ -541,10 +601,13 @@ pub const Server = struct {
 
     /// Takes a credential `saveCredential` wrote, as a sign-in would: what
     /// waits for one goes out with it (another host process signed in).
-    pub fn useCredential(r: *Server, saved: []const u8) Error!void {
+    /// False when it can't be used, as `Auth.restore` says, and nothing
+    /// changes.
+    pub fn useCredential(r: *Server, saved: []const u8) Error!bool {
         if (r.stdio) return error.NotReady;
-        try r.auth.restore(saved);
+        if (!try r.auth.restore(saved)) return false;
         try r.runAuth(null);
+        return true;
     }
 
     /// Sends the refresh `refresh_due` announced.
@@ -674,7 +737,7 @@ pub const Server = struct {
             .opened => |key| if (r.legacy != null and key == r.listen_key) try r.listenSettled(),
             .ended => |e| try r.onEnded(e.key, e.status, e.how, e.challenge),
             .fetched => |f| {
-                _ = try r.auth.fetched(f.key, f.status, f.body);
+                _ = try r.auth.fetched(f.key, f.status, f.media, f.challenge, f.body);
                 try r.runAuth(null);
             },
             .timeout => unreachable,
@@ -687,11 +750,35 @@ pub const Server = struct {
         switch (incoming) {
             // On stdio a response names its request only by its id.
             .message => |m| try r.onMessage(if (m.message == .response) m.message.response.id orelse 0 else 0, 200, m.message),
-            // With no sink for stderr, and a line that isn't MCP.
-            .stderr, .dropped => {},
+            // With no sink for stderr.
+            .stderr => {},
+            .dropped => |d| try r.onRefusedLine(d.err, d.line),
             .changed => |c| try r.onProcessChanged(c.state, c.lost),
             .timeout => unreachable,
         }
+    }
+
+    /// A line `decode` refused that names a request in flight is that
+    /// request's answer, an invalid one: the request fails with what was
+    /// wrong and the start of the line. Any other is ignored.
+    fn onRefusedLine(r: *Server, err: wire.DecodeError, line: []const u8) Error!void {
+        // Empty for a process that has gone since.
+        if (line.len == 0) return;
+        const id = wire.responseId(line) orelse return r.keepStray(line);
+        if (r.logicalFor(id) == null) return r.keepStray(line);
+        const why = switch (err) {
+            error.NotJsonRpc2 => "its jsonrpc isn't \"2.0\"",
+            error.Ambiguous => "it has both a result and an error, or neither",
+            error.InvalidResult => "its result isn't an object",
+            error.InvalidErrorObject => "its error isn't an error object",
+            else => "it isn't valid JSON-RPC",
+        };
+        var buf: [excerpt_max + 3]u8 = undefined;
+        var text: [192]u8 = undefined;
+        const plain = std.mem.print(&text, "invalid reply ({s}): {s}", .{ why, excerptOf(excerpt_max, &buf, line) }) catch unreachable;
+        var w: std.Io.Writer = .fixed(&r.refused_reply);
+        std.json.Stringify.value(plain, .{}, &w) catch unreachable;
+        try r.onMessage(id, 200, .{ .response = .{ .id = id, .body = .{ .failure = .{ .code = wire.code.invalid_request, .message = w.buffered(), .data = null } } } });
     }
 
     fn onProcessChanged(r: *Server, state: stdio_conn.State, lost: bool) Error!void {
@@ -859,11 +946,18 @@ pub const Server = struct {
         var id: request.Id = 0;
         for (out.effects()) |effect| switch (effect) {
             .write_request => |w| id = w.id,
-            .arm_timer => |a| try r.armRequestTimer(a.timer, a.after_ms),
+            .arm_timer => |a| try r.armRequestTimer(a.timer, if (kind == .initialize and a.timer.kind == .hard) r.startLeft(a.after_ms) else a.after_ms),
             else => {},
         };
         if (r.questionsHeld() > 0) try r.stepRequest(.{ .idle_paused = id });
         return id;
+    }
+
+    /// What is left of the start's time, at most `after_ms`. An initialize
+    /// that renews a ready 2025 session isn't a start.
+    fn startLeft(r: *const Server, after_ms: u32) u32 {
+        if (r.detector.ready()) return after_ms;
+        return @intCast(std.math.clamp(r.start_due_ms - r.now(), 0, after_ms));
     }
 
     /// 2025 questions the host holds and hasn't answered.
@@ -1023,11 +1117,26 @@ pub const Server = struct {
                 // One without a subscriptionId still refreshes the list.
                 if (std.mem.eql(u8, n.method, "notifications/tools/list_changed")) return r.stepCatalog(.invalidated);
                 if (std.mem.eql(u8, n.method, "notifications/progress")) {
-                    var found: [2]?[]const u8 = undefined;
-                    wire.objectFields(n.params orelse "{}", &.{ "progressToken", "progress" }, &found) catch return;
+                    var found: [4]?[]const u8 = undefined;
+                    wire.objectFields(n.params orelse "{}", &.{ "progressToken", "progress", "total", "message" }, &found) catch return;
                     const token = wire.decimal(found[0] orelse return) orelse return;
                     const value = std.fmt.parseFloat(f64, found[1] orelse return) catch return;
-                    return r.stepRequest(.{ .progress_received = .{ .token = token, .value = value } });
+                    const before = r.table.progressCount(token);
+                    try r.stepRequest(.{ .progress_received = .{ .token = token, .value = value } });
+                    // Accepted progress on a call reaches the host.
+                    if (r.table.progressCount(token) == before) return;
+                    const l = r.logicalFor(token) orelse return;
+                    if (l.what != .call) return;
+                    var text: [1024]u8 = undefined;
+                    var fixed: std.heap.FixedBufferAllocator = .init(&text);
+                    const said = if (found[3]) |raw| wire.decodeString(fixed.allocator(), raw) catch null else null;
+                    r.emit(.{ .progress = .{
+                        .handle = l.handle,
+                        .progress = value,
+                        .total = if (found[2]) |t| std.fmt.parseFloat(f64, t) catch null else null,
+                        .message = if (said) |m| excerptOf(note_max, &r.note, m) else null,
+                    } });
+                    return;
                 }
             },
             // A 2026 server sends no requests; they are dropped. A 2025
@@ -1138,9 +1247,12 @@ pub const Server = struct {
             .result => |res| {
                 if (res.kind != .complete) return .page_failed;
                 const page = tools.parsePage(res.raw) catch return .page_failed;
+                // `x-mcp-header` is a 2026 annotation: a 2025 server's tools
+                // keep theirs unchecked, as nothing projects them.
+                r.store.check_headers = !r.legacyEra();
                 const added = r.store.addPage(r.gpa, page) catch return .page_failed;
                 r.last_added = added;
-                return .{ .page_received = .{ .more = page.next_cursor != null, .ttl_ms = page.ttl_ms } };
+                return .{ .page_received = .{ .more = page.next_cursor != null, .ttl_ms = page.ttl_ms, .now_ms = r.now() } };
             },
         }
     }
@@ -1484,9 +1596,10 @@ pub const Server = struct {
 
     /// A 2025 initialized notification went unanswered for the request
     /// timeout. Every later send waits for it, so the session can't go on:
-    /// it fails with the reason. The host's teardown closes the
-    /// POST with the session.
-    fn onInitializedTimedOut(r: *Server) void {
+    /// it fails with the reason. Nothing reads its answer now, so its POST
+    /// is closed here; the teardown doesn't know of it.
+    fn onInitializedTimedOut(r: *Server) Error!void {
+        if (r.initialized_key) |key| try r.closeKey(key, .forgotten);
         r.initialized_key = null;
         r.emit(.{ .failed = .initialized_timed_out });
     }
@@ -1749,6 +1862,12 @@ pub const Server = struct {
                 .refresh_ended => r.emit(.refresh_ended),
             }
         }
+        // A refresh that went out gets `refresh_ms` to be answered.
+        const key = r.auth.refresh_key;
+        if (key != 0 and key != r.refresh_timed) {
+            r.refresh_timed = key;
+            try r.timers.append(r.gpa, .{ .kind = .{ .refresh = key }, .due_ms = r.now() + r.options.timeouts.refresh_ms });
+        }
     }
 
     /// Posts a kept request with the token's `Authorization`, in
@@ -1766,15 +1885,17 @@ pub const Server = struct {
     /// The gate gave up on `key`. Before the era is known that stops detection.
     /// Otherwise a request ends as the server's 401: the server never read
     /// it, whether it waited for a sign-in or for a renewal that got no usable
-    /// answer, so a call never counts as maybe run. Anything else, such as
-    /// the listening GET, ends as a broken stream when the refresh got no
-    /// answer.
+    /// answer, so a call never counts as maybe run. A listen whose renewal
+    /// got no usable answer ends as a broken stream instead, so it listens
+    /// again after its backoff rather than stopping for good, as anything
+    /// else does, such as the listening GET.
     fn authGaveUp(r: *Server, key: u64, why: auth_core.GiveUp) Error!void {
         r.unkeep(key);
         if (key < aux_base) if (r.logicalFor(key)) |l| {
             l.needs_auth = why == .needs_sign_in;
             l.unrenewed = why == .failed;
             if ((l.what == .discover or l.what == .initialize) and !r.detector.ready()) return r.abortDetection(why);
+            if (why == .failed and l.what == .listen) return r.onEndedDomain(key, 0, .broken);
             return r.onEndedDomain(key, 401, .http_failure);
         };
         try r.onEndedDomain(key, if (why == .needs_sign_in) 401 else 0, if (why == .needs_sign_in) .http_failure else .broken);
@@ -1874,8 +1995,10 @@ pub const Server = struct {
     }
 
     fn stepEra(r: *Server, event: era.Event) Error!void {
+        const was = r.detector.state;
         var out: era.Output = .{};
         r.detector.step(event, &out) catch return;
+        if (was == .unknown and r.detector.state != .unknown) r.start_due_ms = r.now() + r.options.timeouts.start_ms;
         if (r.tracer()) |t| try era.writeTrace(t, r.era_instance, &out);
         for (out.effects()) |effect| switch (effect) {
             .send_discover => |i| {
@@ -1894,7 +2017,7 @@ pub const Server = struct {
                 try era.writeInitialized(&body.writer);
                 r.proc.send(.notification, body.written()) catch {};
             },
-            .arm_probe_timer => |a| try r.timers.append(r.gpa, .{ .kind = .{ .probe = a.probe }, .due_ms = r.now() + a.after_ms }),
+            .arm_probe_timer => |a| try r.timers.append(r.gpa, .{ .kind = .{ .probe = a.probe }, .due_ms = r.now() + r.startLeft(a.after_ms) }),
             .ready => |v| {
                 // The catalog starts over for each new process or detection
                 // run; a new 2025 session in a run does that too.
@@ -1902,6 +2025,7 @@ pub const Server = struct {
                 const first = r.catalog_generation != run;
                 r.catalog_generation = run;
                 if (r.stdio) r.proc.setEra(if (v == .legacy) .legacy else .modern) catch {};
+                r.stray_len = 0;
                 r.emit(.{ .ready = era.versionName(r.detector.config, v).? });
                 if (first) try r.stepCatalog(.{ .process_started = if (v == .legacy) .legacy else .modern });
                 // The listens a process exit ended go out again.
@@ -1919,8 +2043,14 @@ pub const Server = struct {
 
     fn stepCatalog(r: *Server, event: catalog.Event) Error!void {
         var out: catalog.Output = .{};
+        const generation = r.catalog.generation;
+        const was_fresh = r.catalog.cache == .fresh;
         r.catalog.step(event, &out) catch return;
         if (r.tracer()) |t| try catalog.writeTrace(t, "remote", &out);
+        // A host has nothing to drop before the first list, unless one is
+        // being listed: what that listing brings is already old.
+        const changed = r.catalog.generation != generation and (r.catalog.cache != .none or r.catalog.listing);
+        if (changed or (was_fresh and r.catalog.cache != .fresh)) r.emit(.tools_stale);
         for (out.effects()) |effect| switch (effect) {
             .send_page => {
                 const l = try r.newLogical(.list, .idempotent);
@@ -1937,6 +2067,17 @@ pub const Server = struct {
                 r.emit(.{ .tools = .{ .ok = false, .fresh = false, .needs_auth = r.page_needs_auth } });
                 r.page_needs_auth = false;
                 try r.relisted(false);
+            },
+            // The last list goes out unless the page needs a sign-in, which
+            // every call from that list would need too.
+            .serve_last => {
+                r.store.discard();
+                r.emit(.{ .tools = .{ .ok = !r.page_needs_auth, .fresh = false, .needs_auth = r.page_needs_auth } });
+                r.page_needs_auth = false;
+                try r.relisted(false);
+                // Still stale: a host that keeps its copy asks again next
+                // time.
+                r.emit(.tools_stale);
             },
             .serve => r.emit(.{ .tools = .{ .ok = true, .fresh = true } }),
             .arm_expiry => |a| try r.timers.append(r.gpa, .{ .kind = .{ .expiry = a.generation }, .due_ms = r.now() + a.after_ms }),
@@ -2001,7 +2142,14 @@ pub const Server = struct {
                 .listen_wait => try r.listenSettled(),
                 .backoff => |handle| if (r.logicalByHandle(handle)) |l| try r.stepChain(l, .backoff_elapsed),
                 .relisten => |x| try r.stepSubs(.{ .retry_due = .{ .sub = x.sub, .generation = x.generation } }),
-                .initialized => |key| if (r.initialized_key == key) r.onInitializedTimedOut(),
+                .initialized => |key| if (r.initialized_key == key) try r.onInitializedTimedOut(),
+                // No answer in time is no answer: the refresh fails, the
+                // tokens stay, and what waits for it fails.
+                .refresh => |key| if (r.auth.refresh_key == key) {
+                    r.client.cancel(key);
+                    _ = try r.auth.fetched(key, 0, "", null, "");
+                    try r.runAuth(null);
+                },
             }
             i = 0;
         }

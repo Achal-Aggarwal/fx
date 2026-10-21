@@ -24,7 +24,6 @@ const gateway_provider = @import("../core/gateway/gateway_provider.zig");
 const model_catalog = @import("../core/gateway/model_catalog.zig");
 const model_capabilities = @import("../core/config/model_capabilities.zig");
 const hooks = @import("../core/hooks/hooks.zig");
-const mcp_runtime = @import("../core/mcp/mcp_runtime.zig");
 const mcp_host = @import("../core/mcp_host/host.zig");
 const mode_registry = @import("../core/modes/mode_registry.zig");
 const skill_runtime = @import("../core/skills/skill_runtime.zig");
@@ -256,8 +255,7 @@ pub const ActiveSessionState = struct {
     session_grants: []types.PermissionGrant = &.{},
     session_rt: session_runtime.SessionRuntime,
     title_task: ?*session_title_generation.Task = null,
-    mcp: ?*mcp_runtime.McpRuntime = null,
-    /// MCP-v2's host when FX_MCP_ENGINE=v2 selects it; `mcp` then stays null.
+    /// The session's MCP servers; null when it has none.
     mcp_host: ?*mcp_host.Host = null,
     /// Session-scoped client system prompt, appended after fx's instructions.
     /// Owned by the server allocator; empty when the client supplied none.
@@ -376,8 +374,6 @@ pub const ServerState = struct {
     outbound_mutex: std.Io.Mutex = .init,
     outbound_cond: std.Io.Condition = .init,
     next_outbound_request_id: u64 = 1,
-    /// Source of fresh logical MCP request IDs for MCP over ACP.
-    next_mcp_message_id: std.atomic.Value(u64) = .init(1),
     pending_outbound: std.AutoHashMapUnmanaged(u64, PendingOutbound) = .empty,
     legacy_url_mutex: std.Io.Mutex = .init,
     pending_legacy_urls: std.ArrayList(PendingLegacyUrl) = .empty,
@@ -757,11 +753,6 @@ fn destroyActiveSession(state: *ServerState) void {
     active.staged_images.deinit(state.alloc);
     types.freePermissionGrantSlice(state.alloc, active.session_grants);
     if (comptime !host_target.is_wasm) {
-        if (active.mcp) |runtime| {
-            runtime.retireAndWait();
-            runtime.deinit();
-            state.alloc.destroy(runtime);
-        }
         if (active.mcp_host) |h| h.destroy();
     }
     active.session_rt.deinit(state.alloc);
@@ -814,8 +805,6 @@ fn resolveSubagentAuthority(
     defer state.subagent_authority_mutex.unlock(io_mod.getIo());
     const integrations = if (active.mcp_host) |h|
         h.catalog.snapshotToolNames(alloc, active.permission_rules)
-    else if (active.mcp) |mcp|
-        mcp.snapshotToolNames(alloc, active.permission_rules)
     else
         alloc.alloc([]u8, 0);
     const owned_integrations = integrations catch return error.OutOfMemory;
@@ -824,16 +813,7 @@ fn resolveSubagentAuthority(
         alloc.free(owned_integrations);
     }
     var mcp_view = if (active.mcp_host) |h|
-        try h.catalog.snapshotAccessView(alloc, root_id, root_id, active.permission_rules, false)
-    else if (active.mcp) |mcp|
-        try mcp.snapshotAccessView(
-            alloc,
-            root_id,
-            root_id,
-            active.permission_rules,
-            state.cfg.mode_registry.toolAllowed(builtin_tools.advertisement_set, active.mode, "mcp_features") and
-                !permissions.rulesDenyAllTargetsForTool(active.permission_rules, "mcp_features"),
-        )
+        try h.catalog.snapshotAccessView(alloc, root_id, root_id, active.permission_rules)
     else
         null;
     defer if (mcp_view) |*view| view.deinit(alloc);
@@ -3003,10 +2983,10 @@ fn handleInitialize(state: *ServerState, alloc: Allocator, msg: *jsonrpc.Message
         .mcp_servers = state.cfg.allow_acp_mcp,
         .steering = !host_target.is_wasm and !state.cfg.minimal_kernel,
         .system_prompt = !host_target.is_wasm and !state.cfg.minimal_kernel,
-        // MCP-v2 takes only what ACP v1 defines and it speaks: stdio and
+        // fx takes only what ACP v1 defines and fx's MCP engine speaks: stdio and
         // HTTP.
-        .mcp_over_acp = state.cfg.allow_acp_mcp and !host_target.is_wasm and !mcp_host.selected(),
-        .mcp_sse = !mcp_host.selected(),
+        .mcp_over_acp = false,
+        .mcp_sse = false,
     });
     try state.writer.writeResponse(alloc, msg.id, out.writer.buffered());
 }

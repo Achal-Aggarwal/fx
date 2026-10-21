@@ -16,7 +16,8 @@
 \* server Owner(c). The host's permission comes first: a call it refuses
 \* never reaches a server (PermissionBeforeCall). A call to a ready server
 \* goes out at once; one to any other server waits, goes out the moment its
-\* server is ready, and ends when the server gives up. A call in flight ends
+\* server is ready, and fails with the first start that fails while it waits
+\* (WaitsForOneStart). A call in flight ends
 \* with its server's answer, or as lost when its process dies. The host may
 \* reconnect or disconnect a server at most MaxHost times in all. The ghosts
 \* record what the invariants need: whether the host allowed a call, whether
@@ -160,16 +161,18 @@ Stable(s) ==
     /\ stayed' = [stayed EXCEPT ![s] = TRUE]
     /\ UNCHANGED <<phase, need, call, ended, allowed, cause, host, retry, dropped, asked>>
 
-\* The start or the link failed. The calls in flight are lost. After
-\* MaxAttempts tries in a row the server gives up, and what waits for it ends.
+\* The start or the link failed. The calls in flight are lost, and the calls
+\* waiting for that start fail with it: a call waits for one start, and later
+\* tries are for later calls. After MaxAttempts tries in a row the server
+\* gives up.
 Down(s) ==
     /\ phase[s] \in {"connecting", "ready"}
     /\ LET gaveUp == attempts[s] >= MaxAttempts IN
        /\ phase' = [phase EXCEPT ![s] = IF gaveUp THEN "failed" ELSE "backoff"]
        /\ need' = [need EXCEPT ![s] = need[s] /\ ~gaveUp]
-       /\ call' = [c \in Calls |-> IF c \in Sent(s) \/ (gaveUp /\ c \in Waiting(s)) THEN "done" ELSE call[c]]
+       /\ call' = [c \in Calls |-> IF c \in Sent(s) \/ c \in Waiting(s) THEN "done" ELSE call[c]]
        /\ ended' = [c \in Calls |-> IF c \in Sent(s) THEN "lost"
-                                    ELSE IF gaveUp /\ c \in Waiting(s) THEN "failed" ELSE ended[c]]
+                                    ELSE IF c \in Waiting(s) THEN "failed" ELSE ended[c]]
        /\ retry' = [retry EXCEPT ![s] = ~gaveUp]
        /\ asked' = [asked EXCEPT ![s] = asked[s] /\ ~gaveUp]
     /\ dropped' = [dropped EXCEPT ![s] = FALSE]
@@ -246,6 +249,13 @@ Isolation ==
         (phase'[s] # phase[s]) =>
             /\ \A t \in Servers \ {s}: phase'[t] = phase[t]
             /\ \A c \in Calls: Owner(c) # s => call'[c] = call[c]]_vars
+
+\* A start that fails leaves no call to its server waiting; a call waits
+\* for one start, never through every try.
+WaitsForOneStart ==
+    [][\A s \in Servers:
+        (phase[s] \in {"connecting", "ready"} /\ phase'[s] \in {"backoff", "failed"}) =>
+            \A c \in Calls: Owner(c) = s => call'[c] # "waiting"]_vars
 
 \* Every allowed call ends, and every need is served or refused.
 EveryCallEnds == \A c \in Calls: call[c] \in {"waiting", "sent"} ~> call[c] = "done"

@@ -5,7 +5,9 @@ const pidPath = process.env.FX_MCP_PID_PATH;
 const resultText = process.env.FX_MCP_RESULT_TEXT ?? "LEGACY_MCP_TOOL_RESULT";
 const mode = process.env.FX_MCP_MODE ?? "normal";
 const invalidationReleasePath = process.env.FX_MCP_INVALIDATION_RELEASE_PATH;
-const legacyVersion = process.env.FX_MCP_LEGACY_VERSION ?? "2024-11-05";
+// By default an old server that never heard of server/discover, at the
+// oldest version fx speaks.
+const legacyVersion = process.env.FX_MCP_LEGACY_VERSION ?? "2025-03-26";
 const discoveryVersions = process.env.FX_MCP_LEGACY_DISCOVERY_VERSIONS?.split(",");
 const discoveryMethodNotFound = process.env.FX_MCP_LEGACY_DISCOVERY_METHOD_NOT_FOUND === "1";
 const discoveryInvalidParams = process.env.FX_MCP_LEGACY_DISCOVERY_INVALID_PARAMS === "1";
@@ -15,10 +17,7 @@ const elicitationUrl = process.env.FX_MCP_ELICITATION_URL ?? "https://example.te
 const urlRequiredOperation = process.env.FX_MCP_URL_REQUIRED_OPERATION ?? "tools";
 let buffer = Buffer.alloc(0);
 let messageCount = 0;
-// By default this fixture also checks v1's own wire choices: `initialize`
-// opens a fresh process after a discovery probe, and `tools/list` carries no
-// `_meta`. FX_MCP_SPEC_CLIENT=1 accepts any client the spec allows instead.
-const specClient = process.env.FX_MCP_SPEC_CLIENT === "1";
+// `initialize` is the first message, or the second after a discovery probe.
 let sawDiscovery = false;
 let toolsListCalls = 0;
 let currentToolName = "echo";
@@ -230,7 +229,11 @@ function handle(message) {
       });
       return;
     }
-    if (legacyVersion !== "2024-11-05" && !discoveryMethodNotFound) {
+    if (
+      process.env.FX_MCP_LEGACY_VERSION !== undefined &&
+      legacyVersion !== "2024-11-05" &&
+      !discoveryMethodNotFound
+    ) {
       send({
         jsonrpc: "2.0",
         id: message.id,
@@ -256,7 +259,7 @@ function handle(message) {
       process.stdout.write("not json\n");
       return;
     }
-    if (messageCount !== 1 && !(specClient && sawDiscovery && messageCount === 2)) process.exit(2);
+    if (messageCount !== 1 && !(sawDiscovery && messageCount === 2)) process.exit(2);
     const requestedVersion = message.params?.protocolVersion;
     if (requestedVersion !== legacyVersion && rejectNewerInitialize) process.exit(5);
     if (requestedVersion === "2025-06-18") {
@@ -266,8 +269,12 @@ function handle(message) {
     }
     if (requestedVersion === "2025-11-25") {
       const capability = message.params?.capabilities?.elicitation;
+      // URL questions exist from 2025-11-25; an older server answers with its
+      // own version and never asks for one.
+      const asksForUrl = (mode === "url_required_error" || mode === "url_required_multiple") &&
+        legacyVersion === "2025-11-25";
       if (
-        (mode === "direct_form" || mode === "url_required_error" || mode === "url_required_multiple") &&
+        (mode === "direct_form" || asksForUrl) &&
         (capability?.form == null || capability?.url == null)
       ) process.exit(7);
     }
@@ -295,7 +302,6 @@ function handle(message) {
   if (message.method === "notifications/initialized") return;
   if (message.method === "tools/list") {
     toolsListCalls += 1;
-    if (message.params?._meta != null && !specClient) process.exit(3);
     send({
       jsonrpc: "2.0",
       id: message.id,

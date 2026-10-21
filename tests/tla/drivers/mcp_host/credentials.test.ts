@@ -52,13 +52,13 @@ class Session {
 
 const CREDENTIAL = JSON.stringify({ access: "kept-by-newer-fx", refresh: "r", expires_at_ms: null, token_endpoint: "http://127.0.0.1:9/token", revocation_endpoint: null, resource: URL, client_id: "c", client_secret: null, method: "none" });
 
-/** MCP-v2's store holding web's login, as `version` (1 is this fx's). */
+/** fx's MCP credential store holding web's login, as `version` (this fx reads 1 and 2, and writes 2). */
 function writeV2(f: Fixture, version = 1) {
   mkdirSync(join(f.home, ".fx", "mcp-credentials"), { recursive: true, mode: 0o700 });
   writeFileSync(v2Path(f), JSON.stringify({ version, servers: [{ name: "web", url: URL, credential: CREDENTIAL }] }), { mode: 0o600 });
 }
 
-/** A newer fx's document: version 2, which this fx can't read. */
+/** A newer fx's document: version 3, which this fx can't read. */
 function rewriteAsVersion(f: Fixture, version: number) {
   const doc = JSON.parse(readFileSync(v2Path(f), "utf8"));
   writeFileSync(v2Path(f), JSON.stringify({ ...doc, version }), { mode: 0o600 });
@@ -81,7 +81,7 @@ test("control: v1's login is never taken over, and v1's store is left as it is (
 
 test("A newer fx's store is never written over; sign-in and sign-out say why they can't, and the login is there once it's readable (trace ACCEPTED)", async () => {
   const s = new Session(setup("cred-unreadable"));
-  writeV2(s.f, 2);
+  writeV2(s.f, 3);
   const before = readFileSync(v2Path(s.f), "utf8");
   save(join(s.f.base, "store-before.json"), before);
   expect(s.observe()).toEqual({ kind: "unreadable", entries: ["web"], v1: [] });
@@ -118,7 +118,7 @@ test("a logout stays when the store becomes unreadable (trace ACCEPTED)", async 
   const out = await s.run("logout", ["mcp", "logout", "web"], "web");
   expect(out.ran.stdout).toBe("Signed out of web.\n");
   expect(out.o.entries).toEqual([]);
-  rewriteAsVersion(s.f, 2);
+  rewriteAsVersion(s.f, 3);
   s.fault("unreadable");
   const before = readFileSync(v2Path(s.f), "utf8");
   expect(s.observe().kind).toBe("unreadable");
@@ -130,7 +130,7 @@ test("a logout stays when the store becomes unreadable (trace ACCEPTED)", async 
   expect(verdict.verdict).toBe("ACCEPTED");
 }, 120_000);
 
-test("With MCP-v2's store deleted after a logout, v1's login still isn't taken (trace ACCEPTED)", async () => {
+test("With fx's MCP credential store deleted after a logout, v1's login still isn't taken (trace ACCEPTED)", async () => {
   const s = new Session(setup("cred-deleted"));
   writeV1(s.f, [v1Entry("web", URL)]);
   writeV2(s.f);

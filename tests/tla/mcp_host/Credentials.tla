@@ -1,17 +1,17 @@
 ---- MODULE Credentials ----
-\* fx's MCP-v2 credential store (src/core/mcp_host/credentials.zig), file
+\* fx's MCP credential store (src/core/mcp_host/credentials.zig), file
 \* backend (FX_DISABLE_KEYCHAIN=1; the Keychain backend reads and writes the
 \* same document through native_keychain).
 \*
 \* One document, `~/.fx/mcp-credentials/credentials-v2.json`:
-\*   {"version":1, "servers":[{name,url,credential}]}
+\*   {"version":2, "servers":[{name,url,credential}]}, version 1 still read
 \* Every operation holds the directory's advisory lock (Store.lock), so each
 \* is atomic here, and reads the document first (Store.read): a missing file
-\* is empty; one that doesn't parse, or whose version isn't 1, is unreadable,
+\* is empty; one that doesn't parse, or whose version is neither 1 nor 2, is unreadable,
 \* and nothing writes over it: get finds no login, and put and remove
-\* fail. A read writes nothing. v1's logins (mcp_auth_store.zig) are never
-\* taken over: v1 and MCP-v2 refreshing one login apart, neither seeing
-\* the other's saves, would sign it out.
+\* fail. A read writes nothing. v1's logins (`credentials.json`) are never
+\* taken over: an older fx and this one refreshing one login apart, neither
+\* seeing the other's saves, would sign it out.
 \* Operations: get (Store.snapshot from Runtime.restoreCredentials, one read
 \* for every HTTP server, on the owner thread whenever a host starts:
 \* `fx mcp list`, `fx ask`, the shell),
@@ -34,7 +34,7 @@ Kinds == {"absent", "ok", "unreadable"}
 VARIABLES
     kind,        \* the document: missing, readable, or unreadable
     entries,     \* what it holds (an unreadable one still holds it, for a reader that can read it)
-    v1,          \* v1's logins (mcp_auth_store.zig), never changed by MCP-v2
+    v1,          \* v1's logins (`credentials.json`), never changed by this fx
     loggedOut,   \* ghost: names signed out of and not signed in to since
     kept,        \* ghost: names signed in to and not signed out of since
     taken,       \* ghost: a write added a v1 login no sign-in here made
@@ -103,7 +103,7 @@ Unreadable ==
     /\ UNCHANGED <<entries, v1, loggedOut, kept, taken, overwritten>>
 
 \* Environment: it is readable again (fixed by hand, or saved as version 1
-\* again), holding what it held.
+\* or 2 again), holding what it held.
 Repair ==
     /\ "repair" \in Faults /\ kind = "unreadable"
     /\ kind' = "ok"
@@ -116,7 +116,7 @@ Delete ==
     /\ kept' = {}
     /\ UNCHANGED <<v1, loggedOut, taken, overwritten>>
 
-\* Environment: a sign-in with the v1 engine (FX_MCP_ENGINE unset).
+\* Environment: a sign-in by an older fx, which saved it in v1's store.
 V1Login(n) ==
     /\ "v1login" \in Faults /\ n \notin v1
     /\ v1' = v1 \cup {n}
@@ -133,7 +133,7 @@ Spec == Init /\ [][Next]_vars
 
 \* ---- Safety ----
 
-\* MCP-v2 never takes a v1 login; each server signs in on its own.
+\* fx never takes a v1 login; each server signs in on its own.
 NoV1LoginTaken == ~taken
 
 \* What was signed in to, and not signed out of since, is kept.

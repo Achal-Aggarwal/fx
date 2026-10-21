@@ -699,14 +699,6 @@ jobs:
       - name: Restore executable mode
         run: chmod +x zig-out/bin/fx
 
-      # The client-request-state scenario builds a Zig dispatcher fixture.
-      - name: Setup Zig
-        id: zig
-        uses: ./.github/actions/setup-zig
-        with:
-          version: "0.17.0"
-          cache-key: ci-mcp-fixtures
-
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:

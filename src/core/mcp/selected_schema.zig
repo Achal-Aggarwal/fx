@@ -5,6 +5,7 @@ const model_tool_schema = @import("../tooling/model_tool_schema.zig");
 const tool_mcp_runtime = @import("../tooling/tool_mcp_runtime.zig");
 const McpTool = @import("catalog_state.zig").McpTool;
 const Allocator = std.mem.Allocator;
+const testing_allocator = @import("../shared/testing_allocator.zig");
 const encodeScalarAlloc = model_context_encoding.scalarAlloc;
 
 pub const AlwaysLoadedTools = struct {
@@ -178,5 +179,5 @@ fn loadFour(alloc: Allocator) !void {
 }
 
 test "always-loaded tools are freed whole when memory runs out partway" {
-    try testing.checkAllAllocationFailures(testing.allocator, loadFour, .{});
+    try testing.checkAllAllocationFailures(testing_allocator.no_resize, loadFour, .{});
 }

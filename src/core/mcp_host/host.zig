@@ -1,6 +1,5 @@
-//! fx's side of MCP-v2 in one place: the runtime that owns the
-//! engine, and the catalog the model sees. Chosen with FX_MCP_ENGINE=v2
-//! until v1 is removed.
+//! fx's side of the MCP engine in one place: the runtime that owns the
+//! engine, and the catalog the model sees.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -19,7 +18,6 @@ pub const Catalog = model.Catalog;
 pub const Notify = runtime_mod.Notify;
 pub const Notice = runtime_mod.Notice;
 pub const Status = runtime_mod.Status;
-pub const selected = runtime_mod.selected;
 pub const signalServersForExit = runtime_mod.signalServersForExit;
 pub const waitRetired = runtime_mod.waitRetired;
 pub const menu = @import("menu.zig");
@@ -33,7 +31,7 @@ pub const Extras = struct {
     slash_commands: bool = false,
 };
 
-/// Loads the host for a workspace, or null when MCP-v2 isn't selected or no
+/// Loads the host for a workspace, or null when there is no home folder or no
 /// server is configured.
 pub const LoadFn = *const fn (
     gpa: Allocator,

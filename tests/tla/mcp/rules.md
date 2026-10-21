@@ -1,6 +1,6 @@
-# MCP-v2 client rules
+# MCP client rules
 
-Every client-side rule from the MCP specification that the MCP-v2 engine
+Every client-side rule from the MCP specification that the MCP engine
 (`src/mcp/`) follows, with the ID that the models in this folder and the
 drivers in `../drivers/mcp/` cite.
 
@@ -160,7 +160,7 @@ drivers in `../drivers/mcp/` cite.
 | AUTH-09 | MUST | Have a client id before starting the flow. SHOULD try pre-registered, then CIMD, then DCR, then ask the user | `2026-07-28_basic_authorization_client-registration` (intro); `2026-07-28_basic_authorization_index` §Client Registration | U09 |
 | AUTH-10 | MUST | A CIMD document is served from an HTTPS URL with a path. Its `client_id` equals the document URL, and it contains `client_id`, `client_name`, and `redirect_uris` | `2026-07-28_basic_authorization_client-registration` §Implementation Requirements | U09 |
 | AUTH-11 | MUST | (2026) DCR sends `application_type` (SHOULD be `native` for a CLI) and handles rejections. DCR is deprecated | `2026-07-28_basic_authorization_client-registration` §Application Type and Redirect URI Constraints; `2026-07-28_deprecated` | U09 |
-| AUTH-12 | MUST | Take scopes from the challenge, else from the resource metadata's `scopes_supported`, else omit `scope`. Assume no relationship between the two, and treat challenge scopes as authoritative | `2026-07-28_basic_authorization_index` §Scope Selection Strategy | U09 |
+| AUTH-12 | MUST | Take scopes from the challenge, else from the resource metadata's `scopes_supported`, else omit `scope`. Assume no relationship between the two, and treat challenge scopes as authoritative. Scopes the host configures are asked for with the challenge's, never in their place | `2026-07-28_basic_authorization_index` §Scope Selection Strategy | U09 |
 | AUTH-13 | MUST | (2026) Record the issuer together with the PKCE verifier and `state` before redirecting | `2026-07-28_basic_authorization_index` §Authorization Response Validation | U09 |
 | AUTH-14 | MUST | (2026) Check `iss` (RFC 9207) before redeeming the code, by exact string compare with no normalization. On a mismatch, MUST NOT act on or show `error` fields | `2026-07-28_basic_authorization_index` §Authorization Response Validation | U09 |
 | AUTH-15 | SHOULD | Use and verify `state` | `2026-07-28_basic_authorization_security-considerations` §Open Redirection | U09 |

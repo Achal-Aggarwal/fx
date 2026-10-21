@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { runFx } from "../evals/eval-helpers";
 import { fakeGatewayFinalText, startFakeGateway, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
-// `fx mcp` on MCP-v2. Sign-in is covered in mcp-auth.test.ts.
+// `fx mcp`. Sign-in is covered in mcp-auth.test.ts.
 
 const MODERN_FIXTURE = join(import.meta.dirname, "fixtures", "mcp-modern-stdio.mjs");
 
@@ -48,12 +48,10 @@ function createRoot(profile?: unknown, project?: unknown) {
     projectPath: join(workspace, ".mcp.json"),
     env: {
       HOME: home,
-      FX_MCP_ENGINE: "v2",
       FX_DISABLE_KEYCHAIN: "1",
       FX_AUTO_UPGRADE: "0",
       AI_GATEWAY_API_KEY: "fake-mcp-verbs-key",
       VERCEL_OIDC_TOKEN: undefined,
-      FX_MCP_PROTOCOL_VERSION: undefined,
     },
   };
 }
@@ -67,11 +65,10 @@ function mcp(root: Root, ...args: string[]) {
 const fixtureServer = (extra: Record<string, unknown> = {}) => ({
   command: process.execPath,
   args: [MODERN_FIXTURE],
-  env: { FX_MCP_SPEC_CLIENT: "1" },
   ...extra,
 });
 
-describe("fx mcp on MCP-v2", () => {
+describe("fx mcp", () => {
   test("add writes each file and keeps every key it doesn't know", async () => {
     // Raw text, so the number's spelling reaches fx as written.
     const root = createRoot('{"theme":"dark","mcp":{"old":{"command":"true","environment":{"A":"1"},"startup_timeout_ms":1.50}}}');
@@ -396,10 +393,10 @@ describe("fx mcp on MCP-v2", () => {
   }, 30_000);
 });
 
-describe("/mcp in the shell on MCP-v2", () => {
+describe("/mcp in the shell", () => {
   test.skipIf(!tmuxAvailable())("/mcp runs the same verbs and prints the same text", async () => {
     // The shell can ask questions, so it says so to servers.
-    const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_SPEC_CLIENT: "1", FX_MCP_EXPECT_ELICITATION: "both" } }) } });
+    const root = createRoot({ mcpServers: { fixture: fixtureServer({ env: { FX_MCP_EXPECT_ELICITATION: "both" } }) } });
     gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
       isolated: true,
@@ -457,7 +454,7 @@ describe("/mcp in the shell on MCP-v2", () => {
     const root = createRoot();
     const pidPath = join(root.home, "s.pid");
     const eofPath = join(root.home, "s.eof");
-    writeFileSync(root.profilePath, JSON.stringify({ mcpServers: { s: fixtureServer({ env: { FX_MCP_SPEC_CLIENT: "1", FX_MCP_EXPECT_ELICITATION: "both", FX_MCP_IGNORE_EOF: "1", FX_MCP_IGNORE_TERM: "1", FX_MCP_PID_PATH: pidPath, FX_MCP_EOF_PATH: eofPath } }) } }));
+    writeFileSync(root.profilePath, JSON.stringify({ mcpServers: { s: fixtureServer({ env: { FX_MCP_EXPECT_ELICITATION: "both", FX_MCP_IGNORE_EOF: "1", FX_MCP_IGNORE_TERM: "1", FX_MCP_PID_PATH: pidPath, FX_MCP_EOF_PATH: eofPath } }) } }));
     gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
       isolated: true,
@@ -513,7 +510,7 @@ describe("/mcp in the shell on MCP-v2", () => {
     // `s` takes 3 s to start, so `/mcp show s` holds the old host while the config changes.
     const root = createRoot();
     const pidPath = join(root.home, "s.pid");
-    writeFileSync(root.profilePath, JSON.stringify({ mcpServers: { s: fixtureServer({ env: { FX_MCP_SPEC_CLIENT: "1", FX_MCP_EXPECT_ELICITATION: "both", FX_MCP_DISCOVER_DELAY_MS: "3000", FX_MCP_PID_PATH: pidPath } }) } }));
+    writeFileSync(root.profilePath, JSON.stringify({ mcpServers: { s: fixtureServer({ env: { FX_MCP_EXPECT_ELICITATION: "both", FX_MCP_DISCOVER_DELAY_MS: "3000", FX_MCP_PID_PATH: pidPath } }) } }));
     gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
       isolated: true,
@@ -618,7 +615,7 @@ describe("/mcp in the shell on MCP-v2", () => {
 
   test.skipIf(!tmuxAvailable())("/mcp alone opens the menu, whose choices run the verbs", async () => {
     const root = createRoot(
-      { mcpServers: { fixture: fixtureServer({ env: { FX_MCP_SPEC_CLIENT: "1", FX_MCP_EXPECT_ELICITATION: "both" } }), web: { type: "http", url: "https://w.example/mcp" } } },
+      { mcpServers: { fixture: fixtureServer({ env: { FX_MCP_EXPECT_ELICITATION: "both" } }), web: { type: "http", url: "https://w.example/mcp" } } },
       { mcpServers: { proj: { command: "node", args: ["proj.js", "--port", "4100"] } } },
     );
     gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
@@ -711,7 +708,7 @@ describe("/mcp in the shell on MCP-v2", () => {
   }, 90_000);
 });
 
-describe("fx ask on MCP-v2", () => {
+describe("fx ask", () => {
   test("fx ask names unapproved project servers and the command that approves them", async () => {
     const root = createRoot(undefined, { mcpServers: { proj: fixtureServer() } });
     gateway = startFakeGateway([fakeGatewayFinalText("done")], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
@@ -746,5 +743,25 @@ describe("fx ask on MCP-v2", () => {
     expect(ask.stderr).toContain(note);
     expect(ask.stderr).toContain("fx ask: skipped unapproved project MCP servers: proj. Approve");
     expect(ask.stdout + ask.stderr).not.toContain("\u001b");
+  }, 60_000);
+
+  test("a profile with both mcp and mcpServers names each server it leaves out", async () => {
+    const root = createRoot({ mcp: { alpha: fixtureServer() }, mcpServers: { beta: fixtureServer() } });
+    const note = "note: ~/.fx/mcp.json server 'beta' was skipped: the file has both \"mcp\" and \"mcpServers\", and fx reads only \"mcp\"; merge them into one.";
+
+    const list = await runFx(["mcp", "list"], { cwd: root.workspace, env: root.env, timeoutMs: 30_000 });
+    expect(list.code).toBe(0);
+    expect(list.stdout).toContain("alpha");
+    expect(list.stdout).not.toContain("beta");
+    expect(list.stderr).toContain(note);
+
+    gateway = startFakeGateway([fakeGatewayFinalText("done")], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
+    const ask = await runFx(["ask", "--no-save", "hello"], {
+      cwd: root.workspace,
+      env: { ...root.env, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl, FX_MODEL: "openai/gpt-5" },
+      timeoutMs: 30_000,
+    });
+    expect(ask.code).toBe(0);
+    expect(ask.stderr).toContain(note);
   }, 60_000);
 });

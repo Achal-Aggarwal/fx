@@ -61,6 +61,9 @@ pub const Failure = enum {
     refused,
     insecure_endpoint,
     internal_endpoint,
+    /// Its metadata came as something other than JSON; the message names
+    /// what (RFC 8414 §3.2, RFC 9728 §3.2).
+    metadata_not_json,
 };
 
 pub const Action = union(enum) {
@@ -103,7 +106,8 @@ pub const Ending = union(enum) {
 /// Keys of this module's own requests: above `server.zig`'s auxiliary keys.
 pub const fetch_base: u64 = 3 << 62;
 
-const Stage = enum { idle, resource_metadata, server_metadata, registration, token };
+/// `probe`: the request a sign-in sends first, for the server's challenge.
+const Stage = enum { idle, probe, resource_metadata, server_metadata, registration, token };
 
 /// What a refresh needs, from the sign-in that brought the tokens.
 const Credential = struct {
@@ -158,7 +162,9 @@ pub const Auth = struct {
     /// Why the code wasn't redeemed, in the token endpoint's words.
     token_error: ?[]const u8 = null,
     /// Why this discovery passed over an authorization server, if it did.
-    discovery_refusal: ?discovery.Refusal = null,
+    discovery_refusal: ?enum { insecure, internal, not_json } = null,
+    /// The Content-Type of metadata refused as `not_json`, in the flow arena.
+    refused_media: []const u8 = "",
     pending_code: ?[]const u8 = null,
     flow_key: u64 = 0,
     refresh_key: u64 = 0,
@@ -223,30 +229,46 @@ pub const Auth = struct {
             },
             .forgotten => try a.stepGate(.{ .forget = key }),
             .rejected => |r| {
-                const c = (try discovery.parseChallenge(a.flow_arena.allocator(), r.challenge)) orelse discovery.Challenge{};
-                if (c.resource_metadata) |url| {
-                    if (a.challenge_url) |old| a.gpa.free(old);
-                    a.challenge_url = try a.gpa.dupe(u8, url);
-                }
+                const c = try a.takeChallenge(r.challenge);
                 if (r.status == 403) {
                     if (!c.insufficient_scope) {
                         try a.stepGate(.{ .accepted = key });
                         return false;
                     }
                     // A refresh brings no new scopes; this needs a sign-in.
-                    try a.stepFlow(.{ .challenged = try a.scopeBits(c.scope) });
+                    try a.stepFlow(.{ .challenged = try a.challengeScopes(c.scope) });
                     try a.stepGate(.{ .accepted = key });
+                    // Kept with the login, so a sign-in in another process
+                    // asks for these too.
+                    try a.actions.append(a.gpa, .save);
                     try a.announce(true);
                     try a.actions.append(a.gpa, .{ .give_up = .{ .key = key, .why = .needs_sign_in } });
                     return true;
                 }
                 // The challenge's scopes, or none, which leaves the
                 // resource metadata's.
-                try a.stepFlow(.{ .challenged = try a.scopeBits(c.scope) });
+                try a.stepFlow(.{ .challenged = try a.challengeScopes(c.scope) });
                 try a.stepGate(.{ .rejected = key });
             },
         }
         return true;
+    }
+
+    /// Reads a challenge, keeping its resource_metadata for discovery.
+    fn takeChallenge(a: *Auth, raw: []const u8) Error!discovery.Challenge {
+        const c = (try discovery.parseChallenge(a.flow_arena.allocator(), raw)) orelse discovery.Challenge{};
+        if (c.resource_metadata) |url| {
+            if (a.challenge_url) |old| a.gpa.free(old);
+            a.challenge_url = try a.gpa.dupe(u8, url);
+        }
+        return c;
+    }
+
+    /// The scopes a challenge has the next sign-in ask for: its own, which
+    /// the spec makes authoritative, with the configured ones.
+    fn challengeScopes(a: *Auth, list: ?[]const u8) Allocator.Error!u32 {
+        const configured = a.options.scopes orelse return a.scopeBits(list);
+        return try a.scopeBits(configured) | try a.scopeBits(list);
     }
 
     fn scopeBits(a: *Auth, list: ?[]const u8) Allocator.Error!u32 {
@@ -323,12 +345,27 @@ pub const Auth = struct {
     pub fn signIn(a: *Auth, redirect_uri: []const u8) Error!void {
         if (!discovery.secureOrLoopback(redirect_uri)) return error.InvalidRedirect;
         if (a.flow.phase == .idle) {
+            if (a.stage == .probe) return;
             _ = a.flow_arena.reset(.retain_capacity);
             a.token_error = null;
             a.redirect_uri = try a.flow_arena.allocator().dupe(u8, redirect_uri);
+            // With no challenge seen, one request without a token asks the
+            // server where its metadata is and what scope it wants, so the
+            // sign-in starts knowing both.
+            if (a.challenge_url == null) {
+                a.stage = .probe;
+                a.flow_key = a.newKey();
+                a.client.fetch(a.flow_key, .post, a.server_url, probe_body, "application/json", &.{.{ .name = "accept", .value = "application/json, text/event-stream" }}) catch {
+                    a.stage = .idle;
+                    return a.stepFlow(.sign_in);
+                };
+                return;
+            }
         }
         try a.stepFlow(.sign_in);
     }
+
+    const probe_body = "{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"server/discover\",\"params\":{}}";
 
     /// The URL the browser came back to after the authorization request.
     pub fn finishSignIn(a: *Auth, callback: []const u8) Error!void {
@@ -346,6 +383,12 @@ pub const Auth = struct {
     }
 
     pub fn cancelSignIn(a: *Auth) Error!void {
+        if (a.stage == .probe) {
+            a.client.cancel(a.flow_key);
+            a.flow_key = 0;
+            a.stage = .idle;
+            return a.actions.append(a.gpa, .{ .sign_in_failed = .{ .why = .cancelled } });
+        }
         if (a.flow.phase != .idle) try a.stepFlow(.cancel);
     }
 
@@ -378,6 +421,10 @@ pub const Auth = struct {
         const cred = a.cred orelse return false;
         const access = a.access orelse return false;
         var json: std.json.Stringify = .{ .writer = w };
+        // The scopes the token was asked with, and those a step-up still
+        // owes, for the next sign-in.
+        var granted: [oauth.max_scopes][]const u8 = undefined;
+        var owed: [oauth.max_scopes][]const u8 = undefined;
         try json.write(.{
             .access = access,
             .refresh = a.refresh_token,
@@ -389,6 +436,8 @@ pub const Auth = struct {
             .client_id = cred.client.id,
             .client_secret = cred.client.secret,
             .method = @tagName(cred.client.method),
+            .scope = a.scopes.namesOf(a.flow.granted, &granted),
+            .step_up = a.scopes.namesOf(a.flow.challenge & ~a.flow.granted, &owed),
         });
         return true;
     }
@@ -396,25 +445,26 @@ pub const Auth = struct {
     /// Takes back a credential `save` wrote: its tokens are held again, so
     /// requests carry them and a refresh can renew them. One that can't be
     /// read, whose access token isn't valid, or whose endpoints
-    /// discovery may not reach for this server, is ignored.
-    pub fn restore(a: *Auth, saved: []const u8) Error!void {
-        const names = [_][]const u8{ "access", "refresh", "expires_at_ms", "skew_ms", "token_endpoint", "revocation_endpoint", "resource", "client_id", "client_secret", "method" };
+    /// discovery may not reach for this server, is ignored: false, and the
+    /// credential in use stays.
+    pub fn restore(a: *Auth, saved: []const u8) Error!bool {
+        const names = [_][]const u8{ "access", "refresh", "expires_at_ms", "skew_ms", "token_endpoint", "revocation_endpoint", "resource", "client_id", "client_secret", "method", "scope", "step_up" };
         var raw: [names.len]?[]const u8 = undefined;
-        wire.objectFields(saved, &names, &raw) catch return;
+        wire.objectFields(saved, &names, &raw) catch return false;
         // Checked before the credential in use is replaced, so an ignored one
         // leaves it whole.
         var scratch: std.heap.ArenaAllocator = .init(a.gpa);
         defer scratch.deinit();
         var text: [names.len]?[]const u8 = undefined;
         for (raw, &text) |r, *t| t.* = if (r) |v| try wire.decodeString(scratch.allocator(), v) else null;
-        const access = text[0] orelse return;
-        if (!oauth.validToken(access)) return;
-        const method = std.meta.stringToEnum(oauth.Method, text[9] orelse return) orelse return;
-        const token_endpoint = text[4] orelse return;
-        if (!discovery.fetchable(token_endpoint, a.server_url)) return;
-        if (text[5]) |revocation| if (!discovery.fetchable(revocation, a.server_url)) return;
-        const resource = text[6] orelse return;
-        const client_id = text[7] orelse return;
+        const access = text[0] orelse return false;
+        if (!oauth.validToken(access)) return false;
+        const method = std.meta.stringToEnum(oauth.Method, text[9] orelse return false) orelse return false;
+        const token_endpoint = text[4] orelse return false;
+        if (!discovery.fetchable(token_endpoint, a.server_url)) return false;
+        if (text[5]) |revocation| if (!discovery.fetchable(revocation, a.server_url)) return false;
+        const resource = text[6] orelse return false;
+        const client_id = text[7] orelse return false;
         _ = a.cred_arena.reset(.retain_capacity);
         const ca = a.cred_arena.allocator();
         a.cred = .{
@@ -427,7 +477,11 @@ pub const Auth = struct {
         try a.storeTokens(.{ .access = access, .refresh = text[1], .expires_in = null });
         a.expires_at_ms = if (raw[2]) |v| std.fmt.parseInt(i64, v, 10) catch null else null;
         if (raw[3]) |v| a.skew_ms = std.fmt.parseInt(i64, v, 10) catch a.skew_ms;
+        // Before any sign-in step, as the model's Init.
+        a.flow.granted = if (raw[10]) |v| try a.scopes.ofArray(a.keep.allocator(), v) else 0;
+        a.flow.challenge = if (raw[11]) |v| try a.scopes.ofArray(a.keep.allocator(), v) else 0;
         try a.stepGate(.{ .signed_in = .{ .refreshable = a.refresh_token != null } });
+        return true;
     }
 
     fn stepFlow(a: *Auth, event: core.FlowEvent) Error!void {
@@ -439,6 +493,7 @@ pub const Auth = struct {
                 a.prm = null;
                 a.meta = null;
                 a.discovery_refusal = null;
+                a.refused_media = "";
                 a.candidates = try discovery.resourceMetadataUrls(a.flow_arena.allocator(), a.server_url, a.challenge_url);
                 a.candidate = 0;
                 try a.fetchCandidate(.resource_metadata);
@@ -464,12 +519,14 @@ pub const Auth = struct {
                     .response => if (f.show_error) .response else .mismatch,
                     inline else => |s| @field(Failure, @tagName(s)),
                 };
+                const refusal = if (why == .discovery) a.discovery_refusal else null;
                 try a.actions.append(a.gpa, .{ .sign_in_failed = .{
-                    .why = if (why != .discovery) why else if (a.discovery_refusal) |r| switch (r) {
+                    .why = if (refusal) |r| switch (r) {
                         .insecure => .insecure_endpoint,
                         .internal => .internal_endpoint,
-                    } else .discovery,
-                    .message = if (f.show_error) a.response_error else if (f.stage == .redemption) a.token_error else null,
+                        .not_json => .metadata_not_json,
+                    } else why,
+                    .message = if (f.show_error) a.response_error else if (f.stage == .redemption) a.token_error else if (refusal == .not_json) a.refused_media else null,
                 } });
             },
             .refused => try a.actions.append(a.gpa, .{ .sign_in_failed = .{ .why = .refused } }),
@@ -483,7 +540,10 @@ pub const Auth = struct {
             a.candidate += 1;
             // The authorization server's metadata only from hosts discovery may reach.
             if (stage == .server_metadata) if (discovery.refusal(url, a.server_url)) |r| {
-                a.discovery_refusal = r;
+                a.discovery_refusal = switch (r) {
+                    .insecure => .insecure,
+                    .internal => .internal,
+                };
                 continue;
             };
             a.stage = stage;
@@ -571,8 +631,10 @@ pub const Auth = struct {
 
     /// The answer to one of this module's requests. False when `key` isn't one.
     /// `answer` lasts only until the client's next `next`; what is read from it
-    /// is read from a copy kept as long as it's needed.
-    pub fn fetched(a: *Auth, key: u64, status: u16, answer: []const u8) Error!bool {
+    /// is read from a copy kept as long as it's needed. `media` is its
+    /// Content-Type: metadata must be JSON; `challenge` its
+    /// `WWW-Authenticate`, which only a sign-in's probe reads.
+    pub fn fetched(a: *Auth, key: u64, status: u16, media: []const u8, challenge: ?[]const u8, answer: []const u8) Error!bool {
         if (key == 0) return false;
         if (key == a.revoke_key) {
             a.revoke_key = 0;
@@ -587,8 +649,29 @@ pub const Auth = struct {
         const fa = a.flow_arena.allocator();
         // A registration outlives the sign-in; the rest lasts as long as it.
         const body = try (if (a.stage == .registration) a.keep.allocator() else fa).dupe(u8, answer);
+        // Metadata that came as something else isn't read; the sign-in
+        // names what came if no other candidate has JSON.
+        if ((a.stage == .resource_metadata or a.stage == .server_metadata) and status == 200 and !http.isJson(media)) {
+            a.discovery_refusal = .not_json;
+            a.refused_media = try fa.dupe(u8, media);
+            try a.fetchCandidate(a.stage);
+            return true;
+        }
         switch (a.stage) {
             .idle => {},
+            .probe => {
+                a.stage = .idle;
+                // A 401, or a 403 asking for scopes, says where the metadata
+                // is and what to ask for; anything else leaves the
+                // well-known places.
+                if (status == 401 or status == 403) if (challenge) |raw| {
+                    const c = try a.takeChallenge(raw);
+                    // The probe's challenge is for the probe: a step-up
+                    // still owed is asked for with it.
+                    try a.stepFlow(.{ .challenged = try a.challengeScopes(c.scope) | a.flow.challenge });
+                };
+                try a.stepFlow(.sign_in);
+            },
             .resource_metadata => {
                 if (status == 200) if (discovery.parseResourceMetadata(fa, body, a.server_url)) |prm| {
                     a.prm = prm;
@@ -654,7 +737,7 @@ pub const Auth = struct {
             if (a.options.refresh_via_host) try a.actions.append(a.gpa, .refresh_ended);
             return;
         } else |err| if (err == error.OutOfMemory) return error.OutOfMemory;
-        // An answer naming an error refuses the refresh token for good.
+        // An answer naming a refusal refuses the refresh token for good.
         try a.refreshEnded(if (oauth.refusesRefresh(status, body)) .refused else .failed);
     }
 
@@ -764,21 +847,31 @@ test "a saved credential comes back whole: requests carry its token, and it save
     defer out.deinit();
     try testing.expect(!try a.save(&out.writer));
     // Unreadable or incomplete: ignored.
-    try a.restore("not json");
-    try a.restore("{\"access\":\"at\"}");
+    try std.testing.expect(!try a.restore("not json"));
+    try std.testing.expect(!try a.restore("{\"access\":\"at\"}"));
     try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
     const fields = ",\"expires_at_ms\":4102444800000,\"skew_ms\":30000,\"token_endpoint\":\"https://as/token\",\"revocation_endpoint\":\"https://as/revoke\"," ++
         "\"resource\":\"http://127.0.0.1:9/mcp\",\"client_id\":\"c1\",\"client_secret\":null,\"method\":\"none\"}";
     // Whole, but with a token that would break its header: ignored too.
-    try a.restore("{\"access\":\"at\\r\\n1\",\"refresh\":\"rt\"" ++ fields);
+    try std.testing.expect(!try a.restore("{\"access\":\"at\\r\\n1\",\"refresh\":\"rt\"" ++ fields));
     try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
     try testing.expect(!try a.save(&out.writer));
     // A JSON escape in the token is read as what it stands for.
-    try a.restore("{\"access\":\"at\\/1\",\"refresh\":\"rt\"" ++ fields);
+    try std.testing.expect(try a.restore("{\"access\":\"at\\/1\",\"refresh\":\"rt\"" ++ fields));
     try testing.expectEqualStrings("Bearer at/1", a.authorization(a.gate.gen).?);
     try testing.expect(a.gate.refreshable);
     try testing.expect(try a.save(&out.writer));
-    try testing.expectEqualStrings("{\"access\":\"at/1\",\"refresh\":\"rt\"" ++ fields, out.written());
+    const none = ",\"scope\":[],\"step_up\":[]}";
+    try testing.expectEqualStrings("{\"access\":\"at/1\",\"refresh\":\"rt\"" ++ fields[0 .. fields.len - 1] ++ none, out.written());
+    // The scopes granted and those a step-up owes come back in the flow,
+    // for the next sign-in, and are saved again.
+    const scoped = "{\"access\":\"at2\",\"refresh\":\"rt\"" ++ fields[0 .. fields.len - 1] ++ ",\"scope\":[\"a\",\"b\"],\"step_up\":[\"c\"]}";
+    try std.testing.expect(try a.restore(scoped));
+    try testing.expectEqual(try a.scopeBits("a b"), a.flow.granted);
+    try testing.expectEqual(try a.scopeBits("c"), a.flow.challenge);
+    out.clearRetainingCapacity();
+    try testing.expect(try a.save(&out.writer));
+    try testing.expectEqualStrings(scoped, out.written());
 }
 
 test "a refresh the host decides waits for it, and ends however it does: replaced, signed out of, answered, refused, or failed" {
@@ -792,8 +885,8 @@ test "a refresh the host decides waits for it, and ends however it does: replace
         "\"revocation_endpoint\":null,\"resource\":\"http://127.0.0.1:9/mcp\",\"client_id\":\"c1\",\"client_secret\":null,\"method\":\"none\"}}";
     var buffer: [512]u8 = undefined;
     const actions = &a.actions.items;
-    for ([_]enum { replaced, signed_out, answered, refused, refused_200, failed_429 }{ .replaced, .signed_out, .answered, .refused, .refused_200, .failed_429 }) |case| {
-        try a.restore(try std.mem.print(&buffer, saved, .{"at1"}));
+    for ([_]enum { replaced, signed_out, answered, refused, refused_200, failed_200, failed_429 }{ .replaced, .signed_out, .answered, .refused, .refused_200, .failed_200, .failed_429 }) |case| {
+        try std.testing.expect(try a.restore(try std.mem.print(&buffer, saved, .{"at1"})));
         try a.beforeSend(1);
         a.actions.clearRetainingCapacity();
         // The server rejects the token: the refresh waits, and nothing goes out.
@@ -806,7 +899,7 @@ test "a refresh the host decides waits for it, and ends however it does: replace
             // Another process saved a newer one: the request goes again
             // with it, and the refresh is over.
             .replaced => {
-                try a.restore(try std.mem.print(&buffer, saved, .{"at2"}));
+                try std.testing.expect(try a.restore(try std.mem.print(&buffer, saved, .{"at2"})));
                 try testing.expectEqual(@as(usize, 2), actions.len);
                 try testing.expect(actions.*[0] == .post and actions.*[0].post.key == 1);
                 try testing.expect(actions.*[1] == .refresh_ended);
@@ -822,7 +915,7 @@ test "a refresh the host decides waits for it, and ends however it does: replace
             .answered => {
                 a.refresh_due = false;
                 a.refresh_key = a.newKey();
-                _ = try a.fetched(a.refresh_key, 200, "{\"access_token\":\"at3\",\"token_type\":\"Bearer\",\"refresh_token\":\"rt3\",\"expires_in\":3600}");
+                _ = try a.fetched(a.refresh_key, 200, "application/json", null, "{\"access_token\":\"at3\",\"token_type\":\"Bearer\",\"refresh_token\":\"rt3\",\"expires_in\":3600}");
                 try testing.expectEqual(@as(usize, 3), actions.len);
                 try testing.expect(actions.*[0] == .save);
                 try testing.expect(actions.*[1] == .post and actions.*[1].post.key == 1);
@@ -833,7 +926,7 @@ test "a refresh the host decides waits for it, and ends however it does: replace
             .refused => {
                 a.refresh_due = false;
                 a.refresh_key = a.newKey();
-                _ = try a.fetched(a.refresh_key, 400, "{\"error\":\"invalid_grant\"}");
+                _ = try a.fetched(a.refresh_key, 400, "application/json", null, "{\"error\":\"invalid_grant\"}");
                 try testing.expect(actions.*[0] == .save);
                 try testing.expect(actions.*[actions.len - 1] == .refresh_ended);
                 try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
@@ -843,17 +936,27 @@ test "a refresh the host decides waits for it, and ends however it does: replace
             .refused_200 => {
                 a.refresh_due = false;
                 a.refresh_key = a.newKey();
-                _ = try a.fetched(a.refresh_key, 200, "{\"ok\":false,\"error\":\"bad_client_secret\"}");
+                _ = try a.fetched(a.refresh_key, 200, "application/json", null, "{\"ok\":false,\"error\":\"invalid_refresh_token\"}");
                 try testing.expect(actions.*[0] == .save);
                 try testing.expect(actions.*[actions.len - 1] == .refresh_ended);
                 try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
                 try testing.expectEqual(@as(?[]u8, null), a.refresh_token);
             },
+            // Slack's temporary errors come with HTTP 200 too, and may pass
+            // later: the tokens stay, and nothing is saved.
+            .failed_200 => {
+                a.refresh_due = false;
+                a.refresh_key = a.newKey();
+                _ = try a.fetched(a.refresh_key, 200, "application/json", null, "{\"ok\":false,\"error\":\"internal_error\"}");
+                for (actions.*) |x| try testing.expect(x != .save);
+                try testing.expect(actions.*[actions.len - 1] == .refresh_ended);
+                try testing.expectEqualStrings("rt", a.refresh_token.?);
+            },
             // A 429 may pass later: the tokens stay, and nothing is saved.
             .failed_429 => {
                 a.refresh_due = false;
                 a.refresh_key = a.newKey();
-                _ = try a.fetched(a.refresh_key, 429, "{\"error\":\"slow_down\"}");
+                _ = try a.fetched(a.refresh_key, 429, "application/json", null, "{\"error\":\"slow_down\"}");
                 for (actions.*) |x| try testing.expect(x != .save);
                 try testing.expect(actions.*[actions.len - 1] == .refresh_ended);
                 try testing.expectEqualStrings("rt", a.refresh_token.?);
@@ -892,6 +995,36 @@ test "a request a sign-in is needed for gives up only after the sign-in is annou
     try testing.expect(announced.? < gave_up.?);
 }
 
+test "a step-up is saved with the login, so a sign-in in a new process asks for it with the scopes held" {
+    const testing = std.testing;
+    var client: http.Client = undefined;
+    try client.init(testing.io, testing.allocator, .{ .url = "http://127.0.0.1:9/mcp" });
+    defer client.deinit();
+    var a: Auth = .init(testing.io, testing.allocator, &client, "http://127.0.0.1:9/mcp", .{}, null);
+    defer a.deinit();
+    const login = "{\"access\":\"at\",\"refresh\":\"rt\",\"expires_at_ms\":4102444800000,\"skew_ms\":30000,\"token_endpoint\":\"https://as/token\"," ++
+        "\"revocation_endpoint\":null,\"resource\":\"http://127.0.0.1:9/mcp\",\"client_id\":\"c1\",\"client_secret\":null,\"method\":\"none\",\"scope\":[\"a\"],\"step_up\":[]}";
+    try std.testing.expect(try a.restore(login));
+    try a.beforeSend(1);
+    a.actions.clearRetainingCapacity();
+    _ = try a.ended(1, .{ .rejected = .{ .status = 403, .challenge = "Bearer error=\"insufficient_scope\", scope=\"b\"" } });
+    var saves: usize = 0;
+    for (a.actions.items) |x| saves += @intFromBool(x == .save);
+    try testing.expectEqual(@as(usize, 1), saves);
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try testing.expect(try a.save(&out.writer));
+
+    var b: Auth = .init(testing.io, testing.allocator, &client, "http://127.0.0.1:9/mcp", .{}, null);
+    defer b.deinit();
+    try std.testing.expect(try b.restore(out.written()));
+    try testing.expectEqual(try b.scopeBits("a"), b.flow.granted);
+    try testing.expectEqual(try b.scopeBits("b"), b.flow.challenge);
+    var step: core.FlowOutput = .{};
+    b.flow.step(.sign_in, &step);
+    try testing.expectEqual(try b.scopeBits("a b"), b.flow.flow_scopes);
+}
+
 test "a saved credential whose endpoints discovery may not reach is ignored" {
     const testing = std.testing;
     var client: http.Client = undefined;
@@ -908,13 +1041,13 @@ test "a saved credential whose endpoints discovery may not reach is ignored" {
         .{ "http://auth.example.com/token", "null" },
         .{ "https://auth.example.com/token", "\"https://169.254.169.254/revoke\"" },
     }) |case| {
-        try a.restore(try std.mem.print(&buffer, saved, .{ case[0], case[1] }));
+        try std.testing.expect(!try a.restore(try std.mem.print(&buffer, saved, .{ case[0], case[1] })));
         try testing.expectEqual(@as(?[]const u8, null), a.authorization(a.gate.gen));
     }
-    try a.restore(try std.mem.print(&buffer, saved, .{ "https://auth.example.com/token", "\"https://auth.example.com/revoke\"" }));
+    try std.testing.expect(try a.restore(try std.mem.print(&buffer, saved, .{ "https://auth.example.com/token", "\"https://auth.example.com/revoke\"" })));
     try testing.expectEqualStrings("Bearer at", a.authorization(a.gate.gen).?);
     // An ignored one after it leaves it whole, its endpoints included.
-    try a.restore(try std.mem.print(&buffer, saved, .{ "https://0.0.0.0:1/tokenxxxxxx", "null" }));
+    try std.testing.expect(!try a.restore(try std.mem.print(&buffer, saved, .{ "https://0.0.0.0:1/tokenxxxxxx", "null" })));
     try testing.expectEqualStrings("Bearer at", a.authorization(a.gate.gen).?);
     try testing.expectEqualStrings("https://auth.example.com/token", a.cred.?.token_endpoint);
     try testing.expectEqualStrings("https://auth.example.com/revoke", a.cred.?.revocation_endpoint.?);

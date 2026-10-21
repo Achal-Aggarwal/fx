@@ -2,7 +2,7 @@
 //! with the redirect `http://localhost:3118/callback`. Slack refreshes a PKCE
 //! app's tokens without the app's secret only for a localhost redirect
 //! (Slack's "Using PKCE"), so a login made through any other one lasts only
-//! until its first token expires. MCP-v2 signs in as for any server, asking
+//! until its first token expires. The engine signs in as for any server, asking
 //! for the scopes the app has.
 
 const std = @import("std");

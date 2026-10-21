@@ -15,8 +15,9 @@
 \*   - The refresh token may rotate, and the client always presents the latest
 \*     (AUTH-25). A refusal, any answer naming an error at 200 or a 4xx other
 \*     than 429, drops both tokens: the authorization server won't take that
-\*     refresh token again (AUTH-27). A 429, a 5xx or no answer keeps
-\*     them and fails the requests waiting.
+\*     refresh token again (AUTH-27). A 429, a 5xx or no answer within
+\*     30 s keeps them and fails the requests waiting. A request the host
+\*     cancels leaves the refresh running for the next one.
 \*   - Signing in brings a new token; signing out cancels the refresh in flight.
 EXTENDS Naturals
 
@@ -203,8 +204,8 @@ Next ==
     \/ \E r \in BOOLEAN : SignedIn(r)
     \/ SignOut
 
-\* The server answers every request, and the authorization server every
-\* refresh.
+\* The server answers every request, and every refresh ends: the client gives
+\* one with no answer 30 s, then ends it as RefreshFailed.
 Fairness ==
     /\ \A k \in Keys : WF_vars(Answer(k))
     /\ WF_vars(Refreshed)

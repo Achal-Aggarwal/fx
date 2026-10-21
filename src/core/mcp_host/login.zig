@@ -1,6 +1,6 @@
 //! The loopback redirect for an MCP sign-in (RFC 8252 §7.3): fx listens on
 //! 127.0.0.1, the browser comes back to `GET /callback`, and the address it
-//! came to goes to MCP-v2's `finishSignIn`. Slack's app allows only a
+//! came to goes to the engine's `finishSignIn`. Slack's app allows only a
 //! `localhost` redirect, so for it the redirect and that address say
 //! `localhost`, which browsers reach on 127.0.0.1.
 //!
@@ -98,7 +98,7 @@ pub const Listener = struct {
 
 const Waiting = struct { listener: *Listener, io: std.Io };
 
-/// The browser's return: the address for MCP-v2, and whether it refused.
+/// The browser's return: the address for the engine, and whether it refused.
 const Return = struct { url: []u8, refused: bool };
 
 /// `GET /callback` with the sign-in's state; anything else is unrelated.
@@ -108,7 +108,7 @@ fn takeReturn(context: ?*anyopaque, alloc: Allocator, target: []const u8) browse
     const query = target[query_at + 1 ..];
     if (!std.mem.eql(u8, target[0..query_at], "/callback") or !w.listener.isOwn(w.io, query)) return .unrelated;
     const url = alloc.print("{s}{d}{s}", .{ w.listener.prefix(), w.listener.port, target }) catch |err| return .{ .failed = err };
-    // A refusal comes back with an `error` (RFC 6749 §4.1.2.1); MCP-v2 reads
+    // A refusal comes back with an `error` (RFC 6749 §4.1.2.1); the engine reads
     // the rest from the address.
     return .{ .accepted = .{ .url = url, .refused = hasParam(query, "error") } };
 }

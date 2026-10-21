@@ -87,11 +87,8 @@ function log(message) {
   }
 }
 
-// By default the elicitation capability must appear only on requests that
-// can elicit, as v1 sends it. FX_MCP_SPEC_CLIENT=1 also accepts a client that
-// declares the same capabilities on every request, as the spec allows.
-const specClient = process.env.FX_MCP_SPEC_CLIENT === "1";
-
+// Requests that can elicit carry exactly the declared capabilities; any other
+// request carries none or the same ones, as the spec allows.
 function elicitationCapabilities() {
   return expectedElicitation === "form"
     ? { elicitation: { form: {} } }
@@ -110,7 +107,7 @@ function hasModernMetadata(message) {
   const declared = JSON.stringify(elicitationCapabilities());
   const capabilitiesMatch = advertiseElicitation
     ? capabilities === declared
-    : capabilities === "{}" || (specClient && capabilities === declared);
+    : capabilities === "{}" || capabilities === declared;
   return meta?.["io.modelcontextprotocol/protocolVersion"] === protocolVersion &&
     meta?.["io.modelcontextprotocol/clientInfo"]?.name === "fx" &&
     typeof meta?.["io.modelcontextprotocol/clientInfo"]?.version === "string" &&
@@ -809,8 +806,7 @@ function handle(message) {
                 params,
               },
             },
-            // The spec's requestState is a string; v1 also takes an object.
-            requestState: specClient ? "opaque" : { fixture: "opaque" },
+            requestState: "opaque",
           },
         });
         return;

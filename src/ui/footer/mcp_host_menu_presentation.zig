@@ -1,4 +1,4 @@
-//! Draws the `/mcp` menu on MCP-v2 as fx's picker: a
+//! Draws the `/mcp` menu as fx's picker: a
 //! titled list, a server's facts, choices, and tools, and fx's hint line.
 //! The logic is `core/mcp_host/menu.zig`; this only turns it into rows.
 
