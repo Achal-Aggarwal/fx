@@ -659,7 +659,9 @@ pub const Grid = struct {
                         continue;
                     }
                     const expected = std.unicode.utf8ByteSequenceLength(b) catch 1;
-                    if (expected > 1 and i + expected > bytes.len) {
+                    // Keep only a sequence the next read can still complete;
+                    // anything else is written now, so no text after it waits.
+                    if (expected > 1 and i + expected > bytes.len and allUtf8Continuations(bytes[i + 1 ..])) {
                         const tail = bytes[i..];
                         @memcpy(self.utf8_buffer[0..tail.len], tail);
                         self.utf8_len = @intCast(tail.len);
@@ -827,29 +829,31 @@ pub const Grid = struct {
 
     fn completePendingUtf8(self: *Grid, bytes: []const u8) !usize {
         if (bytes.len == 0) return 0;
-        if (bytes[0] & 0xc0 != 0x80) {
-            self.utf8_len = 0;
-            self.utf8_expected = 0;
-            _ = try self.writeByte("\xef\xbf\xbd", 0);
-            return 0;
-        }
+        // Only continuation bytes extend the sequence. Any other byte, such
+        // as the ESC of a following escape sequence, interrupts it.
         const needed = self.utf8_expected - self.utf8_len;
-        const count = @min(bytes.len, needed);
+        var count: usize = 0;
+        while (count < @min(bytes.len, needed) and bytes[count] & 0xc0 == 0x80) count += 1;
         @memcpy(
             self.utf8_buffer[self.utf8_len .. self.utf8_len + count],
             bytes[0..count],
         );
         self.utf8_len += @intCast(count);
-        if (self.utf8_len != self.utf8_expected) return count;
-        const complete = self.utf8_buffer[0..self.utf8_len];
+        if (self.utf8_len == self.utf8_expected or count < bytes.len) try self.writePendingUtf8();
+        return count;
+    }
+
+    /// Writes the pending bytes as they would be written had they arrived in
+    /// one read: a valid sequence as its character, and a broken or
+    /// interrupted one as one replacement character per byte.
+    fn writePendingUtf8(self: *Grid) !void {
+        var pending: @TypeOf(self.utf8_buffer) = undefined;
+        const len = self.utf8_len;
+        @memcpy(pending[0..len], self.utf8_buffer[0..len]);
         self.utf8_len = 0;
         self.utf8_expected = 0;
-        if (!std.unicode.utf8ValidateSlice(complete)) {
-            _ = try self.writeByte("\xef\xbf\xbd", 0);
-        } else {
-            _ = try self.writeByte(complete, 0);
-        }
-        return count;
+        var index: usize = 0;
+        while (index < len) index += try self.writeByte(pending[0..len], index);
     }
 
     fn dispatchDcsAndFinish(self: *Grid) !void {
@@ -1199,15 +1203,15 @@ pub const Grid = struct {
         }
         self.pending_wrap = false;
 
-        // Wide char that doesn't fit: wrap early (autowrap) or clamp.
+        // Wide char that doesn't fit: wrap early (autowrap) or clamp. One
+        // wider than the terminal fits on no line, so it is dropped.
         if (self.cursor_col + width - 1 > self.cols) {
+            if (width > self.cols) return consumed;
             if (self.autowrap) {
                 self.cursor_col = 1;
                 self.advanceRowOrScroll();
-            } else if (self.cols >= width) {
-                self.cursor_col = self.cols - width + 1;
             } else {
-                return consumed;
+                self.cursor_col = self.cols - width + 1;
             }
         }
 
@@ -2728,7 +2732,11 @@ fn encodeGridState(encoder: *CheckpointEncoder, grid: Grid) !void {
     try encoder.sizedBytes(grid.osc_buffer.items);
     try encoder.boolean(grid.dcs_saw_esc);
     try encoder.sizedBytes(grid.dcs_buffer.items);
-    try encoder.bytes(&grid.utf8_buffer);
+    // Only the pending bytes are state. The rest of the buffer can still hold
+    // bytes of a sequence that already finished.
+    var pending_utf8: @TypeOf(grid.utf8_buffer) = @splat(0);
+    @memcpy(pending_utf8[0..grid.utf8_len], grid.utf8_buffer[0..grid.utf8_len]);
+    try encoder.bytes(&pending_utf8);
     try encoder.int(u8, grid.utf8_len);
     try encoder.int(u8, grid.utf8_expected);
     try encodeHyperlinkPool(encoder, grid.hyperlink_pool.items);
@@ -3471,6 +3479,13 @@ fn clampSub(v: u16, sub: u16, lo: u16) u16 {
 
 const DecodedRune = struct { codepoint: u21, len: usize };
 
+fn allUtf8Continuations(bytes: []const u8) bool {
+    for (bytes) |byte| {
+        if (byte & 0xc0 != 0x80) return false;
+    }
+    return true;
+}
+
 fn decodeUtf8(bytes: []const u8, start: usize) DecodedRune {
     const b = bytes[start];
     const seq_len = std.unicode.utf8ByteSequenceLength(b) catch 1;
@@ -3924,6 +3939,22 @@ test "resize narrowing clears a wide glyph clipped at the right edge" {
     try g.resize(3, 1);
     try expectWideCellInvariant(g);
     try expectRow(g, 1, "ab");
+}
+
+test "a one-column terminal drops wide characters and still checkpoints" {
+    for ([_][]const u8{ "界", "a界b", "\x1b[?7la界b" }) |bytes| {
+        var g = try Grid.init(testing.allocator, 1, 3);
+        defer g.deinit();
+        try g.feed(bytes);
+        try expectWideCellInvariant(g);
+        const payload = try g.checkpointPayload(testing.allocator);
+        defer testing.allocator.free(payload);
+    }
+    var g = try Grid.init(testing.allocator, 1, 3);
+    defer g.deinit();
+    try g.feed("a界b");
+    try expectRow(g, 1, "a");
+    try expectRow(g, 2, "b");
 }
 
 test "writes clear any complete wide glyph overlapping the destination" {
@@ -4795,6 +4826,64 @@ test "checkpoints reject saved last-column cells that would break the row" {
     write.replaced[1] = .{ .codepoint = 0, .width = 0 };
     grid.last_column_write = write;
     try testing.expectError(error.InvalidEngineCheckpoint, grid.checkpointPayload(testing.allocator));
+}
+
+test "text after broken UTF-8 at the end of a read appears at once" {
+    var grid = try Grid.init(testing.allocator, 8, 1);
+    defer grid.deinit();
+    // Latin-1 `é` is a UTF-8 lead byte that no continuation byte follows.
+    try grid.feed("caf\xe9!");
+    try expectRow(grid, 1, "caf\u{fffd}!");
+    const payload = try grid.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(payload);
+}
+
+test "an escape sequence after broken UTF-8 split across reads still runs" {
+    var grid = try Grid.init(testing.allocator, 8, 1);
+    defer grid.deinit();
+    try grid.feed("\xe7");
+    try grid.feed("\x95\x1b[31mx");
+    try expectRow(grid, 1, "\u{fffd}\u{fffd}x");
+    try testing.expect(grid.cellAt(1, 3).?.style.fg.eql(.{ .indexed = 1 }));
+}
+
+test "UTF-8 gives the same state however the output is split into reads" {
+    const cases = [_][]const u8{
+        "caf\xe9!",
+        "\xe7\x95\x1b[31mx",
+        "\xe2a",
+        "\xe2\x80A",
+        "\xe0\x80\x80x",
+        "\xed\xa0\x80x",
+        "\xf0\x9f\x98",
+        "\xe7\x95\x8c\xbaz",
+        "\xe7\x95\x8c",
+        "e\xcc\x81!",
+    };
+    for (cases) |bytes| {
+        var whole = try Grid.init(testing.allocator, 8, 1);
+        defer whole.deinit();
+        try whole.feed(bytes);
+        const expected = try whole.checkpointPayload(testing.allocator);
+        defer testing.allocator.free(expected);
+
+        for (1..bytes.len) |split| {
+            var parts = try Grid.init(testing.allocator, 8, 1);
+            defer parts.deinit();
+            try parts.feed(bytes[0..split]);
+            try parts.feed(bytes[split..]);
+            const actual = try parts.checkpointPayload(testing.allocator);
+            defer testing.allocator.free(actual);
+            try testing.expectEqualSlices(u8, expected, actual);
+        }
+
+        var single_bytes = try Grid.init(testing.allocator, 8, 1);
+        defer single_bytes.deinit();
+        for (bytes) |byte| try single_bytes.feed(&.{byte});
+        const actual = try single_bytes.checkpointPayload(testing.allocator);
+        defer testing.allocator.free(actual);
+        try testing.expectEqualSlices(u8, expected, actual);
+    }
 }
 
 test "fragmented native queries emit one ordered reply and observational modes emit none" {

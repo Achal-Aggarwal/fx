@@ -413,8 +413,8 @@ pub const Server = struct {
     }
 
     /// How the server's last process ended, once it has.
-    pub fn exitStatus(r: *const Server) ?process.Exit {
-        return if (r.stdio) r.proc.exit else null;
+    pub fn exitStatus(r: *Server) ?process.Exit {
+        return if (r.stdio) r.proc.exitStatus() else null;
     }
 
     /// An excerpt of the last stdout line that answered nothing since the

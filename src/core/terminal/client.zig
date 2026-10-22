@@ -542,6 +542,9 @@ pub const Runtime = struct {
         std.debug.assert(self.live_correlations.remove(correlation_id));
     }
 
+    /// Publishes a worker's completion and frees the worker and its intent.
+    /// It frees them before the broadcast that lets `deinit` finish, so a
+    /// detached worker never touches the allocator after its runtime stopped.
     fn finishActive(
         self: *Runtime,
         worker: *RequestWorker,
@@ -555,6 +558,9 @@ pub const Runtime = struct {
         self.active_count -= 1;
         self.observeProjectionLocked(worker.intent.request.value, completion);
         self.completions.push(completion);
+        const alloc = self.alloc.?;
+        worker.intent.deinit(alloc);
+        alloc.destroy(worker);
         self.wake.broadcast(zio);
     }
 
@@ -670,8 +676,6 @@ fn workerMain(runtime: *Runtime) void {
                 .kind = .disconnected,
                 .correlation_id = worker.intent.correlation_id,
             });
-            worker.intent.deinit(alloc);
-            alloc.destroy(worker);
             continue;
         };
         thread.detach();
@@ -686,11 +690,9 @@ const RequestWorker = struct {
     cancelled: std.atomic.Value(bool) = .init(false),
 
     fn run(self: *RequestWorker) void {
-        const alloc = self.runtime.alloc.?;
-        const completion = self.complete(alloc);
+        const completion = self.complete(self.runtime.alloc.?);
+        // This frees the worker, so nothing here may use it afterwards.
         self.runtime.finishActive(self, completion);
-        self.intent.deinit(alloc);
-        alloc.destroy(self);
     }
 
     fn complete(self: *RequestWorker, alloc: Allocator) Completion {
@@ -957,13 +959,16 @@ test "runtime correlation stays reserved until its completion is taken" {
         admitTestIntent(&runtime, 23),
     );
 
-    var worker = RequestWorker{
+    // Finishing frees the worker and its intent; the testing allocator
+    // reports a leak or a double free if it doesn't free them exactly once.
+    const worker = try std.testing.allocator.create(RequestWorker);
+    worker.* = .{
         .runtime = &runtime,
         .intent = takeIntent(&runtime).?,
     };
     const zio = io_mod.getIo();
     runtime.mutex.lockUncancelable(zio);
-    worker.slot = runtime.registerWorkerLocked(&worker).?;
+    worker.slot = runtime.registerWorkerLocked(worker).?;
     runtime.mutex.unlock(zio);
     try std.testing.expectError(
         error.DuplicateCorrelation,
@@ -971,11 +976,10 @@ test "runtime correlation stays reserved until its completion is taken" {
     );
 
     const correlation_id = worker.intent.correlation_id;
-    runtime.finishActive(&worker, .{
+    runtime.finishActive(worker, .{
         .kind = .cancelled,
         .correlation_id = correlation_id,
     });
-    worker.intent.deinit(std.testing.allocator);
     try std.testing.expect(runtime.live_correlations.contains(correlation_id));
     var completion = runtime.takeCompletion().?;
     completion.deinit();

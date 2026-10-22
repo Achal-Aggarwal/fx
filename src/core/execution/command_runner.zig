@@ -2080,8 +2080,10 @@ test "zsh user profile reports natural SIGTERM after alias-safe startup" {
 
     // The startup files ran once into the snapshot. The aliased `builtin`
     // could not intercept the alias-safe `\builtin eval` that runs the
-    // command, and the replayed TRAPDEBUG still observed it.
-    const debug_output = try readAbsoluteFile(arena, debug_log, 64 * 1024);
+    // command, and the replayed TRAPDEBUG still observed it. The log holds a
+    // line for each command TRAPDEBUG saw, and Debian's and Ubuntu's global
+    // compinit defines hundreds of functions, so it can pass 64 KiB.
+    const debug_output = try readAbsoluteFile(arena, debug_log, 4 * 1024 * 1024);
     try std.testing.expect(std.mem.find(u8, debug_output, "builtin eval") != null);
     try std.testing.expect(std.mem.find(u8, debug_output, "kill -TERM $$") != null);
     try std.testing.expect(std.mem.find(u8, signaled.output, "INTERCEPTED") == null);
@@ -2253,6 +2255,37 @@ test "user profile commands reuse one startup-file snapshot" {
     const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
     const loads = try readAbsoluteFile(arena, loads_path, 4096);
     try std.testing.expectEqualStrings("loaded\n", loads);
+}
+
+test "zsh user profile snapshot restores a function that replaces a default alias" {
+    if (comptime !shell_snapshot.isSupported() or !supports_foreground_session) return;
+    std.Io.Dir.accessAbsolute(io_mod.getIo(), "/bin/zsh", .{}) catch
+        return error.SkipZigTest;
+    shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+    defer shell_snapshot.resetProcessOwnerForTest(shell_snapshot.real_capture_fn);
+
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // zsh starts with a `run-help` alias, and Debian's and Ubuntu's global
+    // zshrc replace it with a function, as this startup file does.
+    const paths = try writeSnapshotTestShell(
+        arena,
+        &tmp,
+        "print -r -- loaded >> \"$HOME/rc-loads.log\"\n" ++
+            "unalias run-help\n" ++
+            "run-help() { print -r -- run-help-function; }\n",
+    );
+    const config = Config{ .max_command_output_bytes = 16 * 1024 };
+    for (0..2) |_| {
+        const result = try executeCommandInEnvironment(config, arena, "run-help", paths.workspace, .{ .user = paths.shell });
+        try std.testing.expectEqualStrings("exit_code=0\n<stdout>\nrun-help-function\n</stdout>\n", result.output);
+    }
+    // Both commands ran from the snapshot, so startup ran only for its capture.
+    const loads_path = try std.Io.Dir.path.join(arena, &.{ paths.home, "rc-loads.log" });
+    try std.testing.expectEqualStrings("loaded\n", try readAbsoluteFile(arena, loads_path, 4096));
 }
 
 test "user profile command with an approval from an earlier shell epoch does not run" {

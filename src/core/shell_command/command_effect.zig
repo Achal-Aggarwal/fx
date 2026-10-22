@@ -38,7 +38,7 @@ pub fn knownReversibleAutoCommand(
     var index: usize = 0;
     while (index <= argv.tokens.len) : (index += 1) {
         const at_end = index == argv.tokens.len;
-        if (!at_end and !std.mem.eql(u8, argv.tokens[index].value, "&&")) {
+        if (!at_end and !isStageSeparator(argv.tokens[index])) {
             if (isUnsupportedAutoControlOperator(argv.tokens[index])) return false;
             continue;
         }
@@ -46,6 +46,19 @@ pub fn knownReversibleAutoCommand(
         stage_start = index + 1;
     }
     return true;
+}
+
+/// The `&&` between two stages. Only a bare `&&` separates commands: the
+/// shell passes a quoted or escaped one, such as `'&&'` or `\&\&`, to the
+/// command as an argument, so it is one here too.
+fn isStageSeparator(token: command_lex.ArgvToken) bool {
+    return std.mem.eql(u8, token.raw, "&&");
+}
+
+/// Every shell reads a word that starts with an unquoted `#` as the start of
+/// a comment, so the rest of the command never reaches the program.
+fn startsComment(raw: []const u8) bool {
+    return raw.len > 0 and raw[0] == '#';
 }
 
 fn isUnsupportedAutoOperator(token: command_lex.ArgvToken) bool {
@@ -80,7 +93,10 @@ fn reversibleAutoStage(raw_tokens: []const command_lex.ArgvToken) bool {
     }
     if (tokens.len == 0) return false;
     for (tokens) |token| {
-        if (isUnsupportedAutoOperator(token) or tokenHasDynamicShellSyntax(token.raw)) {
+        if (isUnsupportedAutoOperator(token) or
+            tokenHasDynamicShellSyntax(token.raw) or
+            startsComment(token.raw))
+        {
             return false;
         }
     }
@@ -222,6 +238,12 @@ test "known reversible auto commands exclude destructive and hidden effects" {
         "npm install --prefix=/tmp/global",
         "npm install --location global",
         "git fetch --prune origin",
+        // A quoted or escaped `&&` is an argument, so `--prune` here reaches
+        // `git fetch`.
+        "git fetch '&&' git status --prune",
+        "git fetch \\&\\& git status --prune",
+        // Every shell drops `#note` as a comment.
+        "git status #note",
     }) |command| {
         try std.testing.expect(!try knownReversibleAutoCommand(
             std.testing.allocator,
