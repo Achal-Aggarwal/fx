@@ -31,7 +31,7 @@ import {
   type GatewayRequest,
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
-import { childLines, childWork, compactionRecordPath, copyV1Fixture, logLines, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir } from "./saved-sessions";
+import { childLines, childWork, compactionRecordPath, copyV1Fixture, logLines, onlySessionId, rootSessionIds, savedSession, savedSessionIds, savedToolCallIds, savedText, savedToolResults, sessionDir, withoutConversionNotice } from "./saved-sessions";
 import { stdoutFrames } from "./render-lab/tape";
 import {
   fakeGatewayFinalText,
@@ -3915,7 +3915,7 @@ describe("gateway stream lifecycle", () => {
           timeoutMs: 15_000,
         });
         expect(resumed.code).toBe(0);
-        expect(resumed.stderr).toBe("");
+        expect(withoutConversionNotice(resumed.stderr)).toBe("");
         const result = parseAskJson(resumed.stdout);
         expect(result.session_id).toBe(seed.session_id);
         expect(result.final_output).toBe("Resumed reply.");
