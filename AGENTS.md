@@ -74,7 +74,7 @@ Key rules:
 
 * `src/core/shell_command/safe_git.zig` runs git for the `fx pr` and `fx issue` snapshot and for the agent's direct read-only `git status`, `git diff`, and `git log` when the command does not use the user's own shell environment. It turns off every program a repository's own config can name and refuses to run when git would use a different repository than the one fx read. In `auto` mode a git command it refuses is returned to the agent without running. Commands that run in a shell use git with the repository's full config: git in the shell tool's default `user` environment, and the routine commands `auto` mode runs without review, such as `git status` with other flags, `git fetch`, or `npm test`.
 
-* `src/mcp/` is the MCP-v2 engine. `FX_MCP_ENGINE=v2` selects it in place of the default v1 client in `src/core/mcp/`. Its files import only `std` and each other, and the host passes in `std.Io` and every other service through `src/mcp/host.zig`. fx connects to it through `src/core/mcp_host/`.
+* `src/mcp/` is the MCP engine. Its files import only `std` and each other, and the host passes in `std.Io` and every other service through `src/mcp/host.zig`. fx connects to it through `src/core/mcp_host/`. `src/core/mcp/` holds the MCP types, config parsing, schema checks, search, and tool naming that the host, the tools, ACP, and the UI share.
 
 * `src/tools/` owns built-in tool implementations. Generic tool contracts and dispatch live in `src/core/tooling/`. Default tool specs are centralized in `src/core/tooling/tool_specs.zig` or `src/builtins/tools.zig`, not in individual tool files.
 
