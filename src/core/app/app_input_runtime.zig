@@ -2456,7 +2456,17 @@ pub fn Runtime(comptime App: type) type {
             if (comptime !@hasField(App, "session_persistence")) return;
             const picker = &app.session_persistence.session_picker;
             if (!picker.active) return;
-            picker.setQuery(app.input_runtime.edit_state.input.items);
+            if (comptime !runtime_profile.allows(App, .durable_sessions)) {
+                picker.setQuery(app.input_runtime.edit_state.input.items);
+                return;
+            }
+            app_session_runtime.Runtime(App).searchSessionPicker(app) catch |err| {
+                debug_trace.logf(
+                    "session",
+                    "session picker search dropped the listed sessions err={s}",
+                    .{@errorName(err)},
+                );
+            };
         }
 
         fn skillTokenEnd(items: []const u8, start: usize) usize {
