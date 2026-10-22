@@ -70,10 +70,12 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .stack_check = false,
             .stack_protector = false,
-            .omit_frame_pointer = true,
+            // A sanitized build keeps its frame pointers and symbols, so race
+            // reports show whole stacks and name the code.
+            .omit_frame_pointer = !sanitize_thread,
             .unwind_tables = .none,
             .error_tracing = false,
-            .strip = optimize != .debug,
+            .strip = optimize != .debug and !sanitize_thread,
             .sanitize_thread = sanitize_thread,
         }),
     });
