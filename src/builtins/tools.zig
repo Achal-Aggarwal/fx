@@ -61,99 +61,37 @@ const shell_executable_schema = model_tool_schema.ObjectSchema{
     .additional_properties = false,
 };
 
-const shell_run_properties = [_]model_tool_schema.Property{
-    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"run"} } },
-    .{ .name = "command", .json_type = .string, .bounds = &.{ .max_length = terminal_contracts.max_command_bytes }, .description = "Shell command to execute exactly once." },
-    .{ .name = "cwd", .json_type = .string, .description = "Working directory; defaults to the workspace." },
-    .{ .name = "profile", .json_type = .string, .shape = &.{ .enum_values = &.{ "clean", "user" } }, .description = "Defaults to user; clean skips user startup files. Mutually exclusive with shell." },
-    .{ .name = "shell", .json_type = .object, .shape = &.{ .object = &shell_executable_schema }, .description = "Explicit shell for tty=true. Mutually exclusive with profile." },
-    .{ .name = "tty", .json_type = .boolean, .description = "Use a persistent TTY when interactive input or human attachment is required. Defaults to false." },
-    .{ .name = "yield_time_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = managed_execution_contract.max_yield_time_ms }, .description = "Initial observation window. Defaults to 30000; use 0 to return the owned running handle immediately." },
-    .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = 1 }, .description = "Set only when the user explicitly requests a finite deadline. Omit for commands intended to remain running, receive input, continue across turns, or be stopped later." },
-    .{ .name = "reload", .json_type = .boolean, .description = "Reload the user's startup files before this command, for example after installing a tool or editing a file they source. Edits to the startup files themselves are picked up automatically." },
+// Every shell field sits at the top level. A nested object would make the
+// model write the call's JSON by hand, which repeats keys and breaks escaping.
+// `shell_impl.actionFieldContract` owns which action accepts which field; the
+// test "shell schema fields match the runtime action contract" keeps the two
+// in sync, and each description names the action its field belongs to.
+const shell_properties = [_]model_tool_schema.Property{
+    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "run", "interact", "stop" } }, .description = "run starts a command; interact checks on session_id; stop ends session_id. The shell command itself goes in command. Send only the fields marked for the chosen action." },
+    .{ .name = "command", .json_type = .string, .bounds = &.{ .max_length = terminal_contracts.max_command_bytes }, .description = "run: shell command to execute exactly once." },
+    .{ .name = "cwd", .json_type = .string, .description = "run: working directory; defaults to the workspace." },
+    .{ .name = "profile", .json_type = .string, .shape = &.{ .enum_values = &.{ "clean", "user" } }, .description = "run: defaults to user; clean skips user startup files. Mutually exclusive with shell." },
+    .{ .name = "shell", .json_type = .object, .shape = &.{ .object = &shell_executable_schema }, .description = "run with tty=true only: the shell for an interactive terminal. Ordinary commands already run in the user's shell, so omit it for them. Mutually exclusive with profile." },
+    .{ .name = "tty", .json_type = .boolean, .description = "run: use a persistent TTY when interactive input or human attachment is required. Defaults to false." },
+    .{ .name = "yield_time_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = managed_execution_contract.max_wait_ceiling_ms }, .description = "run: initial observation window of 0-30000 ms, defaults to 30000; use 0 to return the owned running handle immediately. interact: wait before yielding output, defaults to 5000. Empty observations wait 5000-300000 ms; shorter values are raised to 5000. If the process remains running, interact with the same session_id again; never rerun it." },
+    .{ .name = "timeout_ms", .json_type = .integer, .bounds = &.{ .minimum = 1 }, .description = "run: set only when the user explicitly requests a finite deadline. Omit for commands intended to remain running, receive input, continue across turns, or be stopped later." },
+    .{ .name = "reload", .json_type = .boolean, .description = "run: reload the user's startup files before this command, for example after installing a tool or editing a file they source. Edits to the startup files themselves are picked up automatically." },
+    .{ .name = "session_id", .json_type = .string, .description = "interact and stop: owned execution handle returned by run." },
+    .{ .name = "chars", .json_type = .string, .bounds = &.{ .max_length = terminal_contracts.max_write_bytes }, .description = "interact: exact characters to send to tty=true work before observing it. Omit or send an empty string to only observe. Non-empty input caps yield_time_ms at 30000 and keeps shorter waits. Observe application readiness before sending control characters. Press Enter with a newline character and send control characters such as Ctrl-C (U+0003) as the characters themselves; a backslash followed by n is sent as those two characters." },
+    .{ .name = "force", .json_type = .boolean, .description = "stop: use immediate force termination when true. Defaults to false." },
 };
 
-const shell_interact_properties = [_]model_tool_schema.Property{
-    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"interact"} } },
-    .{ .name = "session_id", .json_type = .string, .description = "Owned execution handle returned by shell.run." },
-    .{ .name = "chars", .json_type = .string, .bounds = &.{ .max_length = terminal_contracts.max_write_bytes }, .description = "Exact characters to send to tty=true work before observing it. Omit or send an empty string to only observe. Observe application readiness before sending control characters. Use \\n for Enter and JSON escapes such as \\u0003 for control characters." },
-    .{ .name = "yield_time_ms", .json_type = .integer, .bounds = &.{ .minimum = 0, .maximum = managed_execution_contract.max_wait_ceiling_ms }, .description = "Wait before yielding output. Empty observations wait 5000-300000 ms; shorter values are raised to 5000. Non-empty input is capped at 30000 ms and keeps shorter requested waits. Defaults to 5000. If the process remains running, interact with the same session_id again; never rerun it." },
+// Sessions that cannot keep a terminal open drop the tty fields.
+const shell_process_properties = [_]model_tool_schema.Property{
+    shell_properties[0],
+    shell_properties[1],
+    shell_properties[2],
+    shell_properties[3],
+    shell_properties[6],
+    shell_properties[7],
+    shell_properties[9],
+    shell_properties[11],
 };
-
-const shell_stop_properties = [_]model_tool_schema.Property{
-    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"stop"} } },
-    .{ .name = "session_id", .json_type = .string, .description = "Owned execution handle returned by shell.run." },
-    .{ .name = "force", .json_type = .boolean, .description = "Use immediate force termination when true. Defaults to false." },
-};
-
-const shell_profile_run_properties = [_]model_tool_schema.Property{
-    shell_run_properties[0],
-    shell_run_properties[1],
-    shell_run_properties[2],
-    shell_run_properties[3],
-    shell_run_properties[5],
-    shell_run_properties[6],
-    shell_run_properties[7],
-    shell_run_properties[8],
-};
-
-const shell_explicit_run_properties = [_]model_tool_schema.Property{
-    shell_run_properties[0],
-    shell_run_properties[1],
-    shell_run_properties[2],
-    shell_run_properties[4],
-    shell_run_properties[5],
-    shell_run_properties[6],
-    shell_run_properties[7],
-};
-
-const shell_action_schemas = [_]model_tool_schema.ObjectSchema{
-    .{ .properties = &shell_profile_run_properties, .required = &.{ "action", "command" }, .additional_properties = false },
-    .{ .properties = &shell_explicit_run_properties, .required = &.{ "action", "command", "shell", "tty" }, .additional_properties = false },
-    .{ .properties = &shell_interact_properties, .required = &.{ "action", "session_id" }, .additional_properties = false },
-    .{ .properties = &shell_stop_properties, .required = &.{ "action", "session_id" }, .additional_properties = false },
-};
-
-const shell_action_union_schema = model_tool_schema.ObjectSchema{
-    .one_of = &shell_action_schemas,
-};
-
-const shell_request_properties = [_]model_tool_schema.Property{.{
-    .name = "request",
-    .json_type = .object,
-    .shape = &.{ .object = &shell_action_union_schema },
-}};
-
-const shell_process_run_properties = [_]model_tool_schema.Property{
-    shell_run_properties[0],
-    shell_run_properties[1],
-    shell_run_properties[2],
-    shell_run_properties[3],
-    shell_run_properties[6],
-    shell_run_properties[7],
-};
-
-const shell_process_interact_properties = [_]model_tool_schema.Property{
-    shell_interact_properties[0],
-    shell_interact_properties[1],
-    shell_interact_properties[3],
-};
-
-const shell_process_action_schemas = [_]model_tool_schema.ObjectSchema{
-    .{ .properties = &shell_process_run_properties, .required = &.{ "action", "command" }, .additional_properties = false },
-    .{ .properties = &shell_process_interact_properties, .required = &.{ "action", "session_id" }, .additional_properties = false },
-    shell_action_schemas[3],
-};
-
-const shell_process_action_union_schema = model_tool_schema.ObjectSchema{
-    .one_of = &shell_process_action_schemas,
-};
-
-const shell_process_request_properties = [_]model_tool_schema.Property{.{
-    .name = "request",
-    .json_type = .object,
-    .shape = &.{ .object = &shell_process_action_union_schema },
-}};
 
 const skill_description =
     "Load an installed skill or one required relative text resource completely. Copy the exact advertised location. Resolve paths mentioned in skill instructions from the selected skill directory, not the workspace. Read referenced text with the same location and its relative resource path. When to use: the user explicitly invokes a listed skill or the task clearly matches one. When NOT to use: installing a missing skill.";
@@ -461,8 +399,8 @@ pub const shell = ToolSpec{
         .name = "shell",
         .description = shell_description,
         .input_schema = .{
-            .properties = &shell_request_properties,
-            .required = &.{"request"},
+            .properties = &shell_properties,
+            .required = &.{"action"},
             .additional_properties = false,
         },
     },
@@ -492,8 +430,8 @@ const shell_process_only = blk: {
         .name = "shell",
         .description = shell_description,
         .input_schema = .{
-            .properties = &shell_process_request_properties,
-            .required = &.{"request"},
+            .properties = &shell_process_properties,
+            .required = &.{"action"},
             .additional_properties = false,
         },
     };
@@ -907,7 +845,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "76f7c41414ad29eb584b99fe11acacfd8384bf1c4214b52bd677b7a45ce437e8",
+        "548e468d917181202f38c2e5a29e82fd400f40f5fa267d5f17e066240769674b",
         &actual_hex,
     );
 }
@@ -1011,13 +949,15 @@ test "shell advertises only run interact and stop" {
         "lease",
         "terminal.exec",
         "terminal.start",
+        "\"request\"",
+        "oneOf",
     }) |removed| {
         try std.testing.expect(std.mem.find(u8, schema_json, removed) == null);
     }
     try std.testing.expect(std.mem.find(
         u8,
         schema_json,
-        "Set only when the user explicitly requests a finite deadline",
+        "run: set only when the user explicitly requests a finite deadline",
     ) != null);
     try std.testing.expect(std.mem.find(
         u8,
@@ -1033,16 +973,36 @@ test "shell advertises only run interact and stop" {
     try std.testing.expect(registry.lookup("shell") != null);
 }
 
-test "shell run schema separates profile and explicit shell forms" {
-    try std.testing.expectEqual(@as(usize, 4), shell_action_schemas.len);
-    const profile_run = shell_action_schemas[0];
-    const explicit_run = shell_action_schemas[1];
-    try std.testing.expect(schemaProperty(profile_run, "profile") != null);
-    try std.testing.expect(schemaProperty(profile_run, "shell") == null);
-    try std.testing.expect(schemaProperty(explicit_run, "profile") == null);
-    try std.testing.expect(schemaProperty(explicit_run, "shell") != null);
-    try std.testing.expect(nameInSet(explicit_run.required, "shell"));
-    try std.testing.expect(nameInSet(explicit_run.required, "tty"));
+test "shell schema fields match the runtime action contract" {
+    const actions = std.enums.values(shell_impl.Action);
+    try std.testing.expectEqualStrings("action", shell_properties[0].name);
+    const advertised_actions = shell_properties[0].shape.?.enum_values;
+    try std.testing.expectEqual(actions.len, advertised_actions.len);
+    for (actions, advertised_actions) |action, advertised| {
+        try std.testing.expectEqualStrings(@tagName(action), advertised);
+    }
+
+    const schema = model_tool_schema.ObjectSchema{ .properties = &shell_properties };
+    for (actions) |action| {
+        for (shell_impl.actionFieldContract(action).allowed) |name| {
+            try std.testing.expect(schemaProperty(schema, name) != null);
+        }
+    }
+    // Each field's description opens with an action that accepts the field.
+    for (shell_properties[1..]) |property| {
+        const owner = for (actions) |action| {
+            if (std.mem.startsWith(u8, property.description, @tagName(action))) break action;
+        } else return error.TestExpectedEqual;
+        try std.testing.expect(nameInSet(shell_impl.actionFieldContract(owner).allowed, property.name));
+    }
+
+    const process_schema = model_tool_schema.ObjectSchema{ .properties = &shell_process_properties };
+    for (shell_process_properties) |property| {
+        try std.testing.expect(schemaProperty(schema, property.name) != null);
+    }
+    for ([_][]const u8{ "shell", "tty", "reload", "chars" }) |name| {
+        try std.testing.expect(schemaProperty(process_schema, name) == null);
+    }
 }
 
 test "process-only shell retains observation without tty input" {

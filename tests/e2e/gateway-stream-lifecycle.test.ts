@@ -4858,10 +4858,9 @@ describe("gateway stream lifecycle", () => {
           const correction = JSON.parse(toolResultOutput(body, "repair_invalid")).error;
           expect(correction.code).toBe("invalid_shell_request");
           expect(correction.executed).toBe(false);
-          expect(correction.problems).toContain("request.action is required.");
-          expect(correction.retry_with).toEqual({
-            request: { action: "run", command, profile: "clean", yield_time_ms: 1000 },
-          });
+          expect(correction.problems).toContain("Put the action fields at the top level; shell takes no request wrapper.");
+          expect(correction.problems).toContain("action is required.");
+          expect(correction.retry_with).toEqual({ action: "run", command, profile: "clean", yield_time_ms: 1000 });
           return fakeGatewayToolCall("repair_valid", "shell", correction.retry_with);
         }
         case 3:

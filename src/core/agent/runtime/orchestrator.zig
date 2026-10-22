@@ -325,12 +325,6 @@ fn subagent_request_schema_advertised(
     return false;
 }
 
-fn terminal_request_schema_advertised(
-    advertised_functions: []const model_tool_schema.FunctionSchema,
-) bool {
-    return request_union_schema_advertised(advertised_functions, "shell");
-}
-
 fn read_tool_result_request_schema_advertised(
     advertised_functions: []const model_tool_schema.FunctionSchema,
 ) bool {
@@ -386,40 +380,11 @@ const terminal_model_payload_mappings = [_]TerminalModelPayloadMapping{
     .{ .kind = "paste", .model_field = "paste", .internal_field = "text" },
 };
 
-fn terminal_payload_mapping(
-    wanted: []const u8,
-    comptime field: enum { kind, model },
-) ?TerminalModelPayloadMapping {
+fn terminal_payload_mapping(model_field: []const u8) ?TerminalModelPayloadMapping {
     for (terminal_model_payload_mappings) |mapping| {
-        const candidate = switch (field) {
-            .kind => mapping.kind,
-            .model => mapping.model_field,
-        };
-        if (std.mem.eql(u8, candidate, wanted)) return mapping;
+        if (std.mem.eql(u8, mapping.model_field, model_field)) return mapping;
     }
     return null;
-}
-
-fn project_terminal_model_write(
-    arena: Allocator,
-    object: *std.json.ObjectMap,
-) Allocator.Error!bool {
-    if (!terminal_action_is(object.*, "write")) return false;
-    elide_terminal_null_lease(object);
-    if (object.get("lease") != null or object.get("input") != null) {
-        return false;
-    }
-    const write = object.get("write") orelse return false;
-    if (write != .object) return false;
-    const kind = write.object.get("kind") orelse return false;
-    if (kind != .string) return false;
-    const mapping = terminal_payload_mapping(kind.string, .kind) orelse return false;
-    const payload = write.object.get(mapping.internal_field) orelse return false;
-    var input = std.json.Value{ .object = .empty };
-    try input.object.put(arena, mapping.model_field, payload);
-    try object.put(arena, "input", input);
-    _ = object.orderedRemove("write");
-    return true;
 }
 
 fn normalize_terminal_model_input(
@@ -435,46 +400,13 @@ fn normalize_terminal_model_input(
     if (input != .object or input.object.count() != 1) return false;
     const input_key = input.object.keys()[0];
     const input_value = input.object.values()[0];
-    const mapping = terminal_payload_mapping(input_key, .model) orelse return false;
+    const mapping = terminal_payload_mapping(input_key) orelse return false;
     var write = std.json.Value{ .object = .empty };
     try write.object.put(arena, "kind", .{ .string = mapping.kind });
     try write.object.put(arena, mapping.internal_field, input_value);
     try object.put(arena, "write", write);
     _ = object.orderedRemove("input");
     return true;
-}
-
-fn projected_terminal_request_arguments(
-    alloc: Allocator,
-    arguments_json: []const u8,
-) Allocator.Error!?[]u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
-    };
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const arena = parsed.arena.allocator();
-    if (parsed.value.object.count() == 1) {
-        if (parsed.value.object.getPtr("request")) |request| {
-            if (request.* == .object) {
-                if (!try project_terminal_model_write(arena, &request.object)) {
-                    return null;
-                }
-                var wrapped_out: std.Io.Writer.Allocating = .init(alloc);
-                defer wrapped_out.deinit();
-                std.json.Stringify.value(parsed.value, .{}, &wrapped_out.writer) catch
-                    return error.OutOfMemory;
-                return try wrapped_out.toOwnedSlice();
-            }
-        }
-    }
-    _ = try project_terminal_model_write(arena, &parsed.value.object);
-
-    var out: std.Io.Writer.Allocating = .init(alloc);
-    defer out.deinit();
-    std.json.Stringify.value(.{ .request = parsed.value }, .{}, &out.writer) catch return error.OutOfMemory;
-    return try out.toOwnedSlice();
 }
 
 fn projected_read_tool_result_arguments(
@@ -589,18 +521,18 @@ fn projectLegacyTerminalExecArguments(
     if (action != .string or !std.mem.eql(u8, action.string, "exec")) return null;
     const command = parsed.value.object.get("command") orelse return null;
     if (command != .string) return null;
-    var request = std.json.Value{ .object = .empty };
-    defer request.object.deinit(alloc);
-    try request.object.put(alloc, "action", .{ .string = "run" });
-    try request.object.put(alloc, "command", command);
+    var run = std.json.Value{ .object = .empty };
+    defer run.object.deinit(alloc);
+    try run.object.put(alloc, "action", .{ .string = "run" });
+    try run.object.put(alloc, "command", command);
     for ([_][]const u8{ "cwd", "profile", "timeout_ms" }) |name| {
         if (parsed.value.object.get(name)) |value| {
-            try request.object.put(alloc, name, value);
+            try run.object.put(alloc, name, value);
         }
     }
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(.{ .request = request }, .{}, &out.writer) catch
+    std.json.Stringify.value(run, .{}, &out.writer) catch
         return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
@@ -608,13 +540,9 @@ fn projectLegacyTerminalExecArguments(
 test "legacy exec argument projection releases temporary allocations" {
     const Probe = struct {
         fn run(alloc: Allocator) !void {
-            const projected = try projectLegacyTerminalExecArguments(alloc, "{\"action\":\"exec\",\"command\":\":\"}") orelse return error.TestUnexpectedResult;
+            const projected = try projectLegacyTerminalExecArguments(alloc, "{\"action\":\"exec\",\"command\":\":\",\"cwd\":\"src\"}") orelse return error.TestUnexpectedResult;
             defer alloc.free(projected);
-            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, projected, .{});
-            defer parsed.deinit();
-            const request = parsed.value.object.get("request") orelse return error.TestUnexpectedResult;
-            try std.testing.expectEqualStrings("run", request.object.get("action").?.string);
-            try std.testing.expectEqualStrings(":", request.object.get("command").?.string);
+            try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\":\",\"cwd\":\"src\"}", projected);
         }
     };
     try std.testing.checkAllAllocationFailures(testing_allocator.no_resize, Probe.run, .{});
@@ -754,13 +682,6 @@ fn project_terminal_request_messages(
                     .mapped = mapped_arguments != null,
                 });
                 needs_projection = true;
-                continue;
-            }
-            const tool = registry.lookup(call.name) orelse continue;
-            if (tool.executor_kind != .terminal) continue;
-            if (try projected_terminal_request_arguments(alloc, call.arguments_json)) |arguments| {
-                alloc.free(arguments);
-                needs_projection = true;
             }
         }
     }
@@ -839,18 +760,7 @@ fn project_terminal_request_messages(
                     };
                     continue;
                 }
-                const registered_terminal = if (registry.lookup(call.name)) |tool|
-                    tool.executor_kind == .terminal
-                else
-                    false;
-                const arguments = if (call.argument_integrity == .valid and
-                    registered_terminal)
-                    (try projected_terminal_request_arguments(
-                        alloc,
-                        call.arguments_json,
-                    )) orelse try alloc.dupe(u8, call.arguments_json)
-                else
-                    try alloc.dupe(u8, call.arguments_json);
+                const arguments = try alloc.dupe(u8, call.arguments_json);
                 var copied = call;
                 copied.arguments_json = arguments;
                 calls.append(alloc, copied) catch |err| {
@@ -1614,48 +1524,14 @@ test "subagent request normalization follows effective attempt advertisement" {
     try std.testing.expectEqual(calls[0..].ptr, ineligible.ptr);
 }
 
-test "shell request normalization follows effective attempt advertisement" {
-    const nested = tool_dispatch.Tool{
-        .name = "shell",
-        .description = "shell",
-        .model_schema = .{
-            .name = "shell",
-            .description = "shell",
-            .input_schema = .{
-                .properties = &.{.{
-                    .name = "request",
-                    .json_type = .object,
-                    .shape = &.{ .object = &.{ .one_of = &.{.{}} } },
-                }},
-                .required = &.{"request"},
-                .additional_properties = false,
-            },
-        },
-        .decode = undefined,
-        .call = undefined,
-        .reads_only_fn = undefined,
-        .irreversible_fn = undefined,
-    };
-    const flat = tool_dispatch.Tool{
-        .name = "shell",
-        .description = "shell",
-        .model_schema = .{ .name = "shell", .description = "shell" },
-        .decode = undefined,
-        .call = undefined,
-        .reads_only_fn = undefined,
-        .irreversible_fn = undefined,
-    };
-
-    try std.testing.expect(terminal_request_schema_advertised(&.{nested.model_schema}));
-    try std.testing.expect(!terminal_request_schema_advertised(&.{flat.model_schema}));
-    try std.testing.expect(!terminal_request_schema_advertised(&.{}));
+test "nested request normalization skips required vision calls" {
     try std.testing.expect(terminal_request_normalization_eligible(true, .unavailable));
     try std.testing.expect(terminal_request_normalization_eligible(true, .optional));
     try std.testing.expect(!terminal_request_normalization_eligible(true, .required));
     try std.testing.expect(!terminal_request_normalization_eligible(false, .unavailable));
 }
 
-test "terminal inferred model input round trips every atomic write payload" {
+test "terminal model write input normalizes every atomic payload" {
     const alloc = std.testing.allocator;
     const cases = [_]struct {
         internal: []const u8,
@@ -1679,22 +1555,16 @@ test "terminal inferred model input round trips every atomic write payload" {
         },
     };
     for (cases) |case| {
-        const projected = (try projected_terminal_request_arguments(
-            alloc,
-            case.internal,
-        )).?;
-        defer alloc.free(projected);
-        try std.testing.expectEqualStrings(case.model, projected);
         const normalized = (try normalized_terminal_request_arguments(
             alloc,
-            projected,
+            case.model,
         )).?;
         defer alloc.free(normalized);
         try std.testing.expectEqualStrings(case.internal, normalized);
     }
 }
 
-test "shell request projection wraps eligible flat objects without changing source messages" {
+test "shell history replays stored calls as sent" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -1709,42 +1579,22 @@ test "shell request projection wraps eligible flat objects without changing sour
         .reads_only_fn = undefined,
         .irreversible_fn = undefined,
     };
-    var browser_terminal = terminal_tool;
-    browser_terminal.name = "browser_terminal";
-    browser_terminal.executor_kind = .run_command;
-    const tools = [_]tool_dispatch.Tool{ terminal_tool, browser_terminal };
-    const registry = tool_dispatch.Registry{ .tools = &tools };
-
-    const cases = [_]struct {
-        id: []const u8,
-        input: []const u8,
-        expected: []const u8,
-    }{
-        .{ .id = "missing-action", .input = "{}", .expected = "{\"request\":{}}" },
-        .{ .id = "null-action", .input = "{\"action\":null}", .expected = "{\"request\":{\"action\":null}}" },
-        .{ .id = "non-string-action", .input = "{\"action\":7}", .expected = "{\"request\":{\"action\":7}}" },
-        .{ .id = "unknown-action", .input = "{\"action\":\"unknown\"}", .expected = "{\"request\":{\"action\":\"unknown\"}}" },
-        .{ .id = "valid-action", .input = "{\"action\":\"list\"}", .expected = "{\"request\":{\"action\":\"list\"}}" },
-        .{ .id = "atomic-keys", .input = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}", .expected = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}}" },
-        .{ .id = "null-lease", .input = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":null,\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}", .expected = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}}" },
-        .{ .id = "textual-null-lease", .input = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"null\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}", .expected = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"keys\":[\"enter\"]}}}" },
-        .{ .id = "explicit-lease", .input = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"use\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}", .expected = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"lease\":\"use\",\"write\":{\"kind\":\"keys\",\"keys\":[\"enter\"]}}}" },
-        .{ .id = "null-request", .input = "{\"request\":null}", .expected = "{\"request\":{\"request\":null}}" },
-        .{ .id = "request-sibling", .input = "{\"request\":{\"action\":\"list\"},\"sibling\":true}", .expected = "{\"request\":{\"request\":{\"action\":\"list\"},\"sibling\":true}}" },
-        .{ .id = "exact-wrapper", .input = "{\"request\":{\"action\":\"list\"}}", .expected = "{\"request\":{\"action\":\"list\"}}" },
-        .{ .id = "non-object", .input = "[]", .expected = "[]" },
+    const registry = tool_dispatch.Registry{ .tools = &.{terminal_tool} };
+    // Accepted calls are stored flat; rejected calls keep the bytes the model
+    // sent. Neither gains a request wrapper on the way back to the model
+    // (`tests/tla/shell_command/ShellContract.tla` HistoryFidelity).
+    const calls = [_]ToolCall{
+        .{ .id = "accepted", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"true\"}" },
+        .{ .id = "rejected", .name = "shell", .arguments_json = "{\"action\":\"unknown\"}" },
+        .{ .id = "wrapped", .name = "shell", .arguments_json = "{\"request\":{\"action\":\"run\"},\"sibling\":true}" },
+        .{ .id = "malformed", .name = "shell", .arguments_json = "{}", .argument_integrity = .malformed_json },
     };
-    var calls: [cases.len + 3]ToolCall = undefined;
-    for (cases, 0..) |case, index| {
-        calls[index] = .{ .id = case.id, .name = "shell", .arguments_json = case.input };
-    }
-    calls[cases.len] = .{ .id = "malformed", .name = "shell", .arguments_json = "{", .argument_integrity = .malformed_json };
-    calls[cases.len + 1] = .{ .id = "unknown-tool", .name = "missing", .arguments_json = "{}" };
-    calls[cases.len + 2] = .{ .id = "other-executor", .name = "browser_terminal", .arguments_json = "{}" };
     const messages = [_]ChatMessage{
-        .{ .role = .user, .content = "keep user message", .tool_calls = calls[0..1] },
-        .{ .role = .assistant, .content = "assistant", .tool_calls = &calls, .provider_replay = .{ .source = .{ .provider = .gateway, .model = "test" }, .parts_json = "[]" } },
-        .{ .role = .tool, .content = "keep result", .tool_call_id = "valid-action", .tool_name = "shell" },
+        .{ .role = .assistant, .content = "assistant", .tool_calls = &calls },
+        .{ .role = .tool, .content = "accepted result", .tool_call_id = "accepted", .tool_name = "shell" },
+        .{ .role = .tool, .content = "rejected result", .tool_call_id = "rejected", .tool_name = "shell" },
+        .{ .role = .tool, .content = "wrapped result", .tool_call_id = "wrapped", .tool_name = "shell" },
+        .{ .role = .tool, .content = "malformed result", .tool_call_id = "malformed", .tool_name = "shell" },
     };
 
     const projected = try project_terminal_request_messages(
@@ -1755,38 +1605,7 @@ test "shell request projection wraps eligible flat objects without changing sour
         agent_stream_provider.unavailable_provider,
         .{ .provider = .gateway, .model = "test" },
     );
-    try std.testing.expect(projected.ptr != messages[0..].ptr);
-    try std.testing.expectEqualStrings("keep user message", projected[0].content.?);
-    try std.testing.expect(messages[0].tool_calls.ptr != projected[0].tool_calls.ptr);
-    try std.testing.expectEqualStrings("assistant", projected[1].content.?);
-    try std.testing.expectEqualStrings("[]", projected[1].provider_replay.?.parts_json);
-    try std.testing.expectEqualStrings("keep result", projected[2].content.?);
-    for (cases, 0..) |case, index| {
-        try std.testing.expectEqualStrings(case.expected, projected[1].tool_calls[index].arguments_json);
-        try std.testing.expectEqualStrings(case.input, messages[1].tool_calls[index].arguments_json);
-    }
-    try std.testing.expectEqualStrings("{", projected[1].tool_calls[cases.len].arguments_json);
-    try std.testing.expectEqualStrings("{}", projected[1].tool_calls[cases.len + 1].arguments_json);
-    try std.testing.expectEqualStrings("{}", projected[1].tool_calls[cases.len + 2].arguments_json);
-
-    const idempotent = try project_terminal_request_messages(
-        arena,
-        registry,
-        true,
-        projected,
-        agent_stream_provider.unavailable_provider,
-        .{ .provider = .gateway, .model = "test" },
-    );
-    try std.testing.expectEqual(projected.ptr, idempotent.ptr);
-    const ineligible = try project_terminal_request_messages(
-        arena,
-        registry,
-        false,
-        &messages,
-        agent_stream_provider.unavailable_provider,
-        .{ .provider = .gateway, .model = "test" },
-    );
-    try std.testing.expectEqual(messages[0..].ptr, ineligible.ptr);
+    try std.testing.expectEqual(messages[0..].ptr, projected.ptr);
 }
 
 test "legacy read_tool_result history gains one nested request wrapper" {
@@ -2250,12 +2069,11 @@ fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void
     const tools = [_]tool_dispatch.Tool{terminal_tool};
     const registry = tool_dispatch.Registry{ .tools = &tools };
     const first_calls = [_]ToolCall{
-        .{ .id = "one", .name = "shell", .arguments_json = "{}" },
-        .{ .id = "two", .name = "shell", .arguments_json = "{\"action\":null}" },
-        .{ .id = "atomic", .name = "shell", .arguments_json = "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}" },
+        .{ .id = "legacy", .name = "terminal", .arguments_json = "{\"action\":\"exec\",\"command\":\"printf ok\"}" },
+        .{ .id = "current", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"true\"}" },
     };
     const second_calls = [_]ToolCall{
-        .{ .id = "three", .name = "shell", .arguments_json = "{\"action\":\"list\"}" },
+        .{ .id = "legacy-cwd", .name = "terminal", .arguments_json = "{\"action\":\"exec\",\"command\":\"ls\",\"cwd\":\"src\"}" },
     };
     const source = [_]ChatMessage{
         .{ .role = .assistant, .tool_calls = &first_calls },
@@ -2271,13 +2089,10 @@ fn check_terminal_request_projection_allocation_failures(alloc: Allocator) !void
     );
     if (projected.ptr == source[0..].ptr) return error.TestUnexpectedResult;
     defer free_terminal_request_projection(alloc, &source, projected);
-    try std.testing.expectEqualStrings("{\"request\":{}}", projected[0].tool_calls[0].arguments_json);
-    try std.testing.expectEqualStrings("{\"request\":{\"action\":null}}", projected[0].tool_calls[1].arguments_json);
-    try std.testing.expectEqualStrings(
-        "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"text\":\"input\"}}}",
-        projected[0].tool_calls[2].arguments_json,
-    );
-    try std.testing.expectEqualStrings("{\"request\":{\"action\":\"list\"}}", projected[1].tool_calls[0].arguments_json);
+    try std.testing.expectEqualStrings("shell", projected[0].tool_calls[0].name);
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"printf ok\"}", projected[0].tool_calls[0].arguments_json);
+    try std.testing.expectEqualStrings(first_calls[1].arguments_json, projected[0].tool_calls[1].arguments_json);
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"ls\",\"cwd\":\"src\"}", projected[1].tool_calls[0].arguments_json);
 }
 
 test "terminal request projection cleans every partial allocation failure" {
@@ -5739,9 +5554,6 @@ fn processQueuedPromptInner(
         }
     }
 
-    const base_nested_terminal_advertised = terminal_request_schema_advertised(
-        config.advertised_functions,
-    );
     const base_nested_subagent_advertised = subagent_request_schema_advertised(
         config.advertised_functions,
     );
@@ -5999,7 +5811,6 @@ fn processQueuedPromptInner(
         prepared_job,
         .{ .catalog = if (skill_section) |*section| section else null, .explicit = if (explicit_section) |*section| section else null },
         request_capabilities,
-        base_nested_terminal_advertised,
         base_nested_subagent_advertised,
         base_nested_read_tool_result_advertised,
         finalization,
@@ -6899,7 +6710,6 @@ fn processQueuedPromptLoop(
     job: QueuedPrompt,
     skills: PreparedSkills,
     initial_request_capabilities: model_capabilities.Capabilities,
-    base_nested_terminal_advertised: bool,
     base_nested_subagent_advertised: bool,
     base_nested_read_tool_result_advertised: bool,
     finalization: *TurnFinalizationGuard,
@@ -7451,10 +7261,10 @@ fn processQueuedPromptLoop(
                     recovery_source_messages.len - projected_request_messages.len,
                 });
             }
-            const terminal_request_eligible = terminal_request_normalization_eligible(
-                base_nested_terminal_advertised,
-                vision_mode,
-            );
+            // Shell is advertised flat; every step except a required vision
+            // call still unwraps an exact {"request":{...}} a model sends out of
+            // habit and maps legacy terminal history onto shell.
+            const terminal_request_eligible = vision_mode != .required;
             const subagent_request_eligible = subagent_request_normalization_eligible(
                 base_nested_subagent_advertised,
                 vision_mode,

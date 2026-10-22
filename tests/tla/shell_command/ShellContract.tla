@@ -8,7 +8,7 @@
 (*     -> permission admission reads the arguments                         *)
 (*     -> shell decode accepts or rejects                                  *)
 (*     -> execute in a shell -> record the result                          *)
-(*     -> history projection for the next model request                    *)
+(*     -> history replay for the next model request                        *)
 (*     -> loop guard ends the turn on a repeated invalid call.             *)
 (*                                                                         *)
 (* Design = "current" models the shell tool as fx implements it;          *)
@@ -44,8 +44,8 @@ Intents == {"run", "run_eq", "run_bash", "run_bash_tty", "type", "observe", "sto
 
 (* How the arguments arrived (all seen in real sessions or the evals).       *)
 (*   flat_new        proposed flat form: command | session_id (+ input, stop)*)
-(*   flat_action     flat with an action field and today's names (accepted)  *)
-(*   wrapped         {"request": {...}}, today's advertised form             *)
+(*   flat_action     flat with an action field, today's advertised form      *)
+(*   wrapped         {"request": {...}}, the earlier advertised form         *)
 (*   wrapped_string  {"request": "<valid JSON>"}  (Qwen, Nemotron)           *)
 (*   wrapped_broken  {"request": "<invalid JSON>"} (GLM escaping)            *)
 (*   invalid_json    the whole argument text is not JSON (long heredocs)     *)
@@ -98,9 +98,10 @@ AdmissionView(e) ==
   ELSE IF RawReadable(e) THEN e.intent ELSE "unreadable"
 
 (* How the call appears in the next request's history.                       *)
-(* current: accepted calls are stored flat and re-wrapped exactly; a          *)
-(*   rejected call is stored raw and wrapped again unless it was already the  *)
-(*   exact wrapper (orchestrator project_terminal_request_messages).          *)
+(* current: accepted calls are stored and replayed flat with their action; a  *)
+(*   rejected call is replayed as stored, which is as sent except for an      *)
+(*   exact wrapper: the orchestrator unwrapped it before the call was stored  *)
+(*   (normalize_terminal_request_tool_calls).                                 *)
 (* proposed: accepted calls appear in canonical form; rejected calls appear   *)
 (*   exactly as sent.                                                         *)
 (* Argument text that is not JSON cannot be replayed: providers require JSON  *)
@@ -108,7 +109,7 @@ AdmissionView(e) ==
 HistoryEntry(e, acc) ==
   IF acc THEN "canonical"
   ELSE IF e.shape = "invalid_json" THEN "placeholder"
-  ELSE IF Design = "current" /\ e.shape # "wrapped" THEN "rewrapped:" \o e.shape
+  ELSE IF Design = "current" /\ e.shape = "wrapped" THEN "unwrapped:wrapped"
   ELSE "as_sent:" \o e.shape
 
 (* Result of bash-style text in the default shell (zsh). The redesign sets  *)
