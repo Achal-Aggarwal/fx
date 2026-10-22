@@ -354,7 +354,6 @@ const callback_logo = "<svg class=\"brand\" width=\"64\" height=\"64\" viewBox=\
     "C223.737 1.612 230.127 0 237.892 0ZM273.987 99.084L260.073 120.25H234.541L261.003 82.022L273.987 99.084Z" ++
     "\"/></g></svg>";
 
-/// The browser page after a sign-in returns, matching the fx.sh sign-in pages.
 fn callbackPage(comptime title: []const u8, comptime detail: []const u8) []const u8 {
     return "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" ++
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" ++
