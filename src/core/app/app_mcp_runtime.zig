@@ -487,16 +487,21 @@ pub const State = struct {
             defer arena.deinit();
             if (try typedLoginServer(arena.allocator(), args)) |server| sink.markTyped(server);
         }
-        try self.startVerbs(home, workspace_root, args);
+        try self.startVerbs(home, workspace_root, args, .transcript);
     }
 
+    /// Where a `/mcp` command's report goes. A command typed in the
+    /// composer prints it; a choice in the menu shows its result there, so
+    /// only its warnings and errors print.
+    const VerbReport = enum { transcript, warnings_only };
+
     /// Runs `/mcp` with `args` off the UI thread, like `runVerbs`.
-    fn startVerbs(self: *State, home: []const u8, workspace_root: []const u8, args: []const []const u8) !void {
+    fn startVerbs(self: *State, home: []const u8, workspace_root: []const u8, args: []const []const u8, report: VerbReport) !void {
         if (comptime builtin.single_threaded) return error.ThreadsUnsupported;
         const a = std.heap.c_allocator;
         const job = try a.create(VerbJob);
         errdefer a.destroy(job);
-        job.* = .{ .state = self };
+        job.* = .{ .state = self, .report = report };
         errdefer job.free();
         const owned = try a.alloc([]const u8, args.len);
         @memset(owned, "");
@@ -512,6 +517,7 @@ pub const State = struct {
 
     const VerbJob = struct {
         state: *State,
+        report: VerbReport,
         args: []const []const u8 = &.{},
         home: []const u8 = "",
         workspace_root: []const u8 = "",
@@ -549,6 +555,7 @@ pub const State = struct {
             }, args);
             const sink = self.host_sink orelse return;
             for ([_]*std.Io.Writer.Allocating{ &out, &err }, [_]bool{ false, true }) |w, warning| {
+                if (!warning and job.report == .warnings_only) continue;
                 const text = std.mem.trimEnd(u8, w.written(), "\n");
                 if (text.len == 0) continue;
                 sink.push(a.dupe(u8, text) catch continue, warning);
@@ -650,7 +657,7 @@ pub const State = struct {
             .run => |run| {
                 // A confirmed Remove went back to the list already.
                 if (self.host_menu.screen == .list) self.stopMenuTools();
-                try self.startVerbs(home, workspace_root, &.{ run.choice.verb(), run.server });
+                try self.startVerbs(home, workspace_root, &.{ run.choice.verb(), run.server }, .warnings_only);
                 // The status follows sooner than the next refresh would show it.
                 self.host_menu_at_ms = 0;
             },

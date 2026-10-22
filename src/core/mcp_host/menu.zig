@@ -173,8 +173,9 @@ pub fn toolsFor(row: Row, tools: Tools) Tools {
 pub fn serverLayout(row: Row, tools: Tools, filter: []const u8, window: usize) Layout {
     var buf: [max_choices]Choice = undefined;
     return .{
-        // http or runs, file, and error when there is one; then a blank.
-        .lead = 2 + @as(usize, @intFromBool(showsError(row))) + 1,
+        // http or runs, file, status, protocol when known, and error when
+        // there is one; then a blank.
+        .lead = 3 + @as(usize, @intFromBool(row.status.version != null)) + @intFromBool(showsError(row)) + 1,
         .choices = choices(row, &buf).len,
         // A blank, then the heading or the reason there are no tools.
         .gap = 2,
@@ -243,8 +244,12 @@ pub const Effect = union(enum) {
 };
 
 pub const View = struct {
-    /// The servers the list shows, after the filter.
+    /// The servers the list shows, after the filter: the ones that work,
+    /// then the ones that need attention, each by name.
     rows: []const Row,
+    /// Where the servers that need attention start in `rows`; null when the
+    /// list shows none.
+    attention_start: ?usize = null,
     /// The open server, found by name among all servers; null once it's gone.
     open: ?Row = null,
     layout: Layout = .{ .lead = 0, .choices = 0, .gap = 0, .tools = 0, .window = 1 },
@@ -260,15 +265,29 @@ pub const server_window: usize = 11;
 pub fn viewOf(s: *const State, rows: []const Row, filter: []const u8, tools: Tools, buf: []Row) View {
     var n: usize = 0;
     var open_row: ?Row = null;
-    for (rows) |r| {
-        if (s.screen != .list and std.mem.eql(u8, r.status.name, s.selectedName())) open_row = r;
-        if (n == buf.len or !matches(r.status.name, filter)) continue;
-        buf[n] = r;
-        n += 1;
+    var attention_start: usize = 0;
+    // The servers that work first, then the ones that need attention, each
+    // group by name.
+    for ([_]bool{ false, true }) |attention_pass| {
+        if (attention_pass) attention_start = n;
+        const group_start = n;
+        for (rows) |r| {
+            if (needsAttention(r.status) != attention_pass) continue;
+            if (s.screen != .list and std.mem.eql(u8, r.status.name, s.selectedName())) open_row = r;
+            if (n == buf.len or !matches(r.status.name, filter)) continue;
+            buf[n] = r;
+            n += 1;
+        }
+        std.sort.insertion(Row, buf[group_start..n], {}, byName);
     }
-    var v: View = .{ .rows = buf[0..n], .open = open_row };
+    var v: View = .{ .rows = buf[0..n], .attention_start = if (attention_start < n) attention_start else null, .open = open_row };
     if (open_row) |r| v.layout = serverLayout(r, tools, filter, server_window);
     return v;
+}
+
+/// Alphabetical, ignoring case, like a directory listing.
+fn byName(_: void, a: Row, b: Row) bool {
+    return std.ascii.lessThanIgnoreCase(a.status.name, b.status.name);
 }
 
 /// A new tool filter on a server's screen selects the first tool it keeps,
@@ -410,8 +429,7 @@ pub fn statusLine(buf: []u8, statuses: []const runtime.Status, signing_in: ?[]co
     var needs: usize = 0;
     var first: ?runtime.Status = null;
     for (statuses) |s| {
-        if (s.state == .disabled or s.state == .rejected) continue;
-        if (attention(s) == null) continue;
+        if (!needsAttention(s)) continue;
         if (needs == 0) first = s;
         needs += 1;
     }
@@ -424,6 +442,13 @@ pub fn statusLine(buf: []u8, statuses: []const runtime.Status, signing_in: ?[]co
         w.print("MCP config has {d} problem{s} · /mcp list", .{ notes, if (notes == 1) "" else "s" }) catch {};
     }
     return whole(w.buffered());
+}
+
+/// Whether a server waits on the user: the servers the status line counts,
+/// and the list's "Needs attention" group. A disabled or rejected server
+/// was the user's choice, so it doesn't.
+pub fn needsAttention(s: runtime.Status) bool {
+    return s.state != .disabled and s.state != .rejected and attention(s) != null;
 }
 
 /// What a server needs from the user, if anything.
@@ -533,6 +558,33 @@ test "the filter is a case-insensitive part of the name" {
     try testing.expectEqualStrings("context7", viewOf(&s, &rows, "lin", .loading, &buf).open.?.status.name);
 }
 
+test "the list shows the servers that work first, then the ones that need attention, each by name" {
+    const rows = [_]Row{
+        testRow("linear", .failed, .{ .needs_login = true }),
+        testRow("context7", .ready, .{}),
+        testRow("proj", .waiting_for_approval, .{ .source = .workspace }),
+        testRow("old", .disabled, .{ .needs_login = true }),
+        testRow("docs", .idle, .{}),
+    };
+    var buf: [5]Row = undefined;
+    var s: State = .{};
+    open(&s);
+    const v = viewOf(&s, &rows, "", .loading, &buf);
+    var names: [5][]const u8 = undefined;
+    for (v.rows, 0..) |r, i| names[i] = r.status.name;
+    try testing.expectEqualSlices([]const u8, &.{ "context7", "docs", "old", "linear", "proj" }, names[0..v.rows.len]);
+    try testing.expectEqual(@as(?usize, 3), v.attention_start);
+    // Case doesn't change a server's place.
+    try testing.expect(byName({}, testRow("aws", .ready, .{}), testRow("GitLab", .ready, .{})));
+    try testing.expect(byName({}, testRow("GitLab", .ready, .{}), testRow("notion", .ready, .{})));
+    // ↓ follows the groups, from the last working server into the first that needs attention.
+    s.select("old");
+    _ = press(&s, v, .down);
+    try testing.expectEqualStrings("linear", s.selectedName());
+    // A filter that keeps no server needing attention has no such group.
+    try testing.expectEqual(@as(?usize, null), viewOf(&s, &rows, "doc", .loading, &buf).attention_start);
+}
+
 test "the list keeps its selection by name, and Enter opens the server" {
     const rows = [_]Row{ testRow("context7", .ready, .{}), testRow("linear", .failed, .{ .needs_login = true }), testRow("docs", .idle, .{}) };
     var s: State = .{};
@@ -585,9 +637,10 @@ test "the selection moves on from the choices through the tools, and the screen 
     for (&tools) |*t| t.* = .{ .name = "t", .description = "" };
     const r = testRow("github", .ready, .{ .signed_in = true });
     const layout = serverLayout(r, .{ .ready = &tools }, "", 8);
-    try testing.expectEqual(@as(usize, 3), layout.lead);
+    // http, file, status, and a blank.
+    try testing.expectEqual(@as(usize, 4), layout.lead);
     try testing.expectEqual(@as(usize, 2), layout.choices);
-    try testing.expectEqual(@as(usize, 37), layout.lines());
+    try testing.expectEqual(@as(usize, 38), layout.lines());
     var s: State = .{ .active = true, .screen = .server };
     const view: View = .{ .rows = &.{}, .open = r, .layout = layout };
     for (0..10) |_| _ = press(&s, view, .down);

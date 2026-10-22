@@ -13,8 +13,9 @@ const Allocator = std.mem.Allocator;
 const Row = std.ArrayList(u8);
 
 pub const max_inline_rows: u16 = menu.server_window + 1;
-/// Where a server's facts start: after `http`, `runs`, `file`, `error`.
-const fact_col: usize = 9;
+/// Where a server's facts start: after `http`, `runs`, `file`, `status`,
+/// `protocol`, `error`.
+const fact_col: usize = 12;
 
 pub const Projection = struct {
     state: menu.State = .{},
@@ -72,7 +73,8 @@ pub fn menuRowCount(p: Projection, width: u16, budget: u16) u16 {
     var confirm: Confirm = undefined;
     const wanted: usize = switch (p.state.screen) {
         .list => blk: {
-            const shown = @max(matching(p), 1);
+            var buf: [256]menu.Row = undefined;
+            const shown = @max(listLines(menu.viewOf(&p.state, p.rows, p.filter, p.tools, &buf)), 1);
             break :blk 1 + (if (p.rows.len == 0) 2 else shown) + @as(usize, @intFromBool(p.notes > 0));
         },
         .server => if (p.openRow()) |r| serverRows(p, r, width) else 1,
@@ -95,10 +97,22 @@ fn addressWidth(width: u16) usize {
     return @max(@as(usize, width) -| 4, 16);
 }
 
-fn matching(p: Projection) usize {
-    var n: usize = 0;
-    for (p.rows) |r| n += @intFromBool(menu.matches(r.status.name, p.filter));
-    return n;
+/// The list's lines below its title: a line per server, and before the
+/// servers that need attention their heading, set apart by a blank line
+/// when servers that work come first.
+fn listLines(v: menu.View) usize {
+    return v.rows.len + headingLines(v);
+}
+
+fn headingLines(v: menu.View) usize {
+    const start = v.attention_start orelse return 0;
+    return if (start > 0) 2 else 1;
+}
+
+/// The list line the `i`th row of `v` is on, after the heading.
+fn lineOfRow(v: menu.View, i: usize) usize {
+    const start = v.attention_start orelse return i;
+    return if (i >= start) i + headingLines(v) else i;
 }
 
 pub fn composeRow(alloc: Allocator, p: Projection, index: u16, width: u16, row_count: u16) !Row {
@@ -129,7 +143,8 @@ fn title(alloc: Allocator, name: []const u8, meta: []const u8, width: u16) !Row 
 
 fn listRow(alloc: Allocator, arena: Allocator, p: Projection, index: u16, width: u16, row_count: u16) !Row {
     var buf: [256]menu.Row = undefined;
-    const rows = menu.viewOf(&p.state, p.rows, p.filter, p.tools, &buf).rows;
+    const view = menu.viewOf(&p.state, p.rows, p.filter, p.tools, &buf);
+    const rows = view.rows;
     if (index == 0) {
         const meta = if (p.rows.len == 0)
             "none yet"
@@ -155,10 +170,20 @@ fn listRow(alloc: Allocator, arena: Allocator, p: Projection, index: u16, width:
     }
     const selected = p.state.selectedIndex(rows) orelse 0;
     // The window keeps the selection in view.
-    const start = if (selected < body) 0 else selected + 1 - body;
-    const i = start + (index - 1);
-    if (i >= rows.len) return .empty;
-    return serverListRow(alloc, arena, rows[i], i == selected, width);
+    const selected_line = lineOfRow(view, selected);
+    const start = if (selected_line < body) 0 else selected_line + 1 - body;
+    const line = start + (index - 1);
+    if (line >= listLines(view)) return .empty;
+    if (view.attention_start) |first| {
+        const heading = headingLines(view);
+        if (line >= first and line < first + heading) {
+            if (line + 1 < first + heading) return .empty;
+            return title(alloc, "Needs attention", try arena.print("{d}", .{rows.len - first}), width);
+        }
+        const i = if (line > first) line - heading else line;
+        return serverListRow(alloc, arena, rows[i], i == selected, width);
+    }
+    return serverListRow(alloc, arena, rows[line], line == selected, width);
 }
 
 fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool, width: u16) !Row {
@@ -168,7 +193,8 @@ fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool
     const source_col = status_col + 22 + 2;
     var row: Row = .empty;
     errdefer row.deinit(alloc);
-    try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else "");
+    // Like fx's other pickers: dim rows, the selected one bright.
+    try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else ui_render.dim_style);
     try row.appendSlice(alloc, if (selected) "› " else "  ");
     try row_text.appendTerminalSafeSingleLine(alloc, &row, r.status.name, name_width);
     try row.appendSlice(alloc, ui_render.reset_style);
@@ -177,11 +203,8 @@ fn serverListRow(alloc: Allocator, arena: Allocator, r: menu.Row, selected: bool
         .failed, .retrying, .waiting_for_approval, .missing_env, .invalid_env => true,
         else => false,
     };
-    const idle = !needs_you and switch (r.status.state) {
-        .idle, .disabled, .rejected, .unsupported => true,
-        else => false,
-    };
-    try row.appendSlice(alloc, if (needs_you) ui_render.hint_style else if (idle) ui_render.dim_style else "");
+    // What needs the user stays bright so it stands out among dim rows.
+    try row.appendSlice(alloc, if (needs_you) ui_render.hint_style else ui_render.dim_style);
     const status_width = if (show_source) 22 else @as(usize, width) -| status_col;
     try row_text.appendTerminalSafeSingleLine(alloc, &row, try verbs.statusText(arena, runState(r.status)), status_width);
     try row.appendSlice(alloc, ui_render.reset_style);
@@ -202,12 +225,11 @@ fn runState(s: anytype) @TypeOf(s) {
     return out;
 }
 
-fn serverMeta(arena: Allocator, r: menu.Row) ![]const u8 {
-    var out: std.ArrayList(u8) = .empty;
-    try out.appendSlice(arena, try verbs.statusText(arena, runState(r.status)));
-    if (r.status.signed_in) try out.appendSlice(arena, " · signed in");
-    if (r.status.version) |v| try out.print(arena, " · protocol {s}", .{v});
-    return out.items;
+/// The status fact on a server's screen. Its tool count is beside its
+/// tools' heading and its login is in its choices, so neither repeats here.
+fn statusFact(arena: Allocator, s: menu.Row) ![]const u8 {
+    if (s.status.state == .ready and !s.status.needs_login) return "ready";
+    return verbs.statusText(arena, runState(s.status));
 }
 
 /// Line `line` of a server's screen below its title.
@@ -215,11 +237,12 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
     if (line < l.lead) {
         const facts = l.lead - 1;
         if (line >= facts) return .empty;
-        return switch (line) {
-            0 => row_text.composeFactRow(alloc, if (r.status.transport == .stdio) "runs" else @tagName(r.status.transport), r.target orelse "", width, fact_col, ""),
-            1 => row_text.composeFactRow(alloc, "file", p.fileOf(r), width, fact_col, ""),
-            else => row_text.composeFactRow(alloc, "error", r.status.last_error orelse "", width, fact_col, ui_render.hint_style),
-        };
+        const protocol_lines: usize = @intFromBool(r.status.version != null);
+        if (line == 0) return row_text.composeFactRow(alloc, if (r.status.transport == .stdio) "runs" else @tagName(r.status.transport), r.target orelse "", width, fact_col, "");
+        if (line == 1) return row_text.composeFactRow(alloc, "file", p.fileOf(r), width, fact_col, "");
+        if (line == 2) return row_text.composeFactRow(alloc, "status", try statusFact(arena, r), width, fact_col, "");
+        if (line == 3 and protocol_lines == 1) return row_text.composeFactRow(alloc, "protocol", r.status.version.?, width, fact_col, "");
+        return row_text.composeFactRow(alloc, "error", r.status.last_error orelse "", width, fact_col, ui_render.hint_style);
     }
     var buf: [menu.max_choices]menu.Choice = undefined;
     const cs = menu.choices(r, &buf);
@@ -264,7 +287,7 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
             .ready => |t| if (t.len == 0)
                 "It has no tools."
             else if (p.filter.len == 0)
-                "Tools"
+                try arena.print("Tools {d}", .{t.len})
             else if (l.tools == 0)
                 "No tools match."
             else
@@ -294,7 +317,7 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
 
 fn serverRow(alloc: Allocator, arena: Allocator, shown: Projection, index: u16, width: u16, row_count: u16) !Row {
     const r = shown.openRow() orelse return .empty;
-    if (index == 0) return title(alloc, r.status.name, try serverMeta(arena, r), width);
+    if (index == 0) return title(alloc, r.status.name, "", width);
     const l = shown.screenLayout(r, width);
     // A filter typed since the last key can leave fewer items than the
     // selection's place; draw it on the last one left.
@@ -387,7 +410,8 @@ fn confirmLines(p: Projection, r: menu.Row, width: u16, out: *Confirm) []const C
 
 fn confirmRow(alloc: Allocator, arena: Allocator, p: Projection, index: u16, width: u16) !Row {
     const r = p.openRow() orelse return .empty;
-    if (index == 0) return title(alloc, r.status.name, try serverMeta(arena, r), width);
+    // The confirmation hides the server's facts, so its title keeps the status.
+    if (index == 0) return title(alloc, r.status.name, try statusFact(arena, r), width);
     var confirm: Confirm = undefined;
     const lines = confirmLines(p, r, width, &confirm);
     if (index - 1 >= lines.len) return .empty;
@@ -506,11 +530,15 @@ test "the list is fx's picker: a title, rows with status and source, and a filte
     menu.open(&p.state);
     const text = try render(p, 88);
     defer testing.allocator.free(text);
+    // The servers that work come first; the ones that need the user follow
+    // under their own heading.
     try testing.expectEqualStrings(
         \\  MCP servers  3
-        \\› linear                  needs login             profile
-        \\  context7                ready, 2 tools          profile
+        \\› context7                ready, 2 tools          profile
+        \\
+        \\  Needs attention  2
         \\  docs                    waiting for approval    project
+        \\  linear                  needs login             profile
         \\
     , text);
 
@@ -519,6 +547,7 @@ test "the list is fx's picker: a title, rows with status and source, and a filte
     defer testing.allocator.free(filtered);
     try testing.expectEqualStrings(
         \\  MCP servers  1 of 3
+        \\  Needs attention  1
         \\› linear                  needs login             profile
         \\
     , filtered);
@@ -529,13 +558,35 @@ test "the list is fx's picker: a title, rows with status and source, and a filte
     defer testing.allocator.free(narrow);
     try testing.expectEqualStrings(
         \\  MCP servers  3
-        \\› linear        needs login
-        \\  context7      ready, 2 tools
+        \\› context7      ready, 2 tools
+        \\
+        \\  Needs attention  2
         \\  docs          waiting for approval
+        \\  linear        needs login
         \\  1 config note: /mcp list shows it
         \\
     , narrow);
     try testing.expectEqualStrings("↑↓ navigate     enter open     esc close", hintVariants(p, &test_hints)[0]);
+}
+
+test "a long list scrolls to a selection below the attention heading" {
+    var rows: [14]menu.Row = undefined;
+    var names: [14][8]u8 = undefined;
+    for (&rows, &names, 0..) |*r, *n, i| {
+        var s = testStatus(try std.mem.print(n, "srv{d:0>2}", .{i}), .ready);
+        s.needs_login = i >= 8;
+        r.* = .{ .status = s };
+    }
+    var p: Projection = .{ .rows = &rows };
+    menu.open(&p.state);
+    var buf: [14]menu.Row = undefined;
+    for (0..13) |_| _ = menu.press(&p.state, menu.viewOf(&p.state, &rows, "", .loading, &buf), .down);
+    try testing.expectEqualStrings("srv13", p.state.selectedName());
+    try testing.expectEqual(max_inline_rows, menuRowCount(p, 88, max_inline_rows));
+    const text = try render(p, 88);
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.find(u8, text, "  Needs attention  6\n") != null);
+    try testing.expect(std.mem.endsWith(u8, text, "› srv13                   needs login             profile\n"));
 }
 
 test "the list says how a server runs; its login shows on its screen" {
@@ -553,7 +604,11 @@ test "the list says how a server runs; its login shows on its screen" {
     , text);
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    try testing.expectEqualStrings("not started · signed in", try serverMeta(arena.allocator(), rows[0]));
+    // Its login shows as Log out among its choices, not in its status.
+    try testing.expectEqualStrings("not started", try statusFact(arena.allocator(), rows[0]));
+    var ready = testStatus("ready", .ready);
+    ready.tools = 3;
+    try testing.expectEqualStrings("ready", try statusFact(arena.allocator(), .{ .status = ready }));
 }
 
 test "a server's screen: facts, choices with their commands, then tools" {
@@ -569,14 +624,16 @@ test "a server's screen: facts, choices with their commands, then tools" {
     const text = try render(p, 88);
     defer testing.allocator.free(text);
     try testing.expectEqualStrings(
-        \\  github  ready, 2 tools · signed in · protocol 2025-11-25
-        \\  http   https://api.githubcopilot.com/mcp/
-        \\  file   ~/.fx/mcp.json
+        \\  github
+        \\  http      https://api.githubcopilot.com/mcp/
+        \\  file      ~/.fx/mcp.json
+        \\  status    ready
+        \\  protocol  2025-11-25
         \\
         \\› Log out       /mcp logout github
         \\  Remove        /mcp remove github
         \\
-        \\  Tools
+        \\  Tools 2
         \\  create_issue          Create a new issue.
         \\  search_code           Search for code.
         \\
@@ -668,11 +725,11 @@ test "a sign-in that waits shows its whole address on the server's screen" {
     // 44 columns a line at width 48, every piece there, in order.
     const first = std.mem.find(u8, text, "    " ++ url[0..44]).?;
     try testing.expect(std.mem.find(u8, text[first..], "    " ++ url[44..]) != null);
-    // Title, two facts and a blank, two choices, a blank and the heading, two address lines.
-    try testing.expectEqual(@as(u16, 10), menuRowCount(p, 48, 40));
+    // Title, three facts and a blank, two choices, a blank and the heading, two address lines.
+    try testing.expectEqual(@as(u16, 11), menuRowCount(p, 48, 40));
     // No address, no extra lines.
     p.sign_in_url = null;
-    try testing.expectEqual(@as(u16, 8), menuRowCount(p, 48, 40));
+    try testing.expectEqual(@as(u16, 9), menuRowCount(p, 48, 40));
 }
 
 test "names and errors from config and servers stay inert" {
@@ -688,7 +745,7 @@ test "names and errors from config and servers stay inert" {
     const server = try render(p, 80);
     defer testing.allocator.free(server);
     try testing.expect(std.mem.findScalar(u8, server, 0x1b) == null);
-    try testing.expect(std.mem.find(u8, server, "error  boom") != null);
+    try testing.expect(std.mem.find(u8, server, "error     boom") != null);
 }
 
 test "no servers points to /mcp add" {
@@ -716,9 +773,10 @@ test "a server that needs a login says so, once" {
     const text = try render(p, 80);
     defer testing.allocator.free(text);
     try testing.expectEqualStrings(
-        \\  linear  needs login
-        \\  http   https://mcp.linear.app/mcp
-        \\  file   ~/.fx/mcp.json
+        \\  linear
+        \\  http      https://mcp.linear.app/mcp
+        \\  file      ~/.fx/mcp.json
+        \\  status    needs login
         \\
         \\› Log in        /mcp login linear
         \\  Remove        /mcp remove linear
