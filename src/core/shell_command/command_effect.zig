@@ -150,13 +150,52 @@ fn reversibleGit(words: []const command_lex.ArgvToken) bool {
     if (std.mem.eql(u8, subcommand, "worktree")) {
         return words.len >= 2 and std.mem.eql(u8, words[1].value, "list");
     }
-    if (std.mem.eql(u8, subcommand, "fetch")) {
-        for (words[1..]) |word| {
-            if (std.mem.eql(u8, word.value, "--prune") or
-                std.mem.eql(u8, word.value, "-p") or
-                std.mem.eql(u8, word.value, "--prune-tags")) return false;
-        }
-        return true;
+    if (std.mem.eql(u8, subcommand, "fetch")) return reversibleGitFetch(words[1..]);
+    return false;
+}
+
+/// Options `git fetch` may use without review. git accepts any unambiguous
+/// prefix of a long option, so an option spelled any other way goes to
+/// review. That keeps out `--upload-pack`, which names a command for git to
+/// run, and the prune options, which delete remote-tracking branches.
+const reversible_git_fetch_flags = [_][]const u8{
+    "--all",                    "--tags",               "-t",
+    "--no-tags",                "-n",                   "--quiet",
+    "-q",                       "--verbose",            "-v",
+    "--dry-run",                "--force",              "-f",
+    "--unshallow",              "--update-shallow",     "--progress",
+    "--multiple",               "--atomic",             "--append",
+    "-a",                       "--porcelain",          "--show-forced-updates",
+    "--no-show-forced-updates", "--write-fetch-head",   "--no-write-fetch-head",
+    "--set-upstream",           "--refetch",            "--prefetch",
+    "--ipv4",                   "-4",                   "--ipv6",
+    "-6",                       "--recurse-submodules", "--no-recurse-submodules",
+};
+
+/// Options that take a value, accepted only as `--name=value`. `--filter`
+/// is left out: it turns a full clone into a partial clone for good.
+const reversible_git_fetch_value_options = [_][]const u8{
+    "--depth=", "--deepen=",             "--shallow-since=", "--shallow-exclude=",
+    "--jobs=",  "--recurse-submodules=",
+};
+
+fn reversibleGitFetch(words: []const command_lex.ArgvToken) bool {
+    for (words) |word| {
+        const value = word.value;
+        // Everything after `--` names a repository or a refspec.
+        if (std.mem.eql(u8, value, "--")) return true;
+        if (value.len == 0 or value[0] != '-') continue;
+        if (!isReversibleGitFetchOption(value)) return false;
+    }
+    return true;
+}
+
+fn isReversibleGitFetchOption(value: []const u8) bool {
+    for (reversible_git_fetch_flags) |flag| {
+        if (std.mem.eql(u8, value, flag)) return true;
+    }
+    for (reversible_git_fetch_value_options) |prefix| {
+        if (std.mem.startsWith(u8, value, prefix)) return true;
     }
     return false;
 }
@@ -217,6 +256,10 @@ test "known reversible auto commands exclude destructive and hidden effects" {
         "git remote -v",
         "git worktree list --porcelain",
         "git fetch origin main",
+        "git fetch --all --tags",
+        "git fetch --depth=1 origin main",
+        "git fetch --no-tags origin +main:main",
+        "git fetch origin -- --not-an-option",
         "npm install 2>&1",
         "npm run dev",
         "zig build test",
@@ -244,6 +287,16 @@ test "known reversible auto commands exclude destructive and hidden effects" {
         "git fetch \\&\\& git status --prune",
         // Every shell drops `#note` as a comment.
         "git status #note",
+        "git fetch -p",
+        // `--upload-pack` names a command for git to run, and git accepts
+        // any unambiguous prefix of it.
+        "git fetch --upload-pack=x .",
+        "git fetch --upload-pack x origin",
+        "git fetch --upl=x .",
+        "git fetch origin --upload-pack=x",
+        "git fetch '--upload-pack=x' .",
+        // A filter turns a full clone into a partial clone.
+        "git fetch --filter=blob:none origin",
     }) |command| {
         try std.testing.expect(!try knownReversibleAutoCommand(
             std.testing.allocator,
