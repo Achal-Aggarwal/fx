@@ -410,6 +410,22 @@ fn keepVisible(s: *State, l: Layout) void {
 /// How long news of a sign-in stays on the status line.
 pub const news_ms: i64 = 5000;
 
+/// The longest the status line waits for servers to finish starting.
+pub const startup_quiet_ms: i64 = 10_000;
+
+/// Whether servers started `since_start_ms` ago are done starting: none is
+/// still idle, connecting, or retrying, or `startup_quiet_ms` passed. Until
+/// then the count of servers that need the user would climb while they
+/// report in, so the status line waits and shows the total once.
+pub fn startupSettled(statuses: []const runtime.Status, since_start_ms: i64) bool {
+    if (since_start_ms >= startup_quiet_ms) return true;
+    for (statuses) |s| switch (s.state) {
+        .idle, .connecting, .retrying => if (!needsAttention(s)) return false,
+        else => {},
+    };
+    return true;
+}
+
 /// What the status line says about MCP, written into `buf`: fresh news,
 /// else the sign-in waiting for the browser, else what needs the user until
 /// it's handled. Empty when nothing does: `/mcp` lists every server.
@@ -437,7 +453,7 @@ pub fn statusLine(buf: []u8, statuses: []const runtime.Status, signing_in: ?[]co
         writeSafe(&w, first.?.name);
         w.print(" {s} · /mcp", .{attention(first.?).?}) catch {};
     } else if (needs > 1) {
-        w.print("{d} MCP servers need you · /mcp", .{needs}) catch {};
+        w.print("{d} MCP need attention · /mcp", .{needs}) catch {};
     } else if (notes > 0) {
         w.print("MCP config has {d} problem{s} · /mcp list", .{ notes, if (notes == 1) "" else "s" }) catch {};
     }
@@ -495,12 +511,26 @@ test "the status line puts news first, then what needs the user, and is quiet wh
     try testing.expectEqualStrings("Signed in to plain", statusLine(&buf, &.{ plain, ready }, null, "Signed in to plain", 0));
     try testing.expectEqualStrings("Signing in to plain · /mcp", statusLine(&buf, &.{ plain, ready }, "plain", null, 0));
     try testing.expectEqualStrings("plain needs login · /mcp", statusLine(&buf, &.{ plain, ready, off }, null, null, 0));
-    try testing.expectEqualStrings("2 MCP servers need you · /mcp", statusLine(&buf, &.{ plain, proj, ready }, null, null, 3));
+    try testing.expectEqualStrings("2 MCP need attention · /mcp", statusLine(&buf, &.{ plain, proj, ready }, null, null, 3));
     try testing.expectEqualStrings("MCP config has 2 problems · /mcp list", statusLine(&buf, &.{ready}, null, null, 2));
     // All is well, starting included: nothing to say.
     const starting: runtime.Status = .{ .name = "web", .source = .profile, .transport = .http, .state = .connecting };
     try testing.expectEqualStrings("", statusLine(&buf, &.{ ready, off, starting }, null, null, 0));
     try testing.expectEqualStrings("", statusLine(&buf, &.{}, null, null, 0));
+}
+
+test "the status line waits for servers to finish starting, at most startup_quiet_ms" {
+    const ready: runtime.Status = .{ .name = "a", .source = .profile, .transport = .http, .state = .ready };
+    const login: runtime.Status = .{ .name = "b", .source = .profile, .transport = .http, .state = .idle, .needs_login = true };
+    const connecting: runtime.Status = .{ .name = "c", .source = .profile, .transport = .http, .state = .connecting };
+    const not_started: runtime.Status = .{ .name = "d", .source = .profile, .transport = .stdio, .state = .idle };
+    // A server still starting holds the count back.
+    try testing.expect(!startupSettled(&.{ ready, login, connecting }, 100));
+    try testing.expect(!startupSettled(&.{ ready, not_started }, 100));
+    // Waiting on a login is an answer, not a server still starting.
+    try testing.expect(startupSettled(&.{ ready, login }, 100));
+    // A slow server doesn't hide the count for long.
+    try testing.expect(startupSettled(&.{connecting}, startup_quiet_ms));
 }
 
 test "the status line keeps names inert and never ends inside a character" {

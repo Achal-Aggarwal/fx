@@ -68,6 +68,9 @@ pub const State = struct {
     host_status_buf: [120]u8 = undefined,
     host_status_len: usize = 0,
     host_status_at_ms: i64 = 0,
+    /// When the host loaded or `startHostServers` last started its servers;
+    /// the status line waits for them to finish starting from then.
+    host_started_ms: i64 = 0,
     host_menu_tools_arena: ?std.heap.ArenaAllocator = null,
     /// Counts tool loads, so one for a server no longer open is dropped.
     host_menu_load: usize = 0,
@@ -153,6 +156,10 @@ pub const State = struct {
         else
             null;
         sink.mutex.unlock(io_mod.getIo());
+        // While servers start, what needs the user waits so the count shows
+        // once, not climbing; sign-in news still shows at once.
+        if (self.host_started_ms != 0 and !mcp_menu.startupSettled(statuses, now_ms - self.host_started_ms))
+            return mcp_menu.statusLine(buf, &.{}, signing_in, news, 0);
         return mcp_menu.statusLine(buf, statuses, signing_in, news, lease.host.notes.len);
     }
 
@@ -162,6 +169,7 @@ pub const State = struct {
     pub fn startHostServers(self: *State) void {
         const lease = self.leaseHost() orelse return;
         defer lease.deinit();
+        self.host_started_ms = io_mod.milliTimestamp();
         for (0..lease.host.runtime.servers().len) |i| lease.host.runtime.prepare(i) catch |err| {
             debug_trace.logf("mcp", "MCP servers not started in the background at={d} err={s}", .{ i, @errorName(err) });
             return;
@@ -226,6 +234,8 @@ pub const State = struct {
             break :unused h.leases == 0;
         } else false;
         self.host_mutex.unlock(io_mod.getIo());
+        // Its servers haven't reported in yet: the status line waits for them.
+        if (next != null) self.host_started_ms = io_mod.milliTimestamp();
         if (unused) old.?.stop();
     }
 
