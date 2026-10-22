@@ -38,7 +38,7 @@ pub fn knownReversibleAutoCommand(
     var index: usize = 0;
     while (index <= argv.tokens.len) : (index += 1) {
         const at_end = index == argv.tokens.len;
-        if (!at_end and !std.mem.eql(u8, argv.tokens[index].value, "&&")) {
+        if (!at_end and !isStageSeparator(argv.tokens[index])) {
             if (isUnsupportedAutoControlOperator(argv.tokens[index])) return false;
             continue;
         }
@@ -46,6 +46,19 @@ pub fn knownReversibleAutoCommand(
         stage_start = index + 1;
     }
     return true;
+}
+
+/// The `&&` between two stages. Only a bare `&&` separates commands: the
+/// shell passes a quoted or escaped one, such as `'&&'` or `\&\&`, to the
+/// command as an argument, so it is one here too.
+fn isStageSeparator(token: command_lex.ArgvToken) bool {
+    return std.mem.eql(u8, token.raw, "&&");
+}
+
+/// Every shell reads a word that starts with an unquoted `#` as the start of
+/// a comment, so the rest of the command never reaches the program.
+fn startsComment(raw: []const u8) bool {
+    return raw.len > 0 and raw[0] == '#';
 }
 
 fn isUnsupportedAutoOperator(token: command_lex.ArgvToken) bool {
@@ -80,7 +93,10 @@ fn reversibleAutoStage(raw_tokens: []const command_lex.ArgvToken) bool {
     }
     if (tokens.len == 0) return false;
     for (tokens) |token| {
-        if (isUnsupportedAutoOperator(token) or tokenHasDynamicShellSyntax(token.raw)) {
+        if (isUnsupportedAutoOperator(token) or
+            tokenHasDynamicShellSyntax(token.raw) or
+            startsComment(token.raw))
+        {
             return false;
         }
     }
@@ -137,13 +153,52 @@ fn reversibleGit(words: []const command_lex.ArgvToken) bool {
     if (std.mem.eql(u8, subcommand, "worktree")) {
         return words.len >= 2 and std.mem.eql(u8, words[1].value, "list");
     }
-    if (std.mem.eql(u8, subcommand, "fetch")) {
-        for (words[1..]) |word| {
-            if (std.mem.eql(u8, word.value, "--prune") or
-                std.mem.eql(u8, word.value, "-p") or
-                std.mem.eql(u8, word.value, "--prune-tags")) return false;
-        }
-        return true;
+    if (std.mem.eql(u8, subcommand, "fetch")) return reversibleGitFetch(words[1..]);
+    return false;
+}
+
+/// Options `git fetch` may use without review. git accepts any unambiguous
+/// prefix of a long option, so an option spelled any other way goes to
+/// review. That keeps out `--upload-pack`, which names a command for git to
+/// run, and the prune options, which delete remote-tracking branches.
+const reversible_git_fetch_flags = [_][]const u8{
+    "--all",                    "--tags",               "-t",
+    "--no-tags",                "-n",                   "--quiet",
+    "-q",                       "--verbose",            "-v",
+    "--dry-run",                "--force",              "-f",
+    "--unshallow",              "--update-shallow",     "--progress",
+    "--multiple",               "--atomic",             "--append",
+    "-a",                       "--porcelain",          "--show-forced-updates",
+    "--no-show-forced-updates", "--write-fetch-head",   "--no-write-fetch-head",
+    "--set-upstream",           "--refetch",            "--prefetch",
+    "--ipv4",                   "-4",                   "--ipv6",
+    "-6",                       "--recurse-submodules", "--no-recurse-submodules",
+};
+
+/// Options that take a value, accepted only as `--name=value`. `--filter`
+/// is left out: it turns a full clone into a partial clone for good.
+const reversible_git_fetch_value_options = [_][]const u8{
+    "--depth=", "--deepen=",             "--shallow-since=", "--shallow-exclude=",
+    "--jobs=",  "--recurse-submodules=",
+};
+
+fn reversibleGitFetch(words: []const command_lex.ArgvToken) bool {
+    for (words) |word| {
+        const value = word.value;
+        // Everything after `--` names a repository or a refspec.
+        if (std.mem.eql(u8, value, "--")) return true;
+        if (value.len == 0 or value[0] != '-') continue;
+        if (!isReversibleGitFetchOption(value)) return false;
+    }
+    return true;
+}
+
+fn isReversibleGitFetchOption(value: []const u8) bool {
+    for (reversible_git_fetch_flags) |flag| {
+        if (std.mem.eql(u8, value, flag)) return true;
+    }
+    for (reversible_git_fetch_value_options) |prefix| {
+        if (std.mem.startsWith(u8, value, prefix)) return true;
     }
     return false;
 }
@@ -204,6 +259,10 @@ test "known reversible auto commands exclude destructive and hidden effects" {
         "git remote -v",
         "git worktree list --porcelain",
         "git fetch origin main",
+        "git fetch --all --tags",
+        "git fetch --depth=1 origin main",
+        "git fetch --no-tags origin +main:main",
+        "git fetch origin -- --not-an-option",
         "npm install 2>&1",
         "npm run dev",
         "zig build test",
@@ -225,6 +284,22 @@ test "known reversible auto commands exclude destructive and hidden effects" {
         "npm install --prefix=/tmp/global",
         "npm install --location global",
         "git fetch --prune origin",
+        // A quoted or escaped `&&` is an argument, so `--prune` here reaches
+        // `git fetch`.
+        "git fetch '&&' git status --prune",
+        "git fetch \\&\\& git status --prune",
+        // Every shell drops `#note` as a comment.
+        "git status #note",
+        "git fetch -p",
+        // `--upload-pack` names a command for git to run, and git accepts
+        // any unambiguous prefix of it.
+        "git fetch --upload-pack=x .",
+        "git fetch --upload-pack x origin",
+        "git fetch --upl=x .",
+        "git fetch origin --upload-pack=x",
+        "git fetch '--upload-pack=x' .",
+        // A filter turns a full clone into a partial clone.
+        "git fetch --filter=blob:none origin",
         // zsh's `extendedglob` expands these to workspace file names.
         "git fetch ^nomatch .",
         "git fetch --prun#e",

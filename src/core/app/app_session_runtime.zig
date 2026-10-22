@@ -1469,6 +1469,10 @@ pub fn Runtime(comptime App: type) type {
 
         pub fn beginFreshPersistedSession(app: *App) !void {
             closeWritableSession(app);
+            // A fresh session starts with no usage, whether or not it persists.
+            app.total_input_tokens = 0;
+            app.total_output_tokens = 0;
+            app.total_web_search_requests = 0;
             if (comptime runtime_profile.allows(App, .js_host_sessions)) {
                 try beginFreshJsHostSession(app);
             }
@@ -1497,9 +1501,6 @@ pub fn Runtime(comptime App: type) type {
                 return;
             };
             app.session_persistence.degraded_warning_emitted = false;
-            app.total_input_tokens = 0;
-            app.total_output_tokens = 0;
-            app.total_web_search_requests = 0;
         }
 
         fn beginFreshJsHostSession(app: *App) !void {
@@ -1518,9 +1519,6 @@ pub fn Runtime(comptime App: type) type {
                 .revision = null,
             };
             state = undefined;
-            app.total_input_tokens = 0;
-            app.total_output_tokens = 0;
-            app.total_web_search_requests = 0;
         }
 
         pub fn clearSession(app: *App) !void {
@@ -4877,7 +4875,6 @@ pub fn Runtime(comptime App: type) type {
                     root_id,
                     root_id,
                     app.permission_engine.rules,
-                    !permissions.rulesDenyAllTargetsForTool(app.permission_engine.rules, "mcp_features"),
                 )
             else
                 null;
@@ -6386,6 +6383,39 @@ test "initializePersistence silently skips optional missing home and errors when
     try Runtime(TestApp).initializePersistence(&app, false);
     try std.testing.expect(app.session_persistence.v2_store == null);
     try std.testing.expectError(error.HomeNotSet, Runtime(TestApp).initializePersistence(&app, true));
+}
+
+test "a fresh session clears usage counters without a durable store" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const paths = try testPaths(alloc, &tmp);
+    defer {
+        alloc.free(paths.home);
+        alloc.free(paths.workspace);
+    }
+
+    const home = try TestHome.install(alloc, null);
+    defer home.deinit();
+
+    var app = try TestApp.init(alloc, paths.workspace);
+    defer app.deinit();
+
+    try Runtime(TestApp).initializePersistence(&app, false);
+    try std.testing.expect(app.session_persistence.v2_store == null);
+
+    // The previous session's usage, which the footer shows as context used.
+    app.total_input_tokens = 43_000;
+    app.total_output_tokens = 1_200;
+    app.total_web_search_requests = 3;
+
+    try Runtime(TestApp).beginFreshPersistedSession(&app);
+
+    try std.testing.expect(app.session_persistence.v2 == null);
+    try std.testing.expectEqual(@as(u64, 0), app.total_input_tokens);
+    try std.testing.expectEqual(@as(u64, 0), app.total_output_tokens);
+    try std.testing.expectEqual(@as(u64, 0), app.total_web_search_requests);
 }
 
 test "v2 ultrafast resume applies process overrides without persisting them" {

@@ -1136,6 +1136,92 @@ describe("lean auto mode reliability", () => {
   );
 
   test(
+    "routine commands with words the shell reads differently remain reviewer owned",
+    async () => {
+      const root = createIsolatedRoot();
+      const marker = join(root.root, "npm-must-not-run");
+      const bin = installRecorder(root, "npm", marker);
+      const gateway = startGateway(
+        [
+          // The shell passes a quoted or escaped `&&` to `npm test`, with
+          // `--global`.
+          cleanCommandCall("npm test '&&' npm run build --global", "quoted_separator"),
+          cleanCommandCall("npm test \\&\\& npm run build --global", "escaped_separator"),
+          // Every shell drops `#note` as a comment.
+          cleanCommandCall("npm test #note", "comment_word"),
+          (body) => {
+            expect(body).toContain("review_caution");
+            return fakeGatewayFinalText("shell syntax stayed reviewed");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "quoted_separator_review"),
+          fakeGatewayPermissionDecision("caution", "escaped_separator_review"),
+          fakeGatewayPermissionDecision("caution", "comment_word_review"),
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Run the tests."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(3);
+      expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "git fetch with an option that names a program remains reviewer owned",
+    async () => {
+      const root = createIsolatedRoot();
+      runGit(root.workspace, ["init", "-q"]);
+      const marker = join(root.root, "upload-pack-must-not-run");
+      const bin = installRecorder(root, "upload-pack-probe", marker);
+      const gateway = startGateway(
+        [
+          // git runs the `--upload-pack` command to fetch from `.`.
+          cleanCommandCall("git fetch --upload-pack=upload-pack-probe .", "upload_pack"),
+          // git accepts any unambiguous prefix of a long option.
+          cleanCommandCall("git fetch --upl=upload-pack-probe .", "abbreviated_upload_pack"),
+          (body) => {
+            expect(body).toContain("review_caution");
+            return fakeGatewayFinalText("fetch options stayed reviewed");
+          },
+        ],
+        [
+          fakeGatewayPermissionDecision("caution", "upload_pack_review"),
+          fakeGatewayPermissionDecision("caution", "abbreviated_upload_pack_review"),
+        ],
+      );
+      const result = await runFx(
+        ["ask", "--quiet", "--json", "--no-save", "Fetch the latest changes."],
+        {
+          cwd: root.workspace,
+          env: {
+            ...gatewayEnv(root, gateway),
+            PATH: `${bin}:${process.env.PATH ?? "/usr/bin:/bin"}`,
+          },
+          timeoutMs: TIMEOUT,
+        },
+      );
+
+      expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
+      expect(gateway.classifierRequests).toHaveLength(2);
+      expect(existsSync(marker)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "existing startup targets remain reviewer owned",
     async () => {
       const root = createIsolatedRoot();

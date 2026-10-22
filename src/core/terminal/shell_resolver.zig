@@ -237,6 +237,11 @@ pub const snapshot_replay_failure_prefix = "fx-shell-snapshot-replay-failed:";
 /// replay and the command from stdin, so no snapshot text or command appears
 /// in argv. `failure_marker` reaches stderr, with exit status 125, only when
 /// the replay stopped before the command started.
+///
+/// The replay runs with stderr saved on fd 9 and pointed at /dev/null, so
+/// its errors never reach the command's output. The command gets stderr back
+/// through its own redirection (`snapshotScript`), and the bootstrap restores
+/// it once the replay returns, for exit traps and the failure marker.
 pub fn snapshotInvocation(
     alloc: Allocator,
     shell_path: []const u8,
@@ -254,12 +259,22 @@ pub fn snapshotInvocation(
             invocation.append("expand_aliases");
         },
     }
+    // bash's `builtin exec` drops its redirections when it returns, and bash
+    // 3.2 hangs on a `command exec`, so bash uses plain `exec`. Nothing is
+    // replayed before the first one, and the second runs after the command, so
+    // removing a replayed function named `exec` there changes nothing it uses.
+    const park_stderr: []const u8, const restore_stderr: []const u8 = switch (kind) {
+        .zsh => .{ "\\builtin exec 9>&2 2>/dev/null; ", "\\builtin exec 2>&9 9>&-; " },
+        .bash => .{ "exec 9>&2 2>/dev/null; ", "\\builtin unset -f exec; exec 2>&9 9>&-; " },
+    };
     var bootstrap: std.ArrayList(u8) = .empty;
     errdefer bootstrap.deinit(alloc);
+    try bootstrap.appendSlice(alloc, park_stderr);
+    try bootstrap.appendSlice(alloc, "\\builtin source /dev/fd/0; __fx_snapshot_status=$?; ");
+    try bootstrap.appendSlice(alloc, restore_stderr);
     try bootstrap.appendSlice(
         alloc,
-        "\\builtin source /dev/fd/0; __fx_snapshot_status=$?; " ++
-            "if [[ -z ${__fx_snapshot_restored-} ]]; then \\builtin printf '%s' ",
+        "if [[ -z ${__fx_snapshot_restored-} ]]; then \\builtin printf '%s' ",
     );
     try appendShellWord(&bootstrap, alloc, failure_marker);
     // Re-raise the common termination signals so the supervisor reports a
@@ -279,6 +294,9 @@ pub fn snapshotInvocation(
 /// the bootstrap checks, and the command. The command is single-quoted so it
 /// is parsed only when `eval` runs, after the replayed aliases exist, and it
 /// runs with stdin from /dev/null so it cannot read the rest of the script.
+/// Its stderr is the one `snapshotInvocation` saved on fd 9, which it does
+/// not inherit. A redirection, unlike an `exec`, cannot be replaced by a
+/// replayed function or alias.
 pub fn snapshotScript(
     alloc: Allocator,
     kind: ShellKind,
@@ -293,7 +311,7 @@ pub fn snapshotScript(
     if (kind == .zsh) try output.appendSlice(alloc, zsh_command_prelude);
     try output.appendSlice(alloc, "\\builtin eval -- ");
     try appendShellWord(&output, alloc, command);
-    try output.appendSlice(alloc, " </dev/null\n");
+    try output.appendSlice(alloc, " </dev/null 2>&9 9>&-\n");
     return output.toOwnedSlice(alloc);
 }
 
@@ -301,6 +319,11 @@ pub fn snapshotScript(
 /// followed by `:` and the capture nonce.
 pub const snapshot_marker_prefix = "FXSNAP:";
 
+// The replay starts by removing every alias. zsh starts with default aliases
+// such as `run-help`, and a startup file that replaces one with a function,
+// as Debian's and Ubuntu's global zshrc does, would otherwise make the
+// replayed `run-help () {` a parse error that stops the whole replay. The
+// captured `alias -L` lines then restore exactly the user's aliases.
 const zsh_capture_script =
     \\{
     \\\builtin zmodload zsh/parameter 2>/dev/null
@@ -309,6 +332,7 @@ const zsh_capture_script =
     \\\builtin printf 'FXSNAP:@NONCE@:NAMES\0'
     \\\builtin printf '%s\0' ${(k)aliases} ${(k)galiases} ${(k)saliases} ${(k)functions}
     \\\builtin printf 'FXSNAP:@NONCE@:REPLAY\0'
+    \\\builtin print -r -- '\builtin unalias -a; \builtin unalias -as'
     \\\builtin typeset -p fpath
     \\for __fx_snapshot_name in ${(ko)functions}; do
     \\  case $__fx_snapshot_name in (_*|prompt_*|__fx_snapshot_*) continue;; esac
@@ -636,15 +660,38 @@ test "snapshot script turns off zsh equals expansion after the replay" {
     defer std.testing.allocator.free(zsh);
     try std.testing.expectEqualStrings(
         "builtin setopt equals\n__fx_snapshot_restored=1\n" ++
-            "\\builtin unsetopt equals; \\builtin eval -- 'echo ======' </dev/null\n",
+            "\\builtin unsetopt equals; \\builtin eval -- 'echo ======' </dev/null 2>&9 9>&-\n",
         zsh,
     );
 
     const bash = try snapshotScript(std.testing.allocator, .bash, "", "echo ======");
     defer std.testing.allocator.free(bash);
     try std.testing.expectEqualStrings(
-        "__fx_snapshot_restored=1\n\\builtin eval -- 'echo ======' </dev/null\n",
+        "__fx_snapshot_restored=1\n\\builtin eval -- 'echo ======' </dev/null 2>&9 9>&-\n",
         bash,
+    );
+}
+
+test "snapshot bootstrap hides replay errors and restores stderr afterwards" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const tail = "if [[ -z ${__fx_snapshot_restored-} ]]; then \\builtin printf '%s' 'marker' >&2; " ++
+        "\\builtin exit 125; fi; case $__fx_snapshot_status in 129|130|137|143) " ++
+        "\\builtin kill -$((__fx_snapshot_status - 128)) $$;; esac; \\builtin exit $__fx_snapshot_status";
+
+    const zsh = try snapshotInvocation(arena, "/bin/zsh", "marker");
+    try std.testing.expectEqualStrings(
+        "\\builtin exec 9>&2 2>/dev/null; \\builtin source /dev/fd/0; __fx_snapshot_status=$?; " ++
+            "\\builtin exec 2>&9 9>&-; " ++ tail,
+        zsh.argv()[zsh.argv().len - 1],
+    );
+
+    const bash = try snapshotInvocation(arena, "/bin/bash", "marker");
+    try std.testing.expectEqualStrings(
+        "exec 9>&2 2>/dev/null; \\builtin source /dev/fd/0; __fx_snapshot_status=$?; " ++
+            "\\builtin unset -f exec; exec 2>&9 9>&-; " ++ tail,
+        bash.argv()[bash.argv().len - 1],
     );
 }
 
