@@ -301,6 +301,11 @@ pub fn snapshotScript(
 /// followed by `:` and the capture nonce.
 pub const snapshot_marker_prefix = "FXSNAP:";
 
+// The replay starts by removing every alias. zsh starts with default aliases
+// such as `run-help`, and a startup file that replaces one with a function,
+// as Debian's and Ubuntu's global zshrc does, would otherwise make the
+// replayed `run-help () {` a parse error that stops the whole replay. The
+// captured `alias -L` lines then restore exactly the user's aliases.
 const zsh_capture_script =
     \\{
     \\\builtin zmodload zsh/parameter 2>/dev/null
@@ -309,6 +314,7 @@ const zsh_capture_script =
     \\\builtin printf 'FXSNAP:@NONCE@:NAMES\0'
     \\\builtin printf '%s\0' ${(k)aliases} ${(k)galiases} ${(k)saliases} ${(k)functions}
     \\\builtin printf 'FXSNAP:@NONCE@:REPLAY\0'
+    \\\builtin print -r -- '\builtin unalias -a; \builtin unalias -as'
     \\\builtin typeset -p fpath
     \\for __fx_snapshot_name in ${(ko)functions}; do
     \\  case $__fx_snapshot_name in (_*|prompt_*|__fx_snapshot_*) continue;; esac

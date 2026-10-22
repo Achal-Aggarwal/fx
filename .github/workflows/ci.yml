@@ -61,6 +61,15 @@ jobs:
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
 
+      # The zsh user profile tests in src/core/execution/command_runner.zig
+      # skip without /bin/zsh. They start interactive zsh with no terminal,
+      # where Ubuntu's global zshrc runs compinit, and on this runner compinit
+      # aborts and writes an error to stderr, so the job turns it off.
+      - name: Install zsh
+        run: |
+          command -v zsh >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq zsh; }
+          echo 'skip_global_compinit=1' | sudo tee -a /etc/zsh/zshenv >/dev/null
+
       - name: Test
         env:
           TEST_TIMEOUT_SECONDS: ${{ matrix.test_timeout_seconds }}
