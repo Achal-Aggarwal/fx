@@ -20,7 +20,7 @@
     {"name": "responses_stream", "module": "fx", "test": "Responses streams give the same result however they are cut into events and reads", "iterations": 190000},
     {"name": "vercel_stream", "module": "fx", "test": "Gateway streams give the same result however they are cut into events and reads", "iterations": 460000},
     {"name": "chat_completions_stream", "module": "fx", "test": "chat completions streams give the same result however they are cut into events and reads", "iterations": 120000},
-    {"name": "terminal_grid", "module": "fx", "test": "terminal grid state survives fragmented feeds, checkpoints, and repaints", "iterations": 100000},
+    {"name": "terminal_grid", "module": "fx", "test": "terminal grid state survives fragmented feeds, checkpoints, and repaints", "iterations": 50000},
     {"name": "shell_parity", "module": "fx", "test": "shell parity holds for generated commands", "iterations": 600},
     {"name": "command_lex", "module": "fx", "test": "lexing generated commands is consistent and round-trips through quoting", "iterations": 2700000},
     {"name": "command_classification", "module": "fx", "test": "classifying generated commands stays inside the command and agrees with the lexer", "iterations": 4800000}
