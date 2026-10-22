@@ -1112,8 +1112,16 @@ pub const Runtime = struct {
                     r.finish(w.request, if (result) |ok| .{ .tools = ok } else |err| .{ .failed = err });
                 }
             },
-            .auth_required => {
+            .auth_required => |required| {
                 r.flags[i].needs_login = true;
+                // Only a step-up keeps the login working for what it had;
+                // otherwise the saved one, if any, doesn't sign anything in.
+                if (!required.step_up) r.flags[i].signed_in = false;
+                if (required.refused) |refused| {
+                    debug_trace.logf("mcp", "MCP login dropped server={s} reason=refresh refused status={d} error={s}", .{ name, refused.status, refused.code });
+                } else {
+                    debug_trace.logf("mcp", "MCP login needed server={s} reason={s}", .{ name, if (required.step_up) "more scopes" else "sign-in required" });
+                }
                 r.notify(.{ .needs_login = name });
                 // Nothing comes until someone logs in.
                 r.endToolWaiters(i, .needs_login);
@@ -1419,12 +1427,17 @@ pub const Runtime = struct {
                 var buf: [320]u8 = undefined;
                 r.notify(.{ .not_saved = .{ .server = s.name, .reason = notSavedReason(&buf, r.options.credentials.store, err) } });
             }
-        } else if (r.flags[i].tried) |own| {
+        } else {
+            // The tokens are gone, so this process is signed out whatever
+            // the store holds.
+            r.flags[i].signed_in = false;
+            const own = r.flags[i].tried orelse return debug_trace.logf("mcp", "MCP login dropped server={s} saved=none", .{s.name});
             // Only this process's own login goes: one another fx saved since
             // stays, for the next request to take.
-            _ = r.options.credentials.store.removeIfSame(r.gpa, s.credentialKey(), own) catch |err| {
-                debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ s.name, @errorName(err) });
+            const removed = r.options.credentials.store.removeIfSame(r.gpa, s.credentialKey(), own) catch |err| {
+                return debug_trace.logf("mcp", "MCP credential not removed server={s} err={s}", .{ s.name, @errorName(err) });
             };
+            debug_trace.logf("mcp", "MCP login dropped server={s} saved={s}", .{ s.name, if (removed) "removed" else "kept, another fx saved a newer one" });
         }
     }
 

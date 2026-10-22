@@ -45,6 +45,7 @@ const tools = @import("protocol/tools.zig");
 const trace = @import("io/trace.zig");
 const wire = @import("protocol/wire.zig");
 const auth_client = @import("auth/client.zig");
+const oauth = @import("auth/oauth.zig");
 const elicitation = @import("protocol/elicitation.zig");
 const elicit_core = @import("core/elicitation.zig");
 const auth_core = @import("core/auth.zig");
@@ -134,8 +135,9 @@ pub const Event = union(enum) {
     /// valid until then.
     input: struct { handle: Handle, requests: []const mrtr.Request },
     /// Requests need a sign-in: after a 401 a refresh can't fix, or a
-    /// 403 asking for more scopes (`step_up`).
-    auth_required: struct { step_up: bool },
+    /// 403 asking for more scopes (`step_up`). `refused` is the refresh the
+    /// token endpoint refused, when that ended the login.
+    auth_required: struct { step_up: bool, refused: ?oauth.Refusal = null },
     /// The host opens this URL in a browser, and passes the URL it comes back
     /// to to `finishSignIn`.
     authorize: []const u8,
@@ -1853,7 +1855,7 @@ pub const Server = struct {
                     else => return err,
                 },
                 .give_up => |g| try r.authGaveUp(g.key, g.why),
-                .needs_sign_in => |n| r.emit(.{ .auth_required = .{ .step_up = n.step_up } }),
+                .needs_sign_in => |n| r.emit(.{ .auth_required = .{ .step_up = n.step_up, .refused = n.refused } }),
                 .authorize => |url| r.emit(.{ .authorize = url }),
                 .signed_in => r.emit(.signed_in),
                 .sign_in_failed => |f| r.emit(.{ .sign_in_failed = .{ .why = f.why, .message = f.message } }),
