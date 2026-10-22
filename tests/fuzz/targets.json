@@ -17,6 +17,8 @@
     {"name": "file_index", "module": "fx", "test": "file index raw-list and Unicode query bytes remain bounded", "iterations": 620000},
     {"name": "responses_text", "module": "fx", "test": "Responses text finalization fuzzes chunking and capture boundaries", "iterations": 430000},
     {"name": "sse_framing", "module": "fx", "test": "provider framing fuzzes chunk-invariant event data", "iterations": 1300000},
-    {"name": "shell_parity", "module": "fx", "test": "shell parity holds for generated commands", "iterations": 600}
+    {"name": "shell_parity", "module": "fx", "test": "shell parity holds for generated commands", "iterations": 600},
+    {"name": "command_lex", "module": "fx", "test": "lexing generated commands is consistent and round-trips through quoting", "iterations": 2700000},
+    {"name": "command_classification", "module": "fx", "test": "classifying generated commands stays inside the command and agrees with the lexer", "iterations": 4800000}
   ]
 }

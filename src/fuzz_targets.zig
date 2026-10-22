@@ -13,7 +13,9 @@ test {
     _ = @import("core/session/session_event.zig");
     _ = @import("core/shared/display_width.zig");
     _ = @import("core/shared/types.zig");
+    _ = @import("core/shell_command/command_classification.zig");
     _ = @import("core/shell_command/command_effect.zig");
+    _ = @import("core/shell_command/command_lex.zig");
     _ = @import("core/skills/skill_contract.zig");
     _ = @import("core/skills/skill_invocation.zig");
     _ = @import("core/tooling/command_output_content.zig");
