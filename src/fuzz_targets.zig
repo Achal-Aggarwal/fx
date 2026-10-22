@@ -20,6 +20,9 @@ test {
     _ = @import("core/skills/skill_invocation.zig");
     _ = @import("core/tooling/command_output_content.zig");
     _ = @import("core/workspace/file_index.zig");
+    _ = @import("gateway/chat_completions_protocol.zig");
+    _ = @import("gateway/client.zig");
+    _ = @import("gateway/openai_codex.zig");
     _ = @import("gateway/responses_protocol.zig");
     _ = @import("gateway/sse.zig");
 }
