@@ -39,6 +39,12 @@ pub fn build(b: *std.Build) void {
         "Build a Node-API addon surface (core)",
     ) orelse .none;
 
+    const sanitize_thread = b.option(
+        bool,
+        "sanitize-thread",
+        "Build fx and its tests with ThreadSanitizer",
+    ) orelse false;
+
     const git_commit = readGitCommit(b);
     const app_version = readAppVersion(b);
     const update_channel = b.option(UpdateChannel, "update-channel", "Build update channel (stable or dev)") orelse .stable;
@@ -68,11 +74,13 @@ pub fn build(b: *std.Build) void {
             .unwind_tables = .none,
             .error_tracing = false,
             .strip = optimize != .debug,
+            .sanitize_thread = sanitize_thread,
         }),
     });
     exe.root_module.addImport("build_options", build_options.createModule());
     exe.root_module.addImport("fuzz_corpus", fuzz_corpus);
     const session_manager = addSessionManager(b, exe.root_module, target, optimize, null, fuzz_corpora);
+    session_manager.sanitize_thread = sanitize_thread;
 
     b.installArtifact(exe);
 
@@ -104,6 +112,7 @@ pub fn build(b: *std.Build) void {
     const session_manager_hook_tests = b.addTest(.{
         .root_module = sessionManagerModule(b, target, optimize, null, true, fuzz_corpora),
     });
+    session_manager_hook_tests.root_module.sanitize_thread = sanitize_thread;
     const run_session_manager_hook_tests = b.addRunArtifact(session_manager_hook_tests);
     const session_manager_test_step = b.step("test-session-manager", "Run the session manager's tests");
     session_manager_test_step.dependOn(&run_session_manager_tests.step);
