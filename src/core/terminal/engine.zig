@@ -271,12 +271,12 @@ test "grid failures preserve exact error types and identities" {
     try std.testing.expectError(error.OutOfMemory, failGrid(error.OutOfMemory));
 }
 
-/// The cells a one-cell character in the last column wrote over. If a later
-/// read widens the character to two cells, they are put back, so it wraps or
-/// moves left as it would have had it arrived in one read.
 /// What writing printable text can fail with.
 const PrintError = Allocator.Error || error{CombiningPoolCapacityExceeded};
 
+/// The cells a one-cell character in the last column wrote over. If a later
+/// read widens the character to two cells, they are put back, so it wraps or
+/// moves left as it would have had it arrived in one read.
 const LastColumnWrite = struct {
     /// The character's cell.
     idx: usize,
