@@ -1218,26 +1218,48 @@ fn project_read_tool_result_request_messages(
     return projected orelse source;
 }
 
+/// Returns the arguments a shell call is stored and admitted with: an exact
+/// {"request":{...}} unwrapped, and a missing action filled in when
+/// `infer_action` names exactly one. Null keeps the call as it was sent.
 fn normalized_terminal_request_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
+    infer_action: ?tool_dispatch.InferActionFn,
 ) Allocator.Error!?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, arguments_json, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
     defer parsed.deinit();
-    if (parsed.value != .object or parsed.value.object.count() != 1) return null;
-    const request = parsed.value.object.getPtr("request") orelse return null;
-    if (request.* != .object) return null;
-    _ = try normalize_terminal_model_input(
-        parsed.arena.allocator(),
-        &request.object,
-    );
+    if (parsed.value != .object) return null;
+    const arena = parsed.arena.allocator();
+    var args = parsed.value;
+    var changed = false;
+    if (args.object.count() == 1) {
+        if (args.object.get("request")) |request| {
+            if (request != .object) return null;
+            args = request;
+            _ = try normalize_terminal_model_input(arena, &args.object);
+            changed = true;
+        }
+    }
+    if (infer_action) |infer| {
+        if (infer(args.object)) |action| {
+            var with_action = std.json.Value{ .object = .empty };
+            try with_action.object.put(arena, "action", .{ .string = action });
+            var fields = args.object.iterator();
+            while (fields.next()) |entry| {
+                try with_action.object.put(arena, entry.key_ptr.*, entry.value_ptr.*);
+            }
+            args = with_action;
+            changed = true;
+        }
+    }
+    if (!changed) return null;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(request.*, .{}, &out.writer) catch return error.OutOfMemory;
+    std.json.Stringify.value(args, .{}, &out.writer) catch return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
 
@@ -1357,6 +1379,7 @@ fn normalize_terminal_request_tool_calls(
         const arguments_json = try normalized_terminal_request_arguments(
             alloc,
             call.arguments_json,
+            tool.infer_action_fn,
         ) orelse continue;
         if (normalized == null) {
             normalized = alloc.dupe(ToolCall, source) catch |err| {
@@ -1490,6 +1513,7 @@ test "terminal model write input normalizes every atomic payload" {
         const normalized = (try normalized_terminal_request_arguments(
             alloc,
             case.model,
+            null,
         )).?;
         defer alloc.free(normalized);
         try std.testing.expectEqualStrings(case.internal, normalized);
@@ -2183,6 +2207,7 @@ fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !v
         .executor_kind = .terminal,
         .decode = undefined,
         .call = undefined,
+        .infer_action_fn = testInferRunAction,
         .reads_only_fn = undefined,
         .irreversible_fn = undefined,
     };
@@ -2192,6 +2217,7 @@ fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !v
         .{ .id = "one", .name = "terminal", .arguments_json = "{\"request\":{\"action\":\"exec\",\"command\":\"true\"}}" },
         .{ .id = "two", .name = "terminal", .arguments_json = "{\"request\":{\"action\":\"start\"}}" },
         .{ .id = "atomic", .name = "terminal", .arguments_json = "{\"request\":{\"action\":\"write\",\"session_id\":\"terminal-a\",\"input\":{\"text\":\"input\"}}}" },
+        .{ .id = "inferred", .name = "terminal", .arguments_json = "{\"command\":\"true\",\"cwd\":\"src\"}" },
     };
     const normalized = try normalize_terminal_request_tool_calls(alloc, registry, true, &source);
     if (normalized.ptr == source[0..].ptr) return error.TestUnexpectedResult;
@@ -2215,6 +2241,69 @@ fn check_terminal_request_normalization_allocation_failures(alloc: Allocator) !v
         "{\"action\":\"write\",\"session_id\":\"terminal-a\",\"write\":{\"kind\":\"text\",\"text\":\"input\"}}",
         normalized[2].arguments_json,
     );
+    try std.testing.expectEqualStrings(
+        "{\"action\":\"run\",\"command\":\"true\",\"cwd\":\"src\"}",
+        normalized[3].arguments_json,
+    );
+}
+
+/// Stands in for shell's inferAction: a call with a command and no action
+/// means run.
+fn testInferRunAction(object: std.json.ObjectMap) ?[]const u8 {
+    if (object.get("action") != null or object.get("command") == null) return null;
+    return "run";
+}
+
+test "terminal intake adds the action a call leaves out before it is stored" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const shell_tool = tool_dispatch.Tool{
+        .name = "shell",
+        .description = "shell",
+        .model_schema = .{ .name = "shell", .description = "shell" },
+        .executor_kind = .terminal,
+        .decode = undefined,
+        .call = undefined,
+        .infer_action_fn = testInferRunAction,
+        .reads_only_fn = undefined,
+        .irreversible_fn = undefined,
+    };
+    var without_inference = shell_tool;
+    without_inference.infer_action_fn = null;
+    const calls = [_]ToolCall{
+        .{ .id = "inferred", .name = "shell", .arguments_json = "{\"command\":\"ls\",\"cwd\":\"src\"}" },
+        .{ .id = "wrapped", .name = "shell", .arguments_json = "{\"request\":{\"command\":\"ls\"}}" },
+        .{ .id = "explicit", .name = "shell", .arguments_json = "{\"action\":\"run\",\"command\":\"ls\"}" },
+        .{ .id = "unnamed", .name = "shell", .arguments_json = "{\"session_id\":\"shell-1\"}" },
+    };
+
+    const normalized = try normalize_terminal_request_tool_calls(
+        arena,
+        .{ .tools = &.{shell_tool} },
+        true,
+        &calls,
+    );
+    // The action comes first, as in a call that names it.
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"ls\",\"cwd\":\"src\"}", normalized[0].arguments_json);
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"command\":\"ls\"}", normalized[1].arguments_json);
+    try std.testing.expectEqual(calls[2].arguments_json.ptr, normalized[2].arguments_json.ptr);
+    try std.testing.expectEqual(calls[3].arguments_json.ptr, normalized[3].arguments_json.ptr);
+
+    const plain = try normalize_terminal_request_tool_calls(
+        arena,
+        .{ .tools = &.{without_inference} },
+        true,
+        calls[0..1],
+    );
+    try std.testing.expectEqual(calls[0..1].ptr, plain.ptr);
+    const ineligible = try normalize_terminal_request_tool_calls(
+        arena,
+        .{ .tools = &.{shell_tool} },
+        false,
+        &calls,
+    );
+    try std.testing.expectEqual(calls[0..].ptr, ineligible.ptr);
 }
 
 test "terminal request normalization cleans every partial allocation failure" {

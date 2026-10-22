@@ -91,6 +91,82 @@ pub fn actionFieldContract(action: Action) ActionFieldContract {
     };
 }
 
+/// Names the action of a call that omits `action` when exactly one action
+/// takes every field it sends and gets every field it requires. Fields that
+/// decode treats as absent, null or the text "null", are ignored. A bare
+/// session_id fits both interact and stop, so it names neither. The
+/// orchestrator adds the result before the call is stored or admitted, so
+/// permission admission and decode read the same arguments
+/// (`tests/tla/shell_command/ShellContract.tla` AdmissionConsistency).
+pub fn inferAction(object: std.json.ObjectMap) ?[]const u8 {
+    if (object.get("action") != null) return null;
+    var found: ?Action = null;
+    for (std.enums.values(Action)) |action| {
+        if (!fieldsFitAction(object, actionFieldContract(action))) continue;
+        if (found != null) return null;
+        found = action;
+    }
+    return if (found) |action| @tagName(action) else null;
+}
+
+fn fieldsFitAction(object: std.json.ObjectMap, contract: ActionFieldContract) bool {
+    var fields = object.iterator();
+    while (fields.next()) |entry| {
+        if (isAbsentValue(entry.value_ptr.*)) continue;
+        if (!containsFieldName(contract.allowed, entry.key_ptr.*)) return false;
+    }
+    for (contract.required) |name| {
+        if (std.mem.eql(u8, name, "action")) continue;
+        const value = object.get(name) orelse return false;
+        if (isAbsentValue(value)) return false;
+    }
+    return true;
+}
+
+fn isAbsentValue(value: std.json.Value) bool {
+    return value == .null or
+        (value == .string and tool_args.isNullPlaceholderText(value.string));
+}
+
+fn containsFieldName(names: []const []const u8, name: []const u8) bool {
+    for (names) |candidate| {
+        if (std.mem.eql(u8, candidate, name)) return true;
+    }
+    return false;
+}
+
+test "inferAction names the one action a call's fields fit" {
+    const cases = [_]struct { args: []const u8, action: ?[]const u8 }{
+        .{ .args = "{\"command\":\"git status\"}", .action = "run" },
+        .{ .args = "{\"command\":\"make\",\"cwd\":\"src\",\"yield_time_ms\":30000,\"timeout_ms\":600000}", .action = "run" },
+        .{ .args = "{\"command\":\"python3\",\"tty\":true,\"session_id\":null,\"chars\":\"null\"}", .action = "run" },
+        .{ .args = "{\"session_id\":\"shell-1\",\"chars\":\"y\\n\"}", .action = "interact" },
+        .{ .args = "{\"session_id\":\"shell-1\",\"yield_time_ms\":5000}", .action = "interact" },
+        .{ .args = "{\"session_id\":\"shell-1\",\"force\":true}", .action = "stop" },
+        // A bare session_id could observe or stop the session.
+        .{ .args = "{\"session_id\":\"shell-1\"}", .action = null },
+        // A command beside a session could start one or write to one.
+        .{ .args = "{\"command\":\"ls\",\"session_id\":\"shell-1\"}", .action = null },
+        .{ .args = "{\"command\":\"ls\",\"force\":true}", .action = null },
+        .{ .args = "{\"command\":\"ls\",\"note\":\"why\"}", .action = null },
+        .{ .args = "{\"command\":null}", .action = null },
+        .{ .args = "{}", .action = null },
+        .{ .args = "{\"action\":\"run\",\"command\":\"ls\"}", .action = null },
+        .{ .args = "{\"action\":null,\"command\":\"ls\"}", .action = null },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, case.args, .{});
+        defer parsed.deinit();
+        const inferred = inferAction(parsed.value.object);
+        if (case.action) |expected| {
+            try std.testing.expectEqualStrings(expected, inferred orelse return error.TestExpectedEqual);
+        } else if (inferred) |unexpected| {
+            std.debug.print("{s} inferred {s}\n", .{ case.args, unexpected });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 const OwnedInput = struct {
     arena_state: std.heap.ArenaAllocator.State,
     value: Input,

@@ -401,6 +401,7 @@ pub const shell = ToolSpec{
     .runtime_provider = .run_command,
     .captured_command_action = "run",
     .captured_command_fn = shell_impl.isCapturedCommand,
+    .infer_action_fn = shell_impl.inferAction,
     .process_local_fn = shell_impl.isProcessLocal,
     .reads_only_fn = shell_impl.readsOnly,
     .irreversible_fn = shell_impl.isIrreversible,

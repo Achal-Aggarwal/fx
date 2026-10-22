@@ -99,6 +99,12 @@ export function historyClass(design: Design, call: ObservedCall): string {
   // The orchestrator unwraps an exact {"request":{...}} before the call is stored.
   if (sent.ok && isObject(sent.value) && isObject(sent.value.request) &&
     isDeepStrictEqual(input, sent.value.request)) return `unwrapped:${call.shape}`;
+  // It also adds the action a call without one means, as the first field.
+  if (sent.ok && isObject(sent.value) && !("action" in sent.value) && isObject(input) &&
+    typeof input.action === "string" && Object.keys(input)[0] === "action") {
+    const { action: _action, ...rest } = input;
+    if (isDeepStrictEqual(rest, sent.value)) return `inferred:${call.shape}`;
+  }
   return `rewrapped:${call.shape}`;
 }
 
