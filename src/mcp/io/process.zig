@@ -250,7 +250,8 @@ pub const Process = struct {
     queue: std.Io.Queue(Posted),
     queue_buffer: [64]Posted = undefined,
     tasks: std.Io.Group = .init,
-    /// Guards `pid` against the exit watcher reaping it.
+    /// Guards `pid` and `exit`, which the exit watcher writes when it reaps
+    /// the process.
     pid_lock: std.Io.Mutex = .init,
     /// Set while the current process is unreaped.
     pid: ?std.posix.pid_t = null,
@@ -270,8 +271,9 @@ pub const Process = struct {
     budget: Budget,
     /// Why the last start failed, for logs.
     spawn_error: ?SpawnError = null,
-    /// How the last process ended, once it has: set before `.exited` is
-    /// posted, so the owner reads it after the event.
+    /// How the last process ended, once it has: set under `pid_lock` before
+    /// `.exited` is posted. A status can be read before the owner takes that
+    /// event, so read it with `exitStatus`.
     exit: ?Exit = null,
     /// The current process's last stderr lines, terminal-safe, each cut to
     /// `tail_max`: written by its stderr reader under `tail_lock`, cleared at
@@ -434,7 +436,9 @@ pub const Process = struct {
             for (out.effects()) |effect| switch (effect) {
                 .spawn => |g| {
                     p.spawn_error = null;
+                    p.pid_lock.lockUncancelable(p.io);
                     p.exit = null;
+                    p.pid_lock.unlock(p.io);
                     p.tail_lock.lockUncancelable(p.io);
                     p.tail_count = 0;
                     p.tail_lock.unlock(p.io);
@@ -684,6 +688,13 @@ pub const Process = struct {
         p.tail_count = @min(p.tail_count + 1, tail_lines);
     }
 
+    /// How the last process ended, once it has.
+    pub fn exitStatus(p: *Process) ?Exit {
+        p.pid_lock.lockUncancelable(p.io);
+        defer p.pid_lock.unlock(p.io);
+        return p.exit;
+    }
+
     /// The current process's last stderr lines, oldest first, joined with
     /// " / ", and cut from the front to `tail_max`; in `out`.
     pub fn stderrTail(p: *Process, out: *[tail_max]u8) []const u8 {
@@ -850,7 +861,7 @@ test "how a server's process ended is kept until it starts again" {
     defer p.deinit();
     try p.start();
     try expectState(&p, .backoff);
-    try testing.expectEqual(Exit{ .code = 3 }, p.exit.?);
+    try testing.expectEqual(Exit{ .code = 3 }, p.exitStatus().?);
 }
 
 test "a command that can't start counts as a failure" {
