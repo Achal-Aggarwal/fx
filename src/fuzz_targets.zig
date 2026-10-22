@@ -26,5 +26,7 @@ test {
     _ = @import("gateway/openai_codex.zig");
     _ = @import("gateway/responses_protocol.zig");
     _ = @import("gateway/sse.zig");
+    _ = @import("tools/web/http_fetch.zig");
+    _ = @import("tools/web/url_policy.zig");
     _ = @import("ui/resize_tests.zig");
 }
