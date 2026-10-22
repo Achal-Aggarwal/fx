@@ -326,11 +326,7 @@ fn serverRow(alloc: Allocator, arena: Allocator, shown: Projection, index: u16, 
     const window: usize = row_count - 1;
     if (l.lines() <= window) return serverLine(alloc, arena, p, r, l, index - 1, width);
     const v = scrolled(p.state, l, window);
-    var slot: usize = index - 1;
-    if (v.top > 0) {
-        if (slot == 0) return countRow(alloc, arena, v.top, "above", width);
-        slot -= 1;
-    }
+    const slot: usize = index - 1;
     if (slot < v.lines) return serverLine(alloc, arena, p, r, l, v.top + slot, width);
     if (slot == v.lines and v.below > 0) return countRow(alloc, arena, v.below, "more below", width);
     return .empty;
@@ -342,13 +338,13 @@ const Scrolled = struct { top: usize, lines: usize, below: usize };
 /// keeps the selection in view for the full panel, and a shorter panel
 /// moves the view itself.
 fn scrolled(state: menu.State, l: menu.Layout, window: usize) Scrolled {
-    const shown = @max(window -| 2, 1);
+    const shown = @max(window -| 1, 1);
     var top = @min(state.top, l.lines() - shown);
     const at = l.line(state.cursor);
     if (at < top) top = at;
     if (at >= top + shown) top = at + 1 - shown;
     if (state.cursor == 0) top = 0;
-    var lines = window - @intFromBool(top > 0);
+    var lines = window;
     if (top + lines < l.lines()) lines -= 1;
     lines = @min(lines, l.lines() - top);
     return .{ .top = top, .lines = lines, .below = l.lines() - top - lines };
@@ -643,7 +639,7 @@ test "a server's screen: facts, choices with their commands, then tools" {
     try testing.expectEqualStrings("↑↓ navigate     esc back", hintVariants(p, &test_hints)[0]);
 }
 
-test "a long tool list scrolls with the selection, framed by what's hidden" {
+test "a long tool list scrolls with the selection and counts what's below" {
     const gh = testStatus("github", .ready);
     const rows = [_]menu.Row{.{ .status = gh, .target = "https://h/mcp" }};
     var tools: [30]menu.Tool = undefined;
@@ -656,7 +652,8 @@ test "a long tool list scrolls with the selection, framed by what's hidden" {
     for (0..12) |_| _ = menu.press(&p.state, view, .down);
     const text = try render(p, 60);
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.find(u8, text, "above\n") != null);
+    // What scrolled off the top isn't counted; what's below is.
+    try testing.expect(std.mem.find(u8, text, "above\n") == null);
     try testing.expect(std.mem.find(u8, text, "more below\n") != null);
     try testing.expect(std.mem.find(u8, text, "› tool11") != null);
     try testing.expectEqual(@as(u16, max_inline_rows), menuRowCount(p, 60, max_inline_rows));

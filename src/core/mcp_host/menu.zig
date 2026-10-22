@@ -147,10 +147,10 @@ pub const Layout = struct {
         return if (cursor < l.choices) l.lead + cursor else l.lead + l.choices + l.gap + l.waiting + (cursor - l.choices);
     }
 
-    /// Content lines shown; when everything doesn't fit, two rows go to the
-    /// counts of what's above and below.
+    /// Content lines shown; when everything doesn't fit, a row goes to the
+    /// count of what's below.
     pub fn shown(l: Layout) usize {
-        return if (l.lines() <= l.window) l.lines() else @max(l.window -| 2, 1);
+        return if (l.lines() <= l.window) l.lines() else @max(l.window -| 1, 1);
     }
 };
 
@@ -675,7 +675,7 @@ test "the selection moves on from the choices through the tools, and the screen 
     const view: View = .{ .rows = &.{}, .open = r, .layout = layout };
     for (0..10) |_| _ = press(&s, view, .down);
     try testing.expectEqual(@as(usize, 10), s.cursor);
-    // The selected tool is in view, between the counts above and below.
+    // The selected tool is in view, above the count of what's below.
     const at = layout.line(s.cursor);
     try testing.expect(at >= s.top and at < s.top + layout.shown());
     // Enter on a tool does nothing.
