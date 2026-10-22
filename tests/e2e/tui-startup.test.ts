@@ -609,7 +609,7 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
       const home = join(root, "home");
       const store = join(home, ".fx", "mcp-credentials");
       mkdirSync(store, { recursive: true, mode: 0o700 });
-      const lock = join(store, "credentials.lock");
+      const lock = join(store, "credentials-v3.lock");
       writeFileSync(lock, "", { mode: 0o600 });
       writeFileSync(
         join(home, ".fx", "mcp.json"),

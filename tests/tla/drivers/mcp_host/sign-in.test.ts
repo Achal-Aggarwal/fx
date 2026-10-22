@@ -4,53 +4,12 @@
 // the loopback callback, and the code redemption the fake logs. Checked
 // against SignIn.tla through SignInTrace.tla.
 import { expect, test } from "bun:test";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { artifacts, binary } from "../lib/context";
-import { BUN, HTTP_FAKE, fixture, fxEnv, probe, save, stdioServer, waitFor, writeProfile, type Fixture } from "./driver";
+import { BUN, cliLogin, fixture, probe, redemptions, save, startFake, stdioServer, waitFor, writeProfile } from "./driver";
 import { Shell } from "./shell";
 import { checkTrace, type TraceRecord } from "./trace";
-
-const MODERN = "2026-07-28";
-const RULES = [
-  { method: "server/discover", result: { resultType: "complete", supportedVersions: [MODERN], capabilities: { tools: {} } } },
-  { method: "tools/list", result: { resultType: "complete", tools: [{ name: "echo", inputSchema: { type: "object" } }] } },
-];
-
-async function startFake(f: Fixture, server: Record<string, unknown> = {}) {
-  if (!existsSync(HTTP_FAKE)) throw new Error(`harness: the fake HTTP server is missing at ${HTTP_FAKE}`);
-  const rules = join(f.base, "rules.json"), auth = join(f.base, "auth.json"), log = join(f.base, "http-fake.jsonl");
-  writeFileSync(rules, JSON.stringify(RULES));
-  writeFileSync(auth, JSON.stringify({ servers: [server], challengeScope: "mcp:read" }));
-  const child = Bun.spawn([BUN, HTTP_FAKE, "--script", rules, "--log", log, "--auth", auth], { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-  const reader = child.stdout.getReader();
-  let text = "";
-  const deadline = Date.now() + 10_000;
-  while (!text.includes("\n") && Date.now() < deadline) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    text += new TextDecoder().decode(value);
-  }
-  const port = JSON.parse(text.split("\n")[0]!).listening as number;
-  const entries = () => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []) as { t: number; dir?: string; path?: string; form?: Record<string, string>; json?: { redirect_uris?: string[] } }[];
-  return { url: `http://127.0.0.1:${port}/mcp`, entries, stop: () => child.kill() };
-}
-
-const redemptions = (entries: ReturnType<Awaited<ReturnType<typeof startFake>>["entries"]>) =>
-  entries.filter((e) => e.dir === "auth" && e.path?.endsWith("/token") && e.form?.grant_type === "authorization_code");
-
-/** `fx mcp login --no-browser web` with stdin left open, its output read as it comes. */
-async function cliLogin(f: Fixture) {
-  const child = Bun.spawn([binary, "mcp", "login", "--no-browser", "web"], { cwd: f.workspace, env: fxEnv(f), stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-  let out = "", err = "";
-  void (async () => { for await (const c of child.stdout) out += new TextDecoder().decode(c); })();
-  void (async () => { for await (const c of child.stderr) err += new TextDecoder().decode(c); })();
-  const killer = setTimeout(() => child.kill("SIGKILL"), 60_000);
-  return {
-    child, out: () => out, err: () => err,
-    async done() { const code = await child.exited; clearTimeout(killer); await Bun.sleep(50); return code; },
-  };
-}
 
 async function signInScenario(name: string, tamper: boolean) {
   const f = fixture(artifacts, name);
@@ -60,7 +19,7 @@ async function signInScenario(name: string, tamper: boolean) {
   const at = () => Date.now();
   try {
     records.push({ event: "login", at: at() });
-    const login = await cliLogin(f);
+    const login = await cliLogin(binary, f);
     const url = await waitFor("the authorization URL", () => /\n\s+(http\S+)\n/.exec(login.out())?.[1], 30_000);
     records.push({ event: "authorize", data: { login: 1 }, at: at(), note: url });
     const authorize = new URL(url);
@@ -115,7 +74,7 @@ test("control: a sign-in redeems the code of the callback whose state matches, t
   expect(r.out).toContain("Signed in to web.");
   expect(r.tokens.length).toBe(1);
   expect(r.after.result).toBe("closed");
-  expect(readFileSync(join(r.f.home, ".fx", "mcp-credentials", "credentials-v2.json"), "utf8")).toContain("\"name\":\"web\"");
+  expect(readFileSync(join(r.f.home, ".fx", "mcp-credentials", "credentials-v3.json"), "utf8")).toContain("\"name\":\"web\"");
   expect(r.verdict.verdict).toBe("ACCEPTED");
 }, 120_000);
 
@@ -141,7 +100,7 @@ test("contract: a return naming another issuer redeems nothing, and fx says the 
   const fake = await startFake(f, { iss: "wrong" });
   writeProfile(f, { web: { type: "http", url: fake.url } });
   try {
-    const login = await cliLogin(f);
+    const login = await cliLogin(binary, f);
     const url = await waitFor("the authorization URL", () => /\n\s+(http\S+)\n/.exec(login.out())?.[1], 30_000);
     const redirect = await fetch(url, { redirect: "manual" });
     const location = new URL(redirect.headers.get("location")!);
@@ -167,7 +126,7 @@ test("contract: a pasted return with a state fx never made redeems nothing, and 
   const fake = await startFake(f);
   writeProfile(f, { web: { type: "http", url: fake.url } });
   try {
-    const login = await cliLogin(f);
+    const login = await cliLogin(binary, f);
     const url = await waitFor("the authorization URL", () => /\n\s+(http\S+)\n/.exec(login.out())?.[1], 30_000);
     const redirect = await fetch(url, { redirect: "manual" });
     const wrong = new URL(redirect.headers.get("location")!);
