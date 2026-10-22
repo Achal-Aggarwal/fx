@@ -491,3 +491,73 @@ test "word end reads quotes and escapes as the shell does" {
     try std.testing.expect(word_end("CI='x", 0) == null);
     try std.testing.expect(word_end("CI=x\\", 0) == null);
 }
+
+/// Pieces of generated commands: the wrappers and environment assignments
+/// the classifier peels, and the quotes and escapes that move a word boundary
+/// that a split on whitespace cannot see.
+const fuzz_fragments = [_][]const u8{
+    " ",    "\t",   "\n",   "ls",    "rm",   "grep",   "git",  "find",
+    "-rf",  "x",    "[",    "CI=",   "CI=1", "TERM=",  "FOO=", "env",
+    "nice", "-n",   "5",    "-5",    "time", "stdbuf", "-oL",  "timeout",
+    "10s",  "sudo", "bash", "nohup", "'",    "\"",     "\\",   "\\ ",
+    "|",    "&&",   "&",    ";",     ">",    "=",      "-",    "\u{e9}",
+};
+
+fn writeFuzzCommand(smith: *std.testing.Smith, out: *std.Io.Writer) std.Io.Writer.Error!void {
+    for (0..smith.valueRangeAtMost(u8, 0, 16)) |_| {
+        if (smith.boolWeighted(7, 1)) {
+            try out.writeAll(fuzz_fragments[smith.index(fuzz_fragments.len)]);
+            continue;
+        }
+        var raw: [4]u8 = undefined;
+        try out.writeAll(raw[0..smith.slice(&raw)]);
+    }
+}
+
+fn isWithin(outer: []const u8, inner: []const u8) bool {
+    const start = @intFromPtr(inner.ptr);
+    return start >= @intFromPtr(outer.ptr) and start + inner.len <= @intFromPtr(outer.ptr) + outer.len;
+}
+
+fn fuzzClassification(_: void, smith: *std.testing.Smith) !void {
+    var buffer: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    writeFuzzCommand(smith, &writer) catch |err| switch (err) {
+        // A full buffer ends the command early, which is still a command.
+        error.WriteFailed => {},
+    };
+    const command = writer.buffered();
+
+    const tail = analysis_command_tail(command);
+    try std.testing.expect(isWithin(command, tail));
+    try std.testing.expectEqual(@intFromPtr(command.ptr) + command.len, @intFromPtr(tail.ptr) + tail.len);
+    if (terminal_exit_segment(command)) |segment| {
+        try std.testing.expect(isWithin(command, segment) and segment.len > 0);
+        try std.testing.expectEqualStrings(std.mem.trim(u8, segment, whitespace), segment);
+    }
+
+    const base = base_command_token(command) orelse return;
+    try std.testing.expect(isWithin(command, base));
+    try std.testing.expect(std.mem.findAny(u8, base, whitespace) == null);
+    // The base command is the first word the shell runs after the
+    // environment assignments. Callers look for shell operators before they
+    // ask for it, so only a simple command, with no operators, is compared.
+    var argv = lex.tokenize_argv(std.testing.allocator, command) catch return;
+    defer argv.deinit(std.testing.allocator);
+    for (argv.tokens) |token| {
+        if (!token.quoted and std.mem.findNone(u8, token.raw, "&|;<>(){}") == null) return;
+    }
+    for (argv.tokens) |token| {
+        if (is_env_assignment(token.value)) continue;
+        try std.testing.expectEqualStrings(token.value, base);
+        return;
+    }
+    // Every word the shell reads is an assignment, so no command runs.
+    return error.TestBaseCommandMissing;
+}
+
+test "classifying generated commands stays inside the command and agrees with the lexer" {
+    try std.testing.fuzz({}, fuzzClassification, .{
+        .corpus = &(.{""} ++ @import("fuzz_corpus").command_classification.*),
+    });
+}
