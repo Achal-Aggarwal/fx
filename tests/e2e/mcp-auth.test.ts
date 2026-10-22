@@ -17,6 +17,7 @@ import { delimiter, join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { startLegacyStreamableHttpFixture } from "./fixtures/mcp-legacy-remote";
 import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
+import { stdoutFrames } from "./render-lab/tape";
 import {
   fakeGatewayFinalText,
   fakeGatewayToolCall,
@@ -140,6 +141,8 @@ function startAuthFixture(
     resourceAtOrigin?: boolean;
     /** Answer revocations this late. */
     revokeDelayMs?: number;
+    /** Answer the authorization server's metadata this late, like a slow sign-in. */
+    discoveryDelayMs?: number;
     /**
      * Each refresh token works once, as WorkOS and RFC 9700 have it: a refresh
      * returns a new one and retires the one sent. The one just retired still
@@ -245,6 +248,7 @@ function startAuthFixture(
         });
       }
       if (url.pathname === "/.well-known/oauth-authorization-server") {
+        if (options.discoveryDelayMs) await Bun.sleep(options.discoveryDelayMs);
         const metadata = {
           issuer: origin,
           authorization_endpoint: `${origin}/authorize`,
@@ -1292,6 +1296,56 @@ describe("MCP login", () => {
     expect(pane).not.toContain("Its tools show here once you log in.");
     expect(auth.tokenExchanges).toBe(0);
   }, 60_000);
+
+  // Before, nothing changed on the screen until the address came, which a
+  // slow sign-in server makes seconds, and each Enter in the meantime closed
+  // the port the browser comes back to, so the sign-in could never finish.
+  // On the code before, this fails at "Signing in…".
+  test.skipIf(!tmuxAvailable())("Log in says \"Signing in…\" at once, more Enters keep that sign-in, and its address is one link that signs in", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { discoveryDelayMs: 2_000 });
+    const root = createRoot(auth);
+    const tapePath = join(root.root, "sign-in.fxtape");
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 100, height: 40,
+      env: { ...v2Env(root), FX_NO_OPEN_BROWSER: "1", FX_RECORD: tapePath, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    await tui.sendText("/mcp");
+    await tui.waitForText("MCP servers  1", 10_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("› Log in        /mcp login fixture", 15_000);
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Signing in…", 1_500);
+    expect(await tui.capturePane()).not.toContain("Waiting for the browser");
+    // Pressed again while the sign-in server is slow, then once its address shows.
+    await tui.sendKeys("Enter");
+    await tui.waitForText("Waiting for the browser. Didn't open? Go to:", 15_000);
+    await tui.sendKeys("Enter");
+    await Bun.sleep(500);
+
+    // The address, wrapped over the rows under the heading.
+    const lines = (await tui.capturePane()).split("\n");
+    const heading = lines.findIndex((l) => l.includes("Didn't open? Go to:"));
+    let address = "";
+    for (const l of lines.slice(heading + 1)) {
+      if (!l.startsWith("    ") || l.trim() === "") break;
+      address += l.trim();
+    }
+    expect(address).toContain("/authorize?");
+    // Every row of it links the whole address.
+    const written = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString("utf8");
+    expect(written).toContain(`\x1b]8;id=fx-mcp-sign-in;${address}\x1b\\`);
+
+    // The browser's return reaches the sign-in those Enters kept.
+    const redirect = await fetch(address, { redirect: "manual" });
+    const back = await fetch(redirect.headers.get("location")!, { signal: AbortSignal.timeout(10_000) });
+    expect(back.status).toBe(200);
+    await tui.waitForText("· signed in", 15_000);
+    expect(auth.tokenExchanges).toBe(1);
+    expect(auth.requests.filter((r) => r.path === "/.well-known/oauth-authorization-server").length).toBe(1);
+  }, 90_000);
 
   test.skipIf(!tmuxAvailable())("a config change during a sign-in ends it, clears \"Signing in\", and says how to sign in again", async () => {
     upstream = startModernMcpHttpFixture("json");
