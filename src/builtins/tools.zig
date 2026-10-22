@@ -121,40 +121,22 @@ const ask_user_question_question_schema = model_tool_schema.ObjectSchema{
 const subagent_description =
     "Delegate work and receive one terminal child result. Use run for one temporary child and one task. Use message with a stable name to create or continue a persistent conversation in this parent session. A plain message to a working child queues feedback for its next safe boundary without cancelling its current tool. A delivery receipt is not the child's final result; that result arrives separately. Optional instructions replace only that child's system overlay between turns; fx preserves its trusted base prompt. Optional model and effort apply only when a child is created and are rejected for an existing child. fx owns timing, worker identities, cancellation, permissions, persistence, and cleanup.";
 
-const subagent_model_run_properties = [_]model_tool_schema.Property{
-    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"run"} } },
-    .{ .name = "task", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_prompt_bytes }, .description = "One complete task for a temporary child. The child accepts no follow-up." },
-    .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes }, .description = "Optional model for this child, as a catalog model ID such as openai/gpt-5.6-terra. Unambiguous partial names resolve to catalog IDs; unknown or ambiguous names are rejected with candidate IDs. Inherits the parent's model when omitted." },
-    .{ .name = "effort", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes }, .description = "Optional reasoning effort for this child. Inherits the parent's effort when omitted." },
+// Flat so a model never writes the call's JSON by hand inside a wrapper; the
+// decoder in src/tools/agent/subagent.zig rejects a field the action does not
+// take, and the test below keeps these properties in step with it.
+const subagent_properties = [_]model_tool_schema.Property{
+    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{ "run", "message" } }, .description = "run starts one temporary child for task. message creates or continues the persistent child named agent; send each child its own call." },
+    .{ .name = "task", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_prompt_bytes }, .description = "Required for run. One complete task for a temporary child. The child accepts no follow-up." },
+    .{ .name = "agent", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_agent_name_bytes }, .description = "Required for message. Stable lowercase name for one persistent conversation in this parent session. A new valid name creates it; later calls continue it." },
+    .{ .name = "message", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_message_bytes }, .description = "Required for message. Message for that named agent: creates it on first use, continues an idle conversation, or queues feedback for a working child. Do not resend merely to poll for completion." },
+    .{ .name = "instructions", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_instructions_bytes }, .description = "message only. Optional persistent instructions for this child. Replaces its child-specific system overlay before this message when idle; rejected while the child is working. Omit to preserve the overlay or send live feedback. Cannot replace fx's trusted base prompt or widen authority." },
+    .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes }, .description = "Optional model for the child, as a catalog model ID such as openai/gpt-5.6-terra. Unambiguous partial names resolve to catalog IDs; unknown or ambiguous names are rejected with candidate IDs. Inherits the parent's model when omitted. With message, applies only when the message creates the child and is rejected for an existing child." },
+    .{ .name = "effort", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes }, .description = "Optional reasoning effort for the child. Inherits the parent's effort when omitted. With message, applies only when the message creates the child and is rejected for an existing child." },
 };
-
-const subagent_model_message_properties = [_]model_tool_schema.Property{
-    .{ .name = "action", .json_type = .string, .shape = &.{ .enum_values = &.{"message"} } },
-    .{ .name = "agent", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_agent_name_bytes }, .description = "Stable lowercase name for one persistent conversation in this parent session. A new valid name creates it; later calls continue it." },
-    .{ .name = "instructions", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_instructions_bytes }, .description = "Optional persistent instructions for this child. Replaces its child-specific system overlay before this message when idle; rejected while the child is working. Omit to preserve the overlay or send live feedback. Cannot replace fx's trusted base prompt or widen authority." },
-    .{ .name = "message", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_message_bytes }, .description = "Message for that named agent: creates it on first use, continues an idle conversation, or queues feedback for a working child. Do not resend merely to poll for completion." },
-    .{ .name = "model", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = subagent_domain.max_model_bytes }, .description = "Optional model applied when this message creates the child, as a catalog model ID such as openai/gpt-5.6-terra. Unambiguous partial names resolve to catalog IDs; unknown or ambiguous names are rejected with candidate IDs. Inherits the parent's model when omitted. Rejected when the named child already exists." },
-    .{ .name = "effort", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = types.ReasoningEffort.max_name_bytes }, .description = "Optional reasoning effort applied when this message creates the child. Inherits the parent's effort when omitted. Rejected when the named child already exists." },
-};
-
-const subagent_model_action_schemas = [_]model_tool_schema.ObjectSchema{
-    .{ .properties = &subagent_model_run_properties, .required = &.{ "action", "task" }, .additional_properties = false },
-    .{ .properties = &subagent_model_message_properties, .required = &.{ "action", "agent", "message" }, .additional_properties = false },
-};
-
-const subagent_model_action_union = model_tool_schema.ObjectSchema{
-    .one_of = &subagent_model_action_schemas,
-};
-
-const subagent_model_request_properties = [_]model_tool_schema.Property{.{
-    .name = "request",
-    .json_type = .object,
-    .shape = &.{ .object = &subagent_model_action_union },
-}};
 const vision_description =
     "Inspect authorized images attached by the user or local image paths supplied in the conversation, and return structured factual evidence. Pass exactly one source: image_ids for attached images, or paths for local images. When to use: read visible text, UI state, objects, layout, or other visual details needed for the task. When NOT to use: inspect paths the user did not supply, infer details not visible in an image, or repeat evidence already available in the conversation.";
 const read_tool_result_description =
-    "Read a stored tool result or captured command output by opaque handle from the active session or process. Pass request.query to find a known literal line; otherwise use the optional request byte range. Turns, tool calls and earlier compactions saved by compaction open by their ID as the handle, like M12, T12 or L2, and request.search finds them by text. When to use: inspect more after a tool-result preview or command-output handle says retained output is available, or recover details of a compacted turn, tool call or earlier compaction. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
+    "Read a stored tool result or captured command output by opaque handle from the active session or process. Pass handle with query to find a known literal line, or with an optional byte range. Turns, tool calls and earlier compactions saved by compaction open by their ID as the handle, like M12, T12 or L2, and search finds them by text without a handle. When to use: inspect more after a tool-result preview or command-output handle says retained output is available, or recover details of a compacted turn, tool call or earlier compaction. When NOT to use: read arbitrary files, search the workspace, recover secrets, or inspect results from another session or process.";
 
 pub const glob_files = ToolSpec{
     .name = "glob_files",
@@ -546,8 +528,8 @@ pub const subagent = ToolSpec{
         .name = "subagent",
         .description = subagent_description,
         .input_schema = .{
-            .properties = &subagent_model_request_properties,
-            .required = &.{"request"},
+            .properties = &subagent_properties,
+            .required = &.{"action"},
             .additional_properties = false,
         },
     },
@@ -677,33 +659,18 @@ pub const vision = ToolSpec{
     .irreversible_fn = vision_impl.isIrreversible,
 };
 
-const read_tool_result_range_properties = [_]model_tool_schema.Property{
-    .{ .name = "handle", .json_type = .string, .description = "Opaque handle from a prior tool-result preview or captured command output, or a saved turn, tool call or earlier compaction ID like M12, T12 or L2." },
-    .{ .name = "start_byte", .json_type = .integer, .description = "Optional 1-based byte offset. Defaults to 1." },
+const read_tool_result_properties = [_]model_tool_schema.Property{
+    .{ .name = "handle", .json_type = .string, .description = "Required unless search is given. Opaque handle from a prior tool-result preview or captured command output, or a saved turn, tool call or earlier compaction ID like M12, T12 or L2." },
+    .{ .name = "query", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = lexical_relevance.max_query_bytes }, .description = "Non-empty literal line query within handle. Use instead of a byte range." },
+    .{ .name = "start_byte", .json_type = .integer, .description = "Optional 1-based byte offset within handle. Defaults to 1." },
     .{ .name = "byte_count", .json_type = .integer, .description = "Optional positive byte count. Bounded by the tool." },
-};
-
-const read_tool_result_query_properties = [_]model_tool_schema.Property{
-    .{ .name = "handle", .json_type = .string, .description = "Opaque handle from a prior tool-result preview or captured command output." },
-    .{ .name = "query", .json_type = .string, .bounds = &.{ .min_length = 1, .max_length = lexical_relevance.max_query_bytes }, .description = "Non-empty literal line query." },
-};
-
-const read_tool_result_search_properties = [_]model_tool_schema.Property{.{
-    .name = "search",
-    .json_type = .array,
-    .bounds = &.{ .min_items = 1, .max_items = compactor.max_search_phrases },
-    .shape = &.{ .array_values = .{ .json_type = .string } },
-    .description = "One to three searches over turns, tool calls and earlier compactions saved by compaction. Words match in any order; rarer words and exact phrases rank higher.",
-}};
-
-const read_tool_result_input_schemas = [_]model_tool_schema.ObjectSchema{
-    .{ .properties = &read_tool_result_range_properties, .required = &.{"handle"}, .additional_properties = false },
-    .{ .properties = &read_tool_result_query_properties, .required = &.{ "handle", "query" }, .additional_properties = false },
-    .{ .properties = &read_tool_result_search_properties, .required = &.{"search"}, .additional_properties = false },
-};
-
-const read_tool_result_request_schema = model_tool_schema.ObjectSchema{
-    .one_of = &read_tool_result_input_schemas,
+    .{
+        .name = "search",
+        .json_type = .array,
+        .bounds = &.{ .min_items = 1, .max_items = compactor.max_search_phrases },
+        .shape = &.{ .array_values = .{ .json_type = .string } },
+        .description = "Use alone, without handle. One to three searches over turns, tool calls and earlier compactions saved by compaction. Words match in any order; rarer words and exact phrases rank higher.",
+    },
 };
 
 pub const read_tool_result = ToolSpec{
@@ -714,13 +681,7 @@ pub const read_tool_result = ToolSpec{
         .name = "read_tool_result",
         .description = read_tool_result_description,
         .input_schema = .{
-            .properties = &.{.{
-                .name = "request",
-                .json_type = .object,
-                .shape = &.{ .object = &read_tool_result_request_schema },
-                .description = "Choose one request: handle plus query, handle plus an optional byte range, or search.",
-            }},
-            .required = &.{"request"},
+            .properties = &read_tool_result_properties,
             .additional_properties = false,
         },
     },
@@ -845,7 +806,7 @@ test "built-in model-facing tool contract stays byte exact" {
 
     const actual_hex = std.fmt.bytesToHex(hasher.finalResult(), .lower);
     try std.testing.expectEqualStrings(
-        "548e468d917181202f38c2e5a29e82fd400f40f5fa267d5f17e066240769674b",
+        "921f1c5cf785e28616633763f261d942f8cd646ba76731d85f6f98febe66b737",
         &actual_hex,
     );
 }
@@ -1309,17 +1270,16 @@ test "built-in subagent owns product metadata schema and callbacks" {
     try std.testing.expectEqualStrings("subagent", subagent.name);
     try std.testing.expect(std.mem.find(u8, subagent.description, "one temporary child") != null);
     try std.testing.expect(std.mem.find(u8, subagent.description, "stable name") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"request\":{") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"request\"]") != null);
-    for ([_][]const u8{ "run", "message" }) |action| {
-        try std.testing.expect(std.mem.find(u8, schema_json, action) != null);
-    }
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"request\"") == null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"oneOf\"") == null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"required\":[\"action\"]") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"enum\":[\"run\",\"message\"]") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"instructions\":") != null);
     // Creation-time routing overrides are advertised on both actions.
     try std.testing.expect(std.mem.find(u8, schema_json, "\"model\":") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"effort\":") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "Inherits the parent's model when omitted") != null);
-    try std.testing.expect(std.mem.find(u8, schema_json, "Rejected when the named child already exists") != null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "rejected for an existing child") != null);
     for ([_][]const u8{
         "\"command\":",
         "\"relationship\":",
@@ -1350,6 +1310,37 @@ test "built-in subagent owns product metadata schema and callbacks" {
     try std.testing.expect(subagent.call == subagent_impl.call);
     try std.testing.expect(subagent.reads_only_fn == subagent_impl.readsOnly);
     try std.testing.expect(subagent.irreversible_fn == subagent_impl.isIrreversible);
+}
+
+test "subagent schema fields match the decoder's action fields" {
+    const actions = [_]struct { name: []const u8, fields: []const []const u8 }{
+        .{ .name = "run", .fields = &subagent_impl.run_fields },
+        .{ .name = "message", .fields = &subagent_impl.message_fields },
+    };
+    // Every advertised property belongs to some action, and every field an
+    // action takes is advertised, so a flat call can always say what it means.
+    for (subagent_properties) |property| {
+        const used = used: for (actions) |action| {
+            for (action.fields) |field| {
+                if (std.mem.eql(u8, field, property.name)) break :used true;
+            }
+        } else false;
+        try std.testing.expect(used);
+    }
+    for (actions) |action| {
+        for (action.fields) |field| {
+            const advertised = for (subagent_properties) |property| {
+                if (std.mem.eql(u8, property.name, field)) break true;
+            } else false;
+            try std.testing.expect(advertised);
+        }
+        const action_property = subagent_properties[0];
+        try std.testing.expectEqualStrings("action", action_property.name);
+        const listed = for (action_property.shape.?.enum_values) |value| {
+            if (std.mem.eql(u8, value, action.name)) break true;
+        } else false;
+        try std.testing.expect(listed);
+    }
 }
 
 test "built-in install_skill registers run_command compatibility" {
@@ -1596,30 +1587,23 @@ test "built-in read_tool_result owns product metadata schema and callbacks" {
 
     try std.testing.expectEqualStrings("read_tool_result", read_tool_result.name);
     try std.testing.expect(std.mem.find(u8, read_tool_result.description, "opaque handle from the active session or process") != null);
-    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "Pass request.query") != null);
+    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "Pass handle with query") != null);
+    try std.testing.expect(std.mem.find(u8, read_tool_result.description, "request.") == null);
     try std.testing.expect(std.mem.find(u8, read_tool_result.description, "inspect results from another session or process") != null);
     try std.testing.expect(std.mem.find(u8, schema_json, "\"mode\"") == null);
+    try std.testing.expect(std.mem.find(u8, schema_json, "\"oneOf\"") == null);
     const input_schema = parsed.value.object.get("inputSchema").?.object;
     try std.testing.expectEqualStrings("object", input_schema.get("type").?.string);
-    try std.testing.expectEqualStrings("request", input_schema.get("required").?.array.items[0].string);
+    // Search needs no handle, so no field is required by every call.
+    try std.testing.expect(input_schema.get("required") == null);
     try std.testing.expect(!input_schema.get("additionalProperties").?.bool);
-    const request = input_schema.get("properties").?.object.get("request").?.object;
-    const alternatives = request.get("oneOf").?.array.items;
-    try std.testing.expectEqual(@as(usize, 3), alternatives.len);
-    const range = alternatives[0].object;
-    const query = alternatives[1].object;
-    const search = alternatives[2].object;
-    try std.testing.expectEqualStrings("search", search.get("required").?.array.items[0].string);
-    try std.testing.expectEqual(@as(i64, 3), search.get("properties").?.object.get("search").?.object.get("maxItems").?.integer);
-    try std.testing.expect(search.get("properties").?.object.get("handle") == null);
-    try std.testing.expect(range.get("properties").?.object.get("query") == null);
-    try std.testing.expect(query.get("properties").?.object.get("start_byte") == null);
-    try std.testing.expect(query.get("properties").?.object.get("byte_count") == null);
-    try std.testing.expectEqualStrings("handle", range.get("required").?.array.items[0].string);
-    try std.testing.expectEqualStrings("handle", query.get("required").?.array.items[0].string);
-    try std.testing.expectEqualStrings("query", query.get("required").?.array.items[1].string);
-    try std.testing.expect(!range.get("additionalProperties").?.bool);
-    try std.testing.expect(!query.get("additionalProperties").?.bool);
+    const properties = input_schema.get("properties").?.object;
+    try std.testing.expect(properties.get("request") == null);
+    for ([_][]const u8{ "handle", "query", "start_byte", "byte_count", "search" }) |name| {
+        try std.testing.expect(properties.get(name) != null);
+    }
+    try std.testing.expectEqual(@as(i64, 3), properties.get("search").?.object.get("maxItems").?.integer);
+    try std.testing.expect(std.mem.find(u8, properties.get("search").?.object.get("description").?.string, "without handle") != null);
     try std.testing.expectEqual(tool_dispatch.ExecutorKind.read_tool_result, read_tool_result.executor_kind);
     try std.testing.expectEqual(types.ToolActivityKind.read, read_tool_result.activity_kind);
     try std.testing.expect(!read_tool_result.requires_approval);

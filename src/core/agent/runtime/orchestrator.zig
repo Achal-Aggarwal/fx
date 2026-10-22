@@ -298,54 +298,12 @@ fn reset_recovery_after_immediate_steering(
     tool_evidence.* = .none;
 }
 
-fn request_union_schema_advertised(
-    advertised_functions: []const model_tool_schema.FunctionSchema,
-    tool_name: []const u8,
-) bool {
-    for (advertised_functions) |function| {
-        if (!std.mem.eql(u8, function.name, tool_name)) continue;
-        return model_tool_schema.isSingleRequiredObjectUnionField(
-            function.input_schema,
-            "request",
-        );
-    }
-    return false;
-}
-
-fn subagent_request_schema_advertised(
-    advertised_functions: []const model_tool_schema.FunctionSchema,
-) bool {
-    for (advertised_functions) |function| {
-        if (!std.mem.eql(u8, function.name, "subagent")) continue;
-        return model_tool_schema.isSingleRequiredObjectUnionField(
-            function.input_schema,
-            "request",
-        );
-    }
-    return false;
-}
-
-fn read_tool_result_request_schema_advertised(
-    advertised_functions: []const model_tool_schema.FunctionSchema,
-) bool {
-    return request_union_schema_advertised(
-        advertised_functions,
-        "read_tool_result",
-    );
-}
-
-fn terminal_request_normalization_eligible(
-    base_nested_terminal_advertised: bool,
-    vision_mode: runtime_gateway_step.VisionToolMode,
-) bool {
-    return base_nested_terminal_advertised and vision_mode != .required;
-}
-
-fn subagent_request_normalization_eligible(
-    base_nested_subagent_advertised: bool,
-    vision_mode: runtime_gateway_step.VisionToolMode,
-) bool {
-    return base_nested_subagent_advertised and vision_mode != .required;
+/// shell, subagent, and read_tool_result are advertised with top-level
+/// arguments. Every step except a required vision call, which offers no other
+/// tool, unwraps an exact {"request":{...}} a model sends out of habit and
+/// replays stored wrapped calls with top-level arguments.
+fn request_unwrap_eligible(vision_mode: runtime_gateway_step.VisionToolMode) bool {
+    return vision_mode != .required;
 }
 
 fn terminal_action_is(object: std.json.ObjectMap, action_name: []const u8) bool {
@@ -409,6 +367,8 @@ fn normalize_terminal_model_input(
     return true;
 }
 
+/// Returns the top-level arguments of an exact {"request":{...}}
+/// read_tool_result call, or null to replay the call as it was sent.
 fn projected_read_tool_result_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
@@ -423,16 +383,13 @@ fn projected_read_tool_result_arguments(
         else => null,
     };
     defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    if (parsed.value.object.count() == 1 and
-        parsed.value.object.get("request") != null)
-    {
-        return null;
-    }
+    if (parsed.value != .object or parsed.value.object.count() != 1) return null;
+    const request = parsed.value.object.get("request") orelse return null;
+    if (request != .object) return null;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(.{ .request = parsed.value }, .{}, &out.writer) catch
+    std.json.Stringify.value(request, .{}, &out.writer) catch
         return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
@@ -1142,7 +1099,9 @@ test "subagent history makes every removed manager action inert" {
     );
     try std.testing.expect(projected.ptr != messages[0..].ptr);
     try std.testing.expectEqual(@as(usize, 1), projected[0].tool_calls.len);
-    try std.testing.expectEqualStrings(calls[2].arguments_json, projected[0].tool_calls[0].arguments_json);
+    // A stored wrapped call replays with the top-level arguments the schema
+    // now advertises.
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"task\":\"current\"}", projected[0].tool_calls[0].arguments_json);
     try std.testing.expectEqual(types.ChatRole.tool, projected[1].role);
     try std.testing.expectEqualStrings("current-run", projected[1].tool_call_id.?);
     try std.testing.expect(std.mem.find(u8, projected[1].content.?, "operation_id") == null);
@@ -1289,6 +1248,8 @@ fn managed_subagent_action(action: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Returns the top-level arguments of an exact {"request":{...}} subagent call
+/// whose action is run or message, or null to keep the call as it was sent.
 fn normalized_subagent_request_arguments(
     alloc: Allocator,
     arguments_json: []const u8,
@@ -1298,31 +1259,15 @@ fn normalized_subagent_request_arguments(
         else => return null,
     };
     defer parsed.deinit();
-    if (parsed.value != .object) return null;
-    const arena = parsed.arena.allocator();
+    if (parsed.value != .object or parsed.value.object.count() != 1) return null;
+    const request = parsed.value.object.get("request") orelse return null;
+    if (request != .object) return null;
+    const action = request.object.get("action") orelse return null;
+    if (action != .string or managed_subagent_action(action.string) == null) return null;
 
-    if (parsed.value.object.getPtr("request")) |request| {
-        if (parsed.value.object.count() != 1 or request.* != .object) return null;
-        const action = request.object.getPtr("action") orelse return null;
-        if (action.* != .string) return null;
-        const canonical = managed_subagent_action(action.string) orelse return null;
-        if (std.mem.eql(u8, canonical, action.string)) return null;
-        action.* = .{ .string = canonical };
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-        std.json.Stringify.value(parsed.value, .{}, &out.writer) catch return error.OutOfMemory;
-        return try out.toOwnedSlice();
-    }
-
-    const action = parsed.value.object.getPtr("action") orelse return null;
-    if (action.* != .string) return null;
-    const canonical = managed_subagent_action(action.string) orelse return null;
-    action.* = .{ .string = canonical };
     var out: std.Io.Writer.Allocating = .init(alloc);
     defer out.deinit();
-    std.json.Stringify.value(.{ .request = parsed.value }, .{}, &out.writer) catch
-        return error.OutOfMemory;
-    _ = arena;
+    std.json.Stringify.value(request, .{}, &out.writer) catch return error.OutOfMemory;
     return try out.toOwnedSlice();
 }
 
@@ -1461,43 +1406,30 @@ fn normalize_subagent_request_tool_calls(
     return normalized orelse source;
 }
 
-test "subagent request normalization follows effective attempt advertisement" {
+test "subagent intake unwraps an exact request wrapper" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const nested = tool_dispatch.Tool{
+    const tool = tool_dispatch.Tool{
         .name = "subagent",
         .description = "subagent",
-        .model_schema = .{
-            .name = "subagent",
-            .description = "subagent",
-            .input_schema = .{
-                .properties = &.{.{
-                    .name = "request",
-                    .json_type = .object,
-                    .shape = &.{ .object = &.{ .one_of = &.{.{}} } },
-                }},
-                .required = &.{"request"},
-                .additional_properties = false,
-            },
-        },
+        .model_schema = .{ .name = "subagent", .description = "subagent" },
         .executor_kind = .subagent,
         .decode = undefined,
         .call = undefined,
         .reads_only_fn = undefined,
         .irreversible_fn = undefined,
     };
-    const registry = tool_dispatch.Registry{ .tools = &.{nested} };
+    const registry = tool_dispatch.Registry{ .tools = &.{tool} };
     const calls = [_]ToolCall{
         .{ .id = "flat", .name = "subagent", .arguments_json = "{\"action\":\"run\",\"task\":\"review\"}" },
         .{ .id = "message", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review\"}}" },
-        .{ .id = "canonical", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"canonical\"}}" },
+        .{ .id = "run", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"wrapped\"}}" },
         .{ .id = "legacy", .name = "subagent", .arguments_json = "{\"command\":{\"lifecycle\":{\"id\":\"child-4\",\"action\":\"cancel\"}}}" },
+        .{ .id = "unknown-action", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"wait\"}}" },
+        .{ .id = "beside", .name = "subagent", .arguments_json = "{\"request\":{\"action\":\"run\",\"task\":\"a\"},\"task\":\"b\"}" },
     };
 
-    try std.testing.expect(subagent_request_schema_advertised(&.{nested.model_schema}));
-    try std.testing.expect(subagent_request_normalization_eligible(true, .optional));
-    try std.testing.expect(!subagent_request_normalization_eligible(true, .required));
     const normalized = try normalize_subagent_request_tool_calls(
         arena,
         registry,
@@ -1505,16 +1437,17 @@ test "subagent request normalization follows effective attempt advertisement" {
         &calls,
     );
     try std.testing.expect(normalized.ptr != calls[0..].ptr);
+    try std.testing.expectEqual(calls[0].arguments_json.ptr, normalized[0].arguments_json.ptr);
     try std.testing.expectEqualStrings(
-        "{\"request\":{\"action\":\"run\",\"task\":\"review\"}}",
-        normalized[0].arguments_json,
-    );
-    try std.testing.expectEqualStrings(
-        calls[1].arguments_json,
+        "{\"action\":\"message\",\"agent\":\"reviewer\",\"message\":\"review\"}",
         normalized[1].arguments_json,
     );
-    try std.testing.expectEqual(calls[2].arguments_json.ptr, normalized[2].arguments_json.ptr);
-    try std.testing.expectEqual(calls[3].arguments_json.ptr, normalized[3].arguments_json.ptr);
+    try std.testing.expectEqualStrings("{\"action\":\"run\",\"task\":\"wrapped\"}", normalized[2].arguments_json);
+    // Anything but an exact wrapper around a known action reaches the decoder
+    // as sent, which names what is wrong with it.
+    for (calls[3..], normalized[3..]) |call, result| {
+        try std.testing.expectEqual(call.arguments_json.ptr, result.arguments_json.ptr);
+    }
     const ineligible = try normalize_subagent_request_tool_calls(
         arena,
         registry,
@@ -1524,11 +1457,10 @@ test "subagent request normalization follows effective attempt advertisement" {
     try std.testing.expectEqual(calls[0..].ptr, ineligible.ptr);
 }
 
-test "nested request normalization skips required vision calls" {
-    try std.testing.expect(terminal_request_normalization_eligible(true, .unavailable));
-    try std.testing.expect(terminal_request_normalization_eligible(true, .optional));
-    try std.testing.expect(!terminal_request_normalization_eligible(true, .required));
-    try std.testing.expect(!terminal_request_normalization_eligible(false, .unavailable));
+test "request unwrapping skips only required vision calls" {
+    try std.testing.expect(request_unwrap_eligible(.unavailable));
+    try std.testing.expect(request_unwrap_eligible(.optional));
+    try std.testing.expect(!request_unwrap_eligible(.required));
 }
 
 test "terminal model write input normalizes every atomic payload" {
@@ -1608,13 +1540,15 @@ test "shell history replays stored calls as sent" {
     try std.testing.expectEqual(messages[0..].ptr, projected.ptr);
 }
 
-test "legacy read_tool_result history gains one nested request wrapper" {
+test "wrapped read_tool_result history replays with top-level arguments" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const calls = [_]ToolCall{
-        .{ .id = "legacy", .name = "read_tool_result", .arguments_json = "{\"handle\":\"legacy.bin\",\"start_byte\":1,\"byte_count\":160}" },
+        .{ .id = "flat", .name = "read_tool_result", .arguments_json = "{\"handle\":\"flat.bin\",\"start_byte\":1,\"byte_count\":160}" },
         .{ .id = "nested", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"new.bin\",\"query\":\"needle\"}}" },
+        .{ .id = "beside", .name = "read_tool_result", .arguments_json = "{\"request\":{\"handle\":\"a.bin\"},\"query\":\"b\"}" },
+        .{ .id = "string", .name = "read_tool_result", .arguments_json = "{\"request\":\"{}\"}" },
     };
     const messages = [_]ChatMessage{.{ .role = .assistant, .tool_calls = &calls }};
 
@@ -1624,17 +1558,17 @@ test "legacy read_tool_result history gains one nested request wrapper" {
         &messages,
     );
     try std.testing.expect(projected.ptr != messages[0..].ptr);
+    try std.testing.expectEqual(calls[0].arguments_json.ptr, projected[0].tool_calls[0].arguments_json.ptr);
     try std.testing.expectEqualStrings(
-        "{\"request\":{\"handle\":\"legacy.bin\",\"start_byte\":1,\"byte_count\":160}}",
-        projected[0].tool_calls[0].arguments_json,
-    );
-    try std.testing.expectEqualStrings(
-        calls[1].arguments_json,
+        "{\"handle\":\"new.bin\",\"query\":\"needle\"}",
         projected[0].tool_calls[1].arguments_json,
     );
+    // Only an exact wrapper around an object is unwrapped.
+    try std.testing.expectEqual(calls[2].arguments_json.ptr, projected[0].tool_calls[2].arguments_json.ptr);
+    try std.testing.expectEqual(calls[3].arguments_json.ptr, projected[0].tool_calls[3].arguments_json.ptr);
     try std.testing.expectEqualStrings(
-        "{\"handle\":\"legacy.bin\",\"start_byte\":1,\"byte_count\":160}",
-        messages[0].tool_calls[0].arguments_json,
+        "{\"request\":{\"handle\":\"new.bin\",\"query\":\"needle\"}}",
+        messages[0].tool_calls[1].arguments_json,
     );
 
     const idempotent = try project_read_tool_result_request_messages(
@@ -5554,14 +5488,6 @@ fn processQueuedPromptInner(
         }
     }
 
-    const base_nested_subagent_advertised = subagent_request_schema_advertised(
-        config.advertised_functions,
-    );
-    const base_nested_read_tool_result_advertised =
-        read_tool_result_request_schema_advertised(
-            config.advertised_functions,
-        );
-
     var stable_prefix: std.ArrayList(ChatMessage) = .empty;
     defer stable_prefix.deinit(arena);
 
@@ -5811,8 +5737,6 @@ fn processQueuedPromptInner(
         prepared_job,
         .{ .catalog = if (skill_section) |*section| section else null, .explicit = if (explicit_section) |*section| section else null },
         request_capabilities,
-        base_nested_subagent_advertised,
-        base_nested_read_tool_result_advertised,
         finalization,
         arena,
         turn_id,
@@ -6710,8 +6634,6 @@ fn processQueuedPromptLoop(
     job: QueuedPrompt,
     skills: PreparedSkills,
     initial_request_capabilities: model_capabilities.Capabilities,
-    base_nested_subagent_advertised: bool,
-    base_nested_read_tool_result_advertised: bool,
     finalization: *TurnFinalizationGuard,
     arena: Allocator,
     turn_id: u64,
@@ -7261,23 +7183,12 @@ fn processQueuedPromptLoop(
                     recovery_source_messages.len - projected_request_messages.len,
                 });
             }
-            // Shell is advertised flat; every step except a required vision
-            // call still unwraps an exact {"request":{...}} a model sends out of
-            // habit and maps legacy terminal history onto shell.
-            const terminal_request_eligible = vision_mode != .required;
-            const subagent_request_eligible = subagent_request_normalization_eligible(
-                base_nested_subagent_advertised,
-                vision_mode,
-            );
-            const read_tool_result_request_eligible =
-                terminal_request_normalization_eligible(
-                    base_nested_read_tool_result_advertised,
-                    vision_mode,
-                );
+            // Also maps legacy terminal history onto shell.
+            const request_unwrap = request_unwrap_eligible(vision_mode);
             const terminal_request_messages = try project_terminal_request_messages(
                 overlay_arena,
                 deps.tool_registry,
-                terminal_request_eligible,
+                request_unwrap,
                 projected_request_messages,
                 deps.agent_stream_provider,
                 .{ .provider = job.provider, .model = gateway_model },
@@ -7285,7 +7196,7 @@ fn processQueuedPromptLoop(
             const subagent_request_messages = try project_subagent_request_messages(
                 overlay_arena,
                 deps.tool_registry,
-                subagent_request_eligible,
+                request_unwrap,
                 terminal_request_messages,
                 deps.agent_stream_provider,
                 .{ .provider = job.provider, .model = gateway_model },
@@ -7300,7 +7211,7 @@ fn processQueuedPromptLoop(
             // Images the session dropped leave every request as notes.
             const result_request_messages = try image_attachments.withholdDroppedImages(overlay_arena, try project_read_tool_result_request_messages(
                 overlay_arena,
-                read_tool_result_request_eligible,
+                request_unwrap,
                 subagent_request_messages,
             ));
             const materialized_messages = if (image_choice.route == .native) native: {
@@ -8154,13 +8065,13 @@ fn processQueuedPromptLoop(
                 completion.tool_calls = try normalize_terminal_request_tool_calls(
                     arena,
                     deps.tool_registry,
-                    terminal_request_eligible,
+                    request_unwrap,
                     completion.tool_calls,
                 );
                 completion.tool_calls = try normalize_subagent_request_tool_calls(
                     arena,
                     deps.tool_registry,
-                    subagent_request_eligible,
+                    request_unwrap,
                     completion.tool_calls,
                 );
             }
