@@ -18,6 +18,7 @@ test {
     _ = @import("core/shell_command/command_lex.zig");
     _ = @import("core/skills/skill_contract.zig");
     _ = @import("core/skills/skill_invocation.zig");
+    _ = @import("core/terminal/engine.zig");
     _ = @import("core/tooling/command_output_content.zig");
     _ = @import("core/workspace/file_index.zig");
     _ = @import("gateway/chat_completions_protocol.zig");
