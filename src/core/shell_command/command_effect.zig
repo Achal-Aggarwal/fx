@@ -2060,7 +2060,11 @@ fn checkShellParity(command: []const u8, mode: ParityMode) !void {
     const expectations = try parityExpectations(arena, command);
     if (expectations.len == 0) {
         if (mode == .if_run_without_review) return;
-        std.debug.print("expected fx to run this command without review: {s}\n", .{command});
+        // The failure output names the command fx reviews.
+        std.testing.expectEqualStrings(
+            try arena.print("fx runs without review: {s}", .{command}),
+            try arena.print("fx reviews: {s}", .{command}),
+        ) catch {};
         return error.TestExpectedReviewFreeCommand;
     }
     for (parity_shells) |shell| {
@@ -2083,7 +2087,8 @@ fn parityShellPath(shell: ParityShell) !?[]const u8 {
         return path;
     }
     if (@import("../shared/io.zig").getenv("FX_SHELL_PARITY_ALL_SHELLS") != null) {
-        std.debug.print("the shell parity tests need {s}\n", .{shell.name});
+        // The failure output names the path where the shell was expected.
+        std.testing.expectEqualStrings(shell.paths[0], "") catch {};
         return error.TestShellParityShellMissing;
     }
     return null;
@@ -2203,12 +2208,42 @@ fn expectParity(
     };
     if (exited_cleanly and run.created.len == 0 and sameParityRecords(expected, actual)) return;
 
-    std.debug.print("shell parity mismatch in {s} for: {s}\n", .{ shell_name, command });
-    printParityRecords("fx parsed", expectation.stages);
-    printParityRecords("shell ran", run.records);
-    std.debug.print("  term: {any}\n  stderr: {s}\n", .{ run.term, run.stderr });
-    for (run.created) |name| std.debug.print("  created: {s}\n", .{name});
+    // The failure output shows what fx parsed against what the shell ran.
+    const term = switch (run.term) {
+        .exited => |code| try arena.print("exited {d}", .{code}),
+        else => try arena.print("{any}", .{run.term}),
+    };
+    std.testing.expectEqualStrings(
+        try parityReport(arena, shell_name, command, expected, "exited 0", "", &.{}),
+        try parityReport(arena, shell_name, command, actual, term, run.stderr, run.created),
+    ) catch {};
     return error.TestShellParityMismatch;
+}
+
+/// One parity run as text: each record on its own line, then how the shell
+/// ended and anything it created.
+fn parityReport(
+    arena: std.mem.Allocator,
+    shell_name: []const u8,
+    command: []const u8,
+    records: []const []const []const u8,
+    term: []const u8,
+    stderr: []const u8,
+    created: []const []const u8,
+) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const writer = &out.writer;
+    try writer.print("{s} for: {s}\n", .{ shell_name, command });
+    for (records) |record| {
+        try writer.writeByte('[');
+        for (record, 0..) |field, index| {
+            try writer.print("{s}\"{f}\"", .{ if (index == 0) "" else " ", std.zig.fmtString(field) });
+        }
+        try writer.writeAll("]\n");
+    }
+    try writer.print("term: {s}\nstderr: {s}\n", .{ term, stderr });
+    for (created) |name| try writer.print("created: {s}\n", .{name});
+    return out.written();
 }
 
 fn sortedParityRecords(
@@ -2240,18 +2275,6 @@ fn sameParityRecords(expected: []const []const []const u8, actual: []const []con
         }
     }
     return true;
-}
-
-fn printParityRecords(label: []const u8, records: []const []const []const u8) void {
-    std.debug.print("  {s}:", .{label});
-    for (records) |record| {
-        std.debug.print(" [", .{});
-        for (record, 0..) |field, index| {
-            std.debug.print("{s}\"{f}\"", .{ if (index == 0) "" else " ", std.zig.fmtString(field) });
-        }
-        std.debug.print("]", .{});
-    }
-    std.debug.print("\n", .{});
 }
 
 /// Every form of command that fx runs without review. Each must still be
