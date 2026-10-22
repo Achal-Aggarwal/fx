@@ -24,7 +24,11 @@ jobs:
   tsan:
     name: Unit tests with ThreadSanitizer
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
+    env:
+      # Report every race, keep running, and leave the exit status to the
+      # tests themselves.
+      TSAN_OPTIONS: halt_on_error=0:abort_on_error=0:exitcode=0
     steps:
       - uses: actions/checkout@v4
 
@@ -36,14 +40,22 @@ jobs:
           version: "0.17.0"
           cache-key: ci-unit-ReleaseSafe
 
-      - name: Run the unit tests
-        env:
-          # Report every race, keep running, and leave the exit status to the
-          # tests themselves.
-          TSAN_OPTIONS: halt_on_error=0:abort_on_error=0:exitcode=0
+      # The session manager's tests take a minute, so their races are always
+      # reported, even if the fx tests below run out of time.
+      - name: Run the session manager tests
+        timeout-minutes: 20
         run: |
           set -o pipefail
-          zig build test -Dsanitize-thread=true --summary all 2>&1 | tee tsan.log
+          zig build test-session-manager -Doptimize=ReleaseSafe -Dsanitize-thread=true --summary all 2>&1 | tee -a tsan.log
+        continue-on-error: true
+
+      # ReleaseSafe, as the CI unit tests use, runs far faster than Debug
+      # under ThreadSanitizer.
+      - name: Run the fx unit tests
+        timeout-minutes: 80
+        run: |
+          set -o pipefail
+          zig build test -Doptimize=ReleaseSafe -Dsanitize-thread=true --summary all 2>&1 | tee -a tsan.log
         continue-on-error: true
 
       - name: Summarize races
