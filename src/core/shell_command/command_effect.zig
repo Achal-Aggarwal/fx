@@ -120,9 +120,12 @@ fn reversibleAutoStage(raw_tokens: []const command_lex.ArgvToken) bool {
     return false;
 }
 
+// `^` and `#` are globs in zsh with `extendedglob`, which fx replays from the
+// user's startup files: `^x` matches every file not named `x`, and `x#`
+// matches any run of `x`, so a workspace file could supply the word.
 fn tokenHasDynamicShellSyntax(raw: []const u8) bool {
     for (raw) |byte| switch (byte) {
-        '$', '`', '*', '?', '[', '~', '\n', '\r', ';', '(', ')', '{', '}' => return true,
+        '$', '`', '*', '?', '[', '~', '^', '#', '\n', '\r', ';', '(', ')', '{', '}' => return true,
         else => {},
     };
     return false;
@@ -297,6 +300,11 @@ test "known reversible auto commands exclude destructive and hidden effects" {
         "git fetch '--upload-pack=x' .",
         // A filter turns a full clone into a partial clone.
         "git fetch --filter=blob:none origin",
+        // zsh's `extendedglob` expands these to workspace file names.
+        "git fetch ^nomatch .",
+        "git fetch --prun#e",
+        "npm install react@^18",
+        "npm test x##",
     }) |command| {
         try std.testing.expect(!try knownReversibleAutoCommand(
             std.testing.allocator,
