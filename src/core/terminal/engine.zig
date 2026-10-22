@@ -640,7 +640,9 @@ pub const Grid = struct {
                         continue;
                     }
                     const expected = std.unicode.utf8ByteSequenceLength(b) catch 1;
-                    if (expected > 1 and i + expected > bytes.len) {
+                    // Keep only a sequence the next read can still complete;
+                    // anything else is written now, so no text after it waits.
+                    if (expected > 1 and i + expected > bytes.len and allUtf8Continuations(bytes[i + 1 ..])) {
                         const tail = bytes[i..];
                         @memcpy(self.utf8_buffer[0..tail.len], tail);
                         self.utf8_len = @intCast(tail.len);
@@ -809,9 +811,7 @@ pub const Grid = struct {
     fn completePendingUtf8(self: *Grid, bytes: []const u8) !usize {
         if (bytes.len == 0) return 0;
         if (bytes[0] & 0xc0 != 0x80) {
-            self.utf8_len = 0;
-            self.utf8_expected = 0;
-            _ = try self.writeByte("\xef\xbf\xbd", 0);
+            try self.writePendingUtf8();
             return 0;
         }
         const needed = self.utf8_expected - self.utf8_len;
@@ -822,15 +822,21 @@ pub const Grid = struct {
         );
         self.utf8_len += @intCast(count);
         if (self.utf8_len != self.utf8_expected) return count;
-        const complete = self.utf8_buffer[0..self.utf8_len];
+        try self.writePendingUtf8();
+        return count;
+    }
+
+    /// Writes the pending bytes as they would be written had they arrived in
+    /// one read: a valid sequence as its character, and a broken or
+    /// interrupted one as one replacement character per byte.
+    fn writePendingUtf8(self: *Grid) !void {
+        var pending: @TypeOf(self.utf8_buffer) = undefined;
+        const len = self.utf8_len;
+        @memcpy(pending[0..len], self.utf8_buffer[0..len]);
         self.utf8_len = 0;
         self.utf8_expected = 0;
-        if (!std.unicode.utf8ValidateSlice(complete)) {
-            _ = try self.writeByte("\xef\xbf\xbd", 0);
-        } else {
-            _ = try self.writeByte(complete, 0);
-        }
-        return count;
+        var index: usize = 0;
+        while (index < len) index += try self.writeByte(pending[0..len], index);
     }
 
     fn dispatchDcsAndFinish(self: *Grid) !void {
@@ -2601,7 +2607,11 @@ fn encodeGridState(encoder: *CheckpointEncoder, grid: Grid) !void {
     try encoder.sizedBytes(grid.osc_buffer.items);
     try encoder.boolean(grid.dcs_saw_esc);
     try encoder.sizedBytes(grid.dcs_buffer.items);
-    try encoder.bytes(&grid.utf8_buffer);
+    // Only the pending bytes are state. The rest of the buffer can still hold
+    // bytes of a sequence that already finished.
+    var pending_utf8: @TypeOf(grid.utf8_buffer) = @splat(0);
+    @memcpy(pending_utf8[0..grid.utf8_len], grid.utf8_buffer[0..grid.utf8_len]);
+    try encoder.bytes(&pending_utf8);
     try encoder.int(u8, grid.utf8_len);
     try encoder.int(u8, grid.utf8_expected);
     try encodeHyperlinkPool(encoder, grid.hyperlink_pool.items);
@@ -3332,6 +3342,13 @@ fn clampSub(v: u16, sub: u16, lo: u16) u16 {
 }
 
 const DecodedRune = struct { codepoint: u21, len: usize };
+
+fn allUtf8Continuations(bytes: []const u8) bool {
+    for (bytes) |byte| {
+        if (byte & 0xc0 != 0x80) return false;
+    }
+    return true;
+}
 
 fn decodeUtf8(bytes: []const u8, start: usize) DecodedRune {
     const b = bytes[start];
@@ -4561,6 +4578,54 @@ test "tabs alternate screen and fragmented UTF-8 preserve cell invariants" {
     try grid.feed("\x8ce");
     try grid.feed("\xcc\x81");
     try expectWideCellInvariant(grid);
+}
+
+test "text after broken UTF-8 at the end of a read appears at once" {
+    var grid = try Grid.init(testing.allocator, 8, 1);
+    defer grid.deinit();
+    // Latin-1 `é` is a UTF-8 lead byte that no continuation byte follows.
+    try grid.feed("caf\xe9!");
+    try expectRow(grid, 1, "caf\u{fffd}!");
+    const payload = try grid.checkpointPayload(testing.allocator);
+    defer testing.allocator.free(payload);
+}
+
+test "UTF-8 gives the same state however the output is split into reads" {
+    const cases = [_][]const u8{
+        "caf\xe9!",
+        "\xe2a",
+        "\xe2\x80A",
+        "\xe0\x80\x80x",
+        "\xed\xa0\x80x",
+        "\xf0\x9f\x98",
+        "\xe7\x95\x8c\xbaz",
+        "\xe7\x95\x8c",
+        "e\xcc\x81!",
+    };
+    for (cases) |bytes| {
+        var whole = try Grid.init(testing.allocator, 8, 1);
+        defer whole.deinit();
+        try whole.feed(bytes);
+        const expected = try whole.checkpointPayload(testing.allocator);
+        defer testing.allocator.free(expected);
+
+        for (1..bytes.len) |split| {
+            var parts = try Grid.init(testing.allocator, 8, 1);
+            defer parts.deinit();
+            try parts.feed(bytes[0..split]);
+            try parts.feed(bytes[split..]);
+            const actual = try parts.checkpointPayload(testing.allocator);
+            defer testing.allocator.free(actual);
+            try testing.expectEqualSlices(u8, expected, actual);
+        }
+
+        var single_bytes = try Grid.init(testing.allocator, 8, 1);
+        defer single_bytes.deinit();
+        for (bytes) |byte| try single_bytes.feed(&.{byte});
+        const actual = try single_bytes.checkpointPayload(testing.allocator);
+        defer testing.allocator.free(actual);
+        try testing.expectEqualSlices(u8, expected, actual);
+    }
 }
 
 test "fragmented native queries emit one ordered reply and observational modes emit none" {
