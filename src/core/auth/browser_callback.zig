@@ -355,46 +355,45 @@ const callback_logo = "<svg class=\"brand\" width=\"64\" height=\"64\" viewBox=\
     "\"/></g></svg>";
 
 /// The browser page after a sign-in returns, matching the fx.sh sign-in pages.
-/// Only the title and detail differ between outcomes, so the shared markup is
-/// stored once and written around them.
-const callback_page_head = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" ++
-    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" ++
-    "<title>fx</title><style>" ++
-    ":root{color-scheme:light dark;font-family:\"Geist Mono\",ui-monospace,SFMono-Regular,Menlo,monospace;" ++
-    "--background:#fff;--foreground:#171717;--muted:#666;--border:#e5e5e5}" ++
-    "@media(prefers-color-scheme:dark){:root{--background:#0a0a0a;--foreground:#ededed;--muted:#a1a1a1;--border:#333}}" ++
-    "*{box-sizing:border-box}" ++
-    "body{margin:0;min-height:100vh;min-height:100svh;padding:32px 24px;display:grid;place-items:center;" ++
-    "background:var(--background);color:var(--foreground);-webkit-font-smoothing:antialiased}" ++
-    "main{width:100%;max-width:400px;text-align:center}" ++
-    ".brand{display:block;width:64px;height:64px;margin:0 auto 28px;border:1px solid var(--border);border-radius:14px}" ++
-    "h1{margin:0;font-size:24px;line-height:1.25;font-weight:600;letter-spacing:-.025em}" ++
-    "p{margin:16px 0 0;font-size:14px;line-height:1.65;color:var(--muted)}" ++
-    "</style></head><body><main>" ++ callback_logo ++ "<h1>";
-const callback_page_middle = "</h1><p>";
-const callback_page_tail = "</p></main></body></html>";
-
-const CallbackPage = struct { title: []const u8, detail: []const u8 };
+fn callbackPage(comptime title: []const u8, comptime detail: []const u8) []const u8 {
+    return "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">" ++
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">" ++
+        "<title>fx</title><style>" ++
+        ":root{color-scheme:light dark;font-family:\"Geist Mono\",ui-monospace,SFMono-Regular,Menlo,monospace;" ++
+        "--background:#fff;--foreground:#171717;--muted:#666;--border:#e5e5e5}" ++
+        "@media(prefers-color-scheme:dark){:root{--background:#0a0a0a;--foreground:#ededed;--muted:#a1a1a1;--border:#333}}" ++
+        "*{box-sizing:border-box}" ++
+        "body{margin:0;min-height:100vh;min-height:100svh;padding:32px 24px;display:grid;place-items:center;" ++
+        "background:var(--background);color:var(--foreground);-webkit-font-smoothing:antialiased}" ++
+        "main{width:100%;max-width:400px;text-align:center}" ++
+        ".brand{display:block;width:64px;height:64px;margin:0 auto 28px;border:1px solid var(--border);border-radius:14px}" ++
+        "h1{margin:0;font-size:24px;line-height:1.25;font-weight:600;letter-spacing:-.025em}" ++
+        "p{margin:16px 0 0;font-size:14px;line-height:1.65;color:var(--muted)}" ++
+        "</style></head><body><main>" ++ callback_logo ++
+        "<h1>" ++ title ++ "</h1><p>" ++ detail ++ "</p></main></body></html>";
+}
 
 pub fn writeResponse(stream: std.Io.net.Stream, outcome: Response, cors_origin: ?[]const u8) !void {
-    const reply: struct { status: []const u8, page: ?CallbackPage = null, body: []const u8 = "" } = switch (outcome) {
+    const reply: struct { status: []const u8, body: []const u8 } = switch (outcome) {
         .ok => .{
             .status = "200 OK",
-            .page = .{ .title = "Authorization complete", .detail = "Returning you to fx. You can close this tab." },
+            .body = comptime callbackPage(
+                "Authorization complete",
+                "Returning you to fx. You can close this tab.",
+            ),
         },
         .failed => .{
             .status = "400 Bad Request",
-            .page = .{ .title = "Authorization failed", .detail = "Return to fx for details." },
+            .body = comptime callbackPage(
+                "Authorization failed",
+                "Return to fx for details.",
+            ),
         },
         .unrelated => .{
             .status = "404 Not Found",
             .body = "<!doctype html><title>Not found</title>Not found.",
         },
     };
-    const length = if (reply.page) |page|
-        callback_page_head.len + page.title.len + callback_page_middle.len + page.detail.len + callback_page_tail.len
-    else
-        reply.body.len;
     var buffer: [4096]u8 = undefined;
     var writer = stream.writer(io_mod.getIo(), &buffer);
     try writer.interface.print("HTTP/1.1 {s}\r\n", .{reply.status});
@@ -402,18 +401,9 @@ pub fn writeResponse(stream: std.Io.net.Stream, outcome: Response, cors_origin: 
         try writer.interface.print("Access-Control-Allow-Origin: {s}\r\nVary: Origin\r\n", .{origin});
     }
     try writer.interface.print(
-        "Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
-        .{length},
+        "Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ reply.body.len, reply.body },
     );
-    if (reply.page) |page| {
-        try writer.interface.writeAll(callback_page_head);
-        try writer.interface.writeAll(page.title);
-        try writer.interface.writeAll(callback_page_middle);
-        try writer.interface.writeAll(page.detail);
-        try writer.interface.writeAll(callback_page_tail);
-    } else {
-        try writer.interface.writeAll(reply.body);
-    }
     try writer.interface.flush();
 }
 
@@ -813,11 +803,5 @@ test "browser callback permits the xAI CORS private-network preflight" {
     try std.testing.expect(std.mem.find(u8, callback, "<h1>Authorization complete</h1>") != null);
     try std.testing.expect(std.mem.find(u8, callback, "prefers-color-scheme:dark") != null);
     try std.testing.expect(std.mem.find(u8, callback, "<svg class=\"brand\"") != null);
-    // The page is written in pieces; the declared length must cover all of them.
-    const header_end = (std.mem.find(u8, callback, "\r\n\r\n") orelse return error.MissingHeaderEnd) + 4;
-    const length_at = (std.mem.find(u8, callback, "Content-Length: ") orelse return error.MissingContentLength) + "Content-Length: ".len;
-    const length_end = std.mem.findScalarPos(u8, callback, length_at, '\r') orelse return error.MissingContentLength;
-    const declared = try std.fmt.parseInt(usize, callback[length_at..length_end], 10);
-    try std.testing.expectEqual(declared, callback.len - header_end);
     try std.testing.expect(std.mem.endsWith(u8, callback, "</p></main></body></html>"));
 }
