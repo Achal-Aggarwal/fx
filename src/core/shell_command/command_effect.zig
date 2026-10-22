@@ -2073,9 +2073,10 @@ fn checkShellParity(command: []const u8, mode: ParityMode) !void {
     }
 }
 
-/// Finds the shell, or returns null to skip it. The nightly Fuzz workflow
-/// installs every shell and sets `FX_SHELL_PARITY_ALL_SHELLS`, so a missing
-/// shell there fails instead of quietly narrowing the check.
+/// Finds the shell, or returns null to skip it. The Linux unit test job and
+/// the nightly Fuzz workflow install every shell and set
+/// `FX_SHELL_PARITY_ALL_SHELLS`, so a missing shell there fails instead of
+/// quietly narrowing the check.
 fn parityShellPath(shell: ParityShell) !?[]const u8 {
     for (shell.paths) |path| {
         std.Io.Dir.accessAbsolute(std.testing.io, path, .{}) catch continue;
