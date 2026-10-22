@@ -94,6 +94,9 @@ pub const Status = struct {
     last_error: ?[]const u8 = null,
     needs_login: bool = false,
     signed_in: bool = false,
+    /// A login is under way: from `/mcp login` until it signs in, fails,
+    /// or expires, through the requests before its address comes.
+    signing_in: bool = false,
     /// The variable a `missing_env` or `invalid_env` server names.
     missing: ?[]const u8 = null,
     /// What the server told fx to tell the model about it.
@@ -317,6 +320,9 @@ const Login = struct {
     /// The address the browser came back to, kept until the login ends:
     /// The engine reads the code in it when it redeems it.
     callback: ?[]u8 = null,
+    /// The authorization address, once the engine made it, for a login
+    /// asked for again: it shows the same one.
+    url: ?[]u8 = null,
 };
 
 pub const Runtime = struct {
@@ -914,12 +920,23 @@ pub const Runtime = struct {
         const i = r.engineServer(name) orelse return r.finish(req, .{ .failed = if (r.serverIndex(name) == null) error.UnknownServer else error.Held });
         const s = r.resolved.servers[i];
         if (s.transport != .http) return r.finish(req, .{ .failed = error.NotHttp });
+        // The sign-in already under way is the one asked for. Ending it would
+        // close the port its browser comes back to while the engine keeps its
+        // flow, so no sign-in could finish
+        // (`tests/tla/mcp_host/SignIn.tla` FlowHasListener).
+        if (r.loginFor(i)) |l| {
+            l.open_browser = l.open_browser or open_browser;
+            if (l.url) |url| {
+                r.notify(.{ .authorize = .{ .server = s.name, .url = url } });
+                if (open_browser) r.openBrowser(s.name, url);
+            }
+            return r.finish(req, .ok);
+        }
         // A sign-in that couldn't be saved would last only this session.
         r.options.credentials.store.check(r.gpa) catch |err| switch (err) {
             error.CredentialStoreUnreadable => return r.finish(req, .{ .failed = error.CredentialStoreUnreadable }),
             else => debug_trace.logf("mcp", "MCP credential store not checked server={s} err={s}", .{ s.name, @errorName(err) }),
         };
-        r.endLogin(i);
         var listener = loopback.Listener.open(r.io, s.callback_port) catch |err| switch (err) {
             // Only a fixed port can be another app's, and the message names it.
             error.AddressInUse => if (s.callback_port != null) return r.finish(req, .{ .failed = error.CallbackPortInUse }) else return err,
@@ -982,6 +999,12 @@ pub const Runtime = struct {
         };
     }
 
+    /// The URL went out in a notice either way.
+    fn openBrowser(r: *Runtime, name: []const u8, url: []const u8) void {
+        const opened = url_opener.native_opener.open(r.gpa, url) catch false;
+        if (!opened) debug_trace.logf("mcp", "browser not opened for MCP login server={s}", .{name});
+    }
+
     fn loginFor(r: *const Runtime, server: usize) ?*Login {
         for (r.logins.items) |l| if (l.server == server) return l;
         return null;
@@ -992,6 +1015,7 @@ pub const Runtime = struct {
             l.group.cancel(r.io);
             l.listener.close(r.io);
             if (l.callback) |url| r.gpa.free(url);
+            if (l.url) |url| r.gpa.free(url);
             r.gpa.destroy(l);
             _ = r.logins.swapRemove(k);
             return;
@@ -1131,10 +1155,12 @@ pub const Runtime = struct {
                 for (r.logins.items) |l| if (l.server == i) {
                     // Only a return carrying this sign-in's state ends its wait.
                     l.listener.expect(r.io, authorize);
-                    if (!l.open_browser) continue;
-                    // The URL went out in the notice either way.
-                    const opened = url_opener.native_opener.open(r.gpa, authorize) catch false;
-                    if (!opened) debug_trace.logf("mcp", "browser not opened for MCP login server={s}", .{name});
+                    // Out of memory, a login asked for again just doesn't show it.
+                    if (r.gpa.dupe(u8, authorize)) |url| {
+                        if (l.url) |old| r.gpa.free(old);
+                        l.url = url;
+                    } else |_| {}
+                    if (l.open_browser) r.openBrowser(name, authorize);
                 };
             },
             .signed_in => {
@@ -1509,6 +1535,7 @@ pub const Runtime = struct {
             };
             o.needs_login = r.flags[i].needs_login;
             o.signed_in = r.flags[i].signed_in;
+            o.signing_in = r.loginFor(i) != null;
             if (r.engine.instructions(s.name)) |t| o.instructions = try a.dupe(u8, t);
         }
         r.mutex.lockUncancelable(r.io);

@@ -144,6 +144,77 @@ test("contract: a pasted return with a state fx never made redeems nothing, and 
   } finally { fake.stop(); }
 }, 120_000);
 
+// Fixed. Before the fix a second `/mcp login` closed the first one's
+// listener, the port the browser comes back to, while the engine kept the
+// first flow and ignored the second, so no return could finish the sign-in
+// (SignIn.tla FlowHasListener). On the code before it fails here: the second
+// `/mcp login` never shows an address.
+test("contract: a login asked for again while one waits is that login: the same address, its port stays open, and its return signs in (trace ACCEPTED)", async () => {
+  const f = fixture(artifacts, "signin-again");
+  const fake = await startFake(f);
+  writeProfile(f, { web: { type: "http", url: fake.url } });
+  const shell = new Shell(f);
+  const records: TraceRecord[] = [];
+  // The n-th sign-in address the transcript printed, from 0.
+  const address = async (n: number) => {
+    const deadline = Date.now() + 20_000;
+    for (;;) {
+      const found = [...(await shell.tui.captureFullScrollback()).matchAll(/go to:\n\s+(http\S+)/g)].map((m) => m[1]!);
+      if (found.length > n) return found[n]!;
+      if (Date.now() > deadline) throw new Error(`timed out waiting for sign-in address ${n + 1}`);
+      await Bun.sleep(100);
+    }
+  };
+  try {
+    await shell.start({}, 400);
+    records.push({ event: "login", at: Date.now() });
+    await shell.tui.sendText("/mcp login web");
+    const first = await address(0);
+    records.push({ event: "authorize", data: { login: 1 }, at: Date.now(), note: first });
+    const signing = await shell.status({ k: "signing" }, 10_000);
+    expect(signing?.k).toBe("signing");
+    records.push({ event: "status", data: { signing: true }, at: Date.now() });
+    const port = Number(new URL(new URL(first).searchParams.get("redirect_uri")!).port);
+    expect((await probe(port)).result).toBe("open");
+    records.push({ event: "probe", data: { login: 1, result: "open" }, at: Date.now() });
+
+    records.push({ event: "login", at: Date.now() });
+    await shell.tui.sendText("/mcp login web");
+    const again = await address(1);
+    expect(again).toBe(first);
+    const still = await probe(port);
+    records.push({ event: "probe", data: { login: 1, result: still.result }, at: Date.now() });
+
+    const redirect = await fetch(first, { redirect: "manual" });
+    const location = new URL(redirect.headers.get("location")!);
+    records.push({ event: "callback", data: { login: 1, state: 1, kind: "get" }, at: Date.now() });
+    const back = await fetch(location.toString(), { signal: AbortSignal.timeout(10_000) }).catch((e) => ({ status: 0, text: async () => String(e) }));
+    save(join(f.base, "callback.json"), { location: location.toString(), status: back.status, body: (await back.text()).slice(0, 400) });
+    await shell.tui.waitForText("Signed in to web.", 20_000);
+    const ended = Date.now();
+    const tokens = redemptions(fake.entries());
+    for (const t of tokens) records.push({ event: "redeem", data: { login: 1 }, at: Math.min(t.t, ended - 1) });
+    records.push({ event: "signed_in", data: { login: 1 }, at: ended });
+    const after = await probe(port);
+    records.push({ event: "probe", data: { login: 1, result: after.result }, at: Date.now() });
+    records.sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
+    const verdict = await checkTrace({ module: "SignIn", records, dir: join(f.base, "trace"), constants: { ObsMaxLogins: 1, ObsMaxHosts: 1, ObsMaxLeases: 0, ObsBridge: false } });
+    save(join(f.base, "verdict.json"), verdict);
+    expect(still.result).toBe("open");
+    expect(back.status).toBe(200);
+    expect(tokens.length).toBe(1);
+    // The second request started nothing: one client, registered once.
+    expect(fake.entries().filter((e) => e.path?.endsWith("/register")).length).toBe(1);
+    expect(after.result).toBe("closed");
+    expect(verdict.verdict).toBe("ACCEPTED");
+    await shell.quit();
+  } finally {
+    await shell.stop();
+    save(join(f.base, "http-fake-entries.json"), fake.entries());
+    fake.stop();
+  }
+}, 150_000);
+
 // Fixed by stopping the sign-in and saying so. Before the fix this
 // case was a finding: the shell kept saying "Signing in" and the trace broke
 // IndicatorImpliesListener. It fails that way on the code before.
