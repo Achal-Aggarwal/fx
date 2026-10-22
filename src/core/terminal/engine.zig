@@ -1172,15 +1172,15 @@ pub const Grid = struct {
         }
         self.pending_wrap = false;
 
-        // Wide char that doesn't fit: wrap early (autowrap) or clamp.
+        // Wide char that doesn't fit: wrap early (autowrap) or clamp. One
+        // wider than the terminal fits on no line, so it is dropped.
         if (self.cursor_col + width - 1 > self.cols) {
+            if (width > self.cols) return consumed;
             if (self.autowrap) {
                 self.cursor_col = 1;
                 self.advanceRowOrScroll();
-            } else if (self.cols >= width) {
-                self.cursor_col = self.cols - width + 1;
             } else {
-                return consumed;
+                self.cursor_col = self.cols - width + 1;
             }
         }
 
@@ -3786,6 +3786,22 @@ test "resize narrowing clears a wide glyph clipped at the right edge" {
     try g.resize(3, 1);
     try expectWideCellInvariant(g);
     try expectRow(g, 1, "ab");
+}
+
+test "a one-column terminal drops wide characters and still checkpoints" {
+    for ([_][]const u8{ "界", "a界b", "\x1b[?7la界b" }) |bytes| {
+        var g = try Grid.init(testing.allocator, 1, 3);
+        defer g.deinit();
+        try g.feed(bytes);
+        try expectWideCellInvariant(g);
+        const payload = try g.checkpointPayload(testing.allocator);
+        defer testing.allocator.free(payload);
+    }
+    var g = try Grid.init(testing.allocator, 1, 3);
+    defer g.deinit();
+    try g.feed("a界b");
+    try expectRow(g, 1, "a");
+    try expectRow(g, 2, "b");
 }
 
 test "writes clear any complete wide glyph overlapping the destination" {
