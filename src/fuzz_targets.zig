@@ -5,6 +5,7 @@
 //! file imported here and an entry in the registry.
 
 test {
+    _ = @import("acp/jsonrpc.zig");
     _ = @import("acp/mcp_servers.zig");
     _ = @import("core/agent/runtime/vision_contracts.zig");
     _ = @import("core/images/image_data.zig");
