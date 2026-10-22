@@ -810,19 +810,17 @@ pub const Grid = struct {
 
     fn completePendingUtf8(self: *Grid, bytes: []const u8) !usize {
         if (bytes.len == 0) return 0;
-        if (bytes[0] & 0xc0 != 0x80) {
-            try self.writePendingUtf8();
-            return 0;
-        }
+        // Only continuation bytes extend the sequence. Any other byte, such
+        // as the ESC of a following escape sequence, interrupts it.
         const needed = self.utf8_expected - self.utf8_len;
-        const count = @min(bytes.len, needed);
+        var count: usize = 0;
+        while (count < @min(bytes.len, needed) and bytes[count] & 0xc0 == 0x80) count += 1;
         @memcpy(
             self.utf8_buffer[self.utf8_len .. self.utf8_len + count],
             bytes[0..count],
         );
         self.utf8_len += @intCast(count);
-        if (self.utf8_len != self.utf8_expected) return count;
-        try self.writePendingUtf8();
+        if (self.utf8_len == self.utf8_expected or count < bytes.len) try self.writePendingUtf8();
         return count;
     }
 
@@ -4590,9 +4588,19 @@ test "text after broken UTF-8 at the end of a read appears at once" {
     defer testing.allocator.free(payload);
 }
 
+test "an escape sequence after broken UTF-8 split across reads still runs" {
+    var grid = try Grid.init(testing.allocator, 8, 1);
+    defer grid.deinit();
+    try grid.feed("\xe7");
+    try grid.feed("\x95\x1b[31mx");
+    try expectRow(grid, 1, "\u{fffd}\u{fffd}x");
+    try testing.expect(grid.cellAt(1, 3).?.style.fg.eql(.{ .indexed = 1 }));
+}
+
 test "UTF-8 gives the same state however the output is split into reads" {
     const cases = [_][]const u8{
         "caf\xe9!",
+        "\xe7\x95\x1b[31mx",
         "\xe2a",
         "\xe2\x80A",
         "\xe0\x80\x80x",
