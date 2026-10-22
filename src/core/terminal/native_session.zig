@@ -4439,7 +4439,10 @@ test "resize recovery never reflows raw output at final dimensions" {
     try session.engine.rowTextTrimmed(1, &row);
     try std.testing.expectEqualStrings("abcd", row.items);
 
-    const legacy_payload = try alloc.dupe(u8, live_payload);
+    // The previous revision ends before the flag for saved last-column
+    // cells, which this session does not have.
+    try std.testing.expectEqual(@as(u8, 0), live_payload[live_payload.len - 1]);
+    const legacy_payload = try alloc.dupe(u8, live_payload[0 .. live_payload.len - 1]);
     defer alloc.free(legacy_payload);
     std.mem.writeInt(u16, legacy_payload[4..6], terminal_engine.checkpoint_schema_revision - 1, .little);
     try session.durable.store_checkpoint(.{
