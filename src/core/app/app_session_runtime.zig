@@ -690,6 +690,9 @@ fn applySessionPickerCatalogPage(
     append: bool,
 ) !void {
     const workspace = if (picker.scope == .current_workspace) workspace_root else null;
+    // Pages hold only the sessions the search lists, so the search reaches
+    // the whole catalog and "Load more" appears only while matches remain.
+    const query = picker.query();
     var selected_index: ?usize = null;
     var page_limit = limit;
     if (!append) {
@@ -697,9 +700,7 @@ fn applySessionPickerCatalogPage(
         if (picker.selectedId()) |selected_id| {
             var index: usize = 0;
             for (cache.catalog.summaries.items) |summary| {
-                if (workspace) |root| {
-                    if (summary.workspace_root == null or !std.mem.eql(u8, summary.workspace_root.?, root)) continue;
-                }
+                if (!session_catalog.pickerLists(summary, workspace, query)) continue;
                 if (std.mem.eql(u8, summary.id, selected_id)) {
                     selected_index = index;
                     page_limit = @max(page_limit, index + 1);
@@ -709,11 +710,11 @@ fn applySessionPickerCatalogPage(
             }
         }
     }
-    var page = try session_summary_codec.resumablePageFromSummaries(
+    var page = try session_catalog.resumablePage(
         alloc,
         cache.catalog.summaries.items,
         workspace,
-        null,
+        query,
         continuation,
         page_limit,
     );
@@ -741,12 +742,7 @@ fn applySessionPickerCatalogPage(
     picker.loading_more = false;
     picker.load_state = .ready;
     if (!append) {
-        if (selected_index) |index| {
-            picker.selected = session_catalog.filteredCount(
-                picker.summaries.items[0..index],
-                picker.query(),
-            );
-        }
+        if (selected_index) |index| picker.selected = index;
         picker.selected = @min(picker.selected, picker.filteredItemCount() -| 1);
         picker.window_start = @min(picker.window_start, picker.selected);
     } else if (selected_load_more) {
@@ -2267,7 +2263,28 @@ pub fn Runtime(comptime App: type) type {
                 }, true);
                 return;
             }
+            try listSessionPicker(app, scope);
+        }
 
+        /// Re-lists the open picker for the composer's current text, so the
+        /// search covers every saved session in scope, not only loaded pages.
+        pub fn searchSessionPicker(app: *App) !void {
+            const picker = &app.session_persistence.session_picker;
+            if (!picker.active) return;
+            // A listing still in flight applies the query when it lands.
+            if (picker.load_state != .ready) {
+                picker.setQuery(app.input_runtime.edit_state.input.items);
+                return;
+            }
+            listSessionPicker(app, picker.scope) catch |err| {
+                picker.load_state = .failed;
+                return err;
+            };
+        }
+
+        /// Lists the first page for `scope` and the composer's text from the
+        /// held catalog, refreshing a stale or missing catalog in the background.
+        fn listSessionPicker(app: *App, scope: SessionPickerScope) !void {
             var picker = &app.session_persistence.session_picker;
             const previous_generation = picker.generation;
             picker.deinit(app.alloc);
@@ -9857,6 +9874,8 @@ test "session picker reuses a held catalog after resize and workspace switch" {
             const id = try std.mem.print(&id_buffer, "saved-{d}", .{index});
             var summary = try session_summary_codec.cloneSessionSummary(catalog_alloc, .{
                 .id = @constCast(id),
+                // The composer text "saved" searches the titles.
+                .title = @constCast(id),
                 .workspace_root = if (index % 2 == 0) paths.workspace else @constCast("/foreign-workspace"),
                 .created_at_ms = 1,
                 .updated_at_ms = @intCast(100 - index),
