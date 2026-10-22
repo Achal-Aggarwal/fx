@@ -5276,14 +5276,47 @@ fn fuzzCanonicalCheckpoint(grid: Grid) ![]u8 {
     return copy.checkpointPayload(alloc);
 }
 
-/// Paints `to` onto `screen`, which shows `from`, the way the renderer
-/// repaints the user's terminal, and checks the screen then shows `to`.
-fn expectFuzzRepaint(screen: *Grid, from: Grid, to: Grid) !void {
+/// Whether two grids show the same cells. Separate grids keep separate pools,
+/// so links compare by target and suffixes by text, not by pool index.
+fn fuzzScreensEqual(a: Grid, b: Grid) bool {
+    if (a.rows != b.rows or a.cols != b.cols) return false;
+    var row: u16 = 1;
+    while (row <= a.rows) : (row += 1) {
+        var col: u16 = 1;
+        while (col <= a.cols) : (col += 1) {
+            var x = a.cellAt(row, col).?;
+            var y = b.cellAt(row, col).?;
+            const x_link = x.style.hyperlink_id;
+            const y_link = y.style.hyperlink_id;
+            if ((x_link == 0) != (y_link == 0)) return false;
+            if (x_link != 0) {
+                const x_url = a.hyperlinkUrl(x_link) orelse return false;
+                const y_url = b.hyperlinkUrl(y_link) orelse return false;
+                const x_params = a.hyperlinkParams(x_link) orelse return false;
+                const y_params = b.hyperlinkParams(y_link) orelse return false;
+                if (!std.mem.eql(u8, x_url, y_url) or !std.mem.eql(u8, x_params, y_params)) return false;
+            }
+            const x_suffix = a.combiningSuffix(x.combining_suffix_id) orelse "";
+            const y_suffix = b.combiningSuffix(y.combining_suffix_id) orelse "";
+            if (!std.mem.eql(u8, x_suffix, y_suffix)) return false;
+            x.style.hyperlink_id = 0;
+            y.style.hyperlink_id = 0;
+            x.combining_suffix_id = 0;
+            y.combining_suffix_id = 0;
+            if (!cellsEqual(a, x, b, y)) return false;
+        }
+    }
+    return true;
+}
+
+/// Repaints `screen`, a model of the user's terminal, to show `to` the way the
+/// renderer does: from a diff against the model, whose pen is the terminal's.
+fn expectFuzzRepaint(screen: *Grid, to: Grid) !void {
     var diff: std.Io.Writer.Allocating = .init(testing.allocator);
     defer diff.deinit();
-    try Grid.diffTo(from, to, &diff.writer);
+    try Grid.diffTo(screen.*, to, &diff.writer);
     try screen.feed(diff.written());
-    try testing.expect(gridsEqual(screen.*, to));
+    try testing.expect(fuzzScreensEqual(screen.*, to));
 }
 
 fn fuzzGridFeed(_: void, smith: *std.testing.Smith) !void {
@@ -5318,19 +5351,17 @@ fn fuzzGridFeed(_: void, smith: *std.testing.Smith) !void {
     defer alloc.free(repeated);
     try testing.expectEqualSlices(u8, state, repeated);
 
-    // A terminal in its default modes shows each frame after its diff.
+    // A terminal in its default modes shows each frame after its repaint.
     var previous = try Grid.init(alloc, cols, rows);
     defer previous.deinit();
     try previous.feed(bytes.items[0..split]);
     var next = try previous.clone(alloc);
     defer next.deinit();
     try next.feed(bytes.items[split..]);
-    var blank = try Grid.init(alloc, cols, rows);
-    defer blank.deinit();
     var screen = try Grid.init(alloc, cols, rows);
     defer screen.deinit();
-    try expectFuzzRepaint(&screen, blank, previous);
-    try expectFuzzRepaint(&screen, previous, next);
+    try expectFuzzRepaint(&screen, previous);
+    try expectFuzzRepaint(&screen, next);
 }
 
 test "terminal grid state survives fragmented feeds, checkpoints, and repaints" {
