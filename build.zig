@@ -570,7 +570,8 @@ fn readFuzzCorpora(b: *std.Build) []const FuzzCorpus {
     const registry = std.json.parseFromSliceLeaky(FuzzRegistry, b.allocator, registry_bytes, .{}) catch |err|
         std.process.fatal("{s} is not a valid fuzz registry: {t}", .{ fuzz_registry_path, err });
 
-    const corpora = b.allocator.alloc(FuzzCorpus, registry.targets.len) catch @panic("OOM");
+    const corpora = b.allocator.alloc(FuzzCorpus, registry.targets.len) catch |err|
+        std.process.fatal("could not list the fuzz targets: {t}", .{err});
     for (registry.targets, corpora, 0..) |fuzz_target, *corpus, index| {
         if (!isFuzzTargetName(fuzz_target.name)) std.process.fatal(
             "{s}: fuzz target name '{s}' must start with a lowercase letter and use only lowercase letters, digits, and underscores",
@@ -618,11 +619,13 @@ fn readFuzzInputs(b: *std.Build, name: []const u8) []const []const u8 {
             "{s}/{s}: saved fuzz inputs must be regular files",
             .{ folder, entry.name },
         );
-        file_names.append(b.allocator, b.dupe(entry.name)) catch @panic("OOM");
+        file_names.append(b.allocator, b.dupe(entry.name)) catch |err|
+            std.process.fatal("could not list {s}: {t}", .{ folder, err });
     }
     std.mem.sort([]const u8, file_names.items, {}, lessThanBytes);
 
-    const inputs = b.allocator.alloc([]const u8, file_names.items.len) catch @panic("OOM");
+    const inputs = b.allocator.alloc([]const u8, file_names.items.len) catch |err|
+        std.process.fatal("could not read {s}: {t}", .{ folder, err });
     for (file_names.items, inputs) |file_name, *input| {
         b.dependOnFileContents(b.path(b.pathJoin(&.{ folder, file_name })));
         input.* = dir.readFileAlloc(io, file_name, b.allocator, .limited(max_fuzz_input_bytes + 1)) catch |err| switch (err) {
@@ -693,7 +696,8 @@ fn addFuzzStep(
             .fx => &fx_filters,
             .session_manager => &session_manager_filters,
         };
-        filters.append(b.allocator, corpus.target.@"test") catch @panic("OOM");
+        filters.append(b.allocator, corpus.target.@"test") catch |err|
+            std.process.fatal("could not select the fuzz tests: {t}", .{err});
     }
     if (fx_filters.items.len == 0 and session_manager_filters.items.len == 0) {
         const message = if (selected) |name|
