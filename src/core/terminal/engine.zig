@@ -641,6 +641,8 @@ pub const Grid = struct {
         while (i < bytes.len) {
             const b = bytes[i];
             if (b == 0x18 or b == 0x1a) {
+                // A character split across reads ends here, as it would in one read.
+                if (self.utf8_len != 0) try self.writePendingUtf8();
                 self.cancelControlSequence();
                 i += 1;
                 continue;
@@ -1659,8 +1661,9 @@ pub const Grid = struct {
             return;
         }
         if (report != 6) return;
+        // DECRC and VPA can leave the cursor above the top margin.
         const row = if (self.origin_mode)
-            self.cursor_row - self.scroll_top + 1
+            (self.cursor_row -| self.scroll_top) + 1
         else
             self.cursor_row;
         var buffer: [64]u8 = undefined;
@@ -3909,6 +3912,24 @@ test "DSR 6n is swallowed without side effects" {
     try expectRow(g, 1, "ok");
 }
 
+test "DSR 6n in origin mode reports row 1 for a cursor above the top margin" {
+    const cases = [_][]const u8{
+        // DECRC restores a row saved before the top margin moved down.
+        "\x1b[6r\x1b[?6h\x1b7\x1b[7r\x1b8",
+        // VPA moves to an absolute row.
+        "\x1b[3r\x1b[?6h\x1b[1d",
+    };
+    for (cases) |setup| {
+        var g = try Grid.init(testing.allocator, 10, 9);
+        defer g.deinit();
+        try g.feed(setup);
+        var result = try g.feedMode("\x1b[6n", .native_live);
+        defer result.deinit(testing.allocator);
+        try testing.expectEqual(@as(usize, 1), result.replies.items.len);
+        try testing.expectEqualStrings("\x1b[1;1R", result.replies.items[0].bytes);
+    }
+}
+
 test "resize grows keeping top-left content" {
     var g = try Grid.init(testing.allocator, 4, 2);
     defer g.deinit();
@@ -4859,6 +4880,10 @@ test "UTF-8 gives the same state however the output is split into reads" {
         "\xe7\x95\x8c\xbaz",
         "\xe7\x95\x8c",
         "e\xcc\x81!",
+        // CAN and SUB interrupt a character like any other control byte.
+        "a\xd6\x18",
+        "\xe7\x18\x95\x8cz",
+        "\xe7\x95\x1a\x8cz",
     };
     for (cases) |bytes| {
         var whole = try Grid.init(testing.allocator, 8, 1);
