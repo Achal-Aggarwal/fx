@@ -699,10 +699,11 @@ describe("/mcp in the shell", () => {
     await tui.sendKeys("Down Enter");
     await tui.waitForText("› Remove        /mcp remove web", 5_000);
     await tui.sendKeys("Enter");
-    // It asks in the hint line; the server's screen stays as it was.
-    await tui.waitForText("Remove web from ~/.fx/mcp.json?     enter yes     esc no", 5_000);
-    expect(await tui.capturePane()).toContain("› Remove        /mcp remove web");
+    // It asks on Remove's own row, and the hint line says how to answer.
+    await tui.waitForText("› Remove web from ~/.fx/mcp.json?", 5_000);
+    expect(await tui.capturePane()).toContain("enter yes     esc no");
     await tui.sendKeys("Escape");
+    await tui.waitForText("› Remove        /mcp remove web", 5_000);
     await tui.waitForText("↑↓ navigate     enter run     esc back", 5_000);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toBeDefined();
     await tui.sendKeys("Enter");
