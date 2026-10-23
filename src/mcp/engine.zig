@@ -61,7 +61,7 @@ pub const Event = struct {
         phase: Phase,
         /// A call ended. `answer` is set when the server answered, valid
         /// until the next `next`.
-        /// `oversized`: a lost call's server was killed for a stdout line over the limit.
+        /// `oversized`: a lost call's answer was over the message limit.
         called: struct { call: Handle, outcome: Outcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false },
         /// A call's server reported progress; `message` is terminal-safe and
         /// valid until the next `next`.

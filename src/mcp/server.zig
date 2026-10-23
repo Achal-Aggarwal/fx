@@ -125,7 +125,8 @@ pub const Event = union(enum) {
     /// that keeps its own copy lists again before its next call (CAT-05).
     tools_stale,
     /// A call ended. `answer` is set when the server answered, valid until the next `next`.
-    /// `oversized` says a lost call's server was killed for a stdout line over the limit.
+    /// `oversized` says a lost call's answer was over the message limit: a
+    /// stdio line over `max_line`, or an HTTP answer over `max_message`.
     called: struct { handle: Handle, outcome: CallOutcome, maybe_ran: bool, timed_out: bool, answer: ?tools.Call, oversized: bool = false },
     /// A call's server reported progress that the request core accepted.
     /// `message` is terminal-safe and cut to 160 bytes, valid until the
