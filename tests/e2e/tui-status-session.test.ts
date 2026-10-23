@@ -36,7 +36,9 @@ function scenario(name: string, body: (profile: Profile) => Promise<void>) {
 function expectReport(report: StatusReport, id: string | null, saved: boolean) {
   expect(panelSession(report)).toEqual({ id, saved });
   expect(report.labels[0]).toBe("Session");
-  expect(report.labels).toEqual(expect.arrayContaining(["Model", "Auth", "Permissions", "Workspace", "Turns"]));
+  // A panel too tall for its terminal shows the rest a ↓ at a time.
+  const labels = new Set(report.views.flatMap((view) => view.labels));
+  for (const label of ["Model", "Auth", "Permissions", "Workspace", "Turns"]) expect(labels).toContain(label);
   expect(showsStatusPanel(report.closed)).toBe(false);
   if (!closedAsBefore(report)) {
     throw new Error(`the /status panel at tape frame ${report.frame} changed the shell:\n--- before\n${report.before.join("\n")}\n--- closed\n${report.closed.join("\n")}`);
@@ -250,6 +252,11 @@ scenario("a short terminal shows the panel's first lines, and ↓ scrolls it a l
   expect(first!.labels[0]).toBe("Session");
   expect(first!.labels).not.toContain("Build");
   expect(first!.grid.some((row) => row.trimEnd() === "↑↓ scroll     esc close")).toBe(true);
+  // The panel scrolls rather than cover the transcript, so the banner stays
+  // in view while it is open.
+  for (const view of report!.views) {
+    expect(view.grid.some((row) => row.includes("Run /help for commands"))).toBe(true);
+  }
   expect(scrolled.length).toBeGreaterThan(0);
   let previous = first!;
   for (const view of scrolled) {

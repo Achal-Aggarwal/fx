@@ -38,6 +38,14 @@ pub fn desiredRowCount(projection: CompactCommandMenuProjection, width: u16) u16
     return std.math.cast(u16, count) orelse std.math.maxInt(u16);
 }
 
+/// Rows the footer gives the menu in a terminal of `terminal_rows`.
+pub fn footerRowCount(projection: CompactCommandMenuProjection, width: u16, terminal_rows: u16) u16 {
+    return switch (projection) {
+        .status => |status| status_menu_presentation.footerRows(status, width, terminal_rows),
+        else => @min(desiredRowCount(projection, width), terminal_rows -| 3),
+    };
+}
+
 pub noinline fn composeCompactCommandMenuRow(
     alloc: Allocator,
     projection: CompactCommandMenuProjection,

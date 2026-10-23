@@ -149,8 +149,9 @@ export function submittedFrames(tapePath: string, command: string): { typed: num
 }
 
 /// The `/status` panel `grid` shows, or null: its `Status` title, a blank
-/// row, and then one line per label, each wrapped value continuing on the
-/// next lines under it, up to the footer's divider. A value wraps at a
+/// row unless the panel is too short for one, and then one line per label,
+/// each wrapped value continuing on the next lines under it, up to the
+/// footer's divider. A value wraps at a
 /// space, which the join puts back; after a `/`; or, in a word too long for
 /// its column, where the column ends, the only break that fills the line. A
 /// word that exactly fills its column before a space reads back joined to the
@@ -158,7 +159,7 @@ export function submittedFrames(tapePath: string, command: string): { typed: num
 /// `width` is the terminal's; by default the widest row's, since `fx replay`
 /// writes every row at the terminal's full width.
 export function statusPanel(grid: string[], width = Math.max(...grid.map((row) => [...row].length))): StatusPanel | null {
-  const top = grid.findIndex((row, at) => row.trimEnd() === "Status" && (grid[at + 1] ?? "").trim() === "");
+  const top = grid.findIndex((row, at) => row.trimEnd() === "Status" && /^(?: *| {2,}\S.*)$/.test(grid[at + 1] ?? ""));
   if (top < 0) return null;
   const rows: string[] = [];
   const labels: StatusPanelLabel[] = [];
@@ -166,7 +167,8 @@ export function statusPanel(grid: string[], width = Math.max(...grid.map((row) =
   let label: StatusPanelLabel | null = null;
   let valueColumn = 0;
   let previousFilled = false;
-  for (let row = top + 2; row < grid.length; row++) {
+  const first = (grid[top + 1] ?? "").trim() === "" ? top + 2 : top + 1;
+  for (let row = first; row < grid.length; row++) {
     const text = grid[row]!.trimEnd();
     const named = [...STATUS_PANEL_LABELS]
       .sort((a, b) => b.length - a.length)
@@ -193,7 +195,8 @@ export function statusPanel(grid: string[], width = Math.max(...grid.map((row) =
     previousFilled = valueColumn + [...value].length >= width;
     rows.push(text);
   }
-  return labels.length > 0 ? { rows, labels, fields } : null;
+  // A scrolled panel may show only a value's continuation lines.
+  return rows.length > 0 ? { rows, labels, fields } : null;
 }
 
 /// Whether `grid` shows any piece of the panel: its title or a labeled line.
@@ -216,21 +219,70 @@ type Pane = {
 };
 
 /// Waits until `pane` shows a `/status` panel that has what `ready` asks
-/// for, the same in two captures in a row so a frame caught half painted
-/// is not taken for it, and returns it. The panel shows one snapshot, so a
-/// `ready` that never holds fails with the pane.
+/// for, and returns it; without `ready`, every line of it. When the lines do
+/// not all fit and those showing are not what `ready` asks for, the rest are
+/// read a line at a time with ↓, and the panel is scrolled back to its first
+/// line. Each view counts once it is the same in two captures in a row, so a
+/// frame caught half painted is not taken for it. A `ready` that never holds
+/// fails with the pane.
 export async function waitForStatusPanel(
   pane: Pane,
   timeout: number,
-  ready: (panel: StatusPanel) => boolean = () => true,
+  ready?: (panel: StatusPanel) => boolean,
 ): Promise<StatusPanel> {
   const deadline = Date.now() + timeout;
+  while (true) {
+    const first = await settledView(pane, deadline, () => true);
+    let panel = first.panel;
+    const overflows = first.grid.some((row) => /^↑↓ scroll\b/.test(row));
+    if (overflows && !(ready?.(panel) ?? false)) panel = await readScrolledPanel(pane, first.panel);
+    if (ready?.(panel) ?? true) return panel;
+    if (Date.now() >= deadline) {
+      throw new Error(`the /status panel never showed what the test waited for:\n${(await pane.capturePane()).trimEnd()}`);
+    }
+    await Bun.sleep(25);
+  }
+}
+
+/// Every line of the panel `pane` shows with `first` its first lines, read
+/// with ↓ a line at a time to the last, as one panel. Scrolls back to `first`
+/// before returning. Scrolling has its own time, so it fits any timeout.
+async function readScrolledPanel(pane: Pane, first: StatusPanel): Promise<StatusPanel> {
+  const lines = [...first.rows];
+  let shown = first;
+  let scrolled = 0;
+  while (true) {
+    await pane.sendKeys("Down");
+    // ↓ past the last line paints nothing, so a second waits it out.
+    const next = await settledView(pane, Date.now() + 1_000, (view) =>
+      view.rows.join("\n") !== shown.rows.join("\n") &&
+      view.rows.length === shown.rows.length &&
+      view.rows.slice(0, -1).join("\n") === shown.rows.slice(1).join("\n")).catch(() => null);
+    if (!next) break;
+    lines.push(next.panel.rows.at(-1)!);
+    shown = next.panel;
+    scrolled++;
+  }
+  for (let up = 0; up < scrolled; up++) await pane.sendKeys("Up");
+  await settledView(pane, Date.now() + 5_000, (view) => view.rows.join("\n") === first.rows.join("\n"));
+  return statusPanel(["Status", "", ...lines], pane.paneSize().cols)!;
+}
+
+/// The next `/status` panel `pane` shows the same in two captures in a row
+/// that `accept` takes, with the grid it is on.
+async function settledView(
+  pane: Pane,
+  deadline: number,
+  accept: (panel: StatusPanel) => boolean,
+): Promise<{ panel: StatusPanel; grid: string[] }> {
+  const cols = pane.paneSize().cols;
   let previous = "";
   while (true) {
     const text = await pane.capturePane();
-    const panel = statusPanel(text.split("\n"), pane.paneSize().cols);
-    if (panel && text === previous && ready(panel)) return panel;
-    if (Date.now() >= deadline) throw new Error(`the /status panel never showed what the test waited for:\n${text.trimEnd()}`);
+    const grid = text.split("\n");
+    const panel = statusPanel(grid, cols);
+    if (panel && text === previous && accept(panel)) return { panel, grid };
+    if (Date.now() >= deadline) throw new Error(`the /status panel did not settle:\n${text.trimEnd()}`);
     previous = text;
     await Bun.sleep(25);
   }
@@ -253,7 +305,7 @@ export async function closeStatusPanel(pane: Pane, timeout: number): Promise<voi
 export async function readStatusPanel(
   pane: Pane,
   timeout: number,
-  ready: (panel: StatusPanel) => boolean = () => true,
+  ready?: (panel: StatusPanel) => boolean,
 ): Promise<StatusPanel> {
   await pane.sendText("/status");
   const panel = await waitForStatusPanel(pane, timeout, ready);

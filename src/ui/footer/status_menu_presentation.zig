@@ -6,6 +6,7 @@
 const std = @import("std");
 const display_width = @import("../../core/shared/display_width.zig");
 const status_menu = @import("../../core/session/status_menu.zig");
+const picker_presentation = @import("picker_presentation.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
 const ui_render = @import("../render.zig");
@@ -26,10 +27,12 @@ pub fn desiredRowCount(projection: Projection, width: u16) u16 {
     return std.math.cast(u16, header_rows + lineCount(projection.rows, width)) orelse std.math.maxInt(u16);
 }
 
-/// Rows the footer gives the panel in a terminal of `terminal_rows`, as
-/// `surface_frame.zig` sizes every compact command menu.
+/// Rows the footer gives the panel in a terminal of `terminal_rows`. Like the
+/// inline pickers, the panel leaves the end of the transcript in view and
+/// scrolls instead. A panel that covered the turn in progress would hide it,
+/// and output written while the panel was open could lose the rows it covered.
 pub fn footerRows(projection: Projection, width: u16, terminal_rows: u16) u16 {
-    return @min(desiredRowCount(projection, width), terminal_rows -| 3);
+    return picker_presentation.inlinePickerRowBudgetCapped(terminal_rows, 0, 0, desiredRowCount(projection, width));
 }
 
 /// Lines that fit in the `visible_rows` the footer gives the panel.
