@@ -2566,12 +2566,23 @@ pub const Grid = struct {
                 // With DECAWM disabled, terminals can drop suffix codepoints
                 // from a display unit whose base ends at the right margin.
                 if (guard_margin_suffix) try out.writeAll("\x1b[?7h");
+                const disputed_width = suffix != null and hasVariationSelector(suffix.?);
+                // A terminal that draws this glyph one cell narrow never writes
+                // its second cell, so clear both first.
+                if (disputed_width and cell.width == 2) try out.writeAll("\x1b[2X");
                 try emitCodepoint(out, cell.codepoint);
                 if (suffix) |bytes| {
                     try out.writeAll(bytes);
                 }
                 if (guard_margin_suffix) try out.writeAll("\x1b[?7l");
                 col += cell.width;
+                // Terminals disagree on how wide a variation selector makes a
+                // glyph: Ghostty draws U+26A1 U+FE0E in one cell, tmux in two.
+                // Re-anchor the cursor so the cells after it land where this
+                // grid put them, or a later repaint misses one.
+                if (col <= last and disputed_width) {
+                    try out.print("\x1b[{d}G", .{col});
+                }
             }
         }
 
@@ -3348,6 +3359,12 @@ fn cellsEqual(a_grid: Grid, a: Cell, b_grid: Grid, b: Cell) bool {
     return std.mem.eql(u8, a_url, b_url) and std.mem.eql(u8, a_params, b_params);
 }
 
+/// Whether a cell's combining suffix holds VS15 or VS16, which terminals
+/// size differently.
+fn hasVariationSelector(suffix: []const u8) bool {
+    return std.mem.find(u8, suffix, "\u{FE0E}") != null or std.mem.find(u8, suffix, "\u{FE0F}") != null;
+}
+
 fn hasShiftedWideCellOverlap(
     prev: Grid,
     next: Grid,
@@ -4013,6 +4030,37 @@ test "repeated scroll rotations preserve logical rows through clone resize and e
     try expectRow(grid, 3, "five");
     try expectRow(grid, 4, "");
     try testing.expectEqual(@as(u16, 0), grid.row_origin);
+}
+
+test "diff re-anchors the cursor after a glyph with a variation selector" {
+    // The status line: a text-presentation lightning bolt, then a right-hand
+    // notice placed after it. A terminal that draws the bolt one cell narrow
+    // must still put the notice, and later its erasure, in the same cells.
+    var previous = try Grid.init(testing.allocator, 20, 1);
+    defer previous.deinit();
+    var target = try Grid.init(testing.allocator, 20, 1);
+    defer target.deinit();
+    try target.feed("a \u{26A1}\u{FE0E}\x1b[12G13 MCP");
+
+    var diff: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer diff.deinit();
+    try Grid.diffTo(previous, target, &diff.writer);
+    // Both of its cells are cleared first, so a narrow drawing leaves no stale
+    // second cell, then the cursor is re-anchored after it.
+    try testing.expect(std.mem.find(u8, diff.written(), "\x1b[2X\u{26A1}\u{FE0E}\x1b[5G") != null);
+    try previous.feed(diff.written());
+    try testing.expect(gridsEqual(previous, target));
+
+    // A glyph without a selector needs no anchor.
+    var plain_prev = try Grid.init(testing.allocator, 20, 1);
+    defer plain_prev.deinit();
+    var plain = try Grid.init(testing.allocator, 20, 1);
+    defer plain.deinit();
+    try plain.feed("a \u{26A1} b");
+    var plain_diff: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer plain_diff.deinit();
+    try Grid.diffTo(plain_prev, plain, &plain_diff.writer);
+    try testing.expect(std.mem.find(u8, plain_diff.written(), "G") == null);
 }
 
 test "diff compares logical rows across different physical origins" {
