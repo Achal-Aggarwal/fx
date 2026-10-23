@@ -71,6 +71,13 @@ pub const State = struct {
     /// When the host loaded or `startHostServers` last started its servers;
     /// the status line waits for them to finish starting from then.
     host_started_ms: i64 = 0,
+    /// Once the user sends a prompt, the servers that needed attention then:
+    /// the status line stops repeating them and names only new ones.
+    /// Null until the first prompt.
+    host_status_seen: ?mcp_menu.Seen = null,
+    /// A prompt was sent: record what needs attention once servers finish
+    /// starting.
+    host_status_dismiss_requested: bool = false,
     host_menu_tools_arena: ?std.heap.ArenaAllocator = null,
     /// Counts tool loads, so one for a server no longer open is dropped.
     host_menu_load: usize = 0,
@@ -160,7 +167,27 @@ pub const State = struct {
         // once, not climbing; sign-in news still shows at once.
         if (self.host_started_ms != 0 and !mcp_menu.startupSettled(statuses, now_ms - self.host_started_ms))
             return mcp_menu.statusLine(buf, &.{}, signing_in, news, 0);
+        if (self.host_status_dismiss_requested) {
+            var seen: mcp_menu.Seen = .{};
+            seen.record(statuses);
+            self.host_status_seen = seen;
+            self.host_status_dismiss_requested = false;
+        }
+        // After a prompt, what the user already saw stays in /mcp.
+        if (self.host_status_seen) |*seen| {
+            const fresh = a.alloc(std.meta.Elem(@TypeOf(statuses)), statuses.len) catch return "";
+            return mcp_menu.statusLine(buf, mcp_menu.unseen(statuses, seen, fresh), signing_in, news, 0);
+        }
         return mcp_menu.statusLine(buf, statuses, signing_in, news, lease.host.notes.len);
+    }
+
+    /// The user sent a prompt: what needs attention has been seen, so the
+    /// status line clears it and speaks up only about new problems. Servers
+    /// still starting are recorded once they finish.
+    pub fn dismissHostStatus(self: *State) void {
+        self.host_status_dismiss_requested = true;
+        // The next refresh shows the change instead of waiting its turn.
+        self.host_status_at_ms = 0;
     }
 
     /// Starts every server in the background, so each is ready before it's
