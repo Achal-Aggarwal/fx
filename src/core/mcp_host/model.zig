@@ -39,8 +39,9 @@ pub const Catalog = struct {
     builtins: tool_dispatch.Registry,
     /// Every binding carries it, so a binding from another run, or from
     /// before a reload dropped a server, never matches. Read through
-    /// `currentGeneration`, since `reload` changes it.
-    generation: std.atomic.Value(u64),
+    /// `currentGeneration`, since `reload` changes it. 32 bits, since
+    /// wasm32 has no 64-bit atomics; bindings only compare it for equality.
+    generation: std.atomic.Value(u32),
     names: tool_names.Registry,
     mutex: std.Io.Mutex = .init,
     /// The servers the lists are of, from `runtime.servers()`, which keep
@@ -82,7 +83,7 @@ pub const Catalog = struct {
             .io = io,
             .runtime = runtime,
             .builtins = builtins,
-            .generation = .init(@as(u64, @truncate(now)) | 1),
+            .generation = .init(@as(u32, @truncate(now)) | 1),
             .names = .init(gpa),
             .servers = servers,
             .lists = lists,
