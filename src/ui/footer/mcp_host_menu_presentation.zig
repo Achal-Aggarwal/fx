@@ -261,9 +261,19 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
         errdefer row.deinit(alloc);
         try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else "");
         try row.appendSlice(alloc, if (selected) "› " else "  ");
-        // Remove and Reject ask on their own row; the hint line says how to answer.
+        // Remove and Reject ask on their own row, answers included: Enter is
+        // the bright "yes", Esc the dim "no".
         if (asksInPlace(p) and p.state.confirm.? == cs[at]) {
-            try row_text.appendTerminalSafeSingleLine(alloc, &row, try question(arena, p, r, cs[at]), @as(usize, width) -| 2);
+            const answers = "   yes  no";
+            try row_text.appendTerminalSafeSingleLine(alloc, &row, try question(arena, p, r, cs[at]), @as(usize, width) -| 2 -| answers.len);
+            try row.appendSlice(alloc, ui_render.reset_style);
+            try row.appendSlice(alloc, "   ");
+            try row.appendSlice(alloc, ui_render.selected_completion_style);
+            try row.appendSlice(alloc, "yes");
+            try row.appendSlice(alloc, ui_render.reset_style);
+            try row.appendSlice(alloc, "  ");
+            try row.appendSlice(alloc, ui_render.dim_style);
+            try row.appendSlice(alloc, "no");
             try row.appendSlice(alloc, ui_render.reset_style);
             return row;
         }
@@ -456,14 +466,18 @@ fn asksInPlace(p: Projection) bool {
 pub fn hintVariants(p: Projection) []const []const u8 {
     return switch (p.state.screen) {
         .list => if (p.rows.len == 0) &.{"esc close"} else &.{ "↑↓ navigate     enter open     esc close", "↑↓ move  enter open  esc", "enter open  esc close", "enter esc" },
-        .confirm => if (asksInPlace(p)) &.{ "enter yes     esc no", "enter yes  esc no" } else &.{ "enter confirm     esc cancel", "enter confirm  esc cancel", "enter esc" },
-        .server => blk: {
-            const r = p.openRow() orelse break :blk &.{"esc back"};
-            var buf: [menu.max_choices]menu.Choice = undefined;
-            if (p.state.cursor >= menu.choices(r, &buf).len) break :blk &.{ "↑↓ navigate     esc back", "↑↓ move  esc back", "esc" };
-            break :blk &.{ "↑↓ navigate     enter run     esc back", "↑↓ move  enter run  esc", "enter run  esc back", "enter esc" };
-        },
+        // A question asked in place leaves the server's hint line as it was;
+        // the row shows its answers.
+        .confirm => if (asksInPlace(p)) serverHints(p) else &.{ "enter confirm     esc cancel", "enter confirm  esc cancel", "enter esc" },
+        .server => serverHints(p),
     };
+}
+
+fn serverHints(p: Projection) []const []const u8 {
+    const r = p.openRow() orelse return &.{"esc back"};
+    var buf: [menu.max_choices]menu.Choice = undefined;
+    if (p.state.cursor >= menu.choices(r, &buf).len) return &.{ "↑↓ navigate     esc back", "↑↓ move  esc back", "esc" };
+    return &.{ "↑↓ navigate     enter run     esc back", "↑↓ move  enter run  esc", "enter run  esc back", "enter esc" };
 }
 
 /// The question Remove or Reject asks on its row. The row draws it terminal
@@ -706,12 +720,18 @@ test "Remove asks on its own row, at the same size" {
     _ = menu.press(&p.state, .{ .rows = &rows, .open = rows[0], .layout = p.layout(rows[0]) }, .enter);
     try testing.expectEqual(menu.Screen.confirm, p.state.screen);
     try testing.expectEqual(server_rows, menuRowCount(p, 88, 40));
-    // The question takes Remove's row; the hint line says how to answer.
+    // The question takes Remove's row with its answers; the hint line stays
+    // the server screen's.
     const text = try render(p, 88);
     defer testing.allocator.free(text);
-    try testing.expect(std.mem.find(u8, text, "› Remove github and its login from ~/.fx/mcp.json?\n") != null);
+    try testing.expect(std.mem.find(u8, text, "› Remove github and its login from ~/.fx/mcp.json?   yes  no\n") != null);
     try testing.expect(std.mem.find(u8, text, "  Log out       /mcp logout github\n") != null);
-    try testing.expectEqualStrings("enter yes     esc no", hintVariants(p)[0]);
+    try testing.expectEqualStrings("↑↓ navigate     enter run     esc back", hintVariants(p)[0]);
+    var asked = try composeRow(testing.allocator, p, 6, 88, menuRowCount(p, 88, 40));
+    defer asked.deinit(testing.allocator);
+    const answers = try testing.allocator.print("{s}yes{s}  {s}no{s}", .{ ui_render.selected_completion_style, ui_render.reset_style, ui_render.dim_style, ui_render.reset_style });
+    defer testing.allocator.free(answers);
+    try testing.expect(std.mem.endsWith(u8, asked.items, answers));
 
     // A name of any bytes stays inert on the row.
     const odd_rows = [_]menu.Row{.{ .status = testStatus("x\x1b[2Jy", .ready) }};
