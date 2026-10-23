@@ -6050,6 +6050,50 @@ fn visionToolMode(mode: image_route.VisionMode) runtime_gateway_step.VisionToolM
     };
 }
 
+/// The user images a request carries that the session still keeps, split at
+/// the turn's own user message: those before it came from earlier turns, and
+/// the rest arrived this turn. `image_attachments.withholdDroppedImages` turns
+/// the others into notes.
+const RequestUserImages = struct { this_turn: bool, earlier: bool };
+
+fn requestUserImages(messages: []const ChatMessage, current_user_message_index: usize) RequestUserImages {
+    var found: RequestUserImages = .{ .this_turn = false, .earlier = false };
+    for (messages, 0..) |message, index| {
+        for (message.images) |image| {
+            if (image.droppedFromSession()) continue;
+            if (index < current_user_message_index) found.earlier = true else found.this_turn = true;
+            break;
+        }
+    }
+    return found;
+}
+
+test "requestUserImages splits kept images at the turn's own message" {
+    const kept = [_]types.ImageAttachment{.{ .id = 1, .path = @constCast("inline://1"), .media_type = @constCast("image/png"), .inline_data = @constCast("png") }};
+    const dropped = [_]types.ImageAttachment{.{ .id = 2, .path = @constCast("inline://2"), .media_type = @constCast("image/png"), .snapshot_sha256 = @constCast("digest") }};
+    const earlier_only = [_]ChatMessage{
+        .{ .role = .user, .content = "first", .images = &kept },
+        .{ .role = .assistant, .content = "ok" },
+        .{ .role = .user, .content = "Testing" },
+    };
+    try std.testing.expectEqual(RequestUserImages{ .this_turn = false, .earlier = true }, requestUserImages(&earlier_only, 2));
+    const now = [_]ChatMessage{
+        .{ .role = .user, .content = "first", .images = &dropped },
+        .{ .role = .assistant, .content = "ok" },
+        .{ .role = .user, .content = "Look", .images = &kept },
+    };
+    try std.testing.expectEqual(RequestUserImages{ .this_turn = true, .earlier = false }, requestUserImages(&now, 2));
+}
+
+/// What the user hears, once per turn, when a down catalog withholds images.
+fn catalogDownNotice(chosen: image_route.Decision) []const u8 {
+    const tools = chosen.tool_images == .withheld_unknown;
+    const earlier = chosen.earlier_images == .withheld_unknown;
+    if (earlier and tools) return "Earlier images and images from tools aren't reaching the model right now because image support couldn't be confirmed (model catalog unavailable). fx will retry automatically as the catalog recovers.";
+    if (earlier) return "Earlier images aren't reaching the model right now because image support couldn't be confirmed (model catalog unavailable). fx will retry automatically as the catalog recovers.";
+    return "Images from tools aren't reaching the model right now because image support couldn't be confirmed (model catalog unavailable). fx will retry automatically as the catalog recovers.";
+}
+
 /// Whether a tool image in `messages` still reaches the request: one the
 /// session keeps, or a handle to materialize. `image_attachments.withholdDroppedImages`
 /// turns the others into notes.
@@ -7181,8 +7225,10 @@ fn processQueuedPromptLoop(
             // and every route, mode, and tool image choice below follows the
             // decision it returns (`tests/tla/image_route/spec/ImageRoute.tla`
             // OneSnapshot).
+            const user_images = requestUserImages(recovery_source_messages, current_user_message_index);
             var image_event: image_route.Event = .{ .request_ready = .{
-                .user_images = job.authorized_image_catalog.len > 0 or job.images.len > 0,
+                .user_images = job.images.len > 0 or user_images.this_turn,
+                .earlier_images = user_images.earlier,
                 .pending_images = pending_image_ids.len > 0,
                 .tool_images = requestHasToolImages(recovery_source_messages),
                 .fallback = config.provider_capabilities.vision_fallback and deps.tool_registry.lookup("vision") != null,
@@ -7230,7 +7276,7 @@ fn processQueuedPromptLoop(
                 "agent",
                 "vision_policy",
                 step_ctx,
-                "model={s} image_support={s} route={s} mode={s} pending_images={d} tool_images={s}",
+                "model={s} image_support={s} route={s} mode={s} pending_images={d} tool_images={s} earlier_images={s}",
                 .{
                     gateway_model,
                     @tagName(image_route_state.support),
@@ -7238,9 +7284,17 @@ fn processQueuedPromptLoop(
                     @tagName(image_choice.mode),
                     pending_image_ids.len,
                     @tagName(image_choice.tool_images),
+                    @tagName(image_choice.earlier_images),
                 },
             );
             const projected_request_messages = blk: {
+                // The core fails a request whose images attached this turn
+                // have no route, so the user images left on that route came
+                // from earlier turns. They stay in the history and leave this
+                // request as notes (ImageRoute.tla NoSilentWithhold).
+                if (image_choice.route == .unavailable) {
+                    break :blk try image_attachments.withholdEarlierImages(overlay_arena, recovery_source_messages, image_choice.earlier_images);
+                }
                 if (job.authorized_image_catalog.len == 0 and job.images.len == 0) {
                     break :blk recovery_source_messages;
                 }
@@ -7263,7 +7317,7 @@ fn processQueuedPromptLoop(
                             job.authorized_image_catalog,
                         );
                     },
-                    // The core fails a request whose user images have no route.
+                    // Handled above.
                     .unavailable => unreachable,
                 };
             };
@@ -7327,13 +7381,13 @@ fn processQueuedPromptLoop(
             if (request_messages.ptr != located_messages.ptr) {
                 debug_trace.eventf("history", "assistant_tail_continued", step_ctx, "messages={d}", .{located_messages.len});
             }
-            // Tool images withheld because the catalog could not confirm image
+            // Images withheld because the catalog could not confirm image
             // input are invisible in the transcript otherwise. The core asks
             // to tell the user once per turn, and only when the catalog itself
             // is known to be down; a confirmed model without image input
             // relies on the model-facing notice instead.
             if (notify_catalog_down) {
-                try deps.push_text(deps.ctx, .{ .operational = "Images from tools aren't reaching the model right now because image support couldn't be confirmed (model catalog unavailable). fx will retry automatically as the catalog recovers." });
+                try deps.push_text(deps.ctx, .{ .operational = catalogDownNotice(image_choice) });
                 try deps.push_text(deps.ctx, .{ .operational = "\n" });
             }
             last_gateway_message_count = gateway_instructions.items.len + request_messages.len;
