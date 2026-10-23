@@ -1342,7 +1342,8 @@ describe("MCP login", () => {
     const redirect = await fetch(address, { redirect: "manual" });
     const back = await fetch(redirect.headers.get("location")!, { signal: AbortSignal.timeout(10_000) });
     expect(back.status).toBe(200);
-    await tui.waitForText("· signed in", 15_000);
+    // Signed in, the screen offers Log out.
+    await tui.waitForText("Log out       /mcp logout fixture", 15_000);
     expect(auth.tokenExchanges).toBe(1);
     expect(auth.requests.filter((r) => r.path === "/.well-known/oauth-authorization-server").length).toBe(1);
   }, 90_000);
@@ -1873,7 +1874,7 @@ describe("MCP login", () => {
     await tui.sendKeys("Enter");
     await tui.waitForText("› Log in        /mcp login fixture", 15_000);
     const screen = await tui.capturePane();
-    expect(screen).toContain("fixture  needs login");
+    expect(screen).toMatch(/ status +needs login/);
     expect(screen).not.toContain("signed in");
     expect(screen).not.toContain("Log out");
   }, 90_000);
