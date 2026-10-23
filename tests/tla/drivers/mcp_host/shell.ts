@@ -26,11 +26,12 @@ export class Shell {
   tui: any = null;
   constructor(readonly f: Fixture) {}
 
-  async start(extra: Record<string, string> = {}) {
+  /** `width` wide enough keeps a printed sign-in address on one line. */
+  async start(extra: Record<string, string> = {}, width = 160) {
     const { TmuxSession, startFakeGateway } = await targetHelpers();
     this.gateway = startFakeGateway([], { models: [{ id: "openai/gpt-5", type: "language", tags: ["tool-use"] }] });
     this.tui = await TmuxSession.create({
-      cmd: shellQuote(binary), cwd: this.f.workspace, isolated: true, width: 160, height: 40, remainOnExit: true,
+      cmd: shellQuote(binary), cwd: this.f.workspace, isolated: true, width, height: 40, remainOnExit: true,
       stderrPath: join(this.f.base, "stderr.txt"),
       env: fxEnv(this.f, { FX_GATEWAY_BASE_URL: this.gateway!.baseUrl, FX_GATEWAY_CHAT_URL: this.gateway!.chatUrl, FX_MODEL: "openai/gpt-5", ...extra }),
     });

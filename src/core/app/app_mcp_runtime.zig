@@ -747,7 +747,9 @@ pub const State = struct {
             return &.{};
         };
         defer lease.deinit();
-        const statuses = try lease.host.runtime.statuses(a);
+        // Right after launch, waiting for saved logins would freeze the
+        // shell; the next refresh shows them once they're in.
+        const statuses = try lease.host.runtime.statusesNow(a);
         const rows = try a.alloc(mcp_menu.Row, statuses.len);
         for (statuses, lease.host.runtime.servers(), rows) |status, server, *row| row.* = .{
             .status = status,

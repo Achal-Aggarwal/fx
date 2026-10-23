@@ -609,7 +609,7 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
       const home = join(root, "home");
       const store = join(home, ".fx", "mcp-credentials");
       mkdirSync(store, { recursive: true, mode: 0o700 });
-      const lock = join(store, "credentials.lock");
+      const lock = join(store, "credentials-v3.lock");
       writeFileSync(lock, "", { mode: 0o600 });
       writeFileSync(
         join(home, ".fx", "mcp.json"),
@@ -643,6 +643,59 @@ describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {
         expect(firstFrame).toBeGreaterThan(-1);
         // The first frame is drawn while the saved logins are still being read.
         expect(firstFrame).toBeLessThan(gaveUp);
+      } finally {
+        holder.kill();
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  // Before, the menu waited for the saved logins on the UI thread, so /mcp
+  // right after launch froze the shell until they were read.
+  test(
+    "with the MCP sign-in store busy, /mcp opens before the saved logins are read",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-mcp-menu-busy-")));
+      const home = join(root, "home");
+      const store = join(home, ".fx", "mcp-credentials");
+      mkdirSync(store, { recursive: true, mode: 0o700 });
+      const lock = join(store, "credentials-v3.lock");
+      writeFileSync(lock, "", { mode: 0o600 });
+      writeFileSync(
+        join(home, ".fx", "mcp.json"),
+        JSON.stringify({ mcp: { remote: { type: "http", url: "http://127.0.0.1:9/mcp", enabled: true } } }),
+      );
+      const tracePath = join(root, "trace.log");
+      const loaded = () => (existsSync(tracePath) ? readFileSync(tracePath, "utf8") : "").includes("MCP credentials not loaded");
+      // Another fx holds the store's lock: reading the saved logins waits 2 s for it.
+      const holder = Bun.spawn(
+        ["perl", "-e", 'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; $| = 1; print "held\n"; sleep $ARGV[1];', lock, "20"],
+        { stdout: "pipe" },
+      );
+      try {
+        const { value } = await holder.stdout.getReader().read();
+        expect(new TextDecoder().decode(value)).toBe("held\n");
+        session = await TmuxSession.create({
+          cwd: root,
+          env: { HOME: home, FX_AUTO_UPGRADE: "0", FX_DISABLE_KEYCHAIN: "1", FX_TRACE_LOG: tracePath },
+        });
+        await session.waitForComposer(10_000);
+        expect(loaded()).toBe(false);
+        await session.sendText("/mcp");
+        await session.waitForText("MCP servers  1", 5_000);
+        // Still being read when the menu shows.
+        expect(loaded()).toBe(false);
+        // Once they're read, the menu goes on working.
+        const deadline = Date.now() + 10_000;
+        while (!loaded() && Date.now() < deadline) await Bun.sleep(50);
+        expect(loaded()).toBe(true);
+        await session.sendKeys("Enter");
+        await session.waitForText("› Remove        /mcp remove remote", 5_000);
       } finally {
         holder.kill();
         if (session) {
