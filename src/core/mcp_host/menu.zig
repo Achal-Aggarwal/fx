@@ -40,6 +40,12 @@ pub const Choice = enum {
             .login, .logout => false,
         };
     }
+
+    /// Remove and Reject ask on the choice's own row, with yes and no. An
+    /// approval keeps its own screen: it shows everything it trusts.
+    pub fn asksOnRow(c: Choice) bool {
+        return c == .remove or c == .reject;
+    }
 };
 
 /// One server as the menu shows it; borrowed from the host's snapshot.
@@ -196,6 +202,8 @@ pub const State = struct {
     cursor: usize = 0,
     top: usize = 0,
     confirm: ?Choice = null,
+    /// On a question asked on its row: "no" is chosen instead of "yes".
+    answer_no: bool = false,
     /// The list's filter, kept while a server's screen filters its tools.
     list_filter_len: usize = 0,
     list_filter_buf: [name_capacity]u8 = undefined,
@@ -231,7 +239,8 @@ pub const State = struct {
     }
 };
 
-pub const Key = enum { up, down, enter, escape };
+/// ← and → only choose between yes and no on a question asked on its row.
+pub const Key = enum { up, down, left, right, enter, escape };
 
 pub const Effect = union(enum) {
     none,
@@ -330,6 +339,7 @@ pub fn press(s: *State, view: View, key: Key) Effect {
             switch (key) {
                 .up => s.select(view.rows[i -| 1].status.name),
                 .down => s.select(view.rows[@min(i + 1, view.rows.len - 1)].status.name),
+                .left, .right => {},
                 .enter => {
                     const name = view.rows[i].status.name;
                     s.select(name);
@@ -350,6 +360,7 @@ pub fn press(s: *State, view: View, key: Key) Effect {
                 .down => if (s.cursor + 1 < l.selectable()) {
                     s.cursor += 1;
                 },
+                .left, .right => {},
                 .enter => {
                     var buf: [max_choices]Choice = undefined;
                     const cs = choices(r, &buf);
@@ -358,6 +369,7 @@ pub fn press(s: *State, view: View, key: Key) Effect {
                     if (!c.asks()) return .{ .run = .{ .choice = c, .server = r.status.name } };
                     s.screen = .confirm;
                     s.confirm = c;
+                    s.answer_no = false;
                     return .none;
                 },
                 .escape => {
@@ -370,12 +382,23 @@ pub fn press(s: *State, view: View, key: Key) Effect {
             keepVisible(s, l);
             return .none;
         },
-        // Nothing moves while a confirmation is open.
+        // Only the answer moves while a confirmation is open: ← chooses yes
+        // and → no, and Enter on no is Esc.
         .confirm => {
             const r = view.open orelse return settle(s, view);
             const c = s.confirm.?;
             switch (key) {
-                .enter => {
+                .left => if (c.asksOnRow()) {
+                    s.answer_no = false;
+                },
+                .right => if (c.asksOnRow()) {
+                    s.answer_no = true;
+                },
+                .enter => if (c.asksOnRow() and s.answer_no) {
+                    s.screen = .server;
+                    s.confirm = null;
+                    s.answer_no = false;
+                } else {
                     // A removed server has no screen to come back to.
                     s.screen = if (c == .remove) .list else .server;
                     s.confirm = null;
@@ -388,6 +411,7 @@ pub fn press(s: *State, view: View, key: Key) Effect {
                 .escape => {
                     s.screen = .server;
                     s.confirm = null;
+                    s.answer_no = false;
                 },
                 .up, .down => {},
             }
@@ -727,6 +751,34 @@ test "on a server, the next step is selected, and asking actions confirm first" 
     try testing.expectEqual(Screen.list, s.screen);
     try testing.expectEqual(@as(usize, 0), s.cursor);
     try testing.expectEqual(Effect.close, press(&s, view, .escape));
+}
+
+test "a question on its row chooses yes or no with left and right" {
+    const r = testRow("linear", .failed, .{ .needs_login = true });
+    var s: State = .{ .active = true, .screen = .server, .cursor = 1 };
+    const view: View = .{ .rows = &.{}, .open = r, .layout = serverLayout(r, .needs_login, "", 9) };
+    _ = press(&s, view, .enter);
+    try testing.expectEqual(Screen.confirm, s.screen);
+    try testing.expect(!s.answer_no);
+    // → chooses no, and Enter on no runs nothing and goes back.
+    _ = press(&s, view, .right);
+    try testing.expect(s.answer_no);
+    try testing.expectEqual(Effect.none, press(&s, view, .enter));
+    try testing.expectEqual(Screen.server, s.screen);
+    try testing.expect(!s.answer_no);
+    // Asked again, it starts on yes; ← keeps yes, and Enter removes.
+    _ = press(&s, view, .enter);
+    _ = press(&s, view, .right);
+    _ = press(&s, view, .left);
+    try testing.expectEqual(Choice.remove, press(&s, view, .enter).run.choice);
+
+    // An approval keeps its own screen, where ← and → choose nothing.
+    const proj = testRow("proj", .waiting_for_approval, .{ .source = .workspace });
+    var a: State = .{ .active = true, .screen = .confirm, .confirm = .approve };
+    const approval: View = .{ .rows = &.{}, .open = proj, .layout = serverLayout(proj, .needs_approval, "", 9) };
+    _ = press(&a, approval, .right);
+    try testing.expect(!a.answer_no);
+    try testing.expectEqual(Choice.approve, press(&a, approval, .enter).run.choice);
 }
 
 test "the selection moves on from the choices through the tools, and the screen scrolls" {
