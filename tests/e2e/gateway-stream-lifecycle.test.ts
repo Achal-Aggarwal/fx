@@ -4668,11 +4668,9 @@ describe("gateway stream lifecycle", () => {
             part.toolName === "read_tool_result"
           )?.input;
           return fakeGatewayToolCall(readRangeCallId, "read_tool_result", {
-            request: {
-              handle: suffixlessHandle,
-              start_byte: 1,
-              byte_count: 512,
-            },
+            handle: suffixlessHandle,
+            start_byte: 1,
+            byte_count: 512,
           });
         }
         case 3: {
@@ -4723,18 +4721,16 @@ describe("gateway stream lifecycle", () => {
       expect(sessionEvents).toContain(suffixlessHandle);
       expect(sessionEvents).toContain(canonicalHandle);
       expect(sessionEvents).toContain(needle);
+      // A call sent inside a request wrapper replays with the top-level
+      // arguments the schema advertises, like a call sent that way.
       expect(projectedQueryInput).toEqual({
-        request: {
-          handle: suffixlessHandle,
-          query: needle,
-        },
+        handle: suffixlessHandle,
+        query: needle,
       });
       expect(projectedRangeInput).toEqual({
-        request: {
-          handle: suffixlessHandle,
-          start_byte: 1,
-          byte_count: 512,
-        },
+        handle: suffixlessHandle,
+        start_byte: 1,
+        byte_count: 512,
       });
       expect(result.stderr).not.toContain("ResultHandleNotFound");
     } finally {
@@ -4858,10 +4854,9 @@ describe("gateway stream lifecycle", () => {
           const correction = JSON.parse(toolResultOutput(body, "repair_invalid")).error;
           expect(correction.code).toBe("invalid_shell_request");
           expect(correction.executed).toBe(false);
-          expect(correction.problems).toContain("request.action is required.");
-          expect(correction.retry_with).toEqual({
-            request: { action: "run", command, profile: "clean", yield_time_ms: 1000 },
-          });
+          expect(correction.problems).toContain("Put the action fields at the top level; shell takes no request wrapper.");
+          expect(correction.problems).toContain("action is required.");
+          expect(correction.retry_with).toEqual({ action: "run", command, profile: "clean", yield_time_ms: 1000 });
           return fakeGatewayToolCall("repair_valid", "shell", correction.retry_with);
         }
         case 3:
