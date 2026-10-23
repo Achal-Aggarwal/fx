@@ -329,16 +329,30 @@ pub const Tracker = struct {
         preserved_group: ?std.posix.pid_t,
         comptime Effects: type,
     ) DeliverySummary {
-        if (signal == std.posix.SIG.KILL) {
-            _ = self.signalProcessesOnceWith(std.posix.SIG.STOP, preserved_group, Effects);
-        }
+        if (signal == std.posix.SIG.KILL) self.stopProcessesWith(preserved_group, Effects);
         return self.signalProcessesOnceWith(signal, preserved_group, Effects);
     }
 
+    /// Stops every tracked process before a SIGKILL. A parent whose child
+    /// dies before its own kill arrives would otherwise run its next command,
+    /// as `sleep 30; rm -rf out` does once `sleep` is gone. Parents stop
+    /// before their children, because a shell with job control also moves on
+    /// when its foreground job stops.
+    fn stopProcessesWith(
+        self: *Tracker,
+        preserved_group: ?std.posix.pid_t,
+        comptime Effects: type,
+    ) void {
+        var summary: DeliverySummary = .{};
+        if (self.root) |root| {
+            self.signalTrackedProcessWith(root, std.posix.SIG.STOP, preserved_group, &summary, Effects);
+        }
+        for (self.processes.items) |process| {
+            self.signalTrackedProcessWith(process, std.posix.SIG.STOP, preserved_group, &summary, Effects);
+        }
+    }
+
     /// Sends `signal` to each tracked process, children before parents.
-    /// Before a SIGKILL, callers stop every process first: a parent whose
-    /// child dies before its own kill arrives would otherwise run its next
-    /// command, as `sleep 30; rm -rf out` does once `sleep` is gone.
     fn signalProcessesOnceWith(
         self: *Tracker,
         signal: std.posix.SIG,
@@ -440,11 +454,24 @@ pub const Tracker = struct {
         command_session: std.posix.pid_t,
         comptime Effects: type,
     ) CompletionDelivery {
-        // Stopped first for the reason `signalProcessesOnceWith` gives.
-        if (signal == std.posix.SIG.KILL) {
-            _ = self.signalAttachedOnceWith(std.posix.SIG.STOP, command_session, Effects);
-        }
+        if (signal == std.posix.SIG.KILL) self.stopAttachedWith(command_session, Effects);
         return self.signalAttachedOnceWith(signal, command_session, Effects);
+    }
+
+    /// Stops the attached processes, parents first, for the reasons
+    /// `stopProcessesWith` gives.
+    fn stopAttachedWith(
+        self: *Tracker,
+        command_session: std.posix.pid_t,
+        comptime Effects: type,
+    ) void {
+        var result: CompletionDelivery = .{};
+        if (self.root) |root| {
+            self.signalIfAttachedWith(root, std.posix.SIG.STOP, command_session, &result, Effects);
+        }
+        for (self.processes.items) |process| {
+            self.signalIfAttachedWith(process, std.posix.SIG.STOP, command_session, &result, Effects);
+        }
     }
 
     fn signalAttachedOnceWith(
@@ -1133,7 +1160,8 @@ test "a kill stops every tracked process before killing any" {
     }
     const stop = std.posix.SIG.STOP;
     const kill = std.posix.SIG.KILL;
-    const pids = [_]std.posix.pid_t{ 62, 61, 60, 62, 61, 60 };
+    // Parents stop first, so none is running to see a child stop or die.
+    const pids = [_]std.posix.pid_t{ 60, 61, 62, 62, 61, 60 };
     const signals = [_]std.posix.SIG{ stop, stop, stop, kill, kill, kill };
 
     FakeEffects.sent_count = 0;
