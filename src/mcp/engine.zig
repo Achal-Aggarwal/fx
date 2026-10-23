@@ -295,10 +295,15 @@ pub const Engine = struct {
     /// a sign-in, and starts the server; false when the server can't
     /// use it, so it is still signed out and nothing starts.
     pub fn useCredential(e: *Engine, name: []const u8, saved: []const u8) Error!bool {
-        const slot = try e.find(name);
-        if (!try (try e.ensureServer(slot)).useCredential(saved)) return false;
-        try e.step(slot, .need);
+        if (!try e.adoptCredential(name, saved)) return false;
+        try e.step(try e.find(name), .need);
         return true;
+    }
+
+    /// `useCredential` without starting the server, so a sign-out that
+    /// follows revokes that credential and nothing is sent with it first.
+    pub fn adoptCredential(e: *Engine, name: []const u8, saved: []const u8) Error!bool {
+        return (try e.ensureServer(try e.find(name))).useCredential(saved);
     }
 
     /// Sends the refresh server `name` said was due.
