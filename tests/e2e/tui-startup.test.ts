@@ -274,13 +274,13 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         expect(initial.split(banner)).toHaveLength(2);
 
         for (const command of ["/clear", "/reset", "/new"]) {
-          await session.sendText("/status");
-          await session.waitForText("model=", 5_000);
+          await session.sendText("/permissions");
+          await session.waitForText("* permissions: mode=", 5_000);
           await session.sendText(command);
           const pane = await session.waitForPane(
             (value) =>
               value.includes(banner) &&
-              !value.includes("model=") &&
+              !value.includes("* permissions: mode=") &&
               hasEmptyComposer(value),
             5_000,
           );
@@ -334,24 +334,24 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         });
         await session.waitForComposer(10_000);
         for (let i = 0; i < 8; i++) {
-          await session.sendText("/status");
+          await session.sendText("/permissions");
           await session.waitForComposer(5_000);
         }
         const before = await session.captureFullScrollback();
-        const lastStatus = before.slice(before.lastIndexOf("* status:"));
-        expect(lastStatus).toContain("agent_step_limit=0");
+        const lastNotice = before.slice(before.lastIndexOf("* permissions: mode="));
+        expect(lastNotice).toContain("* permissions: saved-session permission rules: none");
 
         await session.sendText("/new");
         await session.waitForPane(
-          (pane) => pane.includes(banner) && !pane.includes("model=") && hasEmptyComposer(pane),
+          (pane) => pane.includes(banner) && !pane.includes("* permissions: mode=") && hasEmptyComposer(pane),
           5_000,
         );
         const after = await session.captureFullScrollback();
-        const priorStatus = after.slice(after.lastIndexOf("* status:"), after.lastIndexOf(banner)).trimEnd();
-        expect(priorStatus).toBe(lastStatus.split("\n┃")[0]?.trimEnd());
-        expect(priorStatus).not.toContain("Commands 1");
-        expect(priorStatus).not.toContain("run /login ·");
-        expect(await session.capturePane()).not.toContain("model=");
+        const priorNotice = after.slice(after.lastIndexOf("* permissions: mode="), after.lastIndexOf(banner)).trimEnd();
+        expect(priorNotice).toBe(lastNotice.split("\n┃")[0]?.trimEnd());
+        expect(priorNotice).not.toContain("Commands 1");
+        expect(priorNotice).not.toContain("run /login ·");
+        expect(await session.capturePane()).not.toContain("* permissions: mode=");
         const replay = JSON.parse(execFileSync(FX_BIN, ["replay", tapePath, "--json"], { encoding: "utf8" }));
         expect(replay.frame_count).toBeGreaterThan(0);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -449,34 +449,40 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           height: 18,
         });
         await session.waitForComposer(10_000);
-        await session.sendText("/status");
-        await session.waitForPane((pane) => pane.includes("agent_step_limit=0"), 5_000);
+        await session.sendText("/permissions");
+        await session.waitForPane((pane) => pane.includes("saved-session permission rules: none"), 5_000);
         const before = await session.captureFullScrollback();
-        const expectedStatus = before.slice(before.lastIndexOf("* status:")).split("\n┃")[0]?.trimEnd();
-        expect(expectedStatus).toContain("agent_step_limit=0");
+        const expectedNotice = before.slice(before.lastIndexOf("* permissions: mode=")).split("\n┃")[0]?.trimEnd();
+        expect(expectedNotice).toContain("saved-session permission rules: none");
         session.sendLiteralImmediate("/new");
         await session.resizeWindow(78, 18, 0);
         await Bun.sleep(40);
         session.sendKeysImmediate(["Enter"]);
 
         await session.waitForPane(
-          (pane) => pane.includes(banner) && !pane.includes("model=") && hasEmptyComposer(pane),
+          (pane) => pane.includes(banner) && !pane.includes("* permissions: mode=") && hasEmptyComposer(pane),
           10_000,
         );
         const history = await session.captureFullScrollback();
-        const oldStatus = history.slice(history.lastIndexOf("* status:"), history.lastIndexOf(banner));
+        const oldNotice = history.slice(history.lastIndexOf("* permissions: mode="), history.lastIndexOf(banner));
         let lastIndex = -1;
-        for (const field of ["* status:", "permission_mode=auto", "workspace=", "history_turns=0", "session_permission_grants=0", "agent_step_limit=0"]) {
-          const index = oldStatus.indexOf(field);
+        for (const field of [
+          "* permissions: mode=auto",
+          "configured rules: (none)",
+          "session grants: (none)",
+          "usage: /permissions",
+          "* permissions: saved-session permission rules: none",
+        ]) {
+          const index = oldNotice.indexOf(field);
           expect(index).toBeGreaterThan(lastIndex);
           lastIndex = index;
         }
-        expect(oldStatus.replace(/\s+/g, "")).toBe(expectedStatus?.replace(/\s+/g, ""));
-        expect(oldStatus).not.toContain("Commands 1");
-        expect(oldStatus).not.toContain("run /login ·");
+        expect(oldNotice.replace(/\s+/g, "")).toBe(expectedNotice?.replace(/\s+/g, ""));
+        expect(oldNotice).not.toContain("Commands 1");
+        expect(oldNotice).not.toContain("run /login ·");
         expect(session.isAlive()).toBe(true);
-        await session.sendText("/status");
-        await session.waitForPane((pane) => pane.includes("agent_step_limit=0") && hasEmptyComposer(pane), 5_000);
+        await session.sendText("/permissions");
+        await session.waitForPane((pane) => pane.includes("saved-session permission rules: none") && hasEmptyComposer(pane), 5_000);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         const replay = JSON.parse(execFileSync(FX_BIN, ["replay", tapePath, "--json"], { encoding: "utf8" }));
         expect(replay.frame_count).toBeGreaterThan(0);
@@ -510,8 +516,8 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           height: 18,
         });
         await session.waitForComposer(10_000);
-        await session.sendText("/status");
-        await session.waitForText("agent_step_limit=0", 5_000);
+        await session.sendText("/permissions");
+        await session.waitForText("saved-session permission rules: none", 5_000);
         session.sendLiteralImmediate("/new");
         await session.resizeWindow(78, 3, 0);
         session.sendKeysImmediate(["Enter"]);

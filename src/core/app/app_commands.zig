@@ -515,9 +515,29 @@ pub fn Handlers(comptime App: type) type {
             }
         }
 
+        /// `/status` opens its panel in the footer, like `/usage`, and
+        /// writes nothing to the transcript.
         fn commandShowStatus(ctx: *anyopaque) !void {
             const app: *App = @ptrCast(@alignCast(ctx));
-            try session_commands.Commands(App).showStatus(app);
+            const snapshot = try session_commands.Commands(App).openStatusSnapshot(app);
+            if (comptime @hasField(App, "skills")) app.skills.closeMenu();
+            if (comptime @hasField(App, "model_cache")) app.model_cache.closeMenu();
+            closeHelpMenuIfPresent(app);
+            app.input_runtime.settings_menu.close();
+            closeInlineCommandMenusIfPresent(app);
+            app.input_runtime.status_menu.open(snapshot);
+            app.shell.render_requests.request(.footer);
+        }
+
+        /// Rebuilds the open `/status` panel when a running turn saved the
+        /// session or ended. Returns whether it did, so the footer repaints.
+        pub fn collectStatusMenuFacts(app: *App) !bool {
+            const menu = &app.input_runtime.status_menu;
+            if (!menu.active) return false;
+            const shown = if (menu.snapshot) |*snapshot| snapshot else return false;
+            const next = (try session_commands.Commands(App).refreshedStatusSnapshot(app, shown)) orelse return false;
+            menu.replace(next);
+            return true;
         }
 
         fn commandAttachImage(ctx: *anyopaque, path: []const u8) !void {
@@ -1162,6 +1182,7 @@ pub fn Handlers(comptime App: type) type {
             if (comptime !@hasField(App, "input_runtime")) return;
             const InputRuntime = @TypeOf(app.input_runtime);
             if (comptime @hasField(InputRuntime, "statusline_menu")) app.input_runtime.statusline_menu.close();
+            if (comptime @hasField(InputRuntime, "status_menu")) app.input_runtime.status_menu.close();
             if (comptime @hasField(InputRuntime, "usage_menu")) closeUsageMenu(app);
             if (comptime @hasField(InputRuntime, "workspace_menu")) app.input_runtime.workspace_menu.close();
         }

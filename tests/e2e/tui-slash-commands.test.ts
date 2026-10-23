@@ -11,6 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, HAS_API_KEY } from "../evals/eval-helpers";
+import { panelSession, readStatusPanel } from "./status-panel";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -154,7 +155,7 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
   );
 
   test(
-    "compact status notice preserves native scrollback",
+    "compact status panel leaves native scrollback whole",
     async () => {
       const root = mkdtempSync(join(tmpdir(), "fx-status-compact-"));
       const home = join(root, "home");
@@ -193,17 +194,15 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
       await session.waitForComposer(10_000);
       expect((await session.captureFullScrollback()).split("Run /help for commands")).toHaveLength(2);
 
-      await session.sendText("/status");
-      await session.waitForText("agent_step_limit=", 5_000);
+      // Twelve rows leave the panel too few to show every line.
+      const panel = await readStatusPanel(session, 5_000, (shown) => shown.fields.Permissions === "auto");
+      expect(panel.labels[0]).toBe("Session");
+      expect(panel.labels).not.toContain("Build");
       await session.waitForComposer(5_000);
       const scrollback = await session.captureFullScrollback();
-
-      for (const field of [
-        "Run /help for commands",
-        "auth_refreshable=",
-        "permission_mode=auto",
-      ]) {
-        expect(scrollback.split(field)).toHaveLength(2);
+      expect(scrollback.split("Run /help for commands")).toHaveLength(2);
+      for (const label of ["Session", "Permissions", "Session grants"]) {
+        expect(scrollback).not.toMatch(new RegExp(`^ {2}${label} {2,}\\S`, "m"));
       }
       expect(session.paneStatus()).toEqual({ dead: false, status: null });
       expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -224,12 +223,14 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
 
 describe.skipIf(SKIP)("tui: slash commands", () => {
   test(
-    "/status shows session info",
+    "/status shows the session, model, and permissions in a panel and Esc closes it",
     async () => {
       session = await launchAndWait();
-      await session.sendText("/status");
-      const pane = await session.waitForText(/model|permission/i, 5_000);
-      expect(pane.toLowerCase()).toMatch(/model|permission/);
+      const panel = await readStatusPanel(session, 5_000);
+      expect(panelSession(panel).id).toMatch(/^[A-Za-z0-9_-]{12}$/);
+      expect(panel.fields.Model).toBeTruthy();
+      expect(panel.fields.Permissions).toBeTruthy();
+      await session.waitForComposer(5_000);
     },
     TIMEOUT,
   );

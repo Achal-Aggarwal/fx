@@ -55,6 +55,7 @@ const approval_prompt = @import("../permissions/approval_prompt.zig");
 const picker_presentation = @import("../../ui/footer/picker_presentation.zig");
 const compact_command_menu_presentation = @import("../../ui/footer/compact_command_menu_presentation.zig");
 const render_input = @import("../../ui/footer/render_input.zig");
+const status_menu_presentation = @import("../../ui/footer/status_menu_presentation.zig");
 const paste_blocks = @import("../input/pasted_blocks.zig");
 const registered_entities = @import("../input/registered_entities.zig");
 const prompt_history_runtime = @import("prompt_history_runtime.zig");
@@ -1828,12 +1829,14 @@ pub fn Runtime(comptime App: type) type {
 
         const CompactCommandMenuKind = enum {
             statusline,
+            status,
             usage,
             workspace,
         };
 
         fn activeCompactCommandMenu(app: *App) ?CompactCommandMenuKind {
             if (app.input_runtime.statusline_menu.active) return .statusline;
+            if (app.input_runtime.status_menu.active) return .status;
             if (app.input_runtime.usage_menu.active) return .usage;
             if (app.input_runtime.workspace_menu.active) return .workspace;
             return null;
@@ -2110,6 +2113,12 @@ pub fn Runtime(comptime App: type) type {
                 try prepareWorkspaceMenuCommand(app, max_input_len);
                 return;
             }
+            // The panel only shows; Enter closes it as Esc does.
+            if (menu == .status) {
+                app.input_runtime.status_menu.close();
+                app.shell.render_requests.request(.footer);
+                return;
+            }
             if (menu == .usage) {
                 if (app.input_runtime.usage_menu.openDetail()) app.shell.render_requests.request(.footer);
                 return;
@@ -2117,7 +2126,7 @@ pub fn Runtime(comptime App: type) type {
             const snapshot = app_commands.settingsCatalogSnapshot(app);
             const change = switch (menu) {
                 .statusline => app.input_runtime.statusline_menu.selectedChange(snapshot),
-                .usage, .workspace => unreachable,
+                .status, .usage, .workspace => unreachable,
             } orelse return;
             if (comptime @hasDecl(App, "notificationPreferences")) {
                 try app_commands.applySettingsCatalogMenuChange(app, change);
@@ -2159,6 +2168,7 @@ pub fn Runtime(comptime App: type) type {
         fn moveCompactCommandMenu(app: *App, menu: CompactCommandMenuKind, delta: i32) bool {
             return switch (menu) {
                 .statusline => app.input_runtime.statusline_menu.move(delta),
+                .status => scrollStatusMenu(app, delta),
                 .usage => app.input_runtime.usage_menu.moveModel(
                     delta,
                     usageMenuVisibleModelItems(app),
@@ -2171,6 +2181,18 @@ pub fn Runtime(comptime App: type) type {
                 else
                     false,
             };
+        }
+
+        /// ↑↓ in the `/status` panel, over the lines the footer shows it.
+        fn scrollStatusMenu(app: *App, delta: i32) bool {
+            const cols = app.shell.layout.cols;
+            const projection = render_input.statusMenuProjection(&app.input_runtime.status_menu, cols, app.shell.layout.rows);
+            const visible_rows = status_menu_presentation.footerRows(projection, cols, app.shell.layout.rows);
+            return app.input_runtime.status_menu.scrollBy(
+                delta,
+                status_menu_presentation.lineCount(projection.rows, cols),
+                status_menu_presentation.visibleLineCount(visible_rows),
+            );
         }
 
         fn usageMenuVisibleModelItems(app: *App) u16 {
@@ -2222,7 +2244,7 @@ pub fn Runtime(comptime App: type) type {
                 const delta: i32 = if (resolved == .cursor_left) -1 else 1;
                 const change = switch (menu) {
                     .statusline => app.input_runtime.statusline_menu.changeSelectedOption(&snapshot, delta),
-                    .usage, .workspace => unreachable,
+                    .status, .usage, .workspace => unreachable,
                 } orelse return;
                 if (comptime @hasDecl(App, "notificationPreferences")) {
                     try app_commands.applySettingsCatalogMenuChange(app, change);
@@ -2789,6 +2811,10 @@ pub fn Runtime(comptime App: type) type {
         fn cancelCompactCommandMenu(app: *App) bool {
             if (app.input_runtime.statusline_menu.active) {
                 app.input_runtime.statusline_menu.close();
+                return true;
+            }
+            if (app.input_runtime.status_menu.active) {
+                app.input_runtime.status_menu.close();
                 return true;
             }
             if (app.input_runtime.usage_menu.active) {
