@@ -117,8 +117,8 @@ describe.skipIf(SKIP)("tui: render stress", () => {
         await session.waitForText("Commands 37", 5_000);
         await session.sendKeys("Escape");
         await session.waitForPane((pane) => !pane.includes("enter open"), 5_000);
-        await session.sendText("/permissions");
-        await session.waitForText("* permissions: mode=", 5_000);
+        await session.sendText("/allowlist");
+        await session.waitForText("* allowlist: effective", 5_000);
         const unknownCommand = `/unknown-render-stress-${run} local transcript notice`;
         await session.sendLiteralText(unknownCommand);
         await session.waitForPane(

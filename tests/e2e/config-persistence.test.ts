@@ -17,7 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
 import { savedSessionIds, sessionDir, storeRoot } from "./saved-sessions";
-import { readStatusPanel } from "./status-panel";
+import { readStatusPanel } from "./info-panel";
 import {
   composerContains,
   FAKE_GATEWAY_MODEL,

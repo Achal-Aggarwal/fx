@@ -17,7 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, REPO_ROOT, runFx, providerVersionTestEnv } from "../evals/eval-helpers";
-import { closeStatusPanel, panelAuth, readStatusPanel, waitForStatusPanel } from "./status-panel";
+import { closeStatusPanel, panelAuth, readStatusPanel, waitForStatusPanel } from "./info-panel";
 import { fakeResponsesTitleDefault, TITLE_GENERATION_MARKER } from "./tmux-helpers";
 import { readTapeFrames } from "./render-lab/tape";
 import { equivalentPngEncodings, solidPng } from "./fixtures/image-encoding";

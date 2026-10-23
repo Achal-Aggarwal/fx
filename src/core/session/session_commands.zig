@@ -20,7 +20,7 @@ const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const render_request = @import("../../ui/render_request.zig");
 const runtime_profile = @import("../hosts/runtime_profile.zig");
-const status_menu = @import("status_menu.zig");
+const info_panel = @import("../input/info_panel.zig");
 
 const freeStringList = collections.freeStringList;
 const containsIgnoreCase = text_utils.containsIgnoreCase;
@@ -280,7 +280,7 @@ pub fn Commands(comptime App: type) type {
         /// The rows the `/status` panel opens with. The profile settings are
         /// read here, once, for the credential they select; a panel whose
         /// settings cannot be read says so in a row instead of showing auth.
-        pub fn openStatusSnapshot(app: *App) !status_menu.Snapshot {
+        pub fn openStatusSnapshot(app: *App) !info_panel.Snapshot {
             var preferred: ?types.CredentialSource = null;
             var settings_error: ?[]const u8 = null;
             if (provider_runtime.provider(app) == .gateway and app.auth.credentialSource() == null) {
@@ -297,12 +297,13 @@ pub fn Commands(comptime App: type) type {
 
         /// New rows for the open `/status` panel when a running turn changed
         /// what `shown` was built from; null while nothing did. Reads no file.
-        pub fn refreshedStatusSnapshot(app: *App, shown: *const status_menu.Snapshot) !?status_menu.Snapshot {
+        pub fn refreshedStatusSnapshot(app: *App, shown: *const info_panel.Snapshot) !?info_panel.Snapshot {
             if (std.meta.eql(statusFacts(app, shellSession(app)), shown.facts)) return null;
-            return try statusSnapshot(app, shown.preferred, shown.settings_error);
+            const inputs = shown.inputs.status;
+            return try statusSnapshot(app, inputs.preferred, inputs.settings_error);
         }
 
-        fn statusSnapshot(app: *App, preferred: ?types.CredentialSource, settings_error: ?[]const u8) !status_menu.Snapshot {
+        fn statusSnapshot(app: *App, preferred: ?types.CredentialSource, settings_error: ?[]const u8) !info_panel.Snapshot {
             const provider = provider_runtime.provider(app);
             const auth = app.auth.statusSnapshot(provider, preferred);
             const session = shellSession(app);
@@ -334,19 +335,67 @@ pub fn Commands(comptime App: type) type {
                 .arena = arena,
                 .rows = rows,
                 .facts = statusFacts(app, session),
-                .preferred = preferred,
-                .settings_error = settings_error,
+                .inputs = .{ .status = .{ .preferred = preferred, .settings_error = settings_error } },
             };
         }
 
-        fn statusFacts(app: *App, session: ?output_contracts.StatusSnapshot.ShellSession) status_menu.Facts {
-            return .{
+        fn statusFacts(app: *App, session: ?output_contracts.StatusSnapshot.ShellSession) info_panel.Facts {
+            return .{ .status = .{
                 .history_turns = app.session.historyLen(),
                 .session_saved = if (session) |shown| switch (shown) {
                     .unavailable => null,
                     .open => |open| open.saved,
                 } else null,
+                .session_grants = permissions.liveSessionGrantCount(app.permission_engine.grants.items),
+            } };
+        }
+
+        /// The rows the `/permissions` panel opens with: the mode, the
+        /// configured rules, the session grants that still apply, and the
+        /// open saved session's remembered rules.
+        pub fn openPermissionsSnapshot(app: *App) !info_panel.Snapshot {
+            var arena = std.heap.ArenaAllocator.init(app.alloc);
+            errdefer arena.deinit();
+            const alloc = arena.allocator();
+            const snapshot: output_contracts.PermissionsSnapshot = .{
+                .workspace_root = app.workspace_root,
+                .mode = app.permission_engine.mode,
+                .grants = try permissions.liveSessionGrants(alloc, app.permission_engine.grants.items),
+                .rules = app.permission_engine.rules,
+                .saved_rules = try savedPermissionRules(app, alloc),
             };
+            const rows = try snapshot.panelRows(alloc);
+            return .{ .arena = arena, .rows = rows, .facts = permissionsFacts(app), .inputs = .permissions };
+        }
+
+        /// New rows for the open `/permissions` panel when an approval
+        /// changed what `shown` was built from; null while nothing did.
+        pub fn refreshedPermissionsSnapshot(app: *App, shown: *const info_panel.Snapshot) !?info_panel.Snapshot {
+            if (std.meta.eql(permissionsFacts(app), shown.facts)) return null;
+            return try openPermissionsSnapshot(app);
+        }
+
+        fn permissionsFacts(app: *App) info_panel.Facts {
+            return .{ .permissions = .{
+                .mode = app.permission_engine.mode,
+                .session_grants = permissions.liveSessionGrantCount(app.permission_engine.grants.items),
+                .configured_rules = app.permission_engine.rules.rules.len,
+            } };
+        }
+
+        /// The open saved session's remembered rules, copied into `alloc`;
+        /// null in a host whose sessions keep none.
+        fn savedPermissionRules(app: *App, alloc: std.mem.Allocator) !?[]const output_contracts.PermissionsSnapshot.SavedRule {
+            if (comptime !@hasDecl(@TypeOf(app.session), "snapshotPermissionState")) return null;
+            var state = try app.session.snapshotPermissionState(app.alloc);
+            defer state.deinit(app.alloc);
+            const saved = try alloc.alloc(output_contracts.PermissionsSnapshot.SavedRule, state.rules.items.len);
+            for (state.rules.items, saved) |rule, *entry| entry.* = .{
+                .id = rule.id.value,
+                .decision = @tagName(rule.decision),
+                .identity = try alloc.dupe(u8, rule.display_identity),
+            };
+            return saved;
         }
 
         /// The open session as `/status` shows it, so its id can be copied
@@ -412,12 +461,10 @@ pub fn Commands(comptime App: type) type {
             try setResolvedModel(app, resolved, true);
         }
 
+        /// `/permissions` with a mode or `reset`. Bare `/permissions` opens its
+        /// panel instead (`openPermissionsSnapshot`), and anything else gets
+        /// the usage.
         pub fn handlePermissions(app: *App, rest: []const u8) !void {
-            if (rest.len == 0) {
-                try writePermissionsStatus(app);
-                return;
-            }
-
             if (config_runtime.parsePermissionMode(rest)) |mode| {
                 try app_permission_runtime.Runtime(App).selectMode(app, mode);
                 try app.writeDomainNotice(.{
@@ -1082,14 +1129,6 @@ pub fn Commands(comptime App: type) type {
                 .tone = if (web_fetch_warning_count == 0) .neutral else .warning,
                 .body = std.mem.trimEnd(u8, text, "\n"),
             }, true);
-        }
-
-        fn writePermissionsStatus(app: *App) !void {
-            const status = try app.permission_engine.formatPermissionsNoticeBody(app.alloc, app.workspace_root);
-            defer app.alloc.free(status);
-            const notice = try app.alloc.print("{s}\n{s}", .{ status, permissions_usage });
-            defer app.alloc.free(notice);
-            try app.writeDomainNotice(.{ .topic = "permissions", .tone = .neutral, .body = notice }, true);
         }
 
         fn writeSettingsStatus(app: *App) !void {
@@ -2124,7 +2163,7 @@ test "session_commands status snapshot builds the panel rows and writes no trans
     try expectStatusRow(refreshed, "Turns", "8");
 }
 
-fn expectStatusRow(snapshot: status_menu.Snapshot, label: []const u8, value: []const u8) !void {
+fn expectStatusRow(snapshot: info_panel.Snapshot, label: []const u8, value: []const u8) !void {
     for (snapshot.rows) |row| {
         if (std.mem.eql(u8, row.label, label)) return std.testing.expectEqualStrings(value, row.value);
     }
@@ -2448,31 +2487,37 @@ test "session_commands handlePermissions persists modes and reset clears session
     try expectTranscriptContains(&app, "permissions reset to ask, session grants cleared");
 }
 
-test "session_commands argless permissions writes one read-only status notice with switching usage" {
+test "session_commands permissions snapshot shows the mode and grants and changes nothing" {
     const alloc = std.testing.allocator;
     var app = try FakeApp.init(alloc, "/tmp/workspace", "anthropic/claude-opus-4.6");
     defer app.deinit();
     app.permission_engine.mode = .auto;
     try app.permission_engine.allow(alloc, "bash", "git *");
 
-    try Commands(FakeApp).handlePermissions(&app, "");
+    var snapshot = try Commands(FakeApp).openPermissionsSnapshot(&app);
+    defer snapshot.deinit();
+    try expectStatusRow(snapshot, "Mode", "auto");
+    try expectStatusRow(snapshot, "Configured rules", "none");
+    try expectStatusRow(snapshot, "Session grants", "1");
+    const grants_at = for (snapshot.rows, 0..) |row, at| {
+        if (std.mem.eql(u8, row.label, "Session grants")) break at;
+    } else return error.TestExpectedEqual;
+    try std.testing.expect(snapshot.rows[grants_at + 1].item);
+    try std.testing.expectEqualStrings("bash → git *", snapshot.rows[grants_at + 1].value);
+    try expectStatusRow(snapshot, "Change mode", "/permissions ask, auto, full-access, or reset");
+    try std.testing.expect(try Commands(FakeApp).refreshedPermissionsSnapshot(&app, &snapshot) == null);
 
-    try std.testing.expectEqual(@as(usize, 1), app.semantic_write_count);
-    try std.testing.expectEqual(types.NoticeTone.neutral, app.last_tone.?);
-    const status_index = std.mem.find(u8, app.text(), "mode=auto") orelse
-        return error.TestExpectedEqual;
-    const usage = permissions_usage ++ "\n";
-    const usage_index = std.mem.find(u8, app.text(), usage) orelse
-        return error.TestExpectedEqual;
-    try std.testing.expect(status_index < usage_index);
-    try std.testing.expect(std.mem.endsWith(u8, app.text(), usage));
+    try std.testing.expectEqual(@as(usize, 0), app.semantic_write_count);
     try std.testing.expectEqual(types.PermissionMode.auto, app.permission_engine.mode);
     try std.testing.expectEqual(@as(usize, 1), app.permission_engine.grants.items.len);
-    try std.testing.expectEqualStrings("bash", app.permission_engine.grants.items[0].tool_name);
-    try std.testing.expectEqualStrings("git *", app.permission_engine.grants.items[0].target_path);
     try std.testing.expectEqual(@as(usize, 0), app.permission_mode_preference_commit_count);
     try std.testing.expectEqual(@as(?types.PermissionMode, null), app.worker.synced_mode);
     try std.testing.expectEqual(@as(?types.PermissionMode, null), app.worker.synced_state_mode);
+
+    try app.permission_engine.allow(alloc, "read_file", "src/**");
+    var refreshed = (try Commands(FakeApp).refreshedPermissionsSnapshot(&app, &snapshot)).?;
+    defer refreshed.deinit();
+    try expectStatusRow(refreshed, "Session grants", "2");
 }
 
 test "session_commands handlePermissions reports usage and invalid action before touching settings" {

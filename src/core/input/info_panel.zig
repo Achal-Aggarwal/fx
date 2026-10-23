@@ -1,32 +1,64 @@
-//! State of the `/status` panel: the rows it shows, built from
-//! `StatusSnapshot.panelRows` when it opens, and how far they are scrolled.
-//! The panel lives in the footer and writes nothing to the transcript.
+//! State of a read-only panel in the footer, such as `/status` and
+//! `/permissions` open: a title over labeled lines, built when it opens and
+//! scrolled when they do not all fit. It writes nothing to the transcript.
 
 const std = @import("std");
 const output_contracts = @import("../output/output_contracts.zig");
 const types = @import("../shared/types.zig");
 
-pub const Row = output_contracts.StatusSnapshot.PanelRow;
+pub const Row = output_contracts.PanelRow;
 
-/// What the panel's rows depend on that changes with no keystroke while it
-/// is open: a running turn that saves the session or ends. The rows are
-/// rebuilt when these differ from the ones they were built from.
-pub const Facts = struct {
-    history_turns: usize = 0,
-    /// Null when the shell has no session.
-    session_saved: ?bool = null,
+pub const Kind = enum {
+    status,
+    permissions,
+
+    pub fn title(self: Kind) []const u8 {
+        return switch (self) {
+            .status => "Status",
+            .permissions => "Permissions",
+        };
+    }
 };
 
-/// The panel's rows and what they were built from. Owns everything.
+/// What a panel's rows depend on that changes with no keystroke while it is
+/// open: a running turn that saves the session, ends, or gains a session
+/// grant from an approval. The rows are rebuilt when these differ from the
+/// ones they were built from.
+pub const Facts = union(Kind) {
+    status: struct {
+        history_turns: usize,
+        /// Null when the shell has no session.
+        session_saved: ?bool,
+        session_grants: usize,
+    },
+    permissions: struct {
+        mode: types.PermissionMode,
+        session_grants: usize,
+        configured_rules: usize,
+    },
+};
+
+/// What a rebuild needs that it must not read again, by kind.
+pub const Inputs = union(Kind) {
+    status: struct {
+        /// The credential the profile settings select, read at open.
+        preferred: ?types.CredentialSource,
+        /// Why the settings could not be read at open, an error name.
+        settings_error: ?[]const u8,
+    },
+    permissions,
+};
+
+/// A panel's rows and what they were built from. Owns everything.
 pub const Snapshot = struct {
     arena: std.heap.ArenaAllocator,
     rows: []const Row,
     facts: Facts,
-    /// The credential the profile settings select, read once at open so a
-    /// rebuild reads no file.
-    preferred: ?types.CredentialSource,
-    /// Why the settings could not be read at open, an error name.
-    settings_error: ?[]const u8,
+    inputs: Inputs,
+
+    pub fn kind(self: *const Snapshot) Kind {
+        return self.facts;
+    }
 
     pub fn deinit(self: *Snapshot) void {
         self.arena.deinit();
@@ -56,6 +88,10 @@ pub const State = struct {
     pub fn close(self: *State) void {
         if (self.snapshot) |*old| old.deinit();
         self.* = .{};
+    }
+
+    pub fn title(self: *const State) []const u8 {
+        return if (self.snapshot) |*snapshot| snapshot.kind().title() else "";
     }
 
     pub fn rows(self: *const State) []const Row {

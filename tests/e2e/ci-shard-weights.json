@@ -46,6 +46,7 @@
   { "file": "tui-keybindings.test.ts", "weight": 1 },
   { "file": "tui-native-clear-recovery.test.ts", "weight": 4 },
   { "file": "tui-permissions.test.ts", "weight": 127 },
+  { "file": "tui-permissions-panel.test.ts", "weight": 25 },
   { "file": "tui-performance.test.ts", "weight": 1 },
   { "file": "tui-render-lab.test.ts", "weight": 62 },
   { "file": "tui-render-live-stress.test.ts", "weight": 1 },

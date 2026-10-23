@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, HAS_API_KEY } from "../evals/eval-helpers";
-import { closeStatusPanel, lastTranscriptRow, panelSession, readStatusPanel, showsStatusPanel, waitForStatusPanel } from "./status-panel";
+import { closeStatusPanel, lastTranscriptRow, panelSession, readPermissionsPanel, readStatusPanel, showsStatusPanel, waitForStatusPanel } from "./info-panel";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -132,20 +132,16 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
   );
 
   test(
-    "/permissions shows state before switching usage and leaves a live composer",
+    "/permissions shows the mode and how to change it in a panel and leaves a live composer",
     async () => {
       const launched = await launchNoKeyAndWait();
       session = launched.terminal;
 
-      await session.sendText("/permissions");
-      await session.waitForText("usage: /permissions [ask|auto|full-access|reset]", 5_000);
-      const scrollback = await session.captureFullScrollback();
-      const statusIndex = scrollback.search(/\* permissions: mode=(?:ask|auto)/);
-      const usageIndex = scrollback.indexOf(
-        "usage: /permissions [ask|auto|full-access|reset]",
-      );
-      expect(statusIndex).toBeGreaterThanOrEqual(0);
-      expect(usageIndex).toBeGreaterThan(statusIndex);
+      const panel = await readPermissionsPanel(session, 5_000);
+      expect(["ask", "auto"]).toContain(panel.fields.Mode);
+      expect(panel.labels.indexOf("Change mode")).toBeGreaterThan(panel.labels.indexOf("Mode"));
+      expect(panel.fields["Change mode"]).toBe("/permissions ask, auto, full-access, or reset");
+      expect(await session.captureFullScrollback()).not.toContain("* permissions:");
 
       await session.sendLiteral("composer-still-usable");
       const pane = await session.waitForText("composer-still-usable", 5_000);

@@ -749,7 +749,7 @@ pub fn composeCompactCommandMenuHintRow(
             "↑↓ move  ←→ change  esc",
             "←→ esc",
         },
-        .status => |status_menu| if (status_menu.overflows) [_][]const u8{
+        .info_panel => |panel| if (panel.overflows) [_][]const u8{
             "↑↓ scroll     esc close",
             "↑↓ scroll  esc",
             "↑↓ esc",

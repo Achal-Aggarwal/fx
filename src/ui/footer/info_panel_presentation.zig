@@ -1,19 +1,20 @@
-//! The `/status` panel in the footer: a title, then one line per row with
-//! its label and value. A value too long for its column continues on the
-//! next lines, under the value, so nothing is cut off; when the lines do
-//! not all fit, ↑↓ scrolls them.
+//! A read-only panel in the footer, such as `/status` and `/permissions`
+//! open: a title, then one line per row with its label and value. A list's
+//! entries follow its labeled row as bullets under the value. A value too
+//! long for its column continues on the next lines, under the value, so
+//! nothing is cut off; when the lines do not all fit, ↑↓ scrolls them.
 
 const std = @import("std");
 const display_width = @import("../../core/shared/display_width.zig");
-const status_menu = @import("../../core/session/status_menu.zig");
+const info_panel = @import("../../core/input/info_panel.zig");
 const picker_presentation = @import("picker_presentation.zig");
 const render_input = @import("render_input.zig");
 const row_text = @import("row_text.zig");
 const ui_render = @import("../render.zig");
 
 const Allocator = std.mem.Allocator;
-const Projection = render_input.StatusMenuProjection;
-const Row = status_menu.Row;
+const Projection = render_input.InfoPanelProjection;
+const Row = info_panel.Row;
 
 const indent: usize = 2;
 const column_gap: usize = 4;
@@ -21,6 +22,9 @@ const column_gap: usize = 4;
 const min_value_width: usize = 24;
 /// The title and the blank row under it.
 const header_rows: u16 = 2;
+/// What starts a list entry, and the indent of its wrapped lines.
+const bullet = "• ";
+const bullet_width: usize = 2;
 
 /// Rows the panel asks for: its header and every line.
 pub fn desiredRowCount(projection: Projection, width: u16) u16 {
@@ -50,7 +54,7 @@ pub fn overflows(projection: Projection, width: u16, terminal_rows: u16) bool {
 pub fn lineCount(rows: []const Row, width: u16) usize {
     const value_width = valueWidth(rows, width);
     var count: usize = 0;
-    for (rows) |row| count += wrappedLineCount(row.value, value_width);
+    for (rows) |row| count += wrappedLineCount(row.value, textWidth(row, value_width));
     return count;
 }
 
@@ -68,7 +72,7 @@ pub fn composeRow(
     if (row_index < header) {
         if (row_index == 0) {
             try row.appendSlice(alloc, ui_render.selected_completion_style);
-            try row_text.appendSingleLineEllipsized(alloc, &row, "Status", width);
+            try row_text.appendSingleLineEllipsized(alloc, &row, projection.title, width);
             try row.appendSlice(alloc, ui_render.reset_style);
         }
         return row;
@@ -83,12 +87,14 @@ pub fn composeRow(
 
     var line: usize = 0;
     for (projection.rows) |panel_row| {
+        const text_width = textWidth(panel_row, value_width);
         var rest = panel_row.value;
         var first = true;
         while (first or rest.len > 0) : (first = false) {
-            const cut = nextBreak(rest, value_width);
+            const cut = nextBreak(rest, text_width);
             if (line == wanted) {
-                try composeLine(alloc, &row, if (first) panel_row.label else "", rest[0..cut.end], value_col, width);
+                const lead = if (!panel_row.item) "" else if (first) bullet else "  ";
+                try composeLine(alloc, &row, if (first) panel_row.label else "", lead, rest[0..cut.end], value_col, width);
                 return row;
             }
             rest = rest[cut.next..];
@@ -102,6 +108,7 @@ fn composeLine(
     alloc: Allocator,
     row: *std.ArrayList(u8),
     label: []const u8,
+    lead: []const u8,
     value: []const u8,
     value_col: usize,
     width: u16,
@@ -115,7 +122,9 @@ fn composeLine(
     if (used >= total_width or value_col >= total_width) return;
     try row.appendNTimes(alloc, ' ', value_col -| used);
     try row.appendSlice(alloc, ui_render.dim_style);
-    try row_text.appendSingleLineEllipsized(alloc, row, value, total_width - value_col);
+    const room = total_width - value_col;
+    try row_text.appendSingleLineEllipsized(alloc, row, lead, room);
+    try row_text.appendSingleLineEllipsized(alloc, row, value, room -| display_width.visibleWidth(lead));
     try row.appendSlice(alloc, ui_render.reset_style);
 }
 
@@ -139,12 +148,18 @@ fn valueWidth(rows: []const Row, width: u16) usize {
     return @max(@as(usize, width) -| valueColumn(rows, width), 1);
 }
 
-fn wrappedLineCount(value: []const u8, value_width: usize) usize {
+/// The columns `row`'s text may take on each of its lines: the value's,
+/// less a list entry's bullet.
+fn textWidth(row: Row, value_width: usize) usize {
+    return if (row.item) @max(value_width -| bullet_width, 1) else value_width;
+}
+
+fn wrappedLineCount(value: []const u8, text_width: usize) usize {
     var rest = value;
     var count: usize = 0;
     while (true) {
         count += 1;
-        const cut = nextBreak(rest, value_width);
+        const cut = nextBreak(rest, text_width);
         rest = rest[cut.next..];
         if (rest.len == 0) return count;
     }

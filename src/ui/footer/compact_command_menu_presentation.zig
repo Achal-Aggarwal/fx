@@ -5,7 +5,7 @@ const text_utils = @import("../../core/shared/text_utils.zig");
 const workspace_access = @import("../../core/workspace/workspace_access.zig");
 const workspace_menu = @import("../../core/workspace/workspace_menu.zig");
 const render_input = @import("render_input.zig");
-const status_menu_presentation = @import("status_menu_presentation.zig");
+const info_panel_presentation = @import("info_panel_presentation.zig");
 const usage_presentation = @import("usage_presentation.zig");
 
 pub const usageVisibleModelItems = usage_presentation.visibleModelItems;
@@ -30,7 +30,7 @@ const ChoiceView = struct {
 pub fn desiredRowCount(projection: CompactCommandMenuProjection, width: u16) u16 {
     const count: usize = switch (projection) {
         .statusline => settings_row_offset + settings_catalog.statuslineChoiceCount(),
-        .status => |status| status_menu_presentation.desiredRowCount(status, width),
+        .info_panel => |panel| info_panel_presentation.desiredRowCount(panel, width),
         .usage => |usage| usage_presentation.desiredRowCount(usage),
         .workspace => |workspace| workspace_pinned_rows +
             workspace_menu.State.rowCount(workspace.entries),
@@ -41,7 +41,7 @@ pub fn desiredRowCount(projection: CompactCommandMenuProjection, width: u16) u16
 /// Rows the footer gives the menu in a terminal of `terminal_rows`.
 pub fn footerRowCount(projection: CompactCommandMenuProjection, width: u16, terminal_rows: u16) u16 {
     return switch (projection) {
-        .status => |status| status_menu_presentation.footerRows(status, width, terminal_rows),
+        .info_panel => |panel| info_panel_presentation.footerRows(panel, width, terminal_rows),
         else => @min(desiredRowCount(projection, width), terminal_rows -| 3),
     };
 }
@@ -57,7 +57,7 @@ pub noinline fn composeCompactCommandMenuRow(
     if (width == 0 or row_index >= visible_rows) return empty;
     return switch (projection) {
         .statusline => composeSettingsRow(alloc, projection, row_index, visible_rows, width),
-        .status => |status| status_menu_presentation.composeRow(alloc, status, row_index, visible_rows, width),
+        .info_panel => |panel| info_panel_presentation.composeRow(alloc, panel, row_index, visible_rows, width),
         .usage => |usage| usage_presentation.composeRow(alloc, usage, row_index, visible_rows, width),
         .workspace => |workspace| composeWorkspaceRow(alloc, workspace, row_index, visible_rows, width),
     };
@@ -73,7 +73,7 @@ fn composeSettingsRow(
     const empty: std.ArrayList(u8) = .empty;
     const statusline = switch (projection) {
         .statusline => |value| value,
-        .status, .usage, .workspace => return empty,
+        .info_panel, .usage, .workspace => return empty,
     };
     const choice_count = settings_catalog.statuslineChoiceCount();
     if (choice_count == 0) return empty;
@@ -113,7 +113,7 @@ fn choiceView(projection: CompactCommandMenuProjection, choice_index: usize) ?Ch
                 .selected = choice_index == statusline.selected_index % settings_catalog.statuslineChoiceCount(),
             };
         },
-        .status, .usage, .workspace => null,
+        .info_panel, .usage, .workspace => null,
     };
 }
 

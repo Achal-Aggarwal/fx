@@ -1,13 +1,13 @@
 // The interactive shell's sessions, driven through tmux, and what fx showed
-// and saved about them: the panels `/status` painted, read back through
-// fx's virtual terminal (`status-panel.ts`), the id each launch, `/new`,
+// and saved about them: the panels `/status` and `/permissions` painted,
+// read back through fx's virtual terminal (`info-panel.ts`), the id each launch, `/new`,
 // `/clear`, `/resume` and `/fork` opened, from fx's wiring trace, the exit
 // line, and the session folders on disk. `tui-status-session.test.ts` and
 // `tests/tla/drivers/session/` use it.
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cleanupIsolatedTestHome, createIsolatedTestHome, FX_BIN } from "../evals/eval-helpers";
-import { showsStatusPanel, statusReports, type StatusReport } from "./status-panel";
+import { infoPanel, panelReports, showsPanel, type InfoPanel, type PanelReport, type PanelTitle } from "./info-panel";
 import { FAKE_GATEWAY_MODEL, fakeGatewayFinalText, heldFakeGatewayFinalText, startDynamicFakeGateway, TmuxSession } from "./tmux-helpers";
 
 const TIMEOUT = 30_000;
@@ -15,6 +15,9 @@ const TIMEOUT = 30_000;
 export type WiringLine = { action: string; session: string; pid: number };
 
 type Held = ReturnType<typeof heldFakeGatewayFinalText>;
+
+/// One reply of a scripted prompt's.
+type Reply = () => Response | Promise<Response>;
 
 /// One profile, its workspace, and a fake gateway that answers each prompt
 /// it was given, by the newest scripted prompt the request holds.
@@ -26,6 +29,7 @@ export class Profile {
   readonly gateway: ReturnType<typeof startDynamicFakeGateway>;
   private readonly answers = new Map<string, string>();
   private readonly held = new Map<string, Held>();
+  private readonly scripted = new Map<string, Reply[]>();
   private readonly shells: Shell[] = [];
   private blocked = false;
 
@@ -37,11 +41,13 @@ export class Profile {
     mkdirSync(join(this.home, ".fx"), { recursive: true, mode: 0o700 });
     mkdirSync(this.workspace);
     this.gateway = startDynamicFakeGateway((body) => {
-      const prompt = [...this.answers.keys(), ...this.held.keys()]
+      const prompt = [...this.answers.keys(), ...this.held.keys(), ...this.scripted.keys()]
         .map((text) => [text, body.lastIndexOf(text)] as const)
         .filter(([, at]) => at >= 0)
         .sort((a, b) => b[1] - a[1])[0]?.[0];
       if (prompt === undefined) return fakeGatewayFinalText("UNSCRIPTED PROMPT");
+      const script = this.scripted.get(prompt);
+      if (script) return script.shift()?.() ?? fakeGatewayFinalText("UNSCRIPTED REQUEST");
       return this.held.get(prompt)?.response ?? fakeGatewayFinalText(this.answers.get(prompt)!);
     });
   }
@@ -75,6 +81,17 @@ export class Profile {
     this.answers.set(prompt, text);
   }
 
+  /// The requests for `prompt` take `replies` in order, one each: a turn
+  /// that calls a tool asks again with its result.
+  script(prompt: string, replies: Reply[]) {
+    this.scripted.set(prompt, [...replies]);
+  }
+
+  /// Writes the profile's `~/.fx/settings.json`.
+  settings(value: object) {
+    writeFileSync(join(this.home, ".fx", "settings.json"), JSON.stringify(value));
+  }
+
   /// `prompt`'s reply waits until `release` sends `text`.
   hold(prompt: string): { release(text: string): void } {
     const held = heldFakeGatewayFinalText();
@@ -82,12 +99,12 @@ export class Profile {
     return { release: (text: string) => held.release(text) };
   }
 
-  async launch(options: { args?: string[]; width?: number; height?: number } = {}): Promise<Shell> {
+  async launch(options: { args?: string[]; width?: number; height?: number; env?: Record<string, string> } = {}): Promise<Shell> {
     const n = this.shells.length + 1;
     const shell = new Shell(this, n, await TmuxSession.create({
       cmd: [this.bin, ...(options.args ?? [])].map(shellQuote).join(" "),
       cwd: this.workspace,
-      env: this.env(join(this.root, `shell-${n}.fxtape`)),
+      env: { ...this.env(join(this.root, `shell-${n}.fxtape`)), ...options.env },
       stderrPath: join(this.root, `shell-${n}.stderr`),
       width: options.width ?? 120,
       height: options.height ?? 48,
@@ -171,7 +188,7 @@ export class Shell {
   pid = 0;
   readonly tape: string;
   readonly stderr: string;
-  private statuses = 0;
+  private readonly panelsShown: Record<PanelTitle, number> = { Status: 0, Permissions: 0 };
 
   constructor(readonly profile: Profile, readonly n: number, readonly session: TmuxSession) {
     this.tape = join(profile.root, `shell-${n}.fxtape`);
@@ -215,33 +232,48 @@ export class Shell {
     };
   }
 
-  /// Opens the `/status` panel, waits until it has settled, presses ↓
+  /// Opens the `/status` panel; see `panel`.
+  async status(options: { scroll?: number } = {}): Promise<InfoPanel> {
+    return this.panel("Status", options);
+  }
+
+  /// Opens the `/permissions` panel; see `panel`.
+  async permissions(options: { scroll?: number } = {}): Promise<InfoPanel> {
+    return this.panel("Permissions", options);
+  }
+
+  /// Opens the panel titled `title`, waits until it has settled, presses ↓
   /// `scroll` times, and closes it with Esc. A Ctrl-U, which changes nothing
   /// in an empty composer, then marks on the tape where the closed shell was
-  /// painted. `reports` reads each panel back. Fails when the panel's text
-  /// stayed in the terminal.
-  async status(options: { scroll?: number } = {}) {
+  /// painted. `reports` reads each panel back from the tape; this returns
+  /// the panel as the live pane showed it when it opened, for a step that
+  /// needs what it showed. Fails when the panel's text stayed in the
+  /// terminal.
+  async panel(title: PanelTitle, options: { scroll?: number } = {}): Promise<InfoPanel> {
     await this.session.sendKeys("C-u");
     await settled(this.session);
-    await this.session.sendText("/status");
-    await this.waitUntilAsync(async () => showsStatusPanel(lines(await this.session.capturePane())), "the /status panel");
-    await settled(this.session);
+    await this.session.sendText(title === "Status" ? "/status" : "/permissions");
+    await this.waitUntilAsync(async () => showsPanel(lines(await this.session.capturePane()), title), `the ${title} panel`);
+    const opened = infoPanel(lines(await settled(this.session)), title, this.session.paneSize().cols);
+    if (!opened) throw new Error(`the ${title} panel did not parse:\n${(await this.session.capturePane()).trimEnd()}`);
     for (let n = 0; n < (options.scroll ?? 0); n++) {
       await this.session.sendKeys("Down");
       await settled(this.session);
     }
     await this.session.sendKeys("Escape");
-    await this.waitUntilAsync(async () => !showsStatusPanel(lines(await this.session.capturePane())), "the /status panel to close");
+    await this.waitUntilAsync(async () => !showsPanel(lines(await this.session.capturePane()), title), `the ${title} panel to close`);
     await settled(this.session);
     await this.session.sendKeys("C-u");
-    this.statuses++;
-    const left = lines(await this.session.captureFullScrollback()).filter((line) => /^ {2}Session grants {2,}\S/.test(line));
-    if (left.length > 0) throw new Error(`the /status panel left its text in the terminal: ${left.join(" | ")}`);
+    this.panelsShown[title]++;
+    const own = title === "Status" ? /^ {2}Session grants {2,}\S/ : /^ {2}Change mode {2,}\S/;
+    const left = lines(await this.session.captureFullScrollback()).filter((line) => own.test(line));
+    if (left.length > 0) throw new Error(`the ${title} panel left its text in the terminal: ${left.join(" | ")}`);
+    return opened;
   }
 
-  /// How many `/status` reports this process was asked for.
+  /// How many `/status` panels this process was asked for.
   statusCount(): number {
-    return this.statuses;
+    return this.panelsShown.Status;
   }
 
   /// Sends a slash command and waits for the composer, for a command that
@@ -308,12 +340,13 @@ export class Shell {
     await this.waitUntil(() => this.session.paneStatus().dead, "fx to die");
   }
 
-  /// Every panel `/status` painted in this process, read through fx's
+  /// Every panel titled `title` this process painted, read through fx's
   /// virtual terminal. Call it once the process has ended.
-  reports(): StatusReport[] {
-    const reports = statusReports(this.profile.bin, this.tape, join(this.profile.root, `shell-${this.n}.frames`));
-    if (reports.length !== this.statuses) {
-      throw new Error(`shell ${this.n} ran /status ${this.statuses} times, but its tape holds ${reports.length} panels`);
+  reports(title: PanelTitle = "Status"): PanelReport[] {
+    const frames = join(this.profile.root, `shell-${this.n}-${title.toLowerCase()}.frames`);
+    const reports = panelReports(this.profile.bin, this.tape, frames, title);
+    if (reports.length !== this.panelsShown[title]) {
+      throw new Error(`shell ${this.n} opened the ${title} panel ${this.panelsShown[title]} times, but its tape holds ${reports.length}`);
     }
     return reports;
   }
