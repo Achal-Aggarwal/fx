@@ -261,18 +261,19 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
         errdefer row.deinit(alloc);
         try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else "");
         try row.appendSlice(alloc, if (selected) "› " else "  ");
-        // Remove and Reject ask on their own row, answers included: Enter is
-        // the bright "yes", Esc the dim "no".
+        // Remove and Reject ask on their own row, answers included: the
+        // chosen one is bright, and ← → move between them.
         if (asksInPlace(p) and p.state.confirm.? == cs[at]) {
             const answers = "   yes  no";
+            const no = p.state.answer_no;
             try row_text.appendTerminalSafeSingleLine(alloc, &row, try question(arena, p, r, cs[at]), @as(usize, width) -| 2 -| answers.len);
             try row.appendSlice(alloc, ui_render.reset_style);
             try row.appendSlice(alloc, "   ");
-            try row.appendSlice(alloc, ui_render.selected_completion_style);
+            try row.appendSlice(alloc, if (no) ui_render.dim_style else ui_render.selected_completion_style);
             try row.appendSlice(alloc, "yes");
             try row.appendSlice(alloc, ui_render.reset_style);
             try row.appendSlice(alloc, "  ");
-            try row.appendSlice(alloc, ui_render.dim_style);
+            try row.appendSlice(alloc, if (no) ui_render.selected_completion_style else ui_render.dim_style);
             try row.appendSlice(alloc, "no");
             try row.appendSlice(alloc, ui_render.reset_style);
             return row;
@@ -459,7 +460,7 @@ fn confirmRow(alloc: Allocator, arena: Allocator, p: Projection, index: u16, wid
 /// everything it trusts, uncut.
 fn asksInPlace(p: Projection) bool {
     const c = p.state.confirm orelse return false;
-    return c == .remove or c == .reject;
+    return c.asksOnRow();
 }
 
 /// fx's hint line for where the menu is, widest first.

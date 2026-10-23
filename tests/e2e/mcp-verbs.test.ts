@@ -702,7 +702,8 @@ describe("/mcp in the shell", () => {
     // It asks on Remove's own row, with its answers; the hint line stays.
     await tui.waitForText("› Remove web from ~/.fx/mcp.json?   yes  no", 5_000);
     expect(await tui.capturePane()).toContain("↑↓ navigate     enter run     esc back");
-    await tui.sendKeys("Escape");
+    // → chooses no, and Enter on no keeps the server.
+    await tui.sendKeys("Right Enter");
     await tui.waitForText("› Remove        /mcp remove web", 5_000);
     await tui.waitForText("↑↓ navigate     enter run     esc back", 5_000);
     expect(JSON.parse(readFileSync(root.profilePath, "utf8")).mcpServers.web).toBeDefined();
