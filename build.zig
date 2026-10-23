@@ -60,6 +60,12 @@ pub fn build(b: *std.Build) void {
 
     const fuzz_corpora = readFuzzCorpora(b);
     const fuzz_corpus = addFuzzCorpusModule(b, fuzz_corpora);
+    // Encodes the fuzz tests' inline seeds the way they read them.
+    const fuzz_seed = b.createModule(.{
+        .root_source_file = b.path("src/fuzz_seed.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const exe = b.addExecutable(.{
         .name = "fx",
@@ -81,6 +87,7 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addImport("build_options", build_options.createModule());
     exe.root_module.addImport("fuzz_corpus", fuzz_corpus);
+    exe.root_module.addImport("fuzz_seed", fuzz_seed);
     const session_manager = addSessionManager(b, exe.root_module, target, optimize, null, fuzz_corpora);
     session_manager.sanitize_thread = sanitize_thread;
 
@@ -142,6 +149,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_session_manager_tests.step);
     test_step.dependOn(&run_session_manager_hook_tests.step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = fuzz_seed })).step);
 
     const fuzz_step = b.step(
         "fuzz",
@@ -160,6 +168,7 @@ pub fn build(b: *std.Build) void {
     });
     fuzz_root.addImport("build_options", build_options.createModule());
     fuzz_root.addImport("fuzz_corpus", fuzz_corpus);
+    fuzz_root.addImport("fuzz_seed", fuzz_seed);
     fuzz_root.addImport("session_manager", session_manager);
     fuzz_root.addImport("test_paths", test_paths_module);
     addFuzzStep(b, fuzz_step, fuzz_corpora, fuzz_target, .{
