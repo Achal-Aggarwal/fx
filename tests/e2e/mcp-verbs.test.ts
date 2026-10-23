@@ -699,9 +699,9 @@ describe("/mcp in the shell", () => {
     await tui.sendKeys("Down Enter");
     await tui.waitForText("› Remove        /mcp remove web", 5_000);
     await tui.sendKeys("Enter");
-    // It asks on Remove's own row, and the hint line says how to answer.
-    await tui.waitForText("› Remove web from ~/.fx/mcp.json?", 5_000);
-    expect(await tui.capturePane()).toContain("enter yes     esc no");
+    // It asks on Remove's own row, with its answers; the hint line stays.
+    await tui.waitForText("› Remove web from ~/.fx/mcp.json?   yes  no", 5_000);
+    expect(await tui.capturePane()).toContain("↑↓ navigate     enter run     esc back");
     await tui.sendKeys("Escape");
     await tui.waitForText("› Remove        /mcp remove web", 5_000);
     await tui.waitForText("↑↓ navigate     enter run     esc back", 5_000);
