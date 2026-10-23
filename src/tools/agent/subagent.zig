@@ -380,10 +380,7 @@ fn expectCorrection(args_json: []const u8, code: []const u8, correction: []const
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
     const text = parsed.value.object.get("result").?.string;
-    if (std.mem.find(u8, text, correction) == null) {
-        std.debug.print("correction {s} lacks {s}\n", .{ text, correction });
-        return error.TestExpectedEqual;
-    }
+    try std.testing.expect(std.mem.find(u8, text, correction) != null);
 }
 
 test "decode accepts flat calls and names what a rejected call got wrong" {
