@@ -261,6 +261,12 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
         errdefer row.deinit(alloc);
         try row.appendSlice(alloc, if (selected) ui_render.selected_completion_style else "");
         try row.appendSlice(alloc, if (selected) "› " else "  ");
+        // Remove and Reject ask on their own row; the hint line says how to answer.
+        if (asksInPlace(p) and p.state.confirm.? == cs[at]) {
+            try row_text.appendTerminalSafeSingleLine(alloc, &row, try question(arena, p, r, cs[at]), @as(usize, width) -| 2);
+            try row.appendSlice(alloc, ui_render.reset_style);
+            return row;
+        }
         try row.appendSlice(alloc, cs[at].label());
         try row.appendSlice(alloc, ui_render.reset_style);
         if (width >= 56) {
@@ -438,26 +444,19 @@ fn confirmRow(alloc: Allocator, arena: Allocator, p: Projection, index: u16, wid
     };
 }
 
-/// Remove and Reject ask on the server's own screen, in the hint line, so the
-/// panel keeps its size. An approval keeps its screen: it shows everything it
-/// trusts, uncut.
+/// Remove and Reject ask on the server's own screen, on the choice's row, so
+/// the panel keeps its size. An approval keeps its screen: it shows
+/// everything it trusts, uncut.
 fn asksInPlace(p: Projection) bool {
     const c = p.state.confirm orelse return false;
     return c == .remove or c == .reject;
 }
 
-/// Room for the hint line's question, which names the server.
-pub const HintBuf = struct {
-    text: [2][320]u8 = undefined,
-    variants: [3][]const u8 = undefined,
-};
-
-/// fx's hint line for where the menu is, widest first; `hints` holds any
-/// that name the server.
-pub fn hintVariants(p: Projection, hints: *HintBuf) []const []const u8 {
+/// fx's hint line for where the menu is, widest first.
+pub fn hintVariants(p: Projection) []const []const u8 {
     return switch (p.state.screen) {
         .list => if (p.rows.len == 0) &.{"esc close"} else &.{ "↑↓ navigate     enter open     esc close", "↑↓ move  enter open  esc", "enter open  esc close", "enter esc" },
-        .confirm => if (asksInPlace(p)) questionHints(p, hints) else &.{ "enter confirm     esc cancel", "enter confirm  esc cancel", "enter esc" },
+        .confirm => if (asksInPlace(p)) &.{ "enter yes     esc no", "enter yes  esc no" } else &.{ "enter confirm     esc cancel", "enter confirm  esc cancel", "enter esc" },
         .server => blk: {
             const r = p.openRow() orelse break :blk &.{"esc back"};
             var buf: [menu.max_choices]menu.Choice = undefined;
@@ -467,28 +466,17 @@ pub fn hintVariants(p: Projection, hints: *HintBuf) []const []const u8 {
     };
 }
 
-/// The question asked in place, widest first. A name that isn't plain ASCII
-/// isn't drawn in the hint line; the screen's title shows it, made safe.
-fn questionHints(p: Projection, buf: *HintBuf) []const []const u8 {
-    const r = p.openRow() orelse return &.{"enter yes  esc no"};
-    const c = p.state.confirm orelse return &.{"enter yes  esc no"};
-    const name = if (plainName(r.status.name)) r.status.name else "this server";
-    const long = switch (c) {
+/// The question Remove or Reject asks on its row. The row draws it terminal
+/// safe, so a name of any bytes stays inert.
+fn question(arena: Allocator, p: Projection, r: menu.Row, c: menu.Choice) ![]const u8 {
+    const name = r.status.name;
+    return switch (c) {
         .remove => if (r.status.signed_in)
-            std.mem.print(&buf.text[0], "Remove {s} and its login from {s}?     enter yes     esc no", .{ name, p.fileOf(r) })
+            arena.print("Remove {s} and its login from {s}?", .{ name, p.fileOf(r) })
         else
-            std.mem.print(&buf.text[0], "Remove {s} from {s}?     enter yes     esc no", .{ name, p.fileOf(r) }),
-        else => std.mem.print(&buf.text[0], "Reject {s}? fx won't start it in this project.     enter yes     esc no", .{name}),
-    } catch "enter yes     esc no";
-    const short = std.mem.print(&buf.text[1], "{s} {s}?  enter yes  esc no", .{ c.label(), name }) catch "enter yes  esc no";
-    buf.variants = .{ long, short, "enter yes  esc no" };
-    return &buf.variants;
-}
-
-fn plainName(name: []const u8) bool {
-    if (name.len == 0 or name.len > 64) return false;
-    for (name) |b| if (b < 0x21 or b > 0x7e) return false;
-    return true;
+            arena.print("Remove {s} from {s}?", .{ name, p.fileOf(r) }),
+        else => arena.print("Reject {s}? fx won't start it in this project.", .{name}),
+    };
 }
 
 const testing = std.testing;
@@ -514,7 +502,6 @@ fn render(p: Projection, width: u16) ![]u8 {
 }
 
 var strip_buf: [4096]u8 = undefined;
-var test_hints: HintBuf = .{};
 
 fn stripped(styled: []const u8) ![]const u8 {
     var n: usize = 0;
@@ -586,7 +573,7 @@ test "the list is fx's picker: a title, rows with status and source, and a filte
         \\  1 config note: /mcp list shows it
         \\
     , narrow);
-    try testing.expectEqualStrings("↑↓ navigate     enter open     esc close", hintVariants(p, &test_hints)[0]);
+    try testing.expectEqualStrings("↑↓ navigate     enter open     esc close", hintVariants(p)[0]);
 }
 
 test "a long list scrolls to a selection below the attention heading" {
@@ -660,7 +647,7 @@ test "a server's screen: facts, choices with their commands, then tools" {
     , text);
     // On a tool, Enter does nothing, so the hint doesn't offer it.
     p.state.cursor = 2;
-    try testing.expectEqualStrings("↑↓ navigate     esc back", hintVariants(p, &test_hints)[0]);
+    try testing.expectEqualStrings("↑↓ navigate     esc back", hintVariants(p)[0]);
 }
 
 test "a long tool list scrolls with the selection and counts what's below" {
@@ -703,10 +690,10 @@ test "a confirmation names its target, and an approval shows everything it trust
         \\    --port 4100 --watch
         \\
     , text);
-    try testing.expectEqualStrings("enter confirm     esc cancel", hintVariants(p, &test_hints)[0]);
+    try testing.expectEqualStrings("enter confirm     esc cancel", hintVariants(p)[0]);
 }
 
-test "Remove asks on the server's own screen, in the hint line, at the same size" {
+test "Remove asks on its own row, at the same size" {
     var gh = testStatus("github", .ready);
     gh.signed_in = true;
     const rows = [_]menu.Row{.{ .status = gh, .target = "https://api.github.com/mcp" }};
@@ -719,16 +706,23 @@ test "Remove asks on the server's own screen, in the hint line, at the same size
     _ = menu.press(&p.state, .{ .rows = &rows, .open = rows[0], .layout = p.layout(rows[0]) }, .enter);
     try testing.expectEqual(menu.Screen.confirm, p.state.screen);
     try testing.expectEqual(server_rows, menuRowCount(p, 88, 40));
-    try testing.expectEqualStrings("Remove github and its login from ~/.fx/mcp.json?     enter yes     esc no", hintVariants(p, &test_hints)[0]);
-    try testing.expectEqualStrings("Remove github?  enter yes  esc no", hintVariants(p, &test_hints)[1]);
+    // The question takes Remove's row; the hint line says how to answer.
+    const text = try render(p, 88);
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.find(u8, text, "› Remove github and its login from ~/.fx/mcp.json?\n") != null);
+    try testing.expect(std.mem.find(u8, text, "  Log out       /mcp logout github\n") != null);
+    try testing.expectEqualStrings("enter yes     esc no", hintVariants(p)[0]);
 
-    // A name that isn't plain stays out of the hint line.
+    // A name of any bytes stays inert on the row.
     const odd_rows = [_]menu.Row{.{ .status = testStatus("x\x1b[2Jy", .ready) }};
     var odd: Projection = .{ .rows = &odd_rows, .tools = .{ .ready = &.{} } };
     menu.open(&odd.state);
     _ = menu.press(&odd.state, .{ .rows = &odd_rows }, .enter);
     _ = menu.press(&odd.state, .{ .rows = &odd_rows, .open = odd_rows[0], .layout = odd.layout(odd_rows[0]) }, .enter);
-    try testing.expectEqualStrings("Remove this server from ~/.fx/mcp.json?     enter yes     esc no", hintVariants(odd, &test_hints)[0]);
+    var row = try composeRow(testing.allocator, odd, 5, 88, menuRowCount(odd, 88, 40));
+    defer row.deinit(testing.allocator);
+    try testing.expect(std.mem.find(u8, row.items, "Remove x") != null);
+    try testing.expect(std.mem.find(u8, row.items, "\x1b[2J") == null);
 }
 
 test "a sign-in that waits shows its whole address on the server's screen" {
@@ -903,7 +897,7 @@ test "no servers points to /mcp add" {
         \\           or /mcp add NAME -- COMMAND
         \\
     , text);
-    try testing.expectEqualStrings("esc close", hintVariants(p, &test_hints)[0]);
+    try testing.expectEqualStrings("esc close", hintVariants(p)[0]);
 }
 
 test "a server that needs a login says so, once" {
