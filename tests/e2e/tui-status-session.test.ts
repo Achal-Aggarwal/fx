@@ -9,7 +9,7 @@
 import { expect, test } from "bun:test";
 import { runFx } from "../evals/eval-helpers";
 import { Profile } from "./shell-sessions";
-import { closedAsBefore, panelSession, showsStatusPanel, type StatusReport } from "./status-panel";
+import { closedAsBefore, lastTranscriptRow, panelSession, showsStatusPanel, type StatusReport } from "./status-panel";
 import { tmuxAvailable } from "./tmux-helpers";
 import { assertSingleFooter } from "./tui-render-assertions";
 
@@ -252,10 +252,11 @@ scenario("a short terminal shows the panel's first lines, and ↓ scrolls it a l
   expect(first!.labels[0]).toBe("Session");
   expect(first!.labels).not.toContain("Build");
   expect(first!.grid.some((row) => row.trimEnd() === "↑↓ scroll     esc close")).toBe(true);
-  // The panel scrolls rather than cover the transcript, so the banner stays
-  // in view while it is open.
+  // The panel scrolls rather than cover the transcript, so the transcript's
+  // last row stays in view while it is open.
+  const kept = lastTranscriptRow(report!.before);
   for (const view of report!.views) {
-    expect(view.grid.some((row) => row.includes("Run /help for commands"))).toBe(true);
+    expect(view.grid.map((row) => row.trimEnd())).toContain(kept);
   }
   expect(scrolled.length).toBeGreaterThan(0);
   let previous = first!;

@@ -338,6 +338,14 @@ function transcriptRows(grid: string[]): string[] {
   return rows;
 }
 
+/// The last row of the transcript `grid` shows above its composer, which the
+/// panel leaves in view while it is open.
+export function lastTranscriptRow(grid: string[]): string {
+  const row = transcriptRows(grid).at(-1);
+  if (row === undefined) throw new Error(`no transcript row above the composer:\n${grid.join("\n")}`);
+  return row;
+}
+
 /// Whether the transcript in `report.closed` is the one `report.before`
 /// showed, or the same with rows that scrolled away above it: the panel
 /// opened and closed without adding a row to the transcript.

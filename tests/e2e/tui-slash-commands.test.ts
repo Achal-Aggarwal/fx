@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, HAS_API_KEY } from "../evals/eval-helpers";
-import { closeStatusPanel, panelSession, readStatusPanel, showsStatusPanel, waitForStatusPanel } from "./status-panel";
+import { closeStatusPanel, lastTranscriptRow, panelSession, readStatusPanel, showsStatusPanel, waitForStatusPanel } from "./status-panel";
 import {
   FAKE_GATEWAY_MODEL,
   fakeGatewayFinalText,
@@ -209,13 +209,15 @@ describe.skipIf(TMUX_SKIP)("tui: no-key slash commands", () => {
       expect((await session!.captureFullScrollback()).split("Run /help for commands")).toHaveLength(2);
 
       // Twelve rows leave the panel room for one line at a time. It scrolls
-      // instead of covering the transcript, so the banner stays in view.
+      // instead of covering the transcript, so the transcript's last row
+      // stays in view.
+      const kept = lastTranscriptRow((await session!.capturePane()).split("\n"));
       await session!.sendText("/status");
       const panel = await waitForStatusPanel(session!, 5_000);
       expect(panel.labels[0]).toBe("Session");
       expect(panel.labels.at(-1)).toBe("Build");
       expect(panel.fields.Permissions).toBe("auto");
-      expect(await session!.capturePane()).toContain("Run /help for commands");
+      expect((await session!.capturePane()).split("\n").map((row) => row.trimEnd())).toContain(kept);
       await closeStatusPanel(session!, 5_000);
       await session!.waitForComposer(5_000);
       const scrollback = await session!.captureFullScrollback();
