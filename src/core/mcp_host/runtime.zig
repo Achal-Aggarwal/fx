@@ -1067,6 +1067,16 @@ pub const Runtime = struct {
                     return r.finish(req, .{ .failed = err });
                 };
                 if (req.declined and result == .ended and result.ended.outcome == .cancelled) result.ended.outcome = .unsupported_input;
+                // fx dropped the reply, and a stdio server with it: the
+                // server didn't go away by itself.
+                if (c.oversized and result == .ended) {
+                    const s = r.resolved.servers[i];
+                    debug_trace.logf("mcp", "MCP call reply dropped server={s} transport={s} reason=too_large", .{ s.name, @tagName(s.transport) });
+                    result.ended.why = if (s.transport == .stdio)
+                        "its reply was larger than fx reads in one message, so fx restarted the server"
+                    else
+                        "its reply was larger than fx reads in one message, so fx dropped it";
+                }
                 if (result == .ended and result.ended.outcome == .transport_failed) {
                     const down = if (r.enginePhase(i)) |p| p == .backoff or p == .failed else false;
                     if (down) result.ended.why = r.failureText(req.alloc, i) catch null;
