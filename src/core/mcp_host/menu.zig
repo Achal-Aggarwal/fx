@@ -255,10 +255,11 @@ pub const View = struct {
     layout: Layout = .{ .lead = 0, .choices = 0, .gap = 0, .tools = 0, .window = 1 },
 };
 
-/// The lines a server's screen has below its title: the inline panel's 12
-/// rows less the title. A shorter panel moves its own view to keep the
-/// selection.
-pub const server_window: usize = 11;
+/// The lines a server's screen has below its title: the inline panel's 13
+/// rows less the title. That fits `http`, `file`, `status`, a blank, two
+/// choices, a blank, and a waiting sign-in's heading with four rows of
+/// address. A shorter panel moves its own view to keep the selection.
+pub const server_window: usize = 12;
 
 /// What `s` shows of `rows` with `filter` typed, the list's rows going into
 /// `buf`. On a server's screen `filter` narrows its tools instead.
