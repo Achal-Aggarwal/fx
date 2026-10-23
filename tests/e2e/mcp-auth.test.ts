@@ -2103,6 +2103,64 @@ describe("MCP login", () => {
     expect(auth.protectedToolCalls).toBe(1);
   }, 40_000);
 
+  // Before, a shell that started before another terminal signed in logged out
+  // without that login, which stayed valid at the server for every other fx.
+  test.skipIf(!tmuxAvailable())("a logout in a shell revokes the login another terminal saved after the shell started", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 110, height: 34,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    // Another terminal signs in while the shell runs.
+    expectExit0(await runFx(["mcp", "login", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 }));
+    expect(auth.revocations).toBe(0);
+    await tui.sendText("/mcp logout fixture");
+    await tui.waitForText("Signed out of fixture.", 15_000);
+    const revoked = auth.requests.filter((request) => request.path === "/revoke").map((request) => new URLSearchParams(request.body).get("token"));
+    expect(revoked).toEqual([REFRESH_INITIAL]);
+    expect(readFileSync(join(root.home, ".fx", "mcp-credentials", "credentials-v3.json"), "utf8")).not.toContain("\"name\":\"fixture\"");
+  }, 60_000);
+
+  // Before, a shell holding a login renewed it at its next use after another
+  // terminal logged out, and saved it again: at a server that doesn't end the
+  // login on revocation, as this fixture, the logout undid itself.
+  test.skipIf(!tmuxAvailable())("after another terminal logs out, a shell holding the login signs out at its next renewal instead of saving it back", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url);
+    const root = createRoot(auth);
+    // Due for renewal 10 s from now: the shell connects with it before, and
+    // calls a tool after.
+    const seeded = Date.now();
+    const store = seedV2Credential(root, auth, { expires_at_ms: seeded + 20_000, skew_ms: 10_000 });
+    gateway = startToolGateway();
+    tui = await TmuxSession.create({
+      isolated: true, cwd: root.workspace, width: 110, height: 34,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+    });
+    await tui.waitForComposer(15_000);
+    const connectedBy = Date.now() + 9_000;
+    while (!auth.requests.some((request) => request.path === "/mcp" && request.authorization === `Bearer ${ACCESS_INITIAL}`) && Date.now() < connectedBy) await Bun.sleep(50);
+    expect(auth.requests.some((request) => request.path === "/mcp" && request.authorization === `Bearer ${ACCESS_INITIAL}`)).toBe(true);
+    expect(auth.refreshes).toBe(0);
+
+    // Another terminal logs out.
+    expectExit0(await runFx(["mcp", "logout", "fixture"], { cwd: root.workspace, env: v2Env(root), timeoutMs: 20_000 }));
+    expect(readFileSync(store, "utf8")).not.toContain("\"name\":\"fixture\"");
+
+    await Bun.sleep(Math.max(0, seeded + 10_500 - Date.now()));
+    await tui.sendText("Call the protected fixture.");
+    await tui.waitForText("Authenticated MCP call complete.", 20_000);
+    // The shell didn't renew the login, so nothing saved it again.
+    expect(auth.refreshes).toBe(0);
+    expect(auth.protectedToolCalls).toBe(0);
+    expect(readFileSync(store, "utf8")).not.toContain("\"name\":\"fixture\"");
+    expect(await statusOf(root)).not.toBe("signed_in");
+  }, 60_000);
+
   test.skipIf(!tmuxAvailable())("/mcp logout with no saved login says so and leaves the running server alone", async () => {
     upstream = startModernMcpHttpFixture("cache_auth_subscription");
     auth = startAuthFixture(upstream.url);
