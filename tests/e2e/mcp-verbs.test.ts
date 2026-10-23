@@ -564,7 +564,7 @@ describe("/mcp in the shell", () => {
     });
     // Not a prompt: the composer is free, and the status line says what's waiting.
     await tui.waitForComposer(15_000);
-    await tui.waitForText("2 MCP servers need you · /mcp", 10_000);
+    await tui.waitForText("2 MCP need attention · /mcp", 10_000);
     // One left, it's named; it stays until it's handled.
     await tui.sendText("/mcp reject broken");
     await tui.waitForText("proj is waiting for approval · /mcp", 10_000);
