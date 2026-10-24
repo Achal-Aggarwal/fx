@@ -19,6 +19,8 @@ const tool_dispatch = @import("../tooling/tool_dispatch.zig");
 const text_utils = @import("../shared/text_utils.zig");
 const types = @import("../shared/types.zig");
 const render_request = @import("../../ui/render_request.zig");
+const runtime_profile = @import("../hosts/runtime_profile.zig");
+const status_menu = @import("status_menu.zig");
 
 const freeStringList = collections.freeStringList;
 const containsIgnoreCase = text_utils.containsIgnoreCase;
@@ -275,19 +277,36 @@ pub fn Commands(comptime App: type) type {
             return "stable";
         }
 
-        pub fn showStatus(app: *App) !void {
-            const provider = provider_runtime.provider(app);
+        /// The rows the `/status` panel opens with. The profile settings are
+        /// read here, once, for the credential they select; a panel whose
+        /// settings cannot be read says so in a row instead of showing auth.
+        pub fn openStatusSnapshot(app: *App) !status_menu.Snapshot {
             var preferred: ?types.CredentialSource = null;
-            if (provider == .gateway and app.auth.credentialSource() == null) {
-                var settings = config_runtime.loadMergedSettings(app.alloc, app.workspace_root) catch |err| {
-                    try writeSettingsLoadError(app, err);
-                    return;
-                };
-                defer settings.deinit(app.alloc);
-                preferred = settings.credential_source;
+            var settings_error: ?[]const u8 = null;
+            if (provider_runtime.provider(app) == .gateway and app.auth.credentialSource() == null) {
+                if (config_runtime.loadMergedSettings(app.alloc, app.workspace_root)) |loaded| {
+                    var settings = loaded;
+                    defer settings.deinit(app.alloc);
+                    preferred = settings.credential_source;
+                } else |err| {
+                    settings_error = @errorName(err);
+                }
             }
+            return statusSnapshot(app, preferred, settings_error);
+        }
+
+        /// New rows for the open `/status` panel when a running turn changed
+        /// what `shown` was built from; null while nothing did. Reads no file.
+        pub fn refreshedStatusSnapshot(app: *App, shown: *const status_menu.Snapshot) !?status_menu.Snapshot {
+            if (std.meta.eql(statusFacts(app, shellSession(app)), shown.facts)) return null;
+            return try statusSnapshot(app, shown.preferred, shown.settings_error);
+        }
+
+        fn statusSnapshot(app: *App, preferred: ?types.CredentialSource, settings_error: ?[]const u8) !status_menu.Snapshot {
+            const provider = provider_runtime.provider(app);
             const auth = app.auth.statusSnapshot(provider, preferred);
-            const text = try (output_contracts.StatusSnapshot{
+            const session = shellSession(app);
+            const status: output_contracts.StatusSnapshot = .{
                 .model = provider_runtime.model(app),
                 .provider = provider,
                 .provider_endpoint = if (comptime @hasField(App, "provider_selection"))
@@ -301,13 +320,42 @@ pub fn Commands(comptime App: type) type {
                 .auth_help = auth.missingHelp(.interactive),
                 .permission_mode = app.permission_engine.mode,
                 .workspace_root = app.workspace_root,
+                .session = session,
+                .settings_error = settings_error,
                 .history_turns = app.session.historyLen(),
                 .session_permission_grants = permissions.liveSessionGrantCount(app.permission_engine.grants.items),
                 .agent_step_limit = app.agent_step_limit,
                 .ultrafast_requested = app.worker.agent_turn_settings.ultrafast_mode,
-            }).renderInteractiveBody(app.alloc);
-            defer app.alloc.free(text);
-            try app.writeDomainNotice(.{ .topic = "status", .tone = .neutral, .body = text }, true);
+            };
+            var arena = std.heap.ArenaAllocator.init(app.alloc);
+            errdefer arena.deinit();
+            const rows = try status.panelRows(arena.allocator());
+            return .{
+                .arena = arena,
+                .rows = rows,
+                .facts = statusFacts(app, session),
+                .preferred = preferred,
+                .settings_error = settings_error,
+            };
+        }
+
+        fn statusFacts(app: *App, session: ?output_contracts.StatusSnapshot.ShellSession) status_menu.Facts {
+            return .{
+                .history_turns = app.session.historyLen(),
+                .session_saved = if (session) |shown| switch (shown) {
+                    .unavailable => null,
+                    .open => |open| open.saved,
+                } else null,
+            };
+        }
+
+        /// The open session as `/status` shows it, so its id can be copied
+        /// before quitting. Saved means a resume opens it
+        /// (`tests/tla/session/ShellSession.tla` StatusSavedIsOnDisk).
+        fn shellSession(app: *App) ?output_contracts.StatusSnapshot.ShellSession {
+            if (comptime !runtime_profile.allows(App, .durable_sessions) or !@hasField(App, "session_persistence")) return null;
+            const v2 = app.session_persistence.v2 orelse return .unavailable;
+            return .{ .open = .{ .id = v2.id(), .saved = v2.saved() } };
         }
 
         pub fn handleSettings(app: *App, rest: []const u8) !void {
@@ -2045,7 +2093,7 @@ fn writeFixtureFile(dir: std.Io.Dir, sub_path: []const u8, text: []const u8) !vo
     try file.writeStreamingAll(io_mod.getIo(), text);
 }
 
-test "session_commands showStatus writes session status snapshot" {
+test "session_commands status snapshot builds the panel rows and writes no transcript" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2058,19 +2106,29 @@ test "session_commands showStatus writes session status snapshot" {
     app.permission_engine.mode = .auto;
     app.session.history_len = 7;
 
-    try Commands(FakeApp).showStatus(&app);
+    var snapshot = try Commands(FakeApp).openStatusSnapshot(&app);
+    defer snapshot.deinit();
+    try expectStatusRow(snapshot, "Model", "anthropic/test-model");
+    try expectStatusRow(snapshot, "Auth", "missing");
+    try expectStatusRow(snapshot, "Permissions", "auto");
+    try expectStatusRow(snapshot, "Turns", "7");
+    try expectStatusRow(snapshot, "Step limit", "24");
+    try std.testing.expectEqual(@as(usize, 0), app.transcript.items.len);
+    try std.testing.expect(try Commands(FakeApp).refreshedStatusSnapshot(&app, &snapshot) == null);
 
-    try expectTranscriptContains(&app, "* status: model=anthropic/test-model\n");
-    try expectTranscriptContains(&app, "auth=missing\n");
-    try expectTranscriptContains(&app, "auth_refreshable=false\n");
-    try expectTranscriptContains(&app, "permission_mode=auto\n");
-    try expectTranscriptContains(&app, "history_turns=7\n");
-    try expectTranscriptContains(&app, "agent_step_limit=24\n");
-
-    app.clearTranscript();
     app.permission_engine.mode = .yolo;
-    try Commands(FakeApp).showStatus(&app);
-    try expectTranscriptContains(&app, "permission_mode=full access\n");
+    app.session.history_len = 8;
+    var refreshed = (try Commands(FakeApp).refreshedStatusSnapshot(&app, &snapshot)).?;
+    defer refreshed.deinit();
+    try expectStatusRow(refreshed, "Permissions", "full access");
+    try expectStatusRow(refreshed, "Turns", "8");
+}
+
+fn expectStatusRow(snapshot: status_menu.Snapshot, label: []const u8, value: []const u8) !void {
+    for (snapshot.rows) |row| {
+        if (std.mem.eql(u8, row.label, label)) return std.testing.expectEqualStrings(value, row.value);
+    }
+    return error.TestExpectedEqual;
 }
 
 test "session_commands history setting toggles durable input history" {

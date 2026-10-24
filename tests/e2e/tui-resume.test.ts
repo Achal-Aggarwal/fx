@@ -1783,9 +1783,8 @@ test.skipIf(!tmuxAvailable())(
       expect(compact).not.toContain(stdoutTail);
       expect(compact).not.toContain(stderrTail);
 
-      await active.sendText("/status");
-      const status = await active.waitForText(/model|permission_mode/i, TIMEOUT);
-      expect(status.toLowerCase()).toMatch(/model|permission_mode/);
+      await active.sendText("/permissions");
+      await active.waitForText("* permissions: mode=", TIMEOUT);
       expect(active.paneStatus()).toEqual({ dead: false, status: null });
       const sessionId = sessionIdFromHome(home);
 
