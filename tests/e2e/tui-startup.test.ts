@@ -274,13 +274,13 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         expect(initial.split(banner)).toHaveLength(2);
 
         for (const command of ["/clear", "/reset", "/new"]) {
-          await session.sendText("/permissions");
-          await session.waitForText("* permissions: mode=", 5_000);
+          await session.sendText("/allowlist");
+          await session.waitForText("* allowlist: effective", 5_000);
           await session.sendText(command);
           const pane = await session.waitForPane(
             (value) =>
               value.includes(banner) &&
-              !value.includes("* permissions: mode=") &&
+              !value.includes("* allowlist:") &&
               hasEmptyComposer(value),
             5_000,
           );
@@ -334,24 +334,24 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         });
         await session.waitForComposer(10_000);
         for (let i = 0; i < 8; i++) {
-          await session.sendText("/permissions");
+          await session.sendText("/allowlist");
           await session.waitForComposer(5_000);
         }
         const before = await session.captureFullScrollback();
-        const lastNotice = before.slice(before.lastIndexOf("* permissions: mode="));
-        expect(lastNotice).toContain("* permissions: saved-session permission rules: none");
+        const lastNotice = before.slice(before.lastIndexOf("* allowlist:"));
+        expect(lastNotice).toContain("* allowlist: effective persistent allow rules: (none)");
 
         await session.sendText("/new");
         await session.waitForPane(
-          (pane) => pane.includes(banner) && !pane.includes("* permissions: mode=") && hasEmptyComposer(pane),
+          (pane) => pane.includes(banner) && !pane.includes("* allowlist:") && hasEmptyComposer(pane),
           5_000,
         );
         const after = await session.captureFullScrollback();
-        const priorNotice = after.slice(after.lastIndexOf("* permissions: mode="), after.lastIndexOf(banner)).trimEnd();
+        const priorNotice = after.slice(after.lastIndexOf("* allowlist:"), after.lastIndexOf(banner)).trimEnd();
         expect(priorNotice).toBe(lastNotice.split("\n┃")[0]?.trimEnd());
         expect(priorNotice).not.toContain("Commands 1");
         expect(priorNotice).not.toContain("run /login ·");
-        expect(await session.capturePane()).not.toContain("* permissions: mode=");
+        expect(await session.capturePane()).not.toContain("* allowlist:");
         const replay = JSON.parse(execFileSync(FX_BIN, ["replay", tapePath, "--json"], { encoding: "utf8" }));
         expect(replay.frame_count).toBeGreaterThan(0);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
@@ -449,29 +449,30 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           height: 18,
         });
         await session.waitForComposer(10_000);
-        await session.sendText("/permissions");
-        await session.waitForPane((pane) => pane.includes("saved-session permission rules: none"), 5_000);
+        // Three local notices, one after another.
+        for (const view of ["effective", "local", "user"]) {
+          await session.sendText(`/allowlist view ${view}`);
+          await session.waitForPane((pane) => pane.includes(`* allowlist: ${view} persistent allow rules`), 5_000);
+        }
         const before = await session.captureFullScrollback();
-        const expectedNotice = before.slice(before.lastIndexOf("* permissions: mode=")).split("\n┃")[0]?.trimEnd();
-        expect(expectedNotice).toContain("saved-session permission rules: none");
+        const expectedNotice = before.slice(before.lastIndexOf("* allowlist: effective")).split("\n┃")[0]?.trimEnd();
+        expect(expectedNotice).toContain("* allowlist: user persistent allow rules: (none)");
         session.sendLiteralImmediate("/new");
         await session.resizeWindow(78, 18, 0);
         await Bun.sleep(40);
         session.sendKeysImmediate(["Enter"]);
 
         await session.waitForPane(
-          (pane) => pane.includes(banner) && !pane.includes("* permissions: mode=") && hasEmptyComposer(pane),
+          (pane) => pane.includes(banner) && !pane.includes("* allowlist:") && hasEmptyComposer(pane),
           10_000,
         );
         const history = await session.captureFullScrollback();
-        const oldNotice = history.slice(history.lastIndexOf("* permissions: mode="), history.lastIndexOf(banner));
+        const oldNotice = history.slice(history.lastIndexOf("* allowlist: effective"), history.lastIndexOf(banner));
         let lastIndex = -1;
         for (const field of [
-          "* permissions: mode=auto",
-          "configured rules: (none)",
-          "session grants: (none)",
-          "usage: /permissions",
-          "* permissions: saved-session permission rules: none",
+          "* allowlist: effective persistent allow rules: (none)",
+          "* allowlist: local persistent allow rules: (none)",
+          "* allowlist: user persistent allow rules: (none)",
         ]) {
           const index = oldNotice.indexOf(field);
           expect(index).toBeGreaterThan(lastIndex);
@@ -481,8 +482,8 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         expect(oldNotice).not.toContain("Commands 1");
         expect(oldNotice).not.toContain("run /login ·");
         expect(session.isAlive()).toBe(true);
-        await session.sendText("/permissions");
-        await session.waitForPane((pane) => pane.includes("saved-session permission rules: none") && hasEmptyComposer(pane), 5_000);
+        await session.sendText("/allowlist");
+        await session.waitForPane((pane) => pane.includes("* allowlist: effective persistent allow rules") && hasEmptyComposer(pane), 5_000);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         const replay = JSON.parse(execFileSync(FX_BIN, ["replay", tapePath, "--json"], { encoding: "utf8" }));
         expect(replay.frame_count).toBeGreaterThan(0);
@@ -516,8 +517,8 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           height: 18,
         });
         await session.waitForComposer(10_000);
-        await session.sendText("/permissions");
-        await session.waitForText("saved-session permission rules: none", 5_000);
+        await session.sendText("/allowlist");
+        await session.waitForText("* allowlist: effective persistent allow rules", 5_000);
         session.sendLiteralImmediate("/new");
         await session.resizeWindow(78, 3, 0);
         session.sendKeysImmediate(["Enter"]);

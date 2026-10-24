@@ -577,6 +577,11 @@ fn safeText(alloc: Allocator, raw: []const u8) ![]const u8 {
     return (try text_utils.encodeTerminalSafe(alloc, raw, std.math.maxInt(usize))).bytes;
 }
 
+/// How many entries a panel list holds, or `none`.
+fn countText(alloc: Allocator, count: usize) ![]const u8 {
+    return if (count == 0) "none" else alloc.print("{d}", .{count});
+}
+
 fn gatewayProviderConnected(auth: auth_runtime.StatusSnapshot) bool {
     const source = auth.active_source orelse return auth.gateway_connected;
     return auth.gateway_connected or (source != .chatgpt_subscription and source != .grok_subscription and source != .configured);
@@ -719,12 +724,6 @@ pub const StatusSnapshot = struct {
             /// `fx --resume <id>` opens it now: its log is on disk (D90).
             saved: bool,
         },
-    };
-
-    /// One row of the `/status` panel. Both texts are terminal-safe.
-    pub const PanelRow = struct {
-        label: []const u8,
-        value: []const u8,
     };
 
     /// The `/status` panel's rows, in order, the session first. Everything
@@ -974,12 +973,34 @@ pub const StatusSnapshot = struct {
     }
 };
 
+/// One line of a read-only footer panel, such as `/status` and
+/// `/permissions` open. Both texts are terminal-safe.
+pub const PanelRow = struct {
+    /// Empty for an entry of a list.
+    label: []const u8,
+    value: []const u8,
+    /// An entry of the list the labeled row above it counts, drawn as a
+    /// bullet under its value.
+    item: bool = false,
+};
+
 pub const PermissionsSnapshot = struct {
     workspace_root: []const u8,
     mode: types.PermissionMode,
     grants: []const types.PermissionGrant,
     rules: types.PermissionRuleSet = .{},
     runtime_grants_available: bool = true,
+    /// The open saved session's remembered rules, which only the
+    /// `/permissions` panel shows. `fx permissions` leaves it null.
+    saved_rules: ?[]const SavedRule = null,
+
+    pub const SavedRule = struct {
+        /// What `/permissions revoke` takes.
+        id: u64,
+        decision: []const u8,
+        /// The tool and arguments the rule matches, as it was remembered.
+        identity: []const u8,
+    };
 
     pub fn render(self: PermissionsSnapshot, alloc: Allocator, format: OutputFormat) ![]u8 {
         return switch (format) {
@@ -1009,31 +1030,33 @@ pub const PermissionsSnapshot = struct {
         return try out.toOwnedSlice();
     }
 
-    pub fn renderInteractiveBody(self: PermissionsSnapshot, alloc: Allocator) ![]u8 {
-        var out: std.Io.Writer.Allocating = .init(alloc);
-        defer out.deinit();
-
-        try out.writer.print("mode={s}\n", .{permissions.permissionModeDisplayLabel(self.mode)});
-        if (self.rules.rules.len == 0) {
-            try out.writer.writeAll("configured rules: (none)\n");
-        } else {
-            try out.writer.writeAll("configured rules:\n");
-            for (self.rules.rules) |rule| {
-                try out.writer.print(" - {s} {s} -> {s}\n", .{ @tagName(rule.action), rule.permission, rule.pattern });
-            }
+    /// The `/permissions` panel's rows, in order: the mode, each list with
+    /// its count and entries, and how to change them. Everything is
+    /// allocated with `alloc`, which should be an arena.
+    pub fn panelRows(self: PermissionsSnapshot, alloc: Allocator) ![]PanelRow {
+        var rows: std.ArrayList(PanelRow) = .empty;
+        try rows.append(alloc, .{ .label = "Mode", .value = permissions.permissionModeDisplayLabel(self.mode) });
+        try rows.append(alloc, .{ .label = "Configured rules", .value = try countText(alloc, self.rules.rules.len) });
+        for (self.rules.rules) |rule| try rows.append(alloc, .{ .label = "", .item = true, .value = try safeText(alloc, try alloc.print(
+            "{s} {s} → {s}",
+            .{ @tagName(rule.action), rule.permission, rule.pattern },
+        )) });
+        try rows.append(alloc, .{ .label = "Session grants", .value = try countText(alloc, self.grants.len) });
+        for (self.grants) |grant| try rows.append(alloc, .{ .label = "", .item = true, .value = try safeText(alloc, try alloc.print(
+            "{s} → {s}",
+            .{ grant.tool_name, try displayGrantTarget(alloc, self.workspace_root, grant) },
+        )) });
+        if (self.saved_rules) |saved| {
+            try rows.append(alloc, .{ .label = "Saved rules", .value = try countText(alloc, saved.len) });
+            for (saved) |rule| try rows.append(alloc, .{ .label = "", .item = true, .value = try safeText(alloc, try alloc.print(
+                "{d} {s} {s}",
+                .{ rule.id, rule.decision, rule.identity },
+            )) });
         }
-        if (self.grants.len == 0) {
-            try out.writer.writeAll("session grants: (none)");
-            return try out.toOwnedSlice();
-        }
-        try out.writer.writeAll("session grants:\n");
-        for (self.grants, 0..) |grant, index| {
-            const display_target = try displayGrantTarget(alloc, self.workspace_root, grant);
-            defer alloc.free(display_target);
-            try out.writer.print(" - {s} -> {s}", .{ grant.tool_name, display_target });
-            if (index + 1 < self.grants.len) try out.writer.writeByte('\n');
-        }
-        return try out.toOwnedSlice();
+        try rows.append(alloc, .{ .label = "Change mode", .value = "/permissions ask, auto, full-access, or reset" });
+        try rows.append(alloc, .{ .label = "Remember", .value = "/permissions remember allow|deny <tool-name> <arguments-json>" });
+        try rows.append(alloc, .{ .label = "Revoke", .value = "/permissions revoke <rule-id>" });
+        return rows.toOwnedSlice(alloc);
     }
 
     pub fn renderJson(self: PermissionsSnapshot, alloc: Allocator) ![]u8 {

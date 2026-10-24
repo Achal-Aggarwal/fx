@@ -21,7 +21,7 @@ import { writeJson } from "../lib/tlc";
 import { checkTrace, type Observation, type Op } from "./bridge";
 
 const { Profile } = await targetModule("shell-sessions.ts");
-const { closedAsBefore, panelSession, showsStatusPanel } = await targetModule("status-panel.ts");
+const { closedAsBefore, panelSession, showsStatusPanel } = await targetModule("info-panel.ts");
 const { tmuxAvailable } = await targetModule("tmux-helpers.ts");
 
 const TIMEOUT = 900_000;

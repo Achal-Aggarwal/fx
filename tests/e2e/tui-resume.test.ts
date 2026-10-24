@@ -1783,8 +1783,8 @@ test.skipIf(!tmuxAvailable())(
       expect(compact).not.toContain(stdoutTail);
       expect(compact).not.toContain(stderrTail);
 
-      await active.sendText("/permissions");
-      await active.waitForText("* permissions: mode=", TIMEOUT);
+      await active.sendText("/allowlist");
+      await active.waitForText("* allowlist: effective", TIMEOUT);
       expect(active.paneStatus()).toEqual({ dead: false, status: null });
       const sessionId = sessionIdFromHome(home);
 

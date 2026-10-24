@@ -10,7 +10,7 @@ const picker_state = @import("../../core/input/picker_state.zig");
 const session_adapter = @import("../../core/session/session_adapter.zig");
 const session_catalog = @import("../../core/session/session_catalog.zig");
 const session_store = @import("../../core/session/session_store.zig");
-const status_menu_presentation = @import("status_menu_presentation.zig");
+const info_panel_presentation = @import("info_panel_presentation.zig");
 const usage_presentation = @import("usage_presentation.zig");
 const command_specs = @import("../../core/slash_commands/command_specs.zig");
 const settings_catalog = @import("../../core/config/settings_catalog.zig");
@@ -23,7 +23,7 @@ const file_index = @import("../../core/workspace/file_index.zig");
 const workspace_menu = @import("../../core/workspace/workspace_menu.zig");
 const activity_runtime = @import("../../core/output/activity_runtime.zig");
 const transcript_presentation = @import("../../core/output/transcript_presentation.zig");
-const status_menu = @import("../../core/session/status_menu.zig");
+const info_panel = @import("../../core/input/info_panel.zig");
 const usage_menu = @import("../../core/session/usage_menu.zig");
 const core_input_runtime = @import("../../core/input/runtime.zig");
 const ui_render = @import("../render.zig");
@@ -233,24 +233,30 @@ pub fn workspaceMenuProjection(
     };
 }
 
-/// The `/status` panel: its rows, how far they are scrolled, and whether
-/// they do not all fit, so its hint offers ↑↓.
-pub const StatusMenuProjection = struct {
+/// A read-only panel such as `/status` opens: its title, its rows, how far
+/// they are scrolled, and whether they do not all fit, so its hint offers ↑↓.
+pub const InfoPanelProjection = struct {
     active: bool = false,
-    rows: []const status_menu.Row = &.{},
+    title: []const u8 = "",
+    rows: []const info_panel.Row = &.{},
     scroll: usize = 0,
     overflows: bool = false,
 };
 
-pub fn statusMenuProjection(menu: *const status_menu.State, cols: u16, terminal_rows: u16) StatusMenuProjection {
-    var projection: StatusMenuProjection = .{ .active = menu.active, .rows = menu.rows(), .scroll = menu.scroll };
-    projection.overflows = status_menu_presentation.overflows(projection, cols, terminal_rows);
+pub fn infoPanelProjection(panel: *const info_panel.State, cols: u16, terminal_rows: u16) InfoPanelProjection {
+    var projection: InfoPanelProjection = .{
+        .active = panel.active,
+        .title = panel.title(),
+        .rows = panel.rows(),
+        .scroll = panel.scroll,
+    };
+    projection.overflows = info_panel_presentation.overflows(projection, cols, terminal_rows);
     return projection;
 }
 
 pub const CompactCommandMenuProjection = union(enum) {
     statusline: StatuslineMenuProjection,
-    status: StatusMenuProjection,
+    info_panel: InfoPanelProjection,
     usage: UsageMenuProjection,
     workspace: WorkspaceMenuProjection,
 };
@@ -375,7 +381,7 @@ pub const RenderContext = struct {
     session_menu: SessionMenuProjection = .{},
     fork_menu: ForkMenuProjection = .{},
     statusline_menu: StatuslineMenuProjection = .{},
-    status_menu: StatusMenuProjection = .{},
+    info_panel: InfoPanelProjection = .{},
     usage_menu: UsageMenuProjection = .{},
     workspace_menu: WorkspaceMenuProjection = .{},
     upgrade_status: []const u8 = "",
@@ -394,7 +400,7 @@ pub const RenderContext = struct {
 
 pub fn activeCompactCommandMenu(ctx: RenderContext) ?CompactCommandMenuProjection {
     if (ctx.statusline_menu.active) return .{ .statusline = ctx.statusline_menu };
-    if (ctx.status_menu.active) return .{ .status = ctx.status_menu };
+    if (ctx.info_panel.active) return .{ .info_panel = ctx.info_panel };
     if (ctx.usage_menu.active) return .{ .usage = ctx.usage_menu };
     if (ctx.workspace_menu.active) return .{ .workspace = ctx.workspace_menu };
     return null;

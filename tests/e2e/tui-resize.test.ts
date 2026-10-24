@@ -1993,8 +1993,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
       finish(1);
       await session.waitForStableComposer(15_000);
       await assertRows(tailCount);
-      await session.sendText("/permissions");
-      await session.waitForText("* permissions: mode=", 10_000);
+      await session.sendText("/allowlist");
+      await session.waitForText("* allowlist: effective", 10_000);
       await session.waitForStableComposer(10_000);
       await assertRows(tailCount);
       await session.sendText("/quit");
@@ -2235,8 +2235,8 @@ describe.skipIf(SKIP)("tui: resize", () => {
             expect(gateway.requests).toHaveLength(4);
           });
           check("native history after output", () => expectHistory(afterOutput, true));
-          await session.sendText("/permissions");
-          await session.waitForText("* permissions: mode=", 10_000);
+          await session.sendText("/allowlist");
+          await session.waitForText("* allowlist: effective", 10_000);
           await session.waitForStableComposer(10_000);
           const afterNotice = await capture("after-notice");
           check("native history after a local notice", () => expectHistory(afterNotice, true));

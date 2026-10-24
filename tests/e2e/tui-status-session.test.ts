@@ -9,7 +9,7 @@
 import { expect, test } from "bun:test";
 import { runFx } from "../evals/eval-helpers";
 import { Profile } from "./shell-sessions";
-import { closedAsBefore, lastTranscriptRow, panelSession, showsStatusPanel, type StatusReport } from "./status-panel";
+import { closedAsBefore, lastTranscriptRow, panelSession, showsStatusPanel, type StatusReport } from "./info-panel";
 import { tmuxAvailable } from "./tmux-helpers";
 import { assertSingleFooter } from "./tui-render-assertions";
 

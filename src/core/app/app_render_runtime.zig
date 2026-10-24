@@ -813,8 +813,8 @@ pub fn Runtime(comptime App: type) type {
                     &app.input_runtime.statusline_menu,
                     settings_snapshot,
                 ),
-                .status_menu = render_input.statusMenuProjection(
-                    &app.input_runtime.status_menu,
+                .info_panel = render_input.infoPanelProjection(
+                    &app.input_runtime.info_panel,
                     app.shell.layout.cols,
                     app.shell.layout.rows,
                 ),
