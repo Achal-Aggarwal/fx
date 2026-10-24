@@ -1161,14 +1161,15 @@ describe("MCP login", () => {
     expect(pane).not.toContain(ACCESS_INITIAL);
   }, 60_000);
 
-  test.skipIf(!tmuxAvailable())("/mcp login NAME --no-browser prints the address and the outcome in the transcript", async () => {
+  test.skipIf(!tmuxAvailable())("/mcp login NAME --no-browser links the address and prints the outcome in the transcript", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
     const root = createRoot(auth, true, "http", auth.url, false);
+    const tapePath = join(root.root, "no-browser.fxtape");
     gateway = startFakeGateway([], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
     tui = await TmuxSession.create({
       isolated: true, cwd: root.workspace, width: 140, height: 36,
-      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      env: { ...v2Env(root), FX_RECORD: tapePath, FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
     });
     await tui.waitForComposer(15_000);
     // The flag after the name, which the parser takes like the flag before it.
@@ -1180,16 +1181,14 @@ describe("MCP login", () => {
       return composer < 0 ? lines : lines.slice(0, composer);
     };
     await tui.waitForText("Sign in to fixture in your browser.", 10_000);
-    // fx wraps the address to the pane; join its lines back up.
-    const lines = await transcript();
-    const start = lines.findIndex((line) => line.includes("If it didn't open, go to:"));
-    expect(start).toBeGreaterThanOrEqual(0);
-    let address = "";
-    for (const line of lines.slice(start + 1)) {
-      const part = line.trim();
-      if (!/^[A-Za-z0-9%._~:/?#\[\]@!$&'()*+,;=-]+$/.test(part)) break;
-      address += part;
-    }
+    // A few words stand for the address, which only their link carries.
+    const shown = (await transcript()).join("\n");
+    expect(shown).toContain("Didn't open? Open the sign-in page.");
+    expect(shown).not.toContain("/authorize?");
+    const written = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString("utf8");
+    const link = /\x1b\]8;id=fx-mcp-sign-in;([^\x1b]+)\x1b\\/.exec(written);
+    expect(link).not.toBeNull();
+    const address = link![1];
     expect(new URL(address).searchParams.get("state")).toBeTruthy();
     expect(existsSync(root.openLog)).toBe(false);
     // The user approves in some other browser, which then loads fx's loopback address.
