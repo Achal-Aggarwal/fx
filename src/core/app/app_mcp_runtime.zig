@@ -347,10 +347,9 @@ pub const State = struct {
             switch (notice) {
                 .authorize => |n| {
                     sink.waitForSignIn(n.server, n.url);
-                    // The menu shows the address; a typed login prints it.
+                    // The menu shows the address; a typed login links it.
                     if (!sink.isTyped(n.server)) return;
-                    const text = a.print("Sign in to {s} in your browser. If it didn't open, go to:\n  {s}", .{ safeText(aa, n.server, 160), safeText(aa, n.url, 16 * 1024) }) catch return;
-                    sink.pushLocked(text, false);
+                    sink.pushLocked(signInText(a, aa, n.server, n.url) catch return, false);
                 },
                 .signed_in => |server| {
                     sink.endSignIn(server);
@@ -436,6 +435,16 @@ pub const State = struct {
 
         fn safeText(arena: Allocator, raw: []const u8, max: usize) []const u8 {
             return (text_utils.encodeTerminalSafeInline(arena, raw, max) catch return "?").bytes;
+        }
+
+        /// What a typed login says once its address comes, owned by `alloc`:
+        /// a link to it, or, when it can't be a link target, the address
+        /// itself made safe, to copy.
+        fn signInText(alloc: Allocator, arena: Allocator, server: []const u8, url: []const u8) ![]u8 {
+            const name = safeText(arena, server, 160);
+            if (text_utils.isLinkTarget(url))
+                return alloc.print("Sign in to {s} in your browser. Didn't open? \x1b]8;id=fx-mcp-sign-in;{s}\x1b\\Open the sign-in page\x1b]8;;\x1b\\.", .{ name, url });
+            return alloc.print("Sign in to {s} in your browser. If it didn't open, go to:\n  {s}", .{ name, safeText(arena, url, 16 * 1024) });
         }
     };
 
@@ -1166,6 +1175,18 @@ test "model catalog baseline reports removals" {
     try std.testing.expect(std.mem.find(u8, removed.?, "slack: removed") != null);
 }
 
+test "a typed sign-in prints an address that can't be a link, to copy" {
+    var sink: State.HostSink = .{};
+    defer sink.deinit();
+    const notify = sink.notify();
+    sink.markTyped("docs");
+    notify.notice(notify.context, .{ .authorize = .{ .server = "docs", .url = "https://a.example/a b\x1b[2J" } });
+    try std.testing.expectEqual(@as(usize, 1), sink.notices.items.len);
+    const text = sink.notices.items[0].text;
+    try std.testing.expect(std.mem.startsWith(u8, text, "Sign in to docs in your browser. If it didn't open, go to:\n  https://a.example/a b"));
+    try std.testing.expect(std.mem.findScalar(u8, text, 0x1b) == null);
+}
+
 test "a typed sign-in reports in the transcript, any other on the status line" {
     var sink: State.HostSink = .{};
     defer sink.deinit();
@@ -1174,6 +1195,11 @@ test "a typed sign-in reports in the transcript, any other on the status line" {
     notify.notice(notify.context, .{ .authorize = .{ .server = "docs", .url = "https://a.example/authorize" } });
     notify.notice(notify.context, .{ .signed_in = "docs" });
     try std.testing.expectEqual(@as(usize, 2), sink.notices.items.len);
+    // The address is a link under a few words, not printed out.
+    try std.testing.expectEqualStrings(
+        "Sign in to docs in your browser. Didn't open? \x1b]8;id=fx-mcp-sign-in;https://a.example/authorize\x1b\\Open the sign-in page\x1b]8;;\x1b\\.",
+        sink.notices.items[0].text,
+    );
     try std.testing.expectEqualStrings("Signed in to docs.", sink.notices.items[1].text);
     try std.testing.expect(sink.news == null);
     // Once reported, the next sign-in to it isn't typed.

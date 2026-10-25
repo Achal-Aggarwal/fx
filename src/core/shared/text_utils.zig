@@ -430,6 +430,22 @@ pub fn isTerminalSafe(raw: []const u8) bool {
     return true;
 }
 
+/// Returns true when `url` can be an OSC 8 link target as it is: printable
+/// ASCII with no space, so nothing in it can end the sequence. Show any other
+/// address as text instead.
+pub fn isLinkTarget(url: []const u8) bool {
+    if (url.len == 0) return false;
+    for (url) |c| if (c <= ' ' or c >= 0x7f) return false;
+    return true;
+}
+
+test "a link target is printable ASCII with no space" {
+    try std.testing.expect(isLinkTarget("https://mcp.example.com/authorize?state=a%20b&x=1#y"));
+    for ([_][]const u8{ "", "https://h/a b", "https://h/a\x1b\\\x1b]8;;evil", "https://h/a\x07", "https://h/\xc3\xa9", "https://h/\x7f" }) |odd| {
+        try std.testing.expect(!isLinkTarget(odd));
+    }
+}
+
 pub fn terminalSafeVisibleWidth(raw: []const u8) usize {
     var width: usize = 0;
     var index: usize = 0;

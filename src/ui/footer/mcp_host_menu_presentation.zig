@@ -7,6 +7,7 @@ const display_width = @import("../../core/shared/display_width.zig");
 const menu = @import("../../core/mcp_host/menu.zig");
 const verbs = @import("../../core/mcp_host/verbs.zig");
 const row_text = @import("row_text.zig");
+const text_utils = @import("../../core/shared/text_utils.zig");
 const ui_render = @import("../render.zig");
 
 const Allocator = std.mem.Allocator;
@@ -95,14 +96,6 @@ fn serverRows(p: Projection, r: menu.Row, width: u16) usize {
 
 fn addressWidth(width: u16) usize {
     return @max(@as(usize, width) -| 4, 16);
-}
-
-/// An address that can go in an OSC 8 link as it is: printable ASCII only,
-/// so nothing in it can end the sequence. Any other is shown unlinked.
-fn linkable(url: []const u8) bool {
-    if (url.len == 0) return false;
-    for (url) |c| if (c <= ' ' or c >= 0x7f) return false;
-    return true;
 }
 
 /// The list's lines below its title: a line per server, and before the
@@ -300,8 +293,9 @@ fn serverLine(alloc: Allocator, arena: Allocator, p: Projection, r: menu.Row, l:
         var row: Row = .empty;
         errdefer row.deinit(alloc);
         try row.appendSlice(alloc, "    ");
-        // One link on every row of it, so a click on any opens the whole address.
-        const linked = linkable(url);
+        // One link on every row of it, so a click on any opens the whole
+        // address; one that can't be a link target is shown unlinked.
+        const linked = text_utils.isLinkTarget(url);
         if (linked) {
             try row.appendSlice(alloc, "\x1b]8;id=fx-mcp-sign-in;");
             try row.appendSlice(alloc, url);
@@ -832,7 +826,7 @@ fn fuzzWaitingAddress(_: void, smith: *testing.Smith) !void {
                 rest = rest[close.len..];
                 continue;
             }
-            try testing.expect(linkable(url));
+            try testing.expect(text_utils.isLinkTarget(url));
             try testing.expect(std.mem.startsWith(u8, rest, open));
             try testing.expect(std.mem.startsWith(u8, rest[open.len..], url));
             try testing.expect(std.mem.startsWith(u8, rest[open.len + url.len ..], "\x1b\\"));
