@@ -15,6 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { FX_BIN, runFx } from "../evals/eval-helpers";
+import { startIdleDropProxy } from "./fixtures/idle-drop-proxy";
 import { startLegacyStreamableHttpFixture } from "./fixtures/mcp-legacy-remote";
 import { startModernMcpHttpFixture } from "./fixtures/mcp-modern-http";
 import { stdoutFrames } from "./render-lab/tape";
@@ -47,6 +48,7 @@ let legacyStreamable:
 let auth: AuthFixture | null = null;
 let gateway: ReturnType<typeof startFakeGateway> | null = null;
 let tui: TmuxSession | null = null;
+let tokenProxy: Awaited<ReturnType<typeof startIdleDropProxy>> | null = null;
 
 beforeAll(() => {
   process.env.FX_DISABLE_KEYCHAIN = "1";
@@ -101,16 +103,19 @@ afterEach(async () => {
   const activeAuth = auth;
   const activeUpstream = upstream;
   const activeLegacyStreamable = legacyStreamable;
+  const activeTokenProxy = tokenProxy;
   const activeCleanupRoot = cleanupRoot;
   tui = null;
   gateway = null;
   auth = null;
   upstream = null;
   legacyStreamable = null;
+  tokenProxy = null;
   cleanupRoot = null;
 
   if (activeTui) await activeTui.kill();
   activeGateway?.stop();
+  activeTokenProxy?.stop();
   activeAuth?.stop();
   activeUpstream?.stop();
   activeLegacyStreamable?.stop();
@@ -1947,6 +1952,47 @@ describe("MCP login", () => {
     expect(readFileSync(storePath, "utf8")).toContain(`${REFRESH_ROTATED}-3`);
     expect(auth.replays).toBe(0);
   }, 90_000);
+
+  // A load balancer resets the token endpoint's keep-alive connection once it
+  // sits idle. fx keeps it for the next renewal, which must find it gone and
+  // go out on a new connection instead of failing every renewal until fx
+  // restarts.
+  test("a renewal after the token endpoint reset its idle connection still goes through", async () => {
+    upstream = startModernMcpHttpFixture("json");
+    auth = startAuthFixture(upstream.url, { singleUseRefresh: { graceMs: 0 } });
+    tokenProxy = await startIdleDropProxy(auth.url, "reset");
+    const root = createRoot(auth);
+    seedV2Credential(root, auth, { token_endpoint: `${tokenProxy.origin}/token` });
+    const activeAuth = auth;
+    // Each call finds its access token withdrawn, so fx renews the login
+    // first. The second comes after the proxy reset the first one's
+    // connection.
+    const renewed = (withdrawn: string, id: string, waitMs: number) => async () => {
+      await Bun.sleep(waitMs);
+      activeAuth.validTokens.delete(withdrawn);
+      return fakeGatewayToolCall(id, TOOL_NAME, { text: id });
+    };
+    gateway = startFakeGateway([
+      fakeGatewayToolCall("select_mcp", "mcp_select_tool", { name: TOOL_NAME }),
+      renewed(ACCESS_INITIAL, "first", 0),
+      renewed(`${ACCESS_REFRESHED}-1`, "second", 600),
+      fakeGatewayFinalText("Renewed twice."),
+    ], { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    const result = await runFx(["ask", "--json", "--auto", "--no-save", "Call the protected fixture twice."], {
+      cwd: root.workspace,
+      env: { ...v2Env(root), FX_GATEWAY_BASE_URL: gateway.baseUrl, FX_GATEWAY_CHAT_URL: gateway.chatUrl },
+      timeoutMs: 30_000,
+    });
+    expectExit0(result);
+    const last = gateway.requests.at(-1)?.body ?? "";
+    expect(toolResultText(last, "first")).toContain("first");
+    expect(toolResultText(last, "second")).toContain("second");
+    expect(auth.refreshes).toBe(2);
+    expect(auth.replays).toBe(0);
+    // Each renewal had its own connection: the reset one wasn't used again.
+    expect(tokenProxy.dropped).toBeGreaterThanOrEqual(1);
+    expect(tokenProxy.connections).toBe(2);
+  }, 40_000);
 
   // A login that can't be saved works only where it was made, so fx says so.
   test("a login that can't be saved says so, and fx mcp login fails", async () => {
