@@ -1278,7 +1278,7 @@ describe("MCP login", () => {
     expect(await tui.captureFullScrollback()).not.toContain(ACCESS_INITIAL);
   }, 60_000);
 
-  test.skipIf(!tmuxAvailable())("while a sign-in waits, the server's screen says so and shows its whole address", async () => {
+  test.skipIf(!tmuxAvailable())("while a sign-in waits, the server's screen says so and links its address", async () => {
     upstream = startModernMcpHttpFixture("json");
     auth = startAuthFixture(upstream.url);
     const root = createRoot(auth);
@@ -1292,11 +1292,12 @@ describe("MCP login", () => {
     await tui.waitForText("MCP servers  1", 10_000);
     await tui.sendKeys("Enter");
     await tui.waitForText("› Log in        /mcp login fixture", 15_000);
-    // No browser opens, so the sign-in waits, and the screen says what for.
+    // No browser opens, so the sign-in waits, and the screen says what for in
+    // one line, like the transcript: its label links the address.
     await tui.sendKeys("Enter");
-    await tui.waitForText("Waiting for the browser. Didn't open? Go to:", 10_000);
+    await tui.waitForText("Waiting for the browser. Didn't open? Open the sign-in page.", 10_000);
     const pane = await tui.capturePane();
-    expect(pane).toContain("/authorize?");
+    expect(pane).not.toContain("/authorize?");
     expect(pane).not.toContain("Its tools show here once you log in.");
     expect(auth.tokenExchanges).toBe(0);
   }, 60_000);
@@ -1325,22 +1326,17 @@ describe("MCP login", () => {
     expect(await tui.capturePane()).not.toContain("Waiting for the browser");
     // Pressed again while the sign-in server is slow, then once its address shows.
     await tui.sendKeys("Enter");
-    await tui.waitForText("Waiting for the browser. Didn't open? Go to:", 15_000);
+    await tui.waitForText("Waiting for the browser. Didn't open? Open the sign-in page.", 15_000);
     await tui.sendKeys("Enter");
     await Bun.sleep(500);
 
-    // The address, wrapped over the rows under the heading.
-    const lines = (await tui.capturePane()).split("\n");
-    const heading = lines.findIndex((l) => l.includes("Didn't open? Go to:"));
-    let address = "";
-    for (const l of lines.slice(heading + 1)) {
-      if (!l.startsWith("    ") || l.trim() === "") break;
-      address += l.trim();
-    }
-    expect(address).toContain("/authorize?");
-    // Every row of it links the whole address.
+    // The label is one link to the whole address, which the screen doesn't spell out.
+    expect(await tui.capturePane()).not.toContain("/authorize?");
     const written = Buffer.concat(stdoutFrames(tapePath).map((frame) => frame.payload)).toString("utf8");
-    expect(written).toContain(`\x1b]8;id=fx-mcp-sign-in;${address}\x1b\\`);
+    const link = /\x1b\]8;id=fx-mcp-sign-in;([^\x1b]+)\x1b\\Open the sign-in page/.exec(written);
+    expect(link).not.toBeNull();
+    const address = link![1];
+    expect(address).toContain("/authorize?");
 
     // The browser's return reaches the sign-in those Enters kept.
     const redirect = await fetch(address, { redirect: "manual" });

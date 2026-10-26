@@ -443,7 +443,7 @@ pub const State = struct {
         fn signInText(alloc: Allocator, arena: Allocator, server: []const u8, url: []const u8) ![]u8 {
             const name = safeText(arena, server, 160);
             if (text_utils.isLinkTarget(url))
-                return alloc.print("Sign in to {s} in your browser. Didn't open? \x1b]8;id=fx-mcp-sign-in;{s}\x1b\\Open the sign-in page\x1b]8;;\x1b\\.", .{ name, url });
+                return alloc.print("Sign in to {s} in your browser. Didn't open? \x1b]8;id=fx-mcp-sign-in;{s}\x1b\\" ++ mcp_menu.sign_in_link_label ++ "\x1b]8;;\x1b\\.", .{ name, url });
             return alloc.print("Sign in to {s} in your browser. If it didn't open, go to:\n  {s}", .{ name, safeText(arena, url, 16 * 1024) });
         }
     };
