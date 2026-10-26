@@ -2,7 +2,7 @@
 
 These instructions apply to work under `sdk/` and supplement the repository-level `AGENTS.md`.
 
-This file is maintainer guidance, not consumer documentation. Keep setup and the supported public surface in `sdk/README.md`. Keep exact API shapes in `sdk/fx-sdk.js`, its tests, and the declarations in `sdk/types/`. Add details here only when they help an agent choose the right owner, preserve a non-obvious invariant, or run the right proof. The native Node-API architecture and security model are documented in `sdk/NAPI.md`.
+This file is maintainer guidance, not consumer documentation. Keep setup and the supported public surface in `sdk/README.md`. Keep exact API shapes in the SDK modules, their tests, and the declarations in `sdk/types/`. Add details here only when they help an agent choose the right owner, preserve a non-obvious invariant, or run the right proof. The native Node-API architecture and security model are documented in `sdk/NAPI.md`.
 
 ## Start from the correct owner
 
@@ -10,13 +10,17 @@ The SDK has two WebAssembly surfaces and one shared JavaScript host layer:
 
 | Concern | Source of truth |
 | --- | --- |
-| Shared loader, host imports, adapters, and public JavaScript exports | `sdk/fx-sdk.js` |
+| The engine both backends share: options, sessions, journals and checkpoints, prompts, tools, and errors | `sdk/engine.js` |
+| The WebAssembly host: WASI, host imports, and instantiation | `sdk/wasm-runtime.js` and `sdk/wasm-module.js` |
+| The terminal on WebAssembly | `sdk/wasm-terminal.js` |
+| The xterm.js adapter | `sdk/xterm.js` |
+| `libfx/wasm`, which exports the engine and terminal on WebAssembly | `sdk/fx-sdk.js` |
 | Headless ACP composition for `fx-core.wasm` | `src/wasm_core_main.zig` |
 | Interactive terminal entry point for `fx-term.wasm` | `src/wasm_term_main.zig` and `runWasmTerminal` in `src/main.zig` |
 | Native and WebAssembly capability policy | `src/core/hosts/runtime_profile.zig` |
-| Host-backed terminal session persistence | `src/core/app/app_session_runtime.zig` and `sdk/fx-sdk.js` |
+| Host-backed terminal session persistence | `src/core/app/app_session_runtime.zig` and `sdk/wasm-runtime.js` |
 | Browser workspace contract and `shell.run` bridge | `src/core/hosts/js_host_workspace.zig` and `src/tools/shell/browser_shell.zig` |
-| Browser workspace AGENTS.md reads | `src/core/hosts/js_host_workspace.zig`, `src/builtins/context.zig`, and `sdk/fx-sdk.js` |
+| Browser workspace AGENTS.md reads | `src/core/hosts/js_host_workspace.zig`, `src/builtins/context.zig`, and `sdk/wasm-runtime.js` |
 | Browser device login, OAuth session persistence, and URL opening | `src/core/auth/js_host_auth.zig`, `src/core/auth/oauth_session.zig`, and `src/core/hosts/js_host_url_opener.zig` |
 | WASI target, optimization mode, threading, and artifact names | `build.zig` |
 | Core browser fixture and its automation contract | `sdk/index.html` and `sdk/tests/test-core-browser.mjs` |
@@ -28,14 +32,15 @@ The SDK has two WebAssembly surfaces and one shared JavaScript host layer:
 | TypeScript declarations for every entry point | `sdk/types/`, checked by `sdk/tests/test-types.mjs` |
 | Checkpoint format, including the libfx version, tool set, and model each checkpoint records | `src/core/agent/runtime/checkpoint.zig` |
 | Images a session saves once, by name: naming in journal events and checkpoints, and the two-phase open | `src/core/session/session_codec.zig`, `src/acp/libfx_journal.zig`, and `src/acp/server.zig` |
-| A session's image store (the internal `persistenceImages` key) and storing before sending | `sdk/fx-sdk.js`; a durable session's images are World streams in `sdk/durable.js` |
+| A session's image store (the internal `persistenceImages` key) and storing before sending | `sdk/engine.js`; a durable session's images are World streams in `sdk/durable.js` |
 | Commands required by CI | `.github/workflows/ci.yml` |
 
 Do not treat the demos or this file as the implementation contract. When prose and behavior disagree, establish the current behavior from code and focused tests before changing either.
 
 ## Preserve these invariants
 
-- Keep `sdk/fx-sdk.js` a dependency-free ECMAScript module. A bundler, framework, or runtime package must not become necessary to load the SDK.
+- Keep `sdk/fx-sdk.js` and every module it imports dependency-free ECMAScript modules. A bundler, framework, or runtime package must not become necessary to load the SDK.
+- Keep `sdk/engine.js` free of the WebAssembly host. The native backend runs the same engine, so `engine.js` must never import `wasm-runtime.js`, `wasm-terminal.js`, or `wasm-module.js`; each caller passes the engine its runtime.
 - Keep the core and terminal surfaces distinct. `fx-core.wasm` starts the headless ACP server; `fx-term.wasm` starts the interactive terminal. Shared loader changes must be validated against both.
 - Detect JavaScript Promise Integration (JSPI) by capability through `supportsJspi()`. Do not replace feature detection with browser or version sniffing. Keep loader errors, demo fallback states, and the compatibility statement in `sdk/README.md` consistent.
 - Treat JavaScript host stores as durable contracts. Session and OAuth snapshots are opaque bytes with optimistic revisions. Preserve `FX_SESSION_REVISION_CONFLICT` and `FX_OAUTH_SESSION_REVISION_CONFLICT`. Persist configuration only after fx accepts it, and do not collapse prompt-history outcomes into generic success.

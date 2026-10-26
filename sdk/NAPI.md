@@ -13,7 +13,7 @@ The relevant ownership boundaries are:
 | Native addon entry point and ACP transport | `src/napi_core_main.zig` |
 | Shared ACP server and agent behavior | `src/acp/` |
 | Node backend discovery and adaptation | `sdk/node.js` |
-| Public JavaScript agent implementation | `sdk/fx-sdk.js` |
+| Public JavaScript agent implementation | `sdk/engine.js` |
 | Native build configuration | `build.zig` |
 | npm artifact assembly | `sdk/scripts/package-libfx.mjs` |
 | Native regression and security tests | `sdk/tests/test-native-core-*.mjs` |
@@ -48,7 +48,7 @@ Zig Runtime thread runs acp_server.runWithTransport()
 newline-delimited ACP JSON-RPC
         |
         v
-shared createFxAgent() logic in sdk/fx-sdk.js
+shared engine logic in sdk/engine.js
 ```
 
 `sdk/node.js` supplies a `runtimeFactory` to the shared JavaScript agent implementation. The factory exposes the same small runtime contract expected from the WebAssembly host:
@@ -159,7 +159,7 @@ This restriction is a security boundary. New tools or host effects must not be e
 
 ## Gateway endpoint policy
 
-The Gateway URL is validated independently in JavaScript and Zig. This duplication is intentional defense in depth because callers can load and call `libfx.node` directly, bypassing `sdk/fx-sdk.js`.
+The Gateway URL is validated independently in JavaScript and Zig. This duplication is intentional defense in depth because callers can load and call `libfx.node` directly, bypassing `sdk/engine.js`.
 
 Accepted endpoints are:
 
@@ -168,7 +168,7 @@ Accepted endpoints are:
 
 URLs with embedded credentials or fragments are rejected. Arbitrary HTTPS hosts, non-loopback HTTP hosts, and other schemes are rejected. Loopback HTTP exists only for local development and deterministic tests.
 
-Keep the validation in `sdk/fx-sdk.js`, `src/napi_core_main.zig`, and `streamable_http.validateEndpoint()` aligned. Loosening only one layer creates inconsistent behavior and may create a server-side request forgery path for callers using the low-level addon directly.
+Keep the validation in `sdk/engine.js`, `src/napi_core_main.zig`, and `streamable_http.validateEndpoint()` aligned. Loosening only one layer creates inconsistent behavior and may create a server-side request forgery path for callers using the low-level addon directly.
 
 ## Resource limits and backpressure
 
