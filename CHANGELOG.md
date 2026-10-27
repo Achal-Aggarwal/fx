@@ -31,6 +31,8 @@
 - Changing MCP configuration restarts only the affected servers. Other servers keep their connections, tool lists, running calls, and sign-ins.
 - `/mcp` groups servers that need attention and shows each server's status, connection, and tools. Startup notices wait for servers to settle.
 - MCP tools show progress while they run, both in the terminal and in `fx ask`.
+- Tool group summaries and the status line count MCP calls separately from shell commands.
+- The agent can distinguish command runs with identical output when reading their saved results, including after resuming a session.
 - Large MCP text results remain available through `read_tool_result` in saved sessions instead of failing when one item exceeds 1 MiB.
 - Slack renews its MCP login without requiring another sign-in every 12 hours.
 
@@ -57,6 +59,7 @@
 - Fixed a crash that could occur on a later turn in an interactive session.
 - Updating fx before its first prompt no longer fails while trying to resume an unsaved session.
 - Codex, Grok, and custom Chat Completions streams time out after 10 minutes without a response event, so fx can attempt to recover the turn.
+- fx can recover an empty reply cut short by a provider's default output limit by retrying once. If the reply still cannot produce text, fx reports the limit instead of saying `Done.`.
 - A connection can use a working address even when another address is unreachable and background tasks occupy the worker pool.
 - Fixed a macOS connection error or crash that could occur after another request finished.
 - Custom Chat Completions turns no longer abort when the model requests an unknown tool or supplies malformed arguments. fx returns a tool error so the model can continue.
@@ -76,6 +79,7 @@
 - Errors from restoring the shell environment no longer appear in command output when fx falls back to loading startup files.
 - Force-stopping a command no longer lets its shell start the next command while child processes are being killed.
 - Unresponsive MCP servers no longer freeze calls to healthy servers. Tool searches and subagents can use available servers while others are still starting.
+- MCP tools no longer fail as unselected when the agent calls a tool from an earlier turn, including after resuming a session.
 - Repeated calls to HTTP MCP servers that leave response streams open no longer crash fx. Flooding servers no longer consume unbounded memory or delay other servers' timeouts.
 - HTTP MCP tool calls reconnect after an idle connection drops instead of failing until fx restarts. Reconnection retries only requests that failed before they were fully sent.
 - MCP login renewal reconnects when the sign-in server drops an idle connection.
