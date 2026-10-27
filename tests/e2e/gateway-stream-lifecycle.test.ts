@@ -495,7 +495,7 @@ function parseAskJson(stdout: string): {
   error?: string;
   session_id: string;
   tool_calls: Array<{ name: string; status: string }>;
-  usage: { input_tokens: number | null; output_tokens: number | null };
+  usage: { input_tokens: number | null; output_tokens: number | null; cache_read_tokens?: number; cache_write_tokens?: number };
   recovery?: {
     state: string;
     kind: string;
@@ -5643,6 +5643,89 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 20_000);
+
+  test("a killed ask keeps each reply's token usage in its log, and a resume keeps counting", async () => {
+    const root = createFixtureRoot("usage-survives-sigkill");
+    let requests = 0;
+    const gateway = startGateway(() => {
+      requests += 1;
+      if (requests === 1) {
+        return fakeGatewaySse([
+          { type: "tool-call", toolCallId: "usage_kill_1", toolName: "shell", input: { request: { action: "run", command: "sleep 3", yield_time_ms: 30_000 } } },
+          {
+            type: "finish",
+            finishReason: { unified: "tool-calls", raw: "tool-calls" },
+            usage: { inputTokens: { total: 100, noCache: 20, cacheRead: 80 }, outputTokens: { total: 7, reasoning: 2 } },
+          },
+        ]);
+      }
+      return fakeGatewaySse([
+        { type: "text-delta", id: "answer_1", delta: "Done." },
+        {
+          type: "finish",
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: { inputTokens: { total: 50, cacheRead: 40 }, outputTokens: { total: 3 } },
+        },
+      ]);
+    });
+    const usageValues = (id: string) =>
+      (logLines(root.home, id) as Array<{ kind: string; key?: string; value?: unknown }>).filter((line) => line.kind === "set" && line.key === "usage").map((line) => line.value);
+    // As Harbor runs fx: the agent phase ends with a kill, not a turn end.
+    const proc = Bun.spawn([FX_BIN, "ask", "--yolo", "--json", "--", "Run the usage fixture."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+
+    try {
+      let id: string | undefined;
+      const deadline = Date.now() + 10_000;
+      while (id === undefined && Date.now() < deadline) {
+        try {
+          const ids = savedSessionIds(root.home);
+          if (ids.length === 1 && usageValues(ids[0]!).length > 0) id = ids[0];
+        } catch {
+          // The store or its log does not exist yet.
+        }
+        if (id === undefined) await Bun.sleep(25);
+      }
+      expect(id).toBeDefined();
+      proc.kill("SIGKILL");
+      await proc.exited;
+
+      const killedLog = logLines(root.home, id!);
+      expect(killedLog.some((line) => line.kind === "turn_committed")).toBe(false);
+      expect(usageValues(id!).at(-1)).toEqual({
+        input_tokens: 100,
+        output_tokens: 7,
+        cache_read_tokens: 80,
+        cache_write_tokens: null,
+        reasoning_tokens: 2,
+      });
+
+      const resumed = await runFx(["ask", "--yolo", "--json", "--resume-id", id!, "--", "Finish up."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "resume-trace.log")),
+        timeoutMs: 15_000,
+      });
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(parseAskJson(resumed.stdout).usage).toEqual({ input_tokens: 50, output_tokens: 3, cache_read_tokens: 40 });
+      expect(usageValues(id!).at(-1)).toEqual({
+        input_tokens: 150,
+        output_tokens: 10,
+        cache_read_tokens: 120,
+        cache_write_tokens: null,
+        reasoning_tokens: 2,
+      });
+    } finally {
+      if (proc.exitCode === null) proc.kill("SIGKILL");
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test.skipIf(process.platform !== "linux")(
     "a second headless shell run survives replacing the running fx binary",

@@ -257,6 +257,10 @@ pub const AgentRuntimeDeps = struct {
     /// Called at every model-request boundary with the turn so far, so each
     /// completed piece is saved as it happens rather than at the turn's end.
     append_turn_piece: ?*const fn (ctx: *anyopaque, progress: TurnProgress) anyerror!void = null,
+    /// Called once with each main-model completion's provider usage, as soon
+    /// as it arrives, so a saved session keeps the usage of every reply even
+    /// when the turn never ends. A failure is traced and never fails the turn.
+    record_usage: ?*const fn (ctx: *anyopaque, usage: types.Usage) anyerror!void = null,
     /// Saves the turn's prompt images in the session before its first
     /// request is built, so the note naming each saved file is true when
     /// that request is sent (D89). It sets `blob_path`, allocated with

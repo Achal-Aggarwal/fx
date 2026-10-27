@@ -3452,6 +3452,8 @@ fn parseSseUsage(root: std.json.Value) types.Usage {
     return .{
         .input_tokens = parseSseTokenTotal(usage_value, "inputTokens"),
         .output_tokens = parseSseTokenTotal(usage_value, "outputTokens"),
+        .cache_read_tokens = parseSseTokenDetail(usage_value, "inputTokens", "cacheRead"),
+        .cache_write_tokens = parseSseTokenDetail(usage_value, "inputTokens", "cacheWrite"),
         .reasoning_tokens = parseSseTokenDetail(usage_value, "outputTokens", "reasoning"),
     };
 }
@@ -4337,12 +4339,12 @@ test "consumeSseStream leaves missing and unknown service tiers unconfirmed" {
     }
 }
 
-test "consumeSseStream surfaces finish reasoning tokens in turn usage" {
+test "consumeSseStream surfaces finish cache and reasoning tokens in turn usage" {
     const Noop = struct {
         fn chunk(_: *anyopaque, _: []const u8) void {}
     };
     const payload =
-        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":10},\"outputTokens\":{\"total\":25,\"reasoning\":5}}}\n\n";
+        "data: {\"type\":\"finish\",\"finishReason\":{\"unified\":\"stop\"},\"usage\":{\"inputTokens\":{\"total\":10,\"noCache\":3,\"cacheRead\":6,\"cacheWrite\":1},\"outputTokens\":{\"total\":25,\"reasoning\":5}}}\n\n";
     var reader = std.Io.Reader.fixed(payload);
     var cancel_flag = std.atomic.Value(bool).init(false);
     var completion = try consumeSseStream(
@@ -4357,6 +4359,8 @@ test "consumeSseStream surfaces finish reasoning tokens in turn usage" {
 
     try std.testing.expectEqual(@as(?u64, 10), completion.usage.input_tokens);
     try std.testing.expectEqual(@as(?u64, 25), completion.usage.output_tokens);
+    try std.testing.expectEqual(@as(?u64, 6), completion.usage.cache_read_tokens);
+    try std.testing.expectEqual(@as(?u64, 1), completion.usage.cache_write_tokens);
     try std.testing.expectEqual(@as(?u64, 5), completion.usage.reasoning_tokens);
 
     const malformed =
