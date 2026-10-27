@@ -83,6 +83,8 @@ const AgentRuntimeDeps = runtime_deps.AgentRuntimeDeps;
 const CredentialRefreshMode = runtime_deps.CredentialRefreshMode;
 
 const http_error_detail_max_bytes: usize = 4096;
+const empty_length_retry_notice = "The reply ran out of output tokens before any text. Retrying with a higher limit.";
+const empty_length_limited_reply = "The reply ran out of output tokens before any text.";
 const assistant_prefill_recovery_prompt =
     "Continue from the preceding tool result.";
 pub const assistant_tail_continuation_prompt =
@@ -6860,6 +6862,9 @@ fn processQueuedPromptLoop(
     defer interrupted_persisted_ptr.* = interrupted_persisted;
     var silent_tool_steps: usize = 0;
     var continuation_injected = false;
+    // Set once, for the turn's single retry of an empty reply the provider
+    // cut short while the request named no output limit.
+    var length_retry_output_tokens: ?u32 = null;
     var last_step_ctx = finish_trace.ctx;
     var current_step_index: usize = 0;
     var last_tool_call_name: []const u8 = "none";
@@ -7426,7 +7431,7 @@ fn processQueuedPromptLoop(
                 .tool_choice = tool_choice,
                 .vision_mode = vision_mode,
                 .provider_options = provider_opts,
-                .max_output_tokens = model_capabilities.requestOutputTokens(request_capabilities),
+                .max_output_tokens = length_retry_output_tokens orelse model_capabilities.requestOutputTokens(request_capabilities),
                 .budget = .{ .cancel_flag = config.cancel_flag },
             };
             // The request re-sends every image the session keeps, and
@@ -9403,6 +9408,22 @@ fn processQueuedPromptLoop(
             },
         );
         try runtime_telemetry.traceReturnedToolCalls(arena, step_ctx, completion.tool_calls);
+        // A reply the provider cut short before any text or tool call, from a
+        // request that named no output limit, ran out of the provider's own
+        // default. It is sent again once with an explicit limit.
+        if (disposition == .length_limited and
+            completion.tool_calls.len == 0 and
+            std.mem.trim(u8, partial_assistant, " \t\r\n").len == 0 and
+            length_retry_output_tokens == null and
+            model_capabilities.requestOutputTokens(request_capabilities) == null and
+            agent_steps.allowsStep(config.agent_step_limit, step + 1))
+        {
+            length_retry_output_tokens = model_capabilities.empty_length_retry_output_tokens;
+            debug_trace.eventf("agent", "empty_length_limited_retry", step_ctx, "max_output_tokens={d}", .{model_capabilities.empty_length_retry_output_tokens});
+            try deps.push_text(deps.ctx, .{ .operational = empty_length_retry_notice });
+            try deps.push_text(deps.ctx, .{ .operational = "\n" });
+            continue;
+        }
         try runtime_assistant_stream.emitProviderLengthNotice(deps, arena, disposition);
         const terminal_provider_completion = isTerminalProviderExecutedCompletion(completion);
         const final_provider_replay = if (terminal_provider_completion or filtered_provider_calls.removed > 0)
@@ -9499,9 +9520,10 @@ fn processQueuedPromptLoop(
                 continue;
             }
 
-            const raw_final = if (has_content) partial_assistant else "Done.";
+            const empty_final: []const u8 = if (disposition == .length_limited) empty_length_limited_reply else "Done.";
+            const raw_final = if (has_content) partial_assistant else empty_final;
             const final_text = try runtime_assistant_stream.normalizeAssistantTextForDisplay(arena, raw_final);
-            const rendered = if (final_text.len > 0) final_text else "Done.";
+            const rendered = if (final_text.len > 0) final_text else empty_final;
             const history_text = try arena.dupe(u8, raw_final);
             const history_replay = if (has_content) final_provider_replay else try deps.agent_stream_provider.projectReplay(arena, final_provider_replay, &.{}, false, true);
 

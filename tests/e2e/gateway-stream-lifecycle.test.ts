@@ -8923,6 +8923,93 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     55_000,
   );
 
+  // The provider's own default limit ran out before any text: reasoning only.
+  const emptyLengthLimitedReply = () => fakeGatewaySse([
+    { type: "reasoning-start", id: "spent_reasoning" },
+    { type: "reasoning-delta", id: "spent_reasoning", delta: "thinking until the provider stops" },
+    { type: "reasoning-end", id: "spent_reasoning" },
+    {
+      type: "finish",
+      finishReason: { unified: "length", raw: "length" },
+      usage: { inputTokens: { total: 3 }, outputTokens: { total: 4096 } },
+    },
+  ]);
+
+  async function askWithReplies(
+    label: string,
+    replies: Array<() => Response>,
+    model: Record<string, unknown> = {},
+  ) {
+    const root = createFixtureRoot(label);
+    const tracePath = join(root.root, "trace.log");
+    let index = 0;
+    const gateway = startDynamicFakeGateway(
+      () => (replies[index++] ?? (() => new Response("unexpected request", { status: 500 })))(),
+      { models: [{ id: MODEL, type: "language", tags: ["tool-use"], ...model }] },
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Answer briefly."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 30_000 },
+      );
+      return {
+        result,
+        json: parseAskJson(result.stdout),
+        bodies: gateway.requests.map((request) => JSON.parse(request.body) as { maxOutputTokens?: number }),
+        trace: readFileSync(tracePath, "utf8"),
+      };
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }
+
+  test("an empty reply cut short by the provider's default limit is asked again with a limit", async () => {
+    const { result, json, bodies, trace } = await askWithReplies("empty-length-retry", [
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("answered after the limit retry"),
+    ]);
+
+    expect(result.code).toBe(0);
+    expect(json.output).toContain("answered after the limit retry");
+    expect(json.final_output).toContain("answered after the limit retry");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
+    expect(json.final_output).not.toContain("ran out of output tokens");
+    // The catalog names no limit, so only the retry sends one.
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]!.maxOutputTokens).toBeUndefined();
+    expect(bodies[1]!.maxOutputTokens).toBe(32_768);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("Retrying with a higher limit.");
+    expect(trace).toContain("event=empty_length_limited_retry");
+  }, 40_000);
+
+  test("an empty reply still cut short after the retry says so instead of Done.", async () => {
+    const { result, json, bodies } = await askWithReplies("empty-length-twice", [
+      emptyLengthLimitedReply,
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("a third request must not be sent"),
+    ]);
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(2);
+    expect(json.final_output).toBe("The reply ran out of output tokens before any text.");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
+  }, 40_000);
+
+  test("an empty reply cut short at the catalog's own limit is not asked again", async () => {
+    const { result, json, bodies, trace } = await askWithReplies("empty-length-catalog-limit", [
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("a retry must not be sent"),
+    ], { context_window: 200_000, max_tokens: 8_000 });
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]!.maxOutputTokens).toBe(8_000);
+    expect(json.final_output).toBe("The reply ran out of output tokens before any text.");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
+    expect(trace).not.toContain("event=empty_length_limited_retry");
+  }, 40_000);
+
   test("provider error finish reconciles without authorizing local tool execution", async () => {
     const root = createFixtureRoot("provider-error");
     const tracePath = join(root.root, "trace.log");

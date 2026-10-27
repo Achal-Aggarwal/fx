@@ -130,6 +130,10 @@ pub fn resolveForApp(comptime App: type, app: *App, model: []const u8) Capabilit
 const full_window_output_tokens: u32 = 32_768;
 const full_window_output_divisor: u32 = 8;
 
+/// The output limit for the one retry of a reply the provider cut short before
+/// any text, when the first request set no limit and the provider's default ran out.
+pub const empty_length_retry_output_tokens: u32 = full_window_output_tokens;
+
 /// Output tokens to request and reserve for one model call, or null to leave the limit unset.
 pub fn requestOutputTokens(capabilities: Capabilities) ?u32 {
     const advertised = capabilities.max_output_tokens orelse return null;
