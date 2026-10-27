@@ -5994,7 +5994,8 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
       await session.waitForComposer(TIMEOUT);
       await session.sendText("Run the supported call after the unknown call.");
       await session.waitForText(finalText, TIMEOUT);
-      const header = "● 2 tool calls · 2 commands · 1 failed";
+      // The unsupported name has the MCP prefix, so it counts as an MCP call.
+      const header = "● 2 tool calls · 1 command · 1 MCP call · 1 failed";
       const failedRow = `├ Failed ${unsupportedToolName}`;
       const completedRow = `└ Ran ${supportedCommand}`;
       const compact = await session.captureFullScrollback();

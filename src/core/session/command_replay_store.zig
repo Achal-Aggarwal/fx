@@ -267,7 +267,8 @@ const ReplayBacking = union(enum) {
 /// blob, and `.bin` (D44). Caller owns.
 /// One run's handle for the blob that holds its output. The blob's hash comes
 /// last, where `artifact_digest.blobHash` reads it, after a random id for the
-/// run, so two commands with the same output still get handles of their own.
+/// run, so two commands with the same output still get handles of their own
+/// (D91).
 fn blobReplayHandle(alloc: Allocator, hash: session_child_store.Blobs.Hash) ![]u8 {
     var run_id: [6]u8 = undefined;
     try std.Io.randomSecure(io_mod.getIo(), &run_id);

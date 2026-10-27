@@ -5929,7 +5929,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(latest.code).toBe(0);
       const sessionId = JSON.parse(latest.stdout).id as string;
       // One command replay, kept as a blob of the session.
-      const replays = new Set(savedText(root.home, sessionId).match(/fx-command-replay-[a-f0-9]{64}\.bin/g) ?? []);
+      const replays = new Set(savedText(root.home, sessionId).match(/fx-command-replay-[a-f0-9]{12}-[a-f0-9]{64}\.bin/g) ?? []);
       expect(replays.size).toBe(1);
       const replayHash = /([a-f0-9]{64})\.bin$/.exec([...replays][0]!)![1]!;
       expect(existsSync(join(sessionDir(root.home, sessionId), "blobs", replayHash))).toBe(true);

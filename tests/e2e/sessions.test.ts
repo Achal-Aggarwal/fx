@@ -525,7 +525,7 @@ test("a long command output is kept as one read-only blob, and the model pages i
   const gateway = startDynamicFakeGateway(async (body) => {
     if (body.includes("Page the output again.")) {
       if (body.includes("replay-read-1")) return fakeGatewayFinalText("REPLAY_PAGED_DONE");
-      const handle = /fx-command-replay-[a-f0-9]{64}\.bin/.exec(body)?.[0] ?? "missing-handle";
+      const handle = /fx-command-replay-[a-f0-9]{12}-[a-f0-9]{64}\.bin/.exec(body)?.[0] ?? "missing-handle";
       return fakeGatewayToolCall("replay-read-1", "read_tool_result", {
         request: { handle, query: "150001" },
       });
@@ -539,8 +539,9 @@ test("a long command output is kept as one read-only blob, and the model pages i
     expect(JSON.parse(created.stdout).output).toBe("LONG_RUN_DONE");
     const id = JSON.parse(created.stdout).session_id;
 
-    const handle = /fx-command-replay-[a-f0-9]{64}\.bin/.exec(JSON.stringify(logLines(fixture.home, id)))?.[0] ?? "";
-    expect(handle).toMatch(/^fx-command-replay-[a-f0-9]{64}\.bin$/);
+    const handle = /fx-command-replay-[a-f0-9]{12}-[a-f0-9]{64}\.bin/.exec(JSON.stringify(logLines(fixture.home, id)))?.[0] ?? "";
+    // A run id, then the hash that names the blob (D44, D91).
+    expect(handle).toMatch(/^fx-command-replay-[a-f0-9]{12}-[a-f0-9]{64}\.bin$/);
     const hash = /-([a-f0-9]{64})\./.exec(handle)![1]!;
     expect(blobNames(fixture, id)).toContain(hash);
     expect(blobNames(fixture, id).every((name) => /^[a-f0-9]{64}$/.test(name))).toBe(true);
