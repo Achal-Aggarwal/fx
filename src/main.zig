@@ -1941,6 +1941,10 @@ const App = struct {
         return AgentAppRuntime.validateToolCall(self, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
 
+    pub fn resolveUnselectedMcpTool(self: *App, arena: Allocator, name: []const u8) !?tool_mcp_runtime.SelectedTool {
+        return AgentAppRuntime.resolveUnselectedMcpTool(self, arena, name, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
+    }
+
     pub fn checkToolAvailability(self: *App, arena: Allocator, call: ToolCall) !?[]const u8 {
         return AgentAppRuntime.checkToolAvailability(self, arena, call, &ignored_list_entries, max_list_entries, max_read_file_bytes, max_read_file_lines, max_read_file_line_len, max_command_output_bytes, builtin_gateway.retry_count, builtin_gateway.defaultChatUrl());
     }
