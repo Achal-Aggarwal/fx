@@ -9010,6 +9010,70 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     expect(trace).not.toContain("event=empty_length_limited_retry");
   }, 40_000);
 
+  test("commands with the same output get their own handles, and each reads back after resume", async () => {
+    const root = createFixtureRoot("distinct-replay-handles");
+    const tracePath = join(root.root, "trace.log");
+    const handles: string[] = [];
+    const run = (id: string, command: string) => fakeGatewayToolCall(id, "shell", {
+      request: { action: "run", command, profile: "clean", yield_time_ms: 30000 },
+    });
+    const read = (id: string, handle: string) => fakeGatewayToolCall(id, "read_tool_result", {
+      request: { handle, query: "SAME_OUTPUT" },
+    });
+    let step = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      switch (step++) {
+        case 0:
+          return run("same-a", "printf 'SAME_OUTPUT\\n'");
+        case 1:
+          handles.push(JSON.parse(toolResultOutput(body, "same-a")).full_output_handle);
+          return run("same-b", "echo SAME_OUTPUT");
+        case 2:
+          handles.push(JSON.parse(toolResultOutput(body, "same-b")).full_output_handle);
+          return fakeGatewayFinalText("DISTINCT_HANDLES_RECORDED");
+        case 3:
+          return read("read-a", handles[0]!);
+        case 4:
+          expect(toolResultOutput(body, "read-a")).toContain("SAME_OUTPUT");
+          return read("read-b", handles[1]!);
+        case 5:
+          expect(toolResultOutput(body, "read-b")).toContain("SAME_OUTPUT");
+          return fakeGatewayFinalText("DISTINCT_HANDLES_READ");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    try {
+      const env = fixtureEnv(root, gateway, tracePath);
+      const first = await runFx(
+        ["ask", "--json", "--auto", "Run both commands."],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(first.code).toBe(0);
+      const firstJson = parseAskJson(first.stdout);
+      expect(firstJson.output).toContain("DISTINCT_HANDLES_RECORDED");
+      expect(handles).toHaveLength(2);
+      const shape = /^fx-command-replay-([0-9a-f]{12})-([0-9a-f]{64})\.bin$/;
+      const [a, b] = handles.map((handle) => shape.exec(handle));
+      expect(a).not.toBeNull();
+      expect(b).not.toBeNull();
+      // One stored copy of the output, named by two runs of their own.
+      expect(a![2]).toBe(b![2]);
+      expect(handles[0]).not.toBe(handles[1]);
+
+      const resumed = await runFx(
+        ["ask", "--json", "--auto", "--resume", firstJson.session_id, "Read both outputs."],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(resumed.code).toBe(0);
+      expect(parseAskJson(resumed.stdout).output).toContain("DISTINCT_HANDLES_READ");
+      expect(step).toBe(6);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 70_000);
+
   test("provider error finish reconciles without authorizing local tool execution", async () => {
     const root = createFixtureRoot("provider-error");
     const tracePath = join(root.root, "trace.log");
