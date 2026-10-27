@@ -13,6 +13,8 @@ The relevant ownership boundaries are:
 | Native addon entry point and ACP transport | `src/napi_core_main.zig` |
 | Shared ACP server and agent behavior | `src/acp/` |
 | Node backend discovery and adaptation | `sdk/node.js` |
+| Node WebAssembly fallback, imported only when it is used | `sdk/node-wasm.js` |
+| Bundled asset URLs under webpack | `sdk/bundled-asset.js` |
 | Public JavaScript agent implementation | `sdk/engine.js` |
 | Native build configuration | `build.zig` |
 | npm artifact assembly | `sdk/scripts/package-libfx.mjs` |
@@ -239,13 +241,23 @@ Consequently:
 - publishing must preserve provenance and use the exact tested artifacts;
 - addon load failures must not be mistaken for a safe sandbox boundary.
 
-The JavaScript loader uses literal references to the four packaged
-`libfx.<platform>-<arch>.node` names and selects the matching supported tuple.
-Local package assembly renames `zig-out/lib/libfx.node` to that tuple's package
-name. The loader validates `libfxApiVersion` and the expected export shape
-before use. `backend: "native"` fails closed if a compatible addon is
+Each supported tuple's addon ships in its own platform package, such as
+`@libfx/libfx-linux-x64-gnu`, which libfx lists as an exact-version optional
+dependency. `node.js` imports only the package for the running tuple. Each
+platform package's `index.js` exports a literal
+`new URL("./libfx.node", import.meta.url)`, so bundlers copy the addon and
+file tracers follow it. Under webpack, `node.js` imports the platform package
+through one template expression limited to `@libfx/libfx-*/index.js`, which
+matches only the packages that are installed, so missing platforms produce no
+build warnings. Everywhere else it uses one literal `import()` per package.
+`node.js` then loads the addon through `createRequire()`. The loader validates
+`libfxApiVersion` and the expected export shape before use. A missing platform
+package is reported as `LIBFX_NATIVE_ARTIFACT_MISSING` with the package name. `backend: "native"` fails closed if a compatible addon is
 unavailable. `backend: "auto"` may fall back to WebAssembly when JSPI is
-available. Explicit `nativeAddon` objects, paths, and URLs remain separate from
+available. `node.js` never imports the WebAssembly host itself: it imports
+`node-wasm.js`, and through it `wasm-runtime.js`, only after native discovery
+fails or when `backend: "wasm"` is requested, so a process on the native
+backend never parses WebAssembly host code or reads a `.wasm` file. Explicit `nativeAddon` objects, paths, and URLs remain separate from
 packaged discovery.
 
 ## Build and packaging
@@ -266,16 +278,21 @@ zig build -Dnapi-surface=core -Doptimize=ReleaseSafe
 
 The N-API artifact currently forces `ReleaseSafe` in `build.zig`; the command-line optimization value does not change that module's mode. Retaining safety checks is intentional for code processing untrusted JavaScript and protocol input.
 
-Published packages contain one addon for each supported tuple:
+Each supported tuple has one platform package:
 
-- `linux-x64`;
-- `linux-arm64`;
-- `darwin-x64`;
-- `darwin-arm64`.
+| Tuple | Package | `os`, `cpu`, `libc` |
+| --- | --- | --- |
+| `linux-x64` | `@libfx/libfx-linux-x64-gnu` | `linux`, `x64`, `glibc` |
+| `linux-arm64` | `@libfx/libfx-linux-arm64-gnu` | `linux`, `arm64`, `glibc` |
+| `darwin-x64` | `@libfx/libfx-darwin-x64` | `darwin`, `x64` |
+| `darwin-arm64` | `@libfx/libfx-darwin-arm64` | `darwin`, `arm64` |
 
-`package-libfx.mjs` requires exactly those four names when assembling a
-publishable multi-platform package. It rejects missing, duplicate, or
-unexpected addon names. Package assembly also generates a self-contained
+`package-libfx.mjs <out-dir> [libfx.<tuple>.node ...]` writes libfx to
+`<out-dir>/libfx` and each platform package beside it. A publishable set
+requires exactly one addon for each of the four tuples and rejects missing,
+duplicate, or unexpected addon names. With no addons, it packages
+`zig-out/lib/libfx.node` as the local tuple's package. `LIBFX_VERSION` sets
+the version of every package and of libfx's optional dependencies. Package assembly also generates a self-contained
 `node.cjs` from the dependency-free ESM source with package-relative module
 URLs. The publish workflow builds and tests each addon on its native runner
 before combining the artifacts with both WebAssembly surfaces, the README, and

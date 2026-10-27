@@ -14,6 +14,8 @@ const result = spawnSync(process.env.BUN_BIN || "bun", [
   "--target=node",
   "--format=cjs",
   "--external=*.node",
+  // Each platform's addon package, which node.js imports at run time.
+  "--external=@libfx/*",
   "--define",
   "import.meta.url=__libfxModuleUrl",
   "--banner",

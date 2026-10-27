@@ -520,6 +520,8 @@ A journal or `checkpoint` from a newer libfx fails with `FxJournalVersionError`.
 
 The default `backend: "auto"` tries the native addon first. Pass `"native"` or `"wasm"` to require one, and call `getBackendInfo()` to see what would load without creating anything.
 
+Each platform's addon is its own package, such as `@libfx/libfx-linux-x64-gnu`, and npm installs only the one for your machine as an optional dependency of libfx. When it is missing, for example because optional dependencies were omitted or the lockfile came from another platform, `getBackendInfo()` names the package and `"auto"` uses WebAssembly instead. Node.js loads the WebAssembly backend only for that fallback.
+
 Next.js works in Node.js route handlers, with webpack or Turbopack, and doesn't need `serverExternalPackages`. CommonJS apps can `require("libfx")`. With TypeScript's `moduleResolution: "bundler"`, add `"node"` to `customConditions` to get the Node.js types.
 
 ## The fx terminal in a browser

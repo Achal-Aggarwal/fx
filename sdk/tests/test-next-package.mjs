@@ -1,21 +1,27 @@
 #!/usr/bin/env node
 import { strict as assert } from "node:assert";
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { createWriteStream } from "node:fs";
 import { access, cp, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { localNativePackage, nativeDirArgument, nativeTarballs } from "./native-package.mjs";
 import { serializeError } from "./package-report.mjs";
 
 const tarball = resolve(process.argv[2]);
 const next15 = process.argv.includes("--next15");
 const webpack = next15 || process.argv.includes("--webpack");
 const bundlerArgs = webpack && !next15 ? ["--webpack"] : [];
+// A directory of platform package tarballs, such as the four a release
+// publishes. The app installs each one pnpm would install on this machine.
+const nativeDir = nativeDirArgument();
+assert.ok(nativeDir, "usage: test-next-package.mjs <libfx.tgz> --native-dir <dir> [--webpack|--next15]");
+let nativeAddonHash;
 const artifactRoot = process.env.LIBFX_TEST_ARTIFACT_ROOT || tmpdir();
 await mkdir(artifactRoot, { recursive: true });
 const root = await mkdtemp(resolve(artifactRoot, "libfx-next-"));
@@ -167,7 +173,16 @@ async function ndjsonUntil(response, done) {
   throw new Error(`the stream ended after ${lines.length} lines without its last event`);
 }
 
+const sha256 = async (path) => createHash("sha256").update(await readFile(path)).digest("hex");
+
 async function assertBundledNativeAssets(buildDir) {
+  // The route traces one addon: the platform package's, whichever bundler
+  // copied it.
+  const routeDir = resolve(buildDir, "server/app/api/fx");
+  const trace = JSON.parse(await readFile(resolve(routeDir, "route.js.nft.json"), "utf8"));
+  const addons = trace.files.filter((path) => path.endsWith(".node") && !/[\\/](@next|@img|sharp)[\\/]/.test(path));
+  assert.equal(addons.length, 1, `the fx route must trace exactly one libfx addon: ${addons.join(", ")}`);
+  assert.equal(await sha256(resolve(routeDir, addons[0])), nativeAddonHash, `${addons[0]} is not ${localNativePackage}'s addon`);
   if (!webpack) return;
   // A deployment carries the durability modules libfx loads on first use.
   const durableDir = resolve(buildDir, "server/app/api/durable");
@@ -177,13 +192,6 @@ async function assertBundledNativeAssets(buildDir) {
     assert.ok(file, `the durable route must trace the emitted durable/${name}.mjs`);
     await access(resolve(durableDir, file));
   }
-  const routeDir = resolve(buildDir, "server/app/api/fx");
-  const trace = JSON.parse(await readFile(resolve(routeDir, "route.js.nft.json"), "utf8"));
-  for (const platform of ["linux-x64", "linux-arm64", "darwin-x64", "darwin-arm64"]) {
-    const file = trace.files.find((path) => path.includes(`/static/media/libfx.${platform}.`) && path.endsWith(".node"));
-    assert.ok(file, `webpack must trace the emitted ${platform} addon, not externalize libfx`);
-    await access(resolve(routeDir, file));
-  }
 }
 
 try {
@@ -191,15 +199,30 @@ try {
   await cp(tarball, resolve(app, "libfx.tgz"));
   const manifest = JSON.parse(await readFile(resolve(app, "package.json"), "utf8"));
   manifest.dependencies.libfx = "file:./libfx.tgz";
+  // libfx's optional dependencies point at the local platform tarballs;
+  // pnpm skips each one whose os, cpu, and libc do not match. pnpm 11 reads
+  // overrides only from pnpm-workspace.yaml.
+  const tarballs = nativeTarballs(nativeDir);
+  assert.ok(tarballs[localNativePackage], `${nativeDir} has no ${localNativePackage} tarball`);
+  const overrides = [];
+  for (const [name, path] of Object.entries(tarballs)) {
+    await cp(path, resolve(app, basename(path)));
+    overrides.push(`  ${JSON.stringify(name)}: ${JSON.stringify(`file:./${basename(path)}`)}`);
+  }
+  await writeFile(resolve(app, "pnpm-workspace.yaml"), `overrides:\n${overrides.join("\n")}\n`);
   if (next15) manifest.dependencies.next = "15.5.25";
   await writeFile(resolve(app, "package.json"), JSON.stringify(manifest, null, 2));
   await run(process.env.PNPM_BIN || "pnpm", ["install", "--no-frozen-lockfile", "--ignore-scripts"], app, "install");
   const require = createRequire(resolve(app, "package.json"));
+  // The installed platform package, resolved from libfx as node.js does.
+  const nativePackageDir = dirname(createRequire(require.resolve("libfx")).resolve(`${localNativePackage}/package.json`));
+  nativeAddonHash = await sha256(resolve(nativePackageDir, "libfx.node"));
   if (!next15) {
     await run(process.execPath, [
       fileURLToPath(new URL("./test-node-tracing.mjs", import.meta.url)),
       dirname(require.resolve("libfx")),
       require.resolve("next/dist/compiled/@vercel/nft"),
+      nativePackageDir,
     ], app, "node-tracing");
   }
   const next = resolve(app, "node_modules/next/dist/bin/next");

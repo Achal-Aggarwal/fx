@@ -269,13 +269,14 @@ jobs:
             (.bin == null)
           ' sdk/package.json >/dev/null
 
-          node sdk/scripts/package-libfx.mjs sdk/dist/libfx native-addons/*.node
-          jq --arg version "$LIBFX_VERSION" '.version = $version' \
-            sdk/dist/libfx/package.json > sdk/dist/libfx/package.json.tmp
-          mv sdk/dist/libfx/package.json.tmp sdk/dist/libfx/package.json
+          # LIBFX_VERSION sets the version of libfx, of each platform's
+          # package, and of the optional dependencies that pin them.
+          node sdk/scripts/package-libfx.mjs sdk/dist native-addons/*.node
           npm pack ./sdk/dist/libfx --ignore-scripts --json > /tmp/libfx-pack.json
           mv "$(jq -r '.[0].filename' /tmp/libfx-pack.json)" libfx-package.tgz
           sha256sum libfx-package.tgz > libfx-package.tgz.sha256
+          mkdir libfx-native
+          for package in sdk/dist/libfx-*/; do npm pack "./$package" --ignore-scripts --pack-destination libfx-native; done
 
       - name: Validate package archive
         run: |
@@ -283,13 +284,11 @@ jobs:
             const report = require("/tmp/libfx-pack.json")[0];
             const names = new Set(report.files.map(({ path }) => path));
             const required = [
-              "package.json", "README.md", "LICENSE", "browser.js", "node.js", "node.cjs", "fx-sdk.js", "engine.js", "xterm.js", "wasm-runtime.js", "wasm-terminal.js", "wasm-module.js",
+              "package.json", "README.md", "LICENSE", "browser.js", "node.js", "node.cjs", "node-wasm.js", "bundled-asset.js", "fx-sdk.js", "engine.js", "xterm.js", "wasm-runtime.js", "wasm-terminal.js", "wasm-module.js",
               "core-output.js", "tool-observation.js", "fetch-cleanup.js", "mcp.js", "skills.js", "skills-node.js", "subscription.js", "oauth.js", "chatgpt.js", "chatgpt-sign-in.js", "grok.js", "grok-sign-in.js", "custom-provider.js",
               "durable.js", "fx-harness.js", "durable/local.mjs", "durable/vercel.mjs", "durable/world.mjs",
               "types/browser.d.ts", "types/chatgpt.d.ts", "types/durable-local.d.ts", "types/durable-vercel.d.ts", "types/durable-world.d.ts", "types/grok.d.ts", "types/libfx.d.cts", "types/mcp.d.ts", "types/node.d.cts", "types/node.d.ts", "types/skills-node.d.ts", "types/skills.d.ts", "types/wasm.d.ts",
               "fx-core.wasm", "fx-term.wasm",
-              "libfx.linux-x64.node", "libfx.linux-arm64.node",
-              "libfx.darwin-x64.node", "libfx.darwin-arm64.node",
             ];
             if (names.size !== required.length) throw new Error(`unexpected package file count: ${names.size}`);
             for (const name of required) {
@@ -303,7 +302,7 @@ jobs:
       # and runs on each backend.
       - name: Smoke test the installed package
         run: |
-          node sdk/tests/test-packed-example.mjs libfx-package.tgz native esm
+          node sdk/tests/test-packed-example.mjs libfx-package.tgz native esm --native-dir libfx-native
           node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs libfx-package.tgz wasm esm
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -358,6 +357,14 @@ jobs:
             echo "libfx@${LIBFX_VERSION} is already published; leaving ${NPM_TAG} unchanged"
             exit 0
           fi
+          # libfx carries no native addon of its own. Without every platform
+          # package it pins, installs would fall back to WebAssembly.
+          for package in $(tar -xzOf libfx-package.tgz package/package.json | jq -r '.optionalDependencies | keys[]'); do
+            if ! npm view "${package}@${LIBFX_VERSION}" version --registry=https://registry.npmjs.org/ >/dev/null 2>&1; then
+              echo "::error::${package}@${LIBFX_VERSION} is not published; refusing to publish libfx without it"
+              exit 1
+            fi
+          done
           npm publish ./libfx-package.tgz --ignore-scripts --access public --tag "$NPM_TAG" --provenance
 
   verify-published:

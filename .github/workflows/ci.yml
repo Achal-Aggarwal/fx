@@ -460,18 +460,20 @@ jobs:
           node --experimental-wasm-jspi sdk/tests/test-node-bundled-assets.mjs
           node sdk/tests/test-node-package.mjs
           node sdk/tests/test-term-demo-package.mjs
-          node sdk/scripts/package-libfx.mjs sdk/dist/libfx native-addons/libfx.linux-x64.node native-addons/libfx.linux-arm64.node native-addons/libfx.darwin-x64.node native-addons/libfx.darwin-arm64.node
+          node sdk/scripts/package-libfx.mjs sdk/dist native-addons/libfx.linux-x64.node native-addons/libfx.linux-arm64.node native-addons/libfx.darwin-x64.node native-addons/libfx.darwin-arm64.node
           node --experimental-wasm-jspi sdk/tests/test-node-async-assets.mjs sdk/dist/libfx
           npm pack ./sdk/dist/libfx --ignore-scripts --json > /tmp/libfx-pack.json
           mv "$(node -p 'require("/tmp/libfx-pack.json")[0].filename')" /tmp/libfx-package.tgz
-          node sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native esm
-          node --no-experimental-require-module sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native cjs
+          mkdir -p /tmp/libfx-native
+          for package in sdk/dist/libfx-*/; do npm pack "./$package" --ignore-scripts --pack-destination /tmp/libfx-native; done
+          node sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native esm --native-dir /tmp/libfx-native
+          node --no-experimental-require-module sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native cjs --native-dir /tmp/libfx-native
           node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz wasm esm
           node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz wasm cjs
 
       - name: Test package recovery and lifecycle boundaries
         run: |
-          node sdk/tests/test-package-resilience.mjs --package /tmp/libfx-package.tgz \
+          node sdk/tests/test-package-resilience.mjs --package /tmp/libfx-package.tgz --native-dir /tmp/libfx-native \
             --cheap-cycles 100 --tool-workflows 20 --duration-ms 5000 --concurrency 4 \
             --json-out "${{ runner.temp }}/libfx-package-evidence/resilience.json"
 
@@ -482,9 +484,9 @@ jobs:
         env:
           LIBFX_TEST_ARTIFACT_ROOT: ${{ runner.temp }}/libfx-package-evidence
         run: |
-          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz
-          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz --webpack
-          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz --next15
+          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz --native-dir /tmp/libfx-native
+          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz --native-dir /tmp/libfx-native --webpack
+          node sdk/tests/test-next-package.mjs /tmp/libfx-package.tgz --native-dir /tmp/libfx-native --next15
 
       - name: Retain package qualification evidence
         if: always()

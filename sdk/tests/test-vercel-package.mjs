@@ -5,8 +5,9 @@ import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { cp, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { nativeDirArgument, nativeTarballs } from "./native-package.mjs";
 import { serializeError } from "./package-report.mjs";
 
 const input = process.argv[2];
@@ -57,6 +58,21 @@ try {
   if (input.endsWith(".tgz")) {
     await cp(resolve(input), resolve(app, "libfx.tgz"));
     manifest.dependencies.libfx = "file:./libfx.tgz";
+    // A local libfx has no published platform packages, so its optional
+    // dependencies point at local tarballs. The deployment installs the
+    // Linux one. pnpm 10 reads package.json overrides; pnpm 11 reads them
+    // only from pnpm-workspace.yaml.
+    const nativeDir = nativeDirArgument();
+    assert.ok(nativeDir, "a local tarball needs --native-dir <dir of platform package tarballs>");
+    const overrides = {};
+    for (const [name, path] of Object.entries(nativeTarballs(nativeDir))) {
+      await cp(path, resolve(app, basename(path)));
+      overrides[name] = `file:./${basename(path)}`;
+    }
+    assert.ok(overrides["@libfx/libfx-linux-x64-gnu"], `${nativeDir} has no @libfx/libfx-linux-x64-gnu tarball`);
+    manifest.pnpm = { overrides };
+    await writeFile(resolve(app, "pnpm-workspace.yaml"), `overrides:\n${Object.entries(overrides)
+      .map(([name, spec]) => `  ${JSON.stringify(name)}: ${JSON.stringify(spec)}`).join("\n")}\n`);
   } else {
     assert.match(input, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/, "pin an immutable version, not a tag");
     manifest.dependencies.libfx = input;
