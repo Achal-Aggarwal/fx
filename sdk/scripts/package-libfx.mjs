@@ -37,6 +37,7 @@ const files = [
   ["LICENSE", "LICENSE"],
   ["sdk/browser.js", "browser.js"],
   ["sdk/node.js", "node.js"],
+  ["sdk/node.cjs", "node.cjs"],
   ["sdk/node-wasm.js", "node-wasm.js"],
   ["sdk/bundled-asset.js", "bundled-asset.js"],
   ["sdk/fx-sdk.js", "fx-sdk.js"],
@@ -92,12 +93,6 @@ for (const { name } of Object.values(nativeTargets)) {
   await rm(resolve(outputRoot, basename(name)), { recursive: true, force: true });
 }
 await mkdir(outputDir, { recursive: true });
-const cjsBuild = spawnSync(process.execPath, [
-  resolve(repoRoot, "sdk/scripts/build-node-cjs.mjs"),
-  resolve(outputDir, "node.cjs"),
-], { cwd: repoRoot, stdio: "inherit" });
-if (cjsBuild.error) throw cjsBuild.error;
-if (cjsBuild.status !== 0) process.exit(cjsBuild.status ?? 1);
 for (const [source, destination] of files) {
   await cp(resolve(repoRoot, source), resolve(outputDir, destination));
 }
@@ -148,6 +143,7 @@ for (const { path, platform } of nativeAddons) {
     cpu: [cpu],
     ...(libc ? { libc: [libc] } : {}),
     exports: { ".": "./index.js", "./package.json": "./package.json" },
+    sideEffects: false,
     engines: sourceManifest.engines,
     publishConfig: sourceManifest.publishConfig,
     license: sourceManifest.license,
@@ -156,10 +152,7 @@ for (const { path, platform } of nativeAddons) {
 }
 
 console.log(`packaged ${manifest.name}@${version} in ${outputDir}`);
-console.log("  node.cjs");
 for (const [, destination] of files) console.log(`  ${destination}`);
-console.log("  durable/local.mjs");
-console.log("  durable/vercel.mjs");
-console.log("  durable/world.mjs");
+for (const name of ["local", "vercel", "world"]) console.log(`  durable/${name}.mjs\n  durable/${name}.mjs.map`);
 for (const name of declarations) console.log(`  types/${name}`);
 for (const dir of nativeDirs) console.log(`packaged ${JSON.parse(await readFile(resolve(dir, "package.json"), "utf8")).name}@${version} in ${dir}`);

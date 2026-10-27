@@ -467,9 +467,9 @@ jobs:
           mkdir -p /tmp/libfx-native
           for package in sdk/dist/libfx-*/; do npm pack "./$package" --ignore-scripts --pack-destination /tmp/libfx-native; done
           node sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native esm --native-dir /tmp/libfx-native
-          node --no-experimental-require-module sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native cjs --native-dir /tmp/libfx-native
+          node sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz native cjs --native-dir /tmp/libfx-native
           node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz wasm esm
-          node --experimental-wasm-jspi --no-experimental-require-module sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz wasm cjs
+          node --experimental-wasm-jspi sdk/tests/test-packed-example.mjs /tmp/libfx-package.tgz wasm cjs
 
       - name: Test package recovery and lifecycle boundaries
         run: |

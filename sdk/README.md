@@ -25,7 +25,7 @@ for await (const event of turn) {
 await agent.close();
 ```
 
-Set `AI_GATEWAY_API_KEY` and run it with Node.js 20 or newer. Model calls go through [AI Gateway](https://vercel.com/docs/ai-gateway), so any model it lists works, and on Vercel libfx uses the deployment's OIDC token instead of a key. libfx can also run on a user's own ChatGPT or Grok plan, or on another server through the OpenAI Chat Completions API. See [Providers](#providers).
+Set `AI_GATEWAY_API_KEY` and run it with Node.js 20.19, 22.12, or newer. Model calls go through [AI Gateway](https://vercel.com/docs/ai-gateway), so any model it lists works, and on Vercel libfx uses the deployment's OIDC token instead of a key. libfx can also run on a user's own ChatGPT or Grok plan, or on another server through the OpenAI Chat Completions API. See [Providers](#providers).
 
 Importing libfx and calling `createFxAgent()` touch no network, files or processes. The engine loads when a session runs its first turn.
 
@@ -513,7 +513,7 @@ A journal or `checkpoint` from a newer libfx fails with `FxJournalVersionError`.
 
 | Runtime | Backend |
 | --- | --- |
-| Node.js 20+ on macOS or Linux, x64 or arm64 | Native addon. Linux needs glibc 2.34 or newer. |
+| Node.js 20.19, 22.12, or newer on macOS or Linux, x64 or arm64 | Native addon. Linux needs glibc 2.34 or newer. |
 | Node.js elsewhere | WebAssembly with JSPI. Some Node versions need `--experimental-wasm-jspi`. |
 | Browsers | WebAssembly with JSPI, from `libfx/browser` |
 | Bun | The same as Node.js. For WebAssembly, use Bun 1.4.2 or newer. |

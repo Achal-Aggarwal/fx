@@ -292,17 +292,20 @@ Each supported tuple has one platform package:
 requires exactly one addon for each of the four tuples and rejects missing,
 duplicate, or unexpected addon names. With no addons, it packages
 `zig-out/lib/libfx.node` as the local tuple's package. `LIBFX_VERSION` sets
-the version of every package and of libfx's optional dependencies. Package assembly also generates a self-contained
-`node.cjs` from the dependency-free ESM source with package-relative module
-URLs. The publish workflow builds and tests each addon on its native runner
+the version of every package and of libfx's optional dependencies.
+`node.cjs` is `module.exports = require("./node.js")`. Node.js 20.19 and 22.12
+load an ES module with `require()`, so CommonJS and ES module callers share one
+copy of libfx and bundlers follow the same imports for both. Each durable
+bundle links a sourcemap that names its sources relative to `sdk/durable` and
+leaves their text out. The publish workflow builds and tests each addon on its native runner
 before combining the artifacts with both WebAssembly surfaces, the README, and
 the Apache-2.0 license.
 
 Package assembly and Next tests run without npm publishing credentials. The
-OIDC publisher uploads the tested archive. The workflow then downloads that
-immutable registry version, compares it byte-for-byte with the archive, and
-exercises its Node entrypoints and Next development, production, and isolated
-deployment output. Failed package qualification blocks publication. Next
+OIDC publisher uploads each platform package, skipping any version npm
+already has, and then libfx, so libfx never pins a package npm lacks. The
+workflow then downloads every immutable registry version and compares each
+byte-for-byte with its tested archive. Failed package qualification blocks publication. Next
 logs and structured results are retained as workflow artifacts, including
 on failure.
 
@@ -310,6 +313,14 @@ CI and publication also run the package resilience matrix with a bounded
 lifecycle, tool, and concurrent workload. Longer soak runs remain manual.
 The Next and Vercel harnesses retain completed scenarios and structured errors
 when qualification fails, and report success only after cleanup succeeds.
+
+npm trusted publishing cannot create a package. Before the workflow can
+publish a new platform package, an owner of the `@libfx` scope publishes a
+placeholder version of it by hand, then adds a trusted publisher on npmjs.com
+for `vercel-labs/fx`, workflow `publish-libfx.yml`, and environment `npm`, with
+`npm publish` allowed. npm expires the trusted publisher if the workflow does
+not publish within two days. Until every pinned package can be published, the
+workflow stops before libfx.
 
 Live Vercel qualification is a separate release check. Run
 `node sdk/tests/test-vercel-package.mjs <tarball>` before publication, then run

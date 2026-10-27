@@ -41,7 +41,7 @@ try {
   assert.ok(packageJob, "publisher package job must exist");
   const bunSetup = packageJob.indexOf("uses: oven-sh/setup-bun@");
   const assembly = packageJob.indexOf("- name: Assemble package");
-  assert.ok(bunSetup >= 0 && bunSetup < assembly, "publisher must install Bun before building the CommonJS entry");
+  assert.ok(bunSetup >= 0 && bunSetup < assembly, "publisher must install Bun before bundling the durable Worlds");
 
   run(process.execPath, [resolve(repoRoot, "sdk/scripts/package-libfx.mjs"), packageRoot], { env: { LIBFX_VERSION: "1.2.3-test.4" } });
 
@@ -59,6 +59,10 @@ try {
   assert.deepEqual(manifest.exports["./mcp"], typed("mcp.d.ts", "./mcp.js"));
   assert.deepEqual(manifest.exports["./skills"], typed("skills.d.ts", "./skills.js"));
   assert.deepEqual(manifest.exports["./skills/node"], typed("skills-node.d.ts", "./skills-node.js"));
+  // No module does work on import, so bundlers may drop the ones an app never
+  // uses. require() of node.js needs Node.js 20.19 or 22.12.
+  assert.equal(manifest.sideEffects, false);
+  assert.equal(manifest.engines.node, "^20.19.0 || >=22.12.0");
   // libfx pins every platform's package to its own version, and a local
   // build produces the one for this machine.
   assert.equal(manifest.version, "1.2.3-test.4");
@@ -95,16 +99,50 @@ try {
     /unexpected package file count|package is missing/,
   );
 
-  const cjs = await readFile(join(packageDir, "node.cjs"), "utf8");
-  assert.doesNotMatch(cjs, new RegExp(repoRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  // Both entries import each platform's package by a literal name, which
-  // bundlers and file tracers follow, and name no addon of their own.
+  // The publisher's platform package check, on reports for every package
+  // libfx pins, then on sets it must reject.
+  const platformValidator = packageJob.match(/- name: Validate platform package archives\n\s+run: \|\n\s+node -e '([\s\S]*?)'/)?.[1];
+  assert.ok(platformValidator, "publisher platform package validation must exist");
+  const manifestPath = join(temp, "libfx-manifest.json");
+  const platformReportPath = join(temp, "libfx-native-pack.json");
+  await writeFile(manifestPath, JSON.stringify(manifest));
+  const platformFiles = ["package.json", "index.js", "libfx.node", "LICENSE", "README.md"].map((path) => ({ path }));
+  const platformReport = Object.keys(manifest.optionalDependencies).map((name) => ({ name, version: manifest.version, size: 0, files: platformFiles }));
+  const validatePlatforms = async (report) => {
+    await writeFile(platformReportPath, JSON.stringify(report));
+    const script = platformValidator.replace("/tmp/libfx-manifest.json", manifestPath).replace("/tmp/libfx-native-pack.json", platformReportPath);
+    return spawnSync(process.execPath, ["-e", script], { encoding: "utf8" });
+  };
+  const accepted = await validatePlatforms(platformReport);
+  assert.equal(accepted.status, 0, accepted.stderr);
+  const changeFirst = (change) => platformReport.map((report, index) => index ? report : { ...report, ...change });
+  for (const [report, message] of [
+    [platformReport.slice(1), /do not match the pinned/],
+    [changeFirst({ version: "0.0.0" }), /does not match libfx/],
+    [changeFirst({ files: [...platformFiles, { path: "extra.js" }] }), /unexpected files/],
+  ]) {
+    const rejected = await validatePlatforms(report);
+    assert.notEqual(rejected.status, 0, "publisher accepted a broken platform package set");
+    assert.match(rejected.stderr, message);
+  }
+
+  // node.cjs only runs node.js, which imports each platform's package by a
+  // literal name that bundlers and file tracers follow, and names no addon.
+  assert.equal(await readFile(join(packageDir, "node.cjs"), "utf8"), await readFile(resolve(repoRoot, "sdk/node.cjs"), "utf8"));
   const source = await readFile(resolve(repoRoot, "sdk/node.js"), "utf8");
-  for (const [entry, text] of [["node.cjs", cjs], ["node.js", source]]) {
-    assert.doesNotMatch(text, /libfx\.(linux|darwin)-[a-z0-9]+\.node/, `${entry} names a bundled addon`);
-    for (const name of Object.values(nativePackages)) {
-      assert.ok(text.includes(`import("${name}")`), `${entry} must import ${name} by a literal name`);
-    }
+  assert.doesNotMatch(source, /libfx\.(linux|darwin)-[a-z0-9]+\.node/, "node.js names a bundled addon");
+  for (const name of Object.values(nativePackages)) {
+    assert.ok(source.includes(`import("${name}")`), `node.js must import ${name} by a literal name`);
+  }
+  // Each durable bundle links a sourcemap that names its sources relative to
+  // sdk/durable and leaves their text out.
+  for (const name of ["local", "vercel", "world"]) {
+    const bundle = await readFile(join(packageDir, "durable", `${name}.mjs`), "utf8");
+    assert.ok(bundle.trimEnd().endsWith(`//# sourceMappingURL=${name}.mjs.map`), `durable/${name}.mjs must link its sourcemap`);
+    const map = JSON.parse(await readFile(join(packageDir, "durable", `${name}.mjs.map`), "utf8"));
+    assert.equal(map.sourcesContent, undefined, `durable/${name}.mjs.map must leave the sources out`);
+    assert.ok(map.sources.includes(`${name}.mjs`), `durable/${name}.mjs.map must name ${name}.mjs`);
+    for (const path of map.sources) assert.ok(!path.startsWith("..") && !path.startsWith("/") && !path.includes("\\"), `durable/${name}.mjs.map names ${path}`);
   }
 
   await cp(packageDir, installedPackage, { recursive: true });
@@ -148,9 +186,14 @@ try {
   `);
 
   const esm = run(process.execPath, ["esm.mjs"], { cwd: consumerDir });
-  const cjsResult = run(process.execPath, ["--no-experimental-require-module", "cjs.cjs"], { cwd: consumerDir });
+  const cjsResult = run(process.execPath, ["cjs.cjs"], { cwd: consumerDir });
   assert.deepEqual(JSON.parse(cjsResult.stdout), JSON.parse(esm.stdout));
-  console.log("Node package passed: publisher prerequisites, archive validation, conditional exports, relocated CJS, literal native assets, and bare imports");
+  // Without require() of ES modules, as before Node.js 20.19 and 22.12,
+  // require("libfx") names the versions it needs.
+  const oldNode = spawnSync(process.execPath, ["--no-experimental-require-module", "cjs.cjs"], { cwd: consumerDir, encoding: "utf8" });
+  assert.notEqual(oldNode.status, 0, "require() without require(esm) must fail");
+  assert.match(oldNode.stderr, /require\("libfx"\) needs Node\.js 20\.19, 22\.12, or newer/);
+  console.log("Node package passed: publisher prerequisites, archive and platform package validation, conditional exports, CJS through require(esm), durable sourcemaps, literal native assets, and bare imports");
 } finally {
   await rm(temp, { recursive: true, force: true });
 }
