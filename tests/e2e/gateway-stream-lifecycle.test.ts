@@ -5929,7 +5929,7 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       expect(latest.code).toBe(0);
       const sessionId = JSON.parse(latest.stdout).id as string;
       // One command replay, kept as a blob of the session.
-      const replays = new Set(savedText(root.home, sessionId).match(/fx-command-replay-[a-f0-9]{64}\.bin/g) ?? []);
+      const replays = new Set(savedText(root.home, sessionId).match(/fx-command-replay-[a-f0-9]{12}-[a-f0-9]{64}\.bin/g) ?? []);
       expect(replays.size).toBe(1);
       const replayHash = /([a-f0-9]{64})\.bin$/.exec([...replays][0]!)![1]!;
       expect(existsSync(join(sessionDir(root.home, sessionId), "blobs", replayHash))).toBe(true);
@@ -8922,6 +8922,170 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     },
     55_000,
   );
+
+  // The provider's own default limit ran out before any text: reasoning only.
+  const emptyLengthLimitedReply = () => fakeGatewaySse([
+    { type: "reasoning-start", id: "spent_reasoning" },
+    { type: "reasoning-delta", id: "spent_reasoning", delta: "thinking until the provider stops" },
+    { type: "reasoning-end", id: "spent_reasoning" },
+    {
+      type: "finish",
+      finishReason: { unified: "length", raw: "length" },
+      usage: { inputTokens: { total: 3 }, outputTokens: { total: 4096 } },
+    },
+  ]);
+
+  async function askWithReplies(
+    label: string,
+    replies: Array<() => Response>,
+    model: Record<string, unknown> = {},
+  ) {
+    const root = createFixtureRoot(label);
+    const tracePath = join(root.root, "trace.log");
+    let index = 0;
+    const gateway = startDynamicFakeGateway(
+      () => (replies[index++] ?? (() => new Response("unexpected request", { status: 500 })))(),
+      { models: [{ id: MODEL, type: "language", tags: ["tool-use"], ...model }] },
+    );
+    try {
+      const result = await runFx(
+        ["ask", "--json", "--auto", "--no-save", "Answer briefly."],
+        { cwd: root.workspace, env: fixtureEnv(root, gateway, tracePath), timeoutMs: 30_000 },
+      );
+      return {
+        result,
+        json: parseAskJson(result.stdout),
+        bodies: gateway.requests.map((request) => JSON.parse(request.body) as { maxOutputTokens?: number }),
+        trace: readFileSync(tracePath, "utf8"),
+      };
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }
+
+  test("an empty reply cut short by the provider's default limit is asked again with a limit", async () => {
+    // A window this large bounds the retry at fx's full-window limit.
+    const { result, json, bodies, trace } = await askWithReplies("empty-length-retry", [
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("answered after the limit retry"),
+    ], { context_window: 1_000_000 });
+
+    expect(result.code).toBe(0);
+    expect(json.output).toContain("answered after the limit retry");
+    expect(json.final_output).toContain("answered after the limit retry");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
+    expect(json.final_output).not.toContain("ran out of output tokens");
+    // The catalog names no limit, so only the retry sends one.
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]!.maxOutputTokens).toBeUndefined();
+    expect(bodies[1]!.maxOutputTokens).toBe(32_768);
+    expect(`${result.stdout}\n${result.stderr}`).toContain("Retrying with a higher limit.");
+    expect(trace).toContain("event=empty_length_limited_retry");
+  }, 40_000);
+
+  test("an empty reply's retry limit stays inside the model's known context window", async () => {
+    const { result, bodies } = await askWithReplies("empty-length-window", [
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("answered inside the window"),
+    ], { context_window: 65_536 });
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]!.maxOutputTokens).toBeUndefined();
+    expect(bodies[1]!.maxOutputTokens).toBe(8_192);
+  }, 40_000);
+
+  test("an empty reply still cut short after the retry says so instead of Done.", async () => {
+    const { result, json, bodies } = await askWithReplies("empty-length-twice", [
+      emptyLengthLimitedReply,
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("a third request must not be sent"),
+    ]);
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(2);
+    expect(json.final_output).toBe("The reply ran out of output tokens before any text.");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
+  }, 40_000);
+
+  test("an empty reply cut short at the catalog's own limit is not asked again", async () => {
+    const { result, json, bodies, trace } = await askWithReplies("empty-length-catalog-limit", [
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("a retry must not be sent"),
+    ], { context_window: 200_000, max_tokens: 8_000 });
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]!.maxOutputTokens).toBe(8_000);
+    expect(json.final_output).toBe("The reply ran out of output tokens before any text.");
+    expect(`${result.stdout}\n${result.stderr}`).not.toContain("Done.");
+    expect(trace).not.toContain("event=empty_length_limited_retry");
+  }, 40_000);
+
+  test("commands with the same output get their own handles, and each reads back after resume", async () => {
+    const root = createFixtureRoot("distinct-replay-handles");
+    const tracePath = join(root.root, "trace.log");
+    const handles: string[] = [];
+    const run = (id: string, command: string) => fakeGatewayToolCall(id, "shell", {
+      request: { action: "run", command, profile: "clean", yield_time_ms: 30000 },
+    });
+    const read = (id: string, handle: string) => fakeGatewayToolCall(id, "read_tool_result", {
+      request: { handle, query: "SAME_OUTPUT" },
+    });
+    let step = 0;
+    const gateway = startDynamicFakeGateway((body) => {
+      switch (step++) {
+        case 0:
+          return run("same-a", "printf 'SAME_OUTPUT\\n'");
+        case 1:
+          handles.push(JSON.parse(toolResultOutput(body, "same-a")).full_output_handle);
+          return run("same-b", "echo SAME_OUTPUT");
+        case 2:
+          handles.push(JSON.parse(toolResultOutput(body, "same-b")).full_output_handle);
+          return fakeGatewayFinalText("DISTINCT_HANDLES_RECORDED");
+        case 3:
+          return read("read-a", handles[0]!);
+        case 4:
+          expect(toolResultOutput(body, "read-a")).toContain("SAME_OUTPUT");
+          return read("read-b", handles[1]!);
+        case 5:
+          expect(toolResultOutput(body, "read-b")).toContain("SAME_OUTPUT");
+          return fakeGatewayFinalText("DISTINCT_HANDLES_READ");
+        default:
+          return new Response("unexpected request", { status: 500 });
+      }
+    }, { models: [{ id: MODEL, type: "language", tags: ["tool-use"] }] });
+    try {
+      const env = fixtureEnv(root, gateway, tracePath);
+      const first = await runFx(
+        ["ask", "--json", "--auto", "Run both commands."],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(first.code).toBe(0);
+      const firstJson = parseAskJson(first.stdout);
+      expect(firstJson.output).toContain("DISTINCT_HANDLES_RECORDED");
+      expect(handles).toHaveLength(2);
+      const shape = /^fx-command-replay-([0-9a-f]{12})-([0-9a-f]{64})\.bin$/;
+      const [a, b] = handles.map((handle) => shape.exec(handle));
+      expect(a).not.toBeNull();
+      expect(b).not.toBeNull();
+      // One stored copy of the output, named by two runs of their own.
+      expect(a![2]).toBe(b![2]);
+      expect(handles[0]).not.toBe(handles[1]);
+
+      const resumed = await runFx(
+        ["ask", "--json", "--auto", "--resume", firstJson.session_id, "Read both outputs."],
+        { cwd: root.workspace, env, timeoutMs: 30_000 },
+      );
+      expect(resumed.code).toBe(0);
+      expect(parseAskJson(resumed.stdout).output).toContain("DISTINCT_HANDLES_READ");
+      expect(step).toBe(6);
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 70_000);
 
   test("provider error finish reconciles without authorizing local tool execution", async () => {
     const root = createFixtureRoot("provider-error");

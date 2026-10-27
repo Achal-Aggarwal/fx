@@ -42,6 +42,10 @@ const picker_revalidate_floor_ms: i64 = 5_000;
 const failure_backoff_base_ms: i64 = 5_000;
 const failure_backoff_cap_ms: i64 = 5 * std.time.ms_per_min;
 
+/// How long a request waits for a failed catalog's retry before it goes out
+/// without the catalog's limits.
+const failed_catalog_retry_wait_ms: i64 = 2_000;
+
 fn failureBackoffMs(failure_streak: u32) i64 {
     var delay = failure_backoff_base_ms;
     var step: u32 = 1;
@@ -355,8 +359,9 @@ pub const Runtime = struct {
     thread: ?std.Thread = null,
     state: ModelCacheState = .idle,
     /// A fetch is running. Only the first load for an access shows as
-    /// `.loading`; a revalidation or retry leaves the state readers see alone,
-    /// so no reader ever waits on it.
+    /// `.loading`; a revalidation or retry leaves the state readers see alone.
+    /// A request waits up to `failed_catalog_retry_wait_ms` for a failed
+    /// catalog's retry, and on nothing else but a first load.
     fetch_in_flight: bool = false,
     /// Consecutive failed fetches. A success or reset clears it.
     failure_streak: u32 = 0,
@@ -498,7 +503,8 @@ pub const Runtime = struct {
             self.mutex.unlock(io_mod.getIo());
             return false;
         }
-        // Only a first load blocks request resolution. A revalidation or retry
+        // A first load blocks request resolution, and a failed catalog's retry
+        // holds it for at most `failed_catalog_retry_wait_ms`. A revalidation
         // runs behind the state readers already see.
         const first_load = self.state == .idle;
         if (first_load) self.state = .loading;
@@ -689,6 +695,7 @@ pub const Runtime = struct {
         model: []const u8,
         cancel_flag: *std.atomic.Value(bool),
     ) model_capabilities.ResolveError!model_capabilities.Capabilities {
+        var retry_wait_until_ms: ?i64 = null;
         while (true) {
             self.finishThreadIfDone();
             self.mutex.lockUncancelable(io_mod.getIo());
@@ -709,9 +716,19 @@ pub const Runtime = struct {
                 }
                 return model_capabilities.resolveCapabilities(model, metadata);
             }
+            // A request waits a moment for a failed catalog's retry, such as
+            // the one a submitted prompt starts, so a retry that lands quickly
+            // gives this request its limits. A slow retry never holds it.
+            const retry_in_flight = state == .failed and self.fetch_in_flight;
             self.mutex.unlock(io_mod.getIo());
+            const wait_for_retry = retry_in_flight and wait: {
+                const now = model_catalog.clockMs();
+                const until = retry_wait_until_ms orelse now + failed_catalog_retry_wait_ms;
+                retry_wait_until_ms = until;
+                break :wait now < until;
+            };
 
-            switch (state) {
+            switch (if (wait_for_retry) .loading else state) {
                 .loading => {
                     if (cancel_flag.load(.seq_cst)) {
                         debug_trace.logf(
@@ -1347,7 +1364,7 @@ test "model picker revalidates past the reopen floor while activity waits for th
     }
 }
 
-test "model cache retries a failed catalog behind the failed state so requests never wait on it" {
+test "model cache retries a failed catalog behind the failed state so requests wait on it only briefly" {
     const public: credentials.CatalogAccess = .{ .public_only = .no_credential };
     var runtime = Runtime.init(std.testing.allocator, "/v1/models");
     defer runtime.deinit();
@@ -1365,10 +1382,17 @@ test "model cache retries a failed catalog behind the failed state so requests n
     try std.testing.expect(runtime.isFailed());
     try std.testing.expect(!runtime.isLoading());
 
-    // A set cancel flag fails any wait at once, so a returned value proves
-    // the request resolved without waiting on the retry.
+    // A set cancel flag fails any wait at once, so the error proves the
+    // request waits on the retry.
     var cancelled = std.atomic.Value(bool).init(true);
-    _ = try runtime.resolveForRequest("first", &cancelled);
+    try std.testing.expectError(error.Cancelled, runtime.resolveForRequest("first", &cancelled));
+    // A retry that has not landed holds a request only for the bound.
+    var live = std.atomic.Value(bool).init(false);
+    const started_ms = model_catalog.clockMs();
+    const unresolved = try runtime.resolveForRequest("first", &live);
+    try std.testing.expect(model_catalog.clockMs() - started_ms >= failed_catalog_retry_wait_ms);
+    try std.testing.expectEqual(@as(?u32, null), unresolved.max_output_tokens);
+    try std.testing.expect(fetchInFlight(&runtime));
     try runtime.openMenu();
     try std.testing.expectEqual(ModelMenuLoadState.loading, runtime.menu.load_state);
 

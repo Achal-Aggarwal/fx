@@ -1561,6 +1561,16 @@ only by quitting):
   can be resumed yet. **Alternative:** show the id only once saved; print
   the full `fx --resume` command; or keep counting turns and show a fork
   before its first prompt as unsaved, though resume opens it.
+- **D91 Decision (amends D44):** a command's output handle is
+  `fx-command-replay-`, a random 12-hex id for the run, `-`, the body's
+  full hash and `.bin`. Readers take the hash after the handle's last `-`,
+  as they do for every v2 handle, so no name index exists, a handle from
+  before this decision still resolves, and two runs with the same output
+  keep sharing one blob. **Why:** a handle that was only the output's hash
+  gave two commands with identical output the same handle, so the model
+  read a later result as a replay of an earlier one. **Alternative:** hash
+  the command into the body, which changes the replay format and still
+  repeats a handle when the same command prints the same output twice.
 
 ## Design Risks And Failure Behavior
 

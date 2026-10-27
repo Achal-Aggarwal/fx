@@ -8833,6 +8833,7 @@ describe("acp: model-independent", () => {
         fakeGatewayToolCall("read_1", "read_file", { path: "a.txt" }),
         fakeGatewayToolCall("read_2", "read_file", { path: "b.txt" }),
         noToolLength(),
+        noToolLength(),
         finalText("UNEXPECTED_CONTINUATION"),
       ]);
       try {
@@ -8848,7 +8849,13 @@ describe("acp: model-independent", () => {
         );
 
         expect(result.promptResult.result.stopReason).toBe("max_output_tokens");
-        expect(gateway.requests).toHaveLength(3);
+        // The empty reply's one retry sends the same request with an output
+        // limit; neither request asks for a summary.
+        expect(gateway.requests).toHaveLength(4);
+        expect(JSON.parse(gateway.requests[2]!.body).maxOutputTokens).toBeUndefined();
+        const retryLimit = JSON.parse(gateway.requests[3]!.body).maxOutputTokens;
+        expect(retryLimit).toBeGreaterThan(0);
+        expect(retryLimit).toBeLessThanOrEqual(32_768);
         expect(gateway.requests.some(({ body }) =>
           body.includes("Summarize what you just did.")
         )).toBe(false);

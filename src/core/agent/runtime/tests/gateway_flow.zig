@@ -8611,6 +8611,7 @@ test "processQueuedPrompt no-tool length bypasses silent-tool continuation" {
         .{ .tool_calls = &call_one },
         .{ .tool_calls = &call_two },
         .{ .finish_reason = .length },
+        .{ .finish_reason = .length },
         .{ .content = "UNEXPECTED_CONTINUATION" },
     };
     var gateway = FakeGateway.init(alloc, &completions);
@@ -8621,12 +8622,17 @@ test "processQueuedPrompt no-tool length bypasses silent-tool continuation" {
 
     try runFakePrompt(&gateway, &hooks, fixture.config(), fixture.job());
 
-    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+    // The empty reply's one retry sends the same request with an output
+    // limit; neither request asks for a summary.
+    try std.testing.expectEqual(@as(usize, 4), gateway.request_bodies.items.len);
+    try expectBodyNotContains(&gateway, 2, "\"maxOutputTokens\"");
+    try expectBodyContains(&gateway, 3, "\"maxOutputTokens\":32768");
+    try expectBodyNotContains(&gateway, 3, "Summarize what you just did.");
     try std.testing.expectEqual(@as(usize, 2), hooks.executed_names.items.len);
     try std.testing.expectEqual(types.TurnPresentationOutcome.completed, hooks.finalized_outcome.?);
     try std.testing.expectEqual(types.ProviderCompletionDisposition.length_limited, hooks.finalized_disposition.?);
     try std.testing.expectEqual(@as(usize, 1), hooks.finalization_count);
-    try std.testing.expectEqualStrings("Done.", hooks.finish_assistant_text.?);
+    try std.testing.expectEqualStrings("The reply ran out of output tokens before any text.", hooks.finish_assistant_text.?);
 }
 
 test "processQueuedPrompt non-ok gateway response trims and clips HTTP detail" {

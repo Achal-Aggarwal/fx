@@ -290,6 +290,7 @@ pub const StreamState = struct {
     open_count: usize = 0,
     command_count: usize = 0,
     subagent_count: usize = 0,
+    mcp_count: usize = 0,
     token_progress: TurnTokenProgress = .{},
     last_activity_kind: ?ToolActivityKind = null,
     /// When the turn started; 0 hides the elapsed counter and activity blink.
@@ -2476,6 +2477,8 @@ pub const ToolActivityKind = enum {
     command,
     subagent,
     ask,
+    /// A call to an MCP server's tool.
+    mcp,
 };
 
 pub const QuestionOption = struct {
