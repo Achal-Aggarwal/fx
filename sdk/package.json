@@ -89,6 +89,8 @@
   },
   "files": [
     "browser.js",
+    "browser-agent.js",
+    "browser-terminal.js",
     "node.js",
     "node.cjs",
     "node-wasm.js",

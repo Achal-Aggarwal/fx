@@ -36,6 +36,8 @@ const files = [
   ["sdk/README.md", "README.md"],
   ["LICENSE", "LICENSE"],
   ["sdk/browser.js", "browser.js"],
+  ["sdk/browser-agent.js", "browser-agent.js"],
+  ["sdk/browser-terminal.js", "browser-terminal.js"],
   ["sdk/node.js", "node.js"],
   ["sdk/node.cjs", "node.cjs"],
   ["sdk/node-wasm.js", "node-wasm.js"],

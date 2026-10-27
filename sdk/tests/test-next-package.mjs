@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { createWriteStream } from "node:fs";
-import { access, cp, mkdir, mkdtemp, readFile, rename, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, mkdtemp, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
@@ -22,6 +22,7 @@ const bundlerArgs = webpack && !next15 ? ["--webpack"] : [];
 const nativeDir = nativeDirArgument();
 assert.ok(nativeDir, "usage: test-next-package.mjs <libfx.tgz> --native-dir <dir> [--webpack|--next15]");
 let nativeAddonHash;
+let coreWasmHash;
 const artifactRoot = process.env.LIBFX_TEST_ARTIFACT_ROOT || tmpdir();
 await mkdir(artifactRoot, { recursive: true });
 const root = await mkdtemp(resolve(artifactRoot, "libfx-next-"));
@@ -85,6 +86,15 @@ async function stop(server) {
 }
 
 async function exercise(server, stage) {
+  // The page whose client component creates a browser agent renders on the
+  // server.
+  const page = await fetch(`${server.url}/agent`, { signal: AbortSignal.timeout(60_000) });
+  const html = await page.text();
+  assert.equal(page.status, 200, html.slice(0, 500));
+  assert.match(html, /id="libfx-agent">function</, "the server must render the browser agent page");
+  results.push({ stage, scenario: "browser-agent-page", status: page.status });
+  console.log(`${stage}/browser agent page passed`);
+
   const unauthorized = await fetch(`${server.url}/api/fx`);
   assert.equal(unauthorized.status, 401);
   for (const backend of ["native", "auto"]) {
@@ -175,6 +185,15 @@ async function ndjsonUntil(response, done) {
 
 const sha256 = async (path) => createHash("sha256").update(await readFile(path)).digest("hex");
 
+// The agent page's client build emits the package's fx-core.wasm, and no
+// fx-term.wasm, which only a terminal loads.
+async function assertBrowserAssets(buildDir) {
+  const wasm = (await readdir(resolve(buildDir, "static"), { recursive: true })).filter((path) => path.endsWith(".wasm"));
+  assert.equal(wasm.length, 1, `the client build must emit exactly one .wasm: ${wasm.join(", ")}`);
+  assert.match(basename(wasm[0]), /^fx-core\./, `the client build emitted ${wasm[0]} instead of fx-core.wasm`);
+  assert.equal(await sha256(resolve(buildDir, "static", wasm[0])), coreWasmHash, `${wasm[0]} is not the package's fx-core.wasm`);
+}
+
 async function assertBundledNativeAssets(buildDir) {
   // The route traces one addon: the platform package's, whichever bundler
   // copied it.
@@ -217,6 +236,7 @@ try {
   // The installed platform package, resolved from libfx as node.js does.
   const nativePackageDir = dirname(createRequire(require.resolve("libfx")).resolve(`${localNativePackage}/package.json`));
   nativeAddonHash = await sha256(resolve(nativePackageDir, "libfx.node"));
+  coreWasmHash = await sha256(resolve(dirname(require.resolve("libfx")), "fx-core.wasm"));
   if (!next15) {
     await run(process.execPath, [
       fileURLToPath(new URL("./test-node-tracing.mjs", import.meta.url)),
@@ -231,6 +251,7 @@ try {
   await stop(dev);
   await run(process.execPath, ["--no-experimental-require-module", next, "build", ...bundlerArgs], app, "build");
   await assertBundledNativeAssets(resolve(app, ".next"));
+  await assertBrowserAssets(resolve(app, ".next"));
   const production = await start(app, [next, "start"], "start");
   await exercise(production, "start");
   await stop(production);
@@ -241,6 +262,7 @@ try {
   })};\n`);
   await run(process.execPath, ["--no-experimental-require-module", next, "build", ...bundlerArgs], app, "standalone-build");
   await assertBundledNativeAssets(resolve(app, distDir));
+  await assertBrowserAssets(resolve(app, distDir));
   const isolated = resolve(root, "isolated");
   await cp(resolve(app, distDir, "standalone"), isolated, { recursive: true, verbatimSymlinks: true });
   await mkdir(resolve(isolated, distDir), { recursive: true });
