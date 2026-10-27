@@ -43,6 +43,7 @@ import {
   startFakeGateway,
   TmuxSession,
   type FakeGatewayModel,
+  type FakeGatewayOptions,
   type FakeGatewayResponse,
   tmuxAvailable,
 } from "./tmux-helpers";
@@ -1504,7 +1505,7 @@ async function launchRouteRecoveryTui(
   responses: FakeGatewayResponse[],
   options: {
     model?: string;
-    models?: FakeGatewayModel[];
+    models?: FakeGatewayOptions["models"];
     settings?: Record<string, unknown>;
   } = {},
 ) {
@@ -1929,6 +1930,62 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       expect(queuedGateway.modelRequests).toHaveLength(1);
       expect(queuedGateway.requests).toHaveLength(1);
+      expect(JSON.parse(queuedGateway.requests[0]!.body).maxOutputTokens).toBe(32_768);
+      expect(session!.isAlive()).toBe(true);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+
+      await session!.sendText("/quit");
+      expect(await session!.waitForSessionEnd(TIMEOUT)).toBe(true);
+      await session!.kill();
+      session = null;
+    },
+    TIMEOUT * 2,
+  );
+
+  test(
+    "a prompt's request waits for the retry of a model catalog that failed to load",
+    async () => {
+      const model = "zai/glm-5.3";
+      const finalText = "Catalog retry reached the first request.";
+      let catalogUp = false;
+      const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
+        "fx-tui-catalog-retry-",
+        [fakeGatewayFinalText(finalText)],
+        {
+          model,
+          models: async () => {
+            if (!catalogUp) return new Response("catalog unavailable", { status: 503 });
+            // Slower than building the request, which goes out first unless it
+            // waits, and well inside the two seconds a request waits.
+            await Bun.sleep(750);
+            return [{
+              id: model,
+              type: "language",
+              tags: ["reasoning", "tool-use"],
+              context_window: 1_000_000,
+              max_tokens: 1_000_000,
+            }];
+          },
+          settings: { model },
+        },
+      );
+      await waitForCondition(
+        () => queuedGateway.modelRequests.length >= 1,
+        "the failed startup catalog load",
+      );
+      // The first retry after a failure waits five seconds; this only paces
+      // the prompt past it, and the request count below proves the retry ran.
+      await Bun.sleep(5_500);
+      const failedLoads = queuedGateway.modelRequests.length;
+      catalogUp = true;
+
+      await session!.sendText("hi");
+      await session!.waitForText(finalText, TIMEOUT);
+      await session!.waitForComposer(TIMEOUT);
+
+      expect(queuedGateway.modelRequests.length).toBe(failedLoads + 1);
+      expect(queuedGateway.requests).toHaveLength(1);
+      // The full-window catalog limit is bounded, as the retried catalog says.
       expect(JSON.parse(queuedGateway.requests[0]!.body).maxOutputTokens).toBe(32_768);
       expect(session!.isAlive()).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
