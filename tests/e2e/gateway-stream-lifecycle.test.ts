@@ -8965,10 +8965,11 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
   }
 
   test("an empty reply cut short by the provider's default limit is asked again with a limit", async () => {
+    // A window this large bounds the retry at fx's full-window limit.
     const { result, json, bodies, trace } = await askWithReplies("empty-length-retry", [
       emptyLengthLimitedReply,
       () => fakeGatewayFinalText("answered after the limit retry"),
-    ]);
+    ], { context_window: 1_000_000 });
 
     expect(result.code).toBe(0);
     expect(json.output).toContain("answered after the limit retry");
@@ -8981,6 +8982,18 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     expect(bodies[1]!.maxOutputTokens).toBe(32_768);
     expect(`${result.stdout}\n${result.stderr}`).toContain("Retrying with a higher limit.");
     expect(trace).toContain("event=empty_length_limited_retry");
+  }, 40_000);
+
+  test("an empty reply's retry limit stays inside the model's known context window", async () => {
+    const { result, bodies } = await askWithReplies("empty-length-window", [
+      emptyLengthLimitedReply,
+      () => fakeGatewayFinalText("answered inside the window"),
+    ], { context_window: 65_536 });
+
+    expect(result.code).toBe(0);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]!.maxOutputTokens).toBeUndefined();
+    expect(bodies[1]!.maxOutputTokens).toBe(8_192);
   }, 40_000);
 
   test("an empty reply still cut short after the retry says so instead of Done.", async () => {

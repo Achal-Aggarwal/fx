@@ -131,8 +131,21 @@ const full_window_output_tokens: u32 = 32_768;
 const full_window_output_divisor: u32 = 8;
 
 /// The output limit for the one retry of a reply the provider cut short before
-/// any text, when the first request set no limit and the provider's default ran out.
-pub const empty_length_retry_output_tokens: u32 = full_window_output_tokens;
+/// any text, when the first request set no limit and the provider's default ran
+/// out. A known context window bounds it as it bounds a full-window limit; null
+/// when that leaves no room.
+pub fn emptyLengthRetryOutputTokens(capabilities: Capabilities) ?u32 {
+    const window = capabilities.context_window orelse return full_window_output_tokens;
+    const bounded = @min(full_window_output_tokens, window / full_window_output_divisor);
+    return if (bounded == 0) null else bounded;
+}
+
+test "empty length retry limit stays inside a known context window" {
+    try std.testing.expectEqual(@as(?u32, 32_768), emptyLengthRetryOutputTokens(.{}));
+    try std.testing.expectEqual(@as(?u32, 32_768), emptyLengthRetryOutputTokens(.{ .context_window = 1_000_000 }));
+    try std.testing.expectEqual(@as(?u32, 8_192), emptyLengthRetryOutputTokens(.{ .context_window = 65_536 }));
+    try std.testing.expectEqual(@as(?u32, null), emptyLengthRetryOutputTokens(.{ .context_window = 7 }));
+}
 
 /// Output tokens to request and reserve for one model call, or null to leave the limit unset.
 pub fn requestOutputTokens(capabilities: Capabilities) ?u32 {

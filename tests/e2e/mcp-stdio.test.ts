@@ -1159,7 +1159,10 @@ describe("modern MCP stdio compatibility", () => {
     });
     expect(laterGateway.requests).toHaveLength(3);
     // A name no live server has still fails without reaching any server.
-    expect(toolResultText(laterGateway.requests[1]!.body, "missing_call")).toContain(missingTool);
+    const missingResult = toolResultText(laterGateway.requests[1]!.body, "missing_call");
+    expect(missingResult).toMatch(/not selected for this model step|Unsupported tool/);
+    expect(missingResult).toContain(missingTool);
+    expect(missingResult).not.toContain(MODERN_RESULT);
     const laterResult = toolResultText(laterGateway.requests[2]!.body, "later_call");
     expect(laterResult).toContain(`${MODERN_RESULT}:later`);
     expect(laterResult).not.toContain("not selected");

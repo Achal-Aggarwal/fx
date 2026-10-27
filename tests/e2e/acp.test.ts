@@ -8853,7 +8853,9 @@ describe("acp: model-independent", () => {
         // limit; neither request asks for a summary.
         expect(gateway.requests).toHaveLength(4);
         expect(JSON.parse(gateway.requests[2]!.body).maxOutputTokens).toBeUndefined();
-        expect(JSON.parse(gateway.requests[3]!.body).maxOutputTokens).toBe(32_768);
+        const retryLimit = JSON.parse(gateway.requests[3]!.body).maxOutputTokens;
+        expect(retryLimit).toBeGreaterThan(0);
+        expect(retryLimit).toBeLessThanOrEqual(32_768);
         expect(gateway.requests.some(({ body }) =>
           body.includes("Summarize what you just did.")
         )).toBe(false);

@@ -359,8 +359,9 @@ pub const Runtime = struct {
     thread: ?std.Thread = null,
     state: ModelCacheState = .idle,
     /// A fetch is running. Only the first load for an access shows as
-    /// `.loading`; a revalidation or retry leaves the state readers see alone,
-    /// so no reader ever waits on it.
+    /// `.loading`; a revalidation or retry leaves the state readers see alone.
+    /// A request waits up to `failed_catalog_retry_wait_ms` for a failed
+    /// catalog's retry, and on nothing else but a first load.
     fetch_in_flight: bool = false,
     /// Consecutive failed fetches. A success or reset clears it.
     failure_streak: u32 = 0,
@@ -502,7 +503,8 @@ pub const Runtime = struct {
             self.mutex.unlock(io_mod.getIo());
             return false;
         }
-        // Only a first load blocks request resolution. A revalidation or retry
+        // A first load blocks request resolution, and a failed catalog's retry
+        // holds it for at most `failed_catalog_retry_wait_ms`. A revalidation
         // runs behind the state readers already see.
         const first_load = self.state == .idle;
         if (first_load) self.state = .loading;
