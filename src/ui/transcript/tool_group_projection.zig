@@ -149,8 +149,10 @@ const category_labels = [_][]const u8{
     "command",
     "subagent",
     "browser",
+    "MCP call",
 };
 const command_category_index = 5;
+const mcp_category_index = 8;
 
 const Summary = struct {
     total: usize = 0,
@@ -184,6 +186,7 @@ fn categoryIndex(kind: types.ToolActivityKind) ?usize {
         .command => command_category_index,
         .subagent => 6,
         .ask => null,
+        .mcp => mcp_category_index,
     };
 }
 
@@ -531,10 +534,13 @@ fn formatGroupSummary(alloc: std.mem.Allocator, summary: Summary) ![]u8 {
         const index = next_index orelse break;
         emitted[index] = true;
         const count = summary.categories[index];
-        const label = if (index == command_category_index and count != 1)
-            "commands"
-        else
-            category_labels[index];
+        const label = if (count == 1)
+            category_labels[index]
+        else switch (index) {
+            command_category_index => "commands",
+            mcp_category_index => "MCP calls",
+            else => category_labels[index],
+        };
         try appendSegment(&out.writer, count, label);
     }
     try appendSegment(&out.writer, summary.completion_unreported, "unreported");
