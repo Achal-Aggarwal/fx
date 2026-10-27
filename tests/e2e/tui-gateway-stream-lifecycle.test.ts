@@ -6427,7 +6427,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         }
         await session.waitForText(finalText, TIMEOUT);
         const compact = await session.captureFullScrollback();
-        expect(compact).toContain("● 5 tool calls · 4 subagent · 1 read");
+        expect(compact).toContain("● 5 tool calls · 4 subagents · 1 read");
         expect(compact).toContain("Invalid Agent failed · Check failure visibility");
         expect(compact).not.toContain("Invalid Agent replied");
         for (let index = 0; index < tasks.length; index += 1) {
@@ -6458,7 +6458,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         session = await TmuxSession.create({ cmd: `${FX_BIN} --resume-last`, cwd: workspace, env, width: 110, height: 35, stderrPath: join(root, "resumed-stderr.log") });
         await session.waitForText(finalText, TIMEOUT);
         const resumed = await session.captureFullScrollback();
-        expect(resumed).toContain("● 5 tool calls · 4 subagent · 1 read");
+        expect(resumed).toContain("● 5 tool calls · 4 subagents · 1 read");
         expect(resumed).toContain("Invalid Agent failed · Check failure visibility");
         expect(resumed).toContain("Subagent finished · Check one-off cleanup");
         expect(resumed).toContain("reviewer replied · Check replay again");

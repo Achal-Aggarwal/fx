@@ -152,6 +152,7 @@ const category_labels = [_][]const u8{
     "MCP call",
 };
 const command_category_index = 5;
+const subagent_category_index = 6;
 const mcp_category_index = 8;
 
 const Summary = struct {
@@ -184,7 +185,7 @@ fn categoryIndex(kind: types.ToolActivityKind) ?usize {
         .edit => 3,
         .open => 4,
         .command => command_category_index,
-        .subagent => 6,
+        .subagent => subagent_category_index,
         .ask => null,
         .mcp => mcp_category_index,
     };
@@ -534,10 +535,9 @@ fn formatGroupSummary(alloc: std.mem.Allocator, summary: Summary) ![]u8 {
         const index = next_index orelse break;
         emitted[index] = true;
         const count = summary.categories[index];
-        const label = if (count == 1)
-            category_labels[index]
-        else switch (index) {
+        const label = if (count == 1) category_labels[index] else switch (index) {
             command_category_index => "commands",
+            subagent_category_index => "subagents",
             mcp_category_index => "MCP calls",
             else => category_labels[index],
         };
@@ -1496,13 +1496,30 @@ test "grouped subagent status keeps the vertical continuation for middle rows" {
     defer projection.deinit(alloc);
 
     try std.testing.expectEqualStrings(
-        "● 4 tool calls · 4 subagent\n" ++
+        "● 4 tool calls · 4 subagents\n" ++
             "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
             "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
             "├ Subagent working · inspect auth\n│ glm-5.3-flash · max\n" ++
             "└ Subagent working · inspect auth\n  glm-5.3-flash · max",
         projection.entry_actions.items[0].override.bytes,
     );
+}
+
+test "group summary uses singular and plural subagent labels" {
+    const alloc = std.testing.allocator;
+    var summary: Summary = .{ .total = 2 };
+    summary.categories[command_category_index] = 1;
+    summary.categories[subagent_category_index] = 1;
+    const single = try formatGroupSummary(alloc, summary);
+    defer alloc.free(single);
+    try std.testing.expectEqualStrings("● 2 tool calls · 1 command · 1 subagent", single);
+
+    summary = .{ .total = 5 };
+    summary.categories[command_category_index] = 2;
+    summary.categories[subagent_category_index] = 3;
+    const plural = try formatGroupSummary(alloc, summary);
+    defer alloc.free(plural);
+    try std.testing.expectEqualStrings("● 5 tool calls · 3 subagents · 2 commands", plural);
 }
 
 test "small minimal tool groups surface canonical action targets" {
