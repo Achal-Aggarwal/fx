@@ -1578,9 +1578,10 @@ only by quitting):
   `cache_write_tokens` and `reasoning_tokens`, each null until a provider
   reports it. The first reply a process records reads the totals from the
   newest `set usage`, so a resumed or forked session keeps counting; a value
-  in any other shape counts from zero. The totals cover the host's own
-  replies: a subagent child writes none, as `fx ask --json` leaves nested
-  usage out. **Why:** a run that is killed or times out never
+  in any other shape counts from zero. Each session's totals cover its own
+  replies: a subagent child writes its totals in its own log, and its
+  parent's leave them out, as `fx ask --json` does. **Why:** a run that is
+  killed or times out never
   reaches the end of its turn, and its log is the only record a benchmark
   harness can read afterwards. **Alternative:** put each reply's counts on
   its `assistant` item, which a reply with no text and no provider replay

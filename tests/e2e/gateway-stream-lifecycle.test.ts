@@ -5727,6 +5727,53 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
     }
   }, 30_000);
 
+  test("a subagent saves its replies' token usage in its own log, apart from its parent's", async () => {
+    const root = createFixtureRoot("usage-subagent");
+    const finish = (unified: string, input: number, cacheRead: number, output: number) => ({
+      type: "finish",
+      finishReason: { unified, raw: unified },
+      usage: { inputTokens: { total: input, cacheRead }, outputTokens: { total: output } },
+    });
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"')) {
+        return fakeGatewaySse([{ type: "text-delta", id: "child_answer", delta: "CHILD_DONE" }, finish("stop", 7000, 700, 70)]);
+      }
+      if (hasCurrentToolResult(body, "usage_child")) {
+        return fakeGatewaySse([{ type: "text-delta", id: "parent_answer", delta: "PARENT_DONE" }, finish("stop", 200, 20, 2)]);
+      }
+      return fakeGatewaySse([
+        { type: "tool-call", toolCallId: "usage_child", toolName: "subagent", input: { request: { action: "run", task: "Reply CHILD_DONE." } } },
+        finish("tool-calls", 100, 10, 1),
+      ]);
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const savedUsage = (id: string) =>
+      (logLines(root.home, id) as Array<{ kind: string; key?: string; value?: unknown }>)
+        .filter((line) => line.kind === "set" && line.key === "usage")
+        .map((line) => line.value)
+        .at(-1);
+
+    try {
+      const result = await runFx(["ask", "--yolo", "--json", "--", "Delegate the usage task."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).final_output).toBe("PARENT_DONE");
+      const [parent] = rootSessionIds(root.home);
+      const children = savedSessionIds(root.home).filter((id) => id !== parent);
+      expect(children.length).toBe(1);
+      expect(savedUsage(parent!)).toEqual({ input_tokens: 300, output_tokens: 3, cache_read_tokens: 30, cache_write_tokens: null, reasoning_tokens: null });
+      expect(savedUsage(children[0]!)).toEqual({ input_tokens: 7000, output_tokens: 70, cache_read_tokens: 700, cache_write_tokens: null, reasoning_tokens: null });
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
+
   test.skipIf(process.platform !== "linux")(
     "a second headless shell run survives replacing the running fx binary",
     async () => {
