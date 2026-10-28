@@ -746,6 +746,11 @@ const App = struct {
 
     pub fn rebindAfterInit(self: *App) void {
         SessionAppRuntime.rebindAfterMove(self);
+        // The WebAssembly terminal runs `/usage` fetches in its event loop,
+        // which they pulse through the app while they wait.
+        if (comptime host_target.is_wasm) {
+            self.usage_dashboard.host = usage_host.cooperativeHost(App, self, self.usage_dashboard.host.home);
+        }
     }
 
     pub fn setNotificationPreferences(
