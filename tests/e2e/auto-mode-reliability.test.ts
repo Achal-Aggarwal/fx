@@ -1150,6 +1150,9 @@ describe("lean auto mode reliability", () => {
           cleanCommandCall("npm test \\&\\& npm run build --global", "escaped_separator"),
           // Every shell drops `#note` as a comment.
           cleanCommandCall("npm test #note", "comment_word"),
+          // Inside double quotes the shell keeps a backslash before `s`, so
+          // npm gets `te\st`, not `test`.
+          cleanCommandCall("npm \"te\\st\"", "double_quoted_backslash"),
           (body) => {
             expect(body).toContain("review_caution");
             return fakeGatewayFinalText("shell syntax stayed reviewed");
@@ -1159,6 +1162,7 @@ describe("lean auto mode reliability", () => {
           fakeGatewayPermissionDecision("caution", "quoted_separator_review"),
           fakeGatewayPermissionDecision("caution", "escaped_separator_review"),
           fakeGatewayPermissionDecision("caution", "comment_word_review"),
+          fakeGatewayPermissionDecision("caution", "double_quoted_backslash_review"),
         ],
       );
       const result = await runFx(
@@ -1174,7 +1178,7 @@ describe("lean auto mode reliability", () => {
       );
 
       expect(result.code, `stdout: ${result.stdout}\nstderr: ${result.stderr}`).toBe(0);
-      expect(gateway.classifierRequests).toHaveLength(3);
+      expect(gateway.classifierRequests).toHaveLength(4);
       expect(existsSync(marker)).toBe(false);
     },
     TIMEOUT,
