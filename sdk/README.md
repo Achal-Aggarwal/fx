@@ -524,6 +524,10 @@ Each platform's addon is its own package, such as `@libfx/libfx-linux-x64-gnu`, 
 
 Next.js works in Node.js route handlers, with webpack or Turbopack, and doesn't need `serverExternalPackages`. CommonJS apps can `require("libfx")`. With TypeScript's `moduleResolution: "bundler"`, add `"node"` to `customConditions` to get the Node.js types.
 
+In a browser build, `createFxAgent` and `createFxEngine` load `fx-core.wasm`, and `createFxTerminal` loads `fx-term.wasm`. Importing `libfx/browser` does no work, so a client component that a server renders can import it. Next.js copies only the files an app's client code uses into the build. Vite 8 copies both unless you set `build.rolldownOptions.experimental.lazyBarrel` to `true`, though a browser still downloads only the file the app uses. esbuild copies neither, so serve the file yourself and pass its URL as `wasm`.
+
+If a CDN serves the `.wasm` files, for example through Next.js's `assetPrefix`, it must send `Content-Type: application/wasm` so the browser can compile while it downloads. Otherwise libfx downloads the whole file before compiling it. When the files come from a different origin than the page, the response also needs CORS headers, such as `Access-Control-Allow-Origin`, or the browser blocks the request.
+
 ## The fx terminal in a browser
 
 ```js

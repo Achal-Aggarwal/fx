@@ -299,7 +299,10 @@ copy of libfx and bundlers follow the same imports for both. Each durable
 bundle links a sourcemap that names its sources relative to `sdk/durable` and
 leaves their text out. The publish workflow builds and tests each addon on its native runner
 before combining the artifacts with both WebAssembly surfaces, the README, and
-the Apache-2.0 license.
+the Apache-2.0 license. Both WebAssembly surfaces are built ReleaseSmall and
+stripped, then `sdk/scripts/optimize-wasm.mjs` shrinks them with
+`wasm-opt -Oz`. CI runs the same pass before its SDK jobs, so they test the
+modules the package ships. A local `zig build` skips it.
 
 Package assembly and Next tests run without npm publishing credentials. The
 OIDC publisher uploads each platform package, skipping any version npm
@@ -310,7 +313,11 @@ logs and structured results are retained as workflow artifacts, including
 on failure.
 
 CI and publication also run the package resilience matrix with a bounded
-lifecycle, tool, and concurrent workload. Longer soak runs remain manual.
+lifecycle, tool, and concurrent workload. CI's SDK package guards job also
+checks which of libfx's modules Node.js loads with and without the native
+addon, what agent-only and terminal browser bundles carry, the package sizes
+against `sdk/tests/package-size-budgets.json`, and the manifest and types with
+publint and attw. Longer soak runs remain manual.
 The Next and Vercel harnesses retain completed scenarios and structured errors
 when qualification fails, and report success only after cleanup succeeds.
 
