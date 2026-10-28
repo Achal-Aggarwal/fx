@@ -76,7 +76,7 @@ async function exercise(sdk) {
 }
 
 async function run(entry, cwd, name) {
-  const child = spawnSync(process.execPath, ["--no-experimental-require-module", entry], {
+  const child = spawnSync(process.execPath, [entry], {
     cwd, encoding: "utf8", timeout: 30_000,
     env: { PATH: process.env.PATH, NODE_PATH: "", NODE_OPTIONS: "", FX_SOUND: "0", FX_DISABLE_KEYCHAIN: "1" },
   });
@@ -103,7 +103,10 @@ try {
     const trace = await nodeFileTrace([join(source, entry)], { base: source, processCwd: source });
     result.files = [...trace.fileList].sort();
     result.warnings = [...trace.warnings].map(String);
-    if (format === "cjs") assert.ok(!result.files.includes("node_modules/libfx/node.js"), "CJS tracing must not be rescued by an ESM import");
+    // require("libfx") runs node.js through node.cjs, so the trace follows both.
+    if (format === "cjs") {
+      for (const file of ["node_modules/libfx/node.cjs", "node_modules/libfx/node.js"]) assert.ok(result.files.includes(file), `CJS trace is missing ${file}`);
+    }
     for (const file of result.files) {
       const from = resolve(source, file);
       const to = resolve(isolated, file);

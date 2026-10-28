@@ -27,10 +27,13 @@ try {
   assert.match(html, new RegExp(`from "\\./${manifest.browser.file.replaceAll(".", "\\.")}";`));
 
   // The page loads browser.js and everything it imports, and nothing else.
+  // browser.js imports the engine and the WebAssembly host itself, not the
+  // libfx/wasm entry.
   const names = Object.keys(manifest.modules);
-  for (const name of ["browser.js", "fx-sdk.js", "engine.js", "wasm-runtime.js", "wasm-terminal.js", "wasm-module.js", "core-output.js", "tool-observation.js", "durable.js", "fx-harness.js"]) {
+  for (const name of ["browser.js", "browser-agent.js", "browser-terminal.js", "engine.js", "xterm.js", "wasm-runtime.js", "wasm-terminal.js", "wasm-module.js", "core-output.js", "tool-observation.js", "durable.js", "fx-harness.js"]) {
     assert.ok(names.includes(name), `the demo package must carry ${name}`);
   }
+  assert.ok(!names.includes("fx-sdk.js"), "the demo package must not carry fx-sdk.js");
   const packagedFiles = new Set(Object.values(manifest.modules).map(({ file }) => file));
   const written = (await readdir(temp)).filter((file) => file.endsWith(".js"));
   assert.deepEqual(written.sort(), [...packagedFiles].sort());
@@ -46,7 +49,7 @@ try {
       assert.ok(existsSync(join(temp, specifier)), `${file} imports ${specifier}, which the package lacks`);
     }
   }
-  for (const key of ["browser", "sdk", "coreOutput", "wasmModule", "toolObservation"]) {
+  for (const key of ["browser", "terminal", "coreOutput", "wasmModule", "toolObservation"]) {
     assert.ok(packagedFiles.has(manifest[key].file), `manifest.${key} names a packaged module`);
   }
   const wasm = await readFile(join(temp, manifest.wasm.file));

@@ -89,6 +89,8 @@
   },
   "files": [
     "browser.js",
+    "browser-agent.js",
+    "browser-terminal.js",
     "node.js",
     "node.cjs",
     "node-wasm.js",
@@ -104,6 +106,7 @@
     "durable/local.mjs",
     "durable/vercel.mjs",
     "durable/world.mjs",
+    "durable/*.mjs.map",
     "types/*.d.ts",
     "types/*.d.cts",
     "wasm-module.js",
@@ -124,8 +127,9 @@
     "README.md",
     "LICENSE"
   ],
+  "sideEffects": false,
   "engines": {
-    "node": ">=20"
+    "node": "^20.19.0 || >=22.12.0"
   },
   "publishConfig": {
     "access": "public",

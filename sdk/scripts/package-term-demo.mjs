@@ -89,7 +89,7 @@ const entry = (name) => {
 const manifest = {
   html: "index.html",
   browser: entry("browser.js"),
-  sdk: entry("fx-sdk.js"),
+  terminal: entry("browser-terminal.js"),
   coreOutput: entry("core-output.js"),
   wasmModule: entry("wasm-module.js"),
   toolObservation: entry("tool-observation.js"),
