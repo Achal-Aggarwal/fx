@@ -1,6 +1,6 @@
 # TLA+ models
 
-TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK model on `main` and on pull requests that change code libfx owns, as `scripts/detect-libfx-need.sh` decides. Run the others when you change the behavior they describe.
+TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK and MCP models on `main` and on pull requests that change the code they cover, as `scripts/detect-ci-need.sh` decides. Run the others when you change the behavior they describe.
 
 | Folder | What it models | Checker |
 |---|---|---|
@@ -51,7 +51,7 @@ npm ci --prefix sdk/durable
 
 ## MCP in CI
 
-CI's `TLA+ MCP models and drivers` job runs each engine model's smoke config (`mcp/run.py check`), `mcp_host/check.sh`, and both MCP drivers. The engine models' planted bugs (`mcp/check.sh`) run only by hand: they measure the checks, not the code.
+CI's `TLA+ MCP models and drivers` job runs each engine model's smoke config (`mcp/run.py check`), `mcp_host/check.sh`, and both MCP drivers, on `main` and on pull requests that change MCP code, these models, their drivers, or the files the drivers load. The engine models' planted bugs (`mcp/check.sh`) run only by hand: they measure the checks, not the code.
 
 ## MCP models without a driver here
 
