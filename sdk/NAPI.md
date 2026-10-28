@@ -313,7 +313,11 @@ logs and structured results are retained as workflow artifacts, including
 on failure.
 
 CI and publication also run the package resilience matrix with a bounded
-lifecycle, tool, and concurrent workload. Longer soak runs remain manual.
+lifecycle, tool, and concurrent workload. CI's SDK package guards job also
+checks which of libfx's modules Node.js loads with and without the native
+addon, what agent-only and terminal browser bundles carry, the package sizes
+against `sdk/tests/package-size-budgets.json`, and the manifest and types with
+publint and attw. Longer soak runs remain manual.
 The Next and Vercel harnesses retain completed scenarios and structured errors
 when qualification fails, and report success only after cleanup succeeds.
 
