@@ -94,7 +94,7 @@ jobs:
   zig:
     name: Build & Test
     if: ${{ always() }}
-    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-browser-wasm, tla-mcp]
+    needs: [zig_mode, sdk-node-wasm, sdk-node-napi, sdk-bun, sdk-package-guards, sdk-browser-wasm, tla-mcp]
     runs-on: ubuntu-latest
     steps:
       - name: Require unit tests and every SDK job
@@ -102,7 +102,7 @@ jobs:
           RESULTS: ${{ toJSON(needs.*.result) }}
         run: |
           printf '%s\n' "$RESULTS"
-          jq -e 'length == 6 and all(.[]; . == "success")' <<<"$RESULTS"
+          jq -e 'length == 7 and all(.[]; . == "success")' <<<"$RESULTS"
 
   build:
     name: Build fx (ReleaseSafe)
@@ -511,6 +511,68 @@ jobs:
             ${{ runner.temp }}/libfx-package-evidence/libfx-trace-*/*.log
             ${{ runner.temp }}/libfx-package-evidence/libfx-trace-*/results.json
           if-no-files-found: ignore
+
+  sdk-package-guards:
+    name: SDK package guards
+    needs: [sdk-wasm, sdk-napi]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.2"
+
+      - name: Download WASM surfaces
+        uses: actions/download-artifact@v4
+        with:
+          name: sdk-wasm
+          path: zig-out/bin
+
+      - name: Download native addons
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sdk-napi-*
+          path: native-addons
+          merge-multiple: true
+
+      - name: Install the durable Worlds and the package test tools
+        run: |
+          npm ci --prefix sdk/durable
+          npm ci --prefix sdk/tests/tools
+
+      - name: Package libfx and its platform packages
+        run: |
+          node sdk/scripts/package-libfx.mjs sdk/dist native-addons/libfx.linux-x64.node native-addons/libfx.linux-arm64.node native-addons/libfx.darwin-x64.node native-addons/libfx.darwin-arm64.node
+          npm pack ./sdk/dist/libfx --ignore-scripts --json > /tmp/libfx-pack.json
+          mv "$(node -p 'require("/tmp/libfx-pack.json")[0].filename')" /tmp/libfx-package.tgz
+          mkdir -p /tmp/libfx-native
+          for package in sdk/dist/libfx-*/; do npm pack "./$package" --ignore-scripts --pack-destination /tmp/libfx-native; done
+
+      # With the platform package, Node.js loads no WebAssembly host code;
+      # with only the macOS package, libfx names the Linux one it needs.
+      - name: Check what Node.js loads from libfx
+        run: node sdk/tests/test-node-load-graph.mjs /tmp/libfx-package.tgz --native-dir /tmp/libfx-native
+
+      - name: Check browser bundles
+        run: node sdk/tests/test-browser-bundles.mjs /tmp/libfx-package.tgz
+
+      - name: Check package sizes
+        run: node sdk/tests/test-package-size.mjs /tmp/libfx-package.tgz --native-dir /tmp/libfx-native
+
+      # The subpaths other than libfx and libfx/node have always been ES
+      # modules only, which require() loads on the Node.js versions libfx
+      # supports.
+      - name: Lint the package and its types
+        run: |
+          sdk/tests/tools/node_modules/.bin/publint /tmp/libfx-package.tgz
+          sdk/tests/tools/node_modules/.bin/attw /tmp/libfx-package.tgz --profile node16 --ignore-rules cjs-resolves-to-esm
 
   sdk-browser-wasm:
     name: SDK (Browser + WASM)
