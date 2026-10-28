@@ -1,6 +1,6 @@
 # TLA+ models
 
-TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK model. Run the others when you change the behavior they describe.
+TLA+ specifications for fx, checked with TLC, together with the scripts and Bun drivers that check them. CI runs the SDK model on `main` and on pull requests that change code libfx owns, as `scripts/detect-libfx-need.sh` decides. Run the others when you change the behavior they describe.
 
 | Folder | What it models | Checker |
 |---|---|---|
