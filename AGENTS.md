@@ -398,7 +398,10 @@ When adding features, consider their impact on startup latency. The `fx help` pa
 
 Every pull request runs `.github/workflows/binary-size.yml`, which builds each
 release target and its base commit on native runners, reports the size change,
-and smoke-tests the pull request binary with `scripts/smoke-binary.sh`.
+and smoke-tests the pull request binary with `scripts/smoke-binary.sh`. Each
+push to `main` builds and caches that commit's binaries, so a pull request
+based on it restores its base binary instead of building it. Pull requests
+never save that cache.
 
 Each platform check is informational. An increase of at least 52,429 bytes
 (0.050000 MiB) emits a warning and retains that platform's binaries for
