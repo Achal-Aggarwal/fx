@@ -1639,6 +1639,16 @@ pub const Usage = struct {
     cache_read_tokens: ?u64 = null,
     cache_write_tokens: ?u64 = null,
     reasoning_tokens: ?u64 = null,
+
+    /// Adds each count `other` reports, saturating at the maximum. A count
+    /// neither side reports stays null.
+    pub fn add(self: *Usage, other: Usage) void {
+        inline for (@typeInfo(Usage).@"struct".field_names) |name| {
+            if (@field(other, name)) |amount| {
+                @field(self, name) = std.math.add(u64, @field(self, name) orelse 0, amount) catch std.math.maxInt(u64);
+            }
+        }
+    }
 };
 
 /// Absolute per-turn token totals. Input covers only user-submitted prompt text

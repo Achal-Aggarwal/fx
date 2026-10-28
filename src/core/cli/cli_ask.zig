@@ -1985,6 +1985,7 @@ fn agentRuntimeDeps(ctx: *AskContext) agent_runtime.AgentRuntimeDeps {
         .propagate_history_turn = propagateHistoryTurn,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .append_turn_piece = if (ctx.v2 != null) appendTurnPiece else null,
+        .record_usage = if (ctx.v2 != null) recordUsage else null,
         .save_prompt_images = if (ctx.v2 != null) savePromptImages else null,
         .propagate_grant = propagateGrant,
         .push_event = pushEvent,
@@ -2923,6 +2924,16 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     ctx.prompt_snapshot_committed = true;
 }
 
+/// `AgentRuntimeDeps.record_usage` on v2: each reply's usage reaches the
+/// log as it arrives, so a killed run keeps it (D92).
+fn recordUsage(raw_ctx: *anyopaque, usage: types.Usage) !void {
+    const ctx: *AskContext = @ptrCast(@alignCast(raw_ctx));
+    ctx.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer ctx.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = ctx.v2 orelse return;
+    try v2.recordUsage(usage);
+}
+
 /// The prompt's images become the session's blobs before its first request
 /// (D89). A failure leaves the rest inline, with no path, as the adapter
 /// does for one image the store refuses.
@@ -3841,11 +3852,15 @@ fn renderFinalJsonResult(alloc: Allocator, result: PromptRunResult) ![]u8 {
         }
         try out.writer.writeAll("}");
     }
-    try out.writer.writeAll("],\"usage\":");
-    try std.json.Stringify.value(.{
-        .input_tokens = result.usage.input_tokens,
-        .output_tokens = result.usage.output_tokens,
-    }, .{}, &out.writer);
+    try out.writer.writeAll("],\"usage\":{\"input_tokens\":");
+    try std.json.Stringify.value(result.usage.input_tokens, .{}, &out.writer);
+    try out.writer.writeAll(",\"output_tokens\":");
+    try std.json.Stringify.value(result.usage.output_tokens, .{}, &out.writer);
+    // Present only when the provider reports caching, so a missing count
+    // never reads as zero cached tokens.
+    if (result.usage.cache_read_tokens) |tokens| try out.writer.print(",\"cache_read_tokens\":{d}", .{tokens});
+    if (result.usage.cache_write_tokens) |tokens| try out.writer.print(",\"cache_write_tokens\":{d}", .{tokens});
+    try out.writer.writeAll("}");
     if (result.error_code) |error_code| {
         try out.writer.writeAll(",\"error\":");
         try std.json.Stringify.value(error_code, .{}, &out.writer);

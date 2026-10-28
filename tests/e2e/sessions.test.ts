@@ -4093,8 +4093,17 @@ async function gridRow(exit: GridExit, entry: GridEntry) {
           expect(first.entered, `${label}: ${first.said}`).toBe(true);
           expectGridHistory(exit, asked(token)!, label);
         } else if (fault === "full-disk" && first.entered) {
-          // Every write fit in space its files already held; nothing is lost.
+          // The turn fit in space its files already held; nothing is lost.
           expectGridHistory(exit, asked(token)!, label);
+          if (readFileSync(c.log).at(-1) !== 0x0a) {
+            // A later line, such as `closed`, did not fit and left a torn
+            // tail. The next open cuts it and keeps the committed turn.
+            await clear();
+            clear = async () => {};
+            const second = await gridEnter(entry, c, gateway, retry, limit);
+            expect(second.entered, `${label} after the fault cleared: ${second.said}`).toBe(true);
+            expect(asked(retry)!, `${label} after the fault cleared`).toContain(`GRID_ANSWER_${token}`);
+          }
         } else {
           expect(first.entered, `${label} entered`).toBe(false);
           const cause = fault === "flipped-byte" || fault === "lost-blob" ? "damaged" : fault === "read-only" ? "denied" : fault === "full-disk" ? "full" : "busy";

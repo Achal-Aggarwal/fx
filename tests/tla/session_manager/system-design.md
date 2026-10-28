@@ -356,7 +356,8 @@ manager:
 
   fx has since dropped its local usage ledger and these markers with it,
   so this item describes the design before that change, and `Wiring.tla`
-  no longer models it (D85).
+  no longer models it (D85). `set usage` now holds the session's token
+  totals, written after each reply (D92).
 - **Checks the adapter keeps:** tool call and result pairing, and v1's
   per-piece size rules, before anything reaches `append`.
 
@@ -1571,6 +1572,20 @@ only by quitting):
   read a later result as a replay of an earlier one. **Alternative:** hash
   the command into the body, which changes the replay format and still
   repeats a handle when the same command prints the same output twice.
+- **D92 Decision (amends D25):** after each main-model reply, fx adds the
+  reply's provider token counts to the session's totals and writes them as
+  `set usage`: `input_tokens`, `output_tokens`, `cache_read_tokens`,
+  `cache_write_tokens` and `reasoning_tokens`, each null until a provider
+  reports it. The first reply a process records reads the totals from the
+  newest `set usage`, so a resumed or forked session keeps counting; a value
+  in any other shape counts from zero. Each session's totals cover its own
+  replies: a subagent child writes its totals in its own log, and its
+  parent's leave them out, as `fx ask --json` does. **Why:** a run that is
+  killed or times out never
+  reaches the end of its turn, and its log is the only record a benchmark
+  harness can read afterwards. **Alternative:** put each reply's counts on
+  its `assistant` item, which a reply with no text and no provider replay
+  does not write.
 
 ## Design Risks And Failure Behavior
 

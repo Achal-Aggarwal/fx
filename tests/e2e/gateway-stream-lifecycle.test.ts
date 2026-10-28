@@ -495,7 +495,7 @@ function parseAskJson(stdout: string): {
   error?: string;
   session_id: string;
   tool_calls: Array<{ name: string; status: string }>;
-  usage: { input_tokens: number | null; output_tokens: number | null };
+  usage: { input_tokens: number | null; output_tokens: number | null; cache_read_tokens?: number; cache_write_tokens?: number };
   recovery?: {
     state: string;
     kind: string;
@@ -5643,6 +5643,136 @@ printf '%s' ${JSON.stringify(trailingMarker)} > ${JSON.stringify(effectPath)}
       rmSync(root.root, { recursive: true, force: true });
     }
   }, 20_000);
+
+  test("a killed ask keeps each reply's token usage in its log, and a resume keeps counting", async () => {
+    const root = createFixtureRoot("usage-survives-sigkill");
+    let requests = 0;
+    const gateway = startGateway(() => {
+      requests += 1;
+      if (requests === 1) {
+        return fakeGatewaySse([
+          { type: "tool-call", toolCallId: "usage_kill_1", toolName: "shell", input: { request: { action: "run", command: "sleep 3", yield_time_ms: 30_000 } } },
+          {
+            type: "finish",
+            finishReason: { unified: "tool-calls", raw: "tool-calls" },
+            usage: { inputTokens: { total: 100, noCache: 20, cacheRead: 80 }, outputTokens: { total: 7, reasoning: 2 } },
+          },
+        ]);
+      }
+      return fakeGatewaySse([
+        { type: "text-delta", id: "answer_1", delta: "Done." },
+        {
+          type: "finish",
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: { inputTokens: { total: 50, cacheRead: 40 }, outputTokens: { total: 3 } },
+        },
+      ]);
+    });
+    const usageValues = (id: string) =>
+      (logLines(root.home, id) as Array<{ kind: string; key?: string; value?: unknown }>).filter((line) => line.kind === "set" && line.key === "usage").map((line) => line.value);
+    // As Harbor runs fx: the agent phase ends with a kill, not a turn end.
+    const proc = Bun.spawn([FX_BIN, "ask", "--yolo", "--json", "--", "Run the usage fixture."], {
+      cwd: root.workspace,
+      env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+
+    try {
+      let id: string | undefined;
+      const deadline = Date.now() + 10_000;
+      while (id === undefined && Date.now() < deadline) {
+        try {
+          const ids = savedSessionIds(root.home);
+          if (ids.length === 1 && usageValues(ids[0]!).length > 0) id = ids[0];
+        } catch {
+          // The store or its log does not exist yet.
+        }
+        if (id === undefined) await Bun.sleep(25);
+      }
+      expect(id).toBeDefined();
+      proc.kill("SIGKILL");
+      await proc.exited;
+
+      const killedLog = logLines(root.home, id!);
+      expect(killedLog.some((line) => line.kind === "turn_committed")).toBe(false);
+      expect(usageValues(id!).at(-1)).toEqual({
+        input_tokens: 100,
+        output_tokens: 7,
+        cache_read_tokens: 80,
+        cache_write_tokens: null,
+        reasoning_tokens: 2,
+      });
+
+      const resumed = await runFx(["ask", "--yolo", "--json", "--resume-id", id!, "--", "Finish up."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "resume-trace.log")),
+        timeoutMs: 15_000,
+      });
+      expect(resumed.code).toBe(0);
+      expect(resumed.stderr).toBe("");
+      expect(parseAskJson(resumed.stdout).usage).toEqual({ input_tokens: 50, output_tokens: 3, cache_read_tokens: 40 });
+      expect(usageValues(id!).at(-1)).toEqual({
+        input_tokens: 150,
+        output_tokens: 10,
+        cache_read_tokens: 120,
+        cache_write_tokens: null,
+        reasoning_tokens: 2,
+      });
+    } finally {
+      if (proc.exitCode === null) proc.kill("SIGKILL");
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a subagent saves its replies' token usage in its own log, apart from its parent's", async () => {
+    const root = createFixtureRoot("usage-subagent");
+    const finish = (unified: string, input: number, cacheRead: number, output: number) => ({
+      type: "finish",
+      finishReason: { unified, raw: unified },
+      usage: { inputTokens: { total: input, cacheRead }, outputTokens: { total: output } },
+    });
+    const gateway = startDynamicFakeGateway((body) => {
+      if (!body.includes('"name":"subagent"')) {
+        return fakeGatewaySse([{ type: "text-delta", id: "child_answer", delta: "CHILD_DONE" }, finish("stop", 7000, 700, 70)]);
+      }
+      if (hasCurrentToolResult(body, "usage_child")) {
+        return fakeGatewaySse([{ type: "text-delta", id: "parent_answer", delta: "PARENT_DONE" }, finish("stop", 200, 20, 2)]);
+      }
+      return fakeGatewaySse([
+        { type: "tool-call", toolCallId: "usage_child", toolName: "subagent", input: { request: { action: "run", task: "Reply CHILD_DONE." } } },
+        finish("tool-calls", 100, 10, 1),
+      ]);
+    }, {
+      classifierDecision: "clear",
+      models: [{ id: MODEL, type: "language", tags: ["tool-use"] }],
+    });
+    const savedUsage = (id: string) =>
+      (logLines(root.home, id) as Array<{ kind: string; key?: string; value?: unknown }>)
+        .filter((line) => line.kind === "set" && line.key === "usage")
+        .map((line) => line.value)
+        .at(-1);
+
+    try {
+      const result = await runFx(["ask", "--yolo", "--json", "--", "Delegate the usage task."], {
+        cwd: root.workspace,
+        env: fixtureEnv(root, gateway, join(root.root, "trace.log")),
+        timeoutMs: 30_000,
+      });
+      expect(result.code).toBe(0);
+      expect(parseAskJson(result.stdout).final_output).toBe("PARENT_DONE");
+      const [parent] = rootSessionIds(root.home);
+      const children = savedSessionIds(root.home).filter((id) => id !== parent);
+      expect(children.length).toBe(1);
+      expect(savedUsage(parent!)).toEqual({ input_tokens: 300, output_tokens: 3, cache_read_tokens: 30, cache_write_tokens: null, reasoning_tokens: null });
+      expect(savedUsage(children[0]!)).toEqual({ input_tokens: 7000, output_tokens: 70, cache_read_tokens: 700, cache_write_tokens: null, reasoning_tokens: null });
+    } finally {
+      gateway.stop();
+      rmSync(root.root, { recursive: true, force: true });
+    }
+  }, 45_000);
 
   test.skipIf(process.platform !== "linux")(
     "a second headless shell run survives replacing the running fx binary",

@@ -446,6 +446,7 @@ fn runtimeDeps(context: *Context) agent_runtime.AgentRuntimeDeps {
         .refresh_gateway_credential = refreshGatewayCredential,
         .format_tool_execution_error = formatToolExecutionError,
         .report_usage = reportUsage,
+        .record_usage = recordUsage,
     };
 }
 
@@ -933,6 +934,13 @@ fn reportUsage(raw: *anyopaque, usage: types.Usage) void {
     if (context.turn.live_metrics) |metrics| {
         metrics.input_tokens.store(context.input_tokens, .monotonic);
     }
+}
+
+/// Saves each reply's usage in the child's own log, as the root saves its
+/// own (D92). The parent's total leaves the child's out.
+fn recordUsage(raw: *anyopaque, usage: types.Usage) !void {
+    const context: *Context = @ptrCast(@alignCast(raw));
+    try context.turn.child.recordUsage(usage);
 }
 
 fn publishCommittedFileHandoff(_: *anyopaque, _: file_mutation.CommittedFileHandoff) agent_runtime.SecondaryPublicationReport {

@@ -8196,6 +8196,9 @@ fn processQueuedPromptLoop(
                     }
                 }
                 agent.observeUsage(completion.usage);
+                if (deps.record_usage) |record| record(deps.ctx, completion.usage) catch |err| {
+                    debug_trace.logf("agent", "event=usage_not_saved err={s}", .{@errorName(err)});
+                };
                 // The completion buffer is step-scoped, so no cross-step
                 // dedupe: each completion reports its serving provider once.
                 // The push_event callback takes ownership of the payload on

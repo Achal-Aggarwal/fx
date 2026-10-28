@@ -1930,6 +1930,7 @@ fn agentRuntimeDeps(ctx: *AcpContext) agent_runtime.AgentRuntimeDeps {
             appendJournalToolIntent
         else
             null,
+        .record_usage = if (session.v2 != null) recordUsage else null,
         .save_prompt_images = if (session.v2 != null) savePromptImages else null,
         .commit_context_compaction = .{ .commit = commitContextCompaction },
         .recovery_checkpoint = if (session.journal != null)
@@ -2787,6 +2788,17 @@ fn appendTurnPiece(raw_ctx: *anyopaque, progress: agent_runtime.TurnProgress) !v
     v2.appendProgress(progress.user, progress.execution, .{ .calls = progress.running_calls, .assistant = progress.running_assistant }) catch |err| {
         debug_trace.logf("session", "event=sessions_v2_stream_failed session={s} err={s} deferred=commit", .{ v2.id(), @errorName(err) });
     };
+}
+
+/// `AgentRuntimeDeps.record_usage` on v2: each reply's usage reaches the
+/// log as it arrives (D92).
+fn recordUsage(raw_ctx: *anyopaque, usage: types.Usage) !void {
+    const ctx: *AcpContext = @ptrCast(@alignCast(raw_ctx));
+    const session = if (ctx.state.active_session) |*value| value else return;
+    session.session_write_mutex.lockUncancelable(io_mod.getIo());
+    defer session.session_write_mutex.unlock(io_mod.getIo());
+    const v2 = session.v2 orelse return;
+    try v2.recordUsage(usage);
 }
 
 /// `AgentRuntimeDeps.save_prompt_images` on v2: the prompt's images become

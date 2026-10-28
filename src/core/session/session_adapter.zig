@@ -1249,6 +1249,9 @@ pub const Session = struct {
     /// A conversion's import: the original time of the batches it writes
     /// next (D59). Null for every other session.
     import_ts: ?u64 = null,
+    /// The session's token totals as its newest `set usage` holds them
+    /// (D92), read from the log on the first reply this process records.
+    usage: ?types.Usage = null,
 
     pub fn create(alloc: Allocator, store: *Store, workspace: []const u8, host: Host, seed: Seed) !*Session {
         // Every v2 write needs a writable open, and both start here or in
@@ -2244,6 +2247,37 @@ pub const Session = struct {
         };
         if (current) |stored| if (std.mem.eql(u8, stored, value)) return;
         _ = try self.write(&.{.{ .set = .{ .key = key, .value = value } }});
+    }
+
+    /// Adds one model reply's provider usage to the session's totals and
+    /// writes them as `set usage`, so a run that is killed or times out
+    /// keeps the usage of every reply it received (D92). A reply with no
+    /// counts writes nothing.
+    pub fn recordUsage(self: *Session, reply: types.Usage) !void {
+        if (std.meta.eql(reply, types.Usage{})) return;
+        self.mutex.lockUncancelable(io_mod.getIo());
+        defer self.mutex.unlock(io_mod.getIo());
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const sa = scratch.allocator();
+        var total = self.usage orelse try self.savedUsage(sa);
+        total.add(reply);
+        const value = try std.json.Stringify.valueAlloc(sa, total, .{});
+        _ = try self.write(&.{.{ .set = .{ .key = .usage, .value = value } }});
+        self.usage = total;
+    }
+
+    /// The totals the log's newest `set usage` holds. A value written
+    /// before D92, or one fx cannot read, counts from zero.
+    fn savedUsage(self: *Session, sa: Allocator) !types.Usage {
+        const raw = (try self.handle.state(sa)).usage orelse return .{};
+        return std.json.parseFromSliceLeaky(types.Usage, sa, raw, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {
+                debug_trace.logf("session", "event=sessions_v2_usage_reset session={s} reason={s} dropped=saved_usage", .{ self.id(), @errorName(err) });
+                return .{};
+            },
+        };
     }
 
     /// A title the user chose. It differs from the derived one, so a
