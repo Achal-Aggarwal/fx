@@ -4957,7 +4957,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
         TIMEOUT,
       );
       await waitForCondition(() => hold.cancelled, "stream cancellation");
-      expect(afterFirst).toContain("■ Cancelled");
+      expect(afterFirst).toContain("▪ Cancelled");
       expect(afterFirst).not.toContain("system: cancelled");
       expect(afterFirst).not.toContain("Cancelling");
       expect(session.isPaneAlive()).toBe(true);

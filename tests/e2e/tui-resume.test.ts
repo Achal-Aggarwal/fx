@@ -7099,7 +7099,7 @@ test.skipIf(!tmuxAvailable())(
       await active.waitForText("What can fx do differently?", TIMEOUT);
       const resumedGrid = await active.capturePaneGrid();
       const footer = findFooterBlocks(resumedGrid).at(-1);
-      const cancelledRow = resumedGrid.findIndex((row) => row.includes("■ Cancelled"));
+      const cancelledRow = resumedGrid.findIndex((row) => row.includes("▪ Cancelled"));
       expect(footer).toBeDefined();
       expect(cancelledRow).toBeGreaterThanOrEqual(0);
       expect(cancelledRow).toBeLessThan(footer!.topDivider);
@@ -7378,7 +7378,7 @@ test.skipIf(!tmuxAvailable())(
       ));
       const cancelledIndex = resumed.indexOf("Cancelled");
       expect(cancelledIndex).toBeGreaterThanOrEqual(0);
-      expect(resumed).toContain("■ Cancelled");
+      expect(resumed).toContain("▪ Cancelled");
       expect(countOccurrences(resumed, "What can fx do differently?")).toBe(1);
       expect(resumed).not.toContain("system: cancelled");
       expect(resumed).not.toContain("Cancelling");
