@@ -1,6 +1,14 @@
 // Bundles each durability module with the World it wraps into one
 // self-contained ES module, so an app installs nothing more and never loads a
 // World of its own. Run with Bun: `bun sdk/scripts/bundle-durable.mjs <out>`.
+//
+// The Worlds stay bundled instead of becoming dependencies of libfx. Their
+// installed dependencies take about 29 MB, mostly zod and undici, against
+// about 2 MB bundled, and every libfx install would carry them, including apps
+// that never use durability. As optional peer dependencies, each app would
+// install them itself. libfx also loads each durability module through an
+// ignored import of one file, which a bundler copies without following its
+// imports, so the module must carry everything it runs.
 import { readFile, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";

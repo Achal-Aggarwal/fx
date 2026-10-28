@@ -203,6 +203,11 @@ jobs:
           zig build -Dwasm-surface=core -Doptimize=ReleaseSmall -Dupdate-channel=${{ needs.metadata.outputs.channel }}
           zig build -Dwasm-surface=term -Doptimize=ReleaseSmall -Dupdate-channel=${{ needs.metadata.outputs.channel }}
 
+      - name: Shrink WebAssembly surfaces with wasm-opt
+        run: |
+          npm ci --prefix sdk/tools
+          node sdk/scripts/optimize-wasm.mjs zig-out/bin/fx-core.wasm zig-out/bin/fx-term.wasm
+
       - name: Install terminal test dependencies
         run: npm ci --prefix sdk/node
 

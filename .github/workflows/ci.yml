@@ -163,6 +163,17 @@ jobs:
           zig build fx-core-wasm -Dwasm-surface=core -Doptimize=ReleaseSmall
           zig build fx-term-wasm -Dwasm-surface=term -Doptimize=ReleaseSmall
 
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      # The SDK jobs test the modules the package ships, after wasm-opt.
+      - name: Shrink WASM surfaces with wasm-opt
+        run: |
+          npm ci --prefix sdk/tools
+          node sdk/scripts/optimize-wasm.mjs zig-out/bin/fx-core.wasm zig-out/bin/fx-term.wasm
+
       - name: Share WASM surfaces with SDK jobs
         uses: actions/upload-artifact@v4
         with:

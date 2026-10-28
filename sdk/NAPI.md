@@ -299,7 +299,10 @@ copy of libfx and bundlers follow the same imports for both. Each durable
 bundle links a sourcemap that names its sources relative to `sdk/durable` and
 leaves their text out. The publish workflow builds and tests each addon on its native runner
 before combining the artifacts with both WebAssembly surfaces, the README, and
-the Apache-2.0 license.
+the Apache-2.0 license. Both WebAssembly surfaces are built ReleaseSmall and
+stripped, then `sdk/scripts/optimize-wasm.mjs` shrinks them with
+`wasm-opt -Oz`. CI runs the same pass before its SDK jobs, so they test the
+modules the package ships. A local `zig build` skips it.
 
 Package assembly and Next tests run without npm publishing credentials. The
 OIDC publisher uploads each platform package, skipping any version npm
