@@ -329,7 +329,8 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
                 };
                 if (canonical_home) |home_root| {
                     global_source_path = try std.Io.Dir.path.join(arena, &.{ home_root, ".fx", "AGENTS.md" });
-                    global_rule = try loadRuleForSelection(arena, &scratch, files, global_source_path.?, options.context_limits.project_instruction_file_bytes);
+                    // The profile rule may link to instructions shared elsewhere in home.
+                    global_rule = try loadRuleForSelection(arena, &scratch, files, global_source_path.?, options.context_limits.project_instruction_file_bytes, home_root);
                     if (pathing.pathInside(home_root, options.workspace_root)) {
                         if (options.bounded_reconstruction) {
                             launch_home = home_root;
@@ -349,7 +350,7 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
                 if (global_source_path == null or
                     !std.mem.eql(u8, global_source_path.?, project_source))
                 {
-                    project_rule = try loadRuleForSelection(arena, &scratch, files, project_source, options.context_limits.project_instruction_file_bytes);
+                    project_rule = try loadRuleForSelection(arena, &scratch, files, project_source, options.context_limits.project_instruction_file_bytes, null);
                 }
             } else {
                 try scratch.addOmission(options.workspace_root, .unsafe_target);
@@ -365,7 +366,7 @@ fn selectProjectContext(alloc: Allocator, options: SelectionOptions) context_con
         }
 
         for (scratch.candidates.items) |*candidate| {
-            switch (try loadRuleWithBudget(arena, files, candidate.source, options.context_limits.project_instruction_file_bytes, if (scratch.work_budget) |*budget| budget else null)) {
+            switch (try loadRuleWithBudget(arena, files, candidate.source, options.context_limits.project_instruction_file_bytes, if (scratch.work_budget) |*budget| budget else null, null)) {
                 .body => |body| {
                     candidate.body = body.text;
                     candidate.observed_bytes = body.observed_bytes;
@@ -470,6 +471,7 @@ fn loadRuleForSelection(
     files: RuleFiles,
     source: []const u8,
     limit: context_limits.Resolved,
+    link_authority: ?[]const u8,
 ) !?LoadedRule {
     if (scratch.work_budget) |*budget| {
         switch (budget.admit_candidate(source)) {
@@ -481,7 +483,7 @@ fn loadRuleForSelection(
             },
         }
     }
-    switch (try loadRuleWithBudget(arena, files, source, limit, if (scratch.work_budget) |*budget| budget else null)) {
+    switch (try loadRuleWithBudget(arena, files, source, limit, if (scratch.work_budget) |*budget| budget else null, link_authority)) {
         .body => |body| {
             try scratch.addDelivered(source);
             return .{ .source = source, .body = body.text, .observed_bytes = body.observed_bytes };
@@ -572,18 +574,21 @@ fn appendRuleCandidate(
 }
 
 fn loadRule(arena: Allocator, path: []const u8, limit: context_limits.Resolved) Allocator.Error!RuleLoad {
-    return loadFilesystemRule(arena, path, limit, null);
+    return loadFilesystemRule(arena, path, limit, null, null);
 }
 
+/// `link_authority` is a canonical directory that a symlinked filesystem rule
+/// may also resolve into, beyond the rule's own directory. Host reads ignore it.
 fn loadRuleWithBudget(
     arena: Allocator,
     files: RuleFiles,
     path: []const u8,
     limit: context_limits.Resolved,
     work_budget: ?*ReconstructionBudget,
+    link_authority: ?[]const u8,
 ) Allocator.Error!RuleLoad {
     return switch (files) {
-        .filesystem => loadFilesystemRule(arena, path, limit, work_budget),
+        .filesystem => loadFilesystemRule(arena, path, limit, work_budget, link_authority),
         .host => |reader| loadHostRule(arena, reader, path, limit, work_budget),
     };
 }
@@ -651,6 +656,7 @@ fn loadFilesystemRule(
     path: []const u8,
     limit: context_limits.Resolved,
     work_budget: ?*ReconstructionBudget,
+    link_authority: ?[]const u8,
 ) Allocator.Error!RuleLoad {
     const stat = std.Io.Dir.cwd().statFile(io_mod.getIo(), path, .{ .follow_symlinks = false }) catch |err| {
         return switch (err) {
@@ -670,7 +676,9 @@ fn loadFilesystemRule(
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return .{ .omitted = .symlink };
         };
-        if (!pathing.pathInside(authority, canonical_target)) return .{ .omitted = .symlink };
+        const inside_authority = pathing.pathInside(authority, canonical_target) or
+            (if (link_authority) |extra| pathing.pathInside(extra, canonical_target) else false);
+        if (!inside_authority) return .{ .omitted = .symlink };
 
         const target_parent = std.Io.Dir.path.dirname(canonical_target) orelse return .{ .omitted = .symlink };
         const target_name = std.Io.Dir.path.basename(canonical_target);
@@ -1149,7 +1157,7 @@ test "reconstruction budget omits file before validation and does not deliver it
         .arena = arena_state.allocator(),
         .work_budget = .{ .admitted_read_bytes = ReconstructionBudget.read_limit - 7 },
     };
-    try std.testing.expectEqual(@as(?LoadedRule, null), try loadRuleForSelection(scratch.arena, &scratch, .filesystem, source, (context_limits.Values{}).project_instruction_file_bytes));
+    try std.testing.expectEqual(@as(?LoadedRule, null), try loadRuleForSelection(scratch.arena, &scratch, .filesystem, source, (context_limits.Values{}).project_instruction_file_bytes, null));
     try std.testing.expectEqual(@as(usize, 0), scratch.delivered_sources.items.len);
     try std.testing.expectEqual(@as(usize, 1), scratch.omissions.items.len);
     try std.testing.expectEqual(context_contract.OmissionReason.oversized, scratch.omissions.items[0].reason);
@@ -1496,6 +1504,68 @@ test "initial gather loads a contained AGENTS symlink with logical provenance" {
     try std.testing.expectEqual(@as(usize, 1), context.delivered_sources.len);
     try std.testing.expectEqualStrings(logical_source, context.delivered_sources[0]);
     try std.testing.expect(std.mem.find(u8, context.modelVisibleBytes(), "symlinked rule file") == null);
+}
+
+test "initial gather loads a global AGENTS symlink that resolves elsewhere in home" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "home/dotfiles/instructions.md", "SHARED_GLOBAL_RULE");
+    try writeTestFile(tmp.dir, "home/dotfiles/project.md", "PROJECT_LINK_OUTSIDE_SCOPE");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/work");
+    const shared = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/dotfiles/instructions.md");
+    defer alloc.free(shared);
+    const project_target = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/dotfiles/project.md");
+    defer alloc.free(project_target);
+    try createSymlinkOrSkip(tmp.dir, shared, "home/.fx/AGENTS.md");
+    try createSymlinkOrSkip(tmp.dir, project_target, "home/work/AGENTS.md");
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work");
+    defer alloc.free(workspace);
+    const global_source = try std.Io.Dir.path.join(alloc, &.{ home, ".fx", "AGENTS.md" });
+    defer alloc.free(global_source);
+    const global_section = try alloc.print("<global-rules from=\"{s}\">\nSHARED_GLOBAL_RULE\n</global-rules>", .{global_source});
+    defer alloc.free(global_section);
+
+    var context = try gatherProjectContextWithHome(alloc, .{ .workspace_root = workspace }, home);
+    defer context.deinit(alloc);
+    const visible = context.modelVisibleBytes();
+
+    try std.testing.expect(std.mem.find(u8, visible, global_section) != null);
+    try std.testing.expectEqual(@as(usize, 1), context.delivered_sources.len);
+    try std.testing.expectEqualStrings(global_source, context.delivered_sources[0]);
+    // The workspace rule keeps its own scope, so a link out of the workspace stays omitted.
+    try std.testing.expect(std.mem.find(u8, visible, "PROJECT_LINK_OUTSIDE_SCOPE") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, visible, "reason=\"symlinked rule file\""));
+}
+
+test "initial gather omits a global AGENTS symlink that leaves home" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try writeTestFile(tmp.dir, "outside/instructions.md", "DO_NOT_EXPOSE_GLOBAL");
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/work");
+    const outside = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "outside/instructions.md");
+    defer alloc.free(outside);
+    try createSymlinkOrSkip(tmp.dir, outside, "home/.fx/AGENTS.md");
+
+    const home = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home);
+    const workspace = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home/work");
+    defer alloc.free(workspace);
+
+    var context = try gatherProjectContextWithHome(alloc, .{ .workspace_root = workspace }, home);
+    defer context.deinit(alloc);
+    const visible = context.modelVisibleBytes();
+
+    try std.testing.expect(std.mem.find(u8, visible, "DO_NOT_EXPOSE_GLOBAL") == null);
+    try std.testing.expect(std.mem.find(u8, visible, "<global-rules") == null);
+    try std.testing.expect(std.mem.find(u8, visible, "reason=\"symlinked rule file\"") != null);
+    try std.testing.expectEqual(@as(usize, 0), context.delivered_sources.len);
 }
 
 test "initial gather orders global ancestors workspace and exact hidden and build target scopes" {
@@ -2029,6 +2099,7 @@ test "host instruction reads reserve reconstruction budget before reading" {
         .{ .host = FakeInstructionHost.reader },
         "/workspace/AGENTS.md",
         (context_limits.Values{}).project_instruction_file_bytes,
+        null,
     ));
     try std.testing.expectEqual(@as(usize, 0), FakeInstructionHost.reads);
     try std.testing.expectEqual(context_contract.OmissionReason.oversized, scratch.omissions.items[0].reason);
@@ -2051,6 +2122,7 @@ test "host instruction reads reserve only the host read bound" {
         .{ .host = .{ .read_fn = FakeInstructionHost.read, .max_read_bytes = 64 } },
         "/workspace/AGENTS.md",
         unbounded_limit,
+        null,
     )) orelse return error.TestExpectedEqual;
     try std.testing.expectEqualStrings("RULE", rule.body);
     try std.testing.expectEqual(@as(usize, 64), FakeInstructionHost.last_max_bytes);
